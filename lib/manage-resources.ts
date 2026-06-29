@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import type { RowDataPacket } from "mysql2/promise";
 import { emptyToNull, parseInteger } from "@/lib/api-utils";
 import { dbExecute, dbQuery, quoteIdentifier, columnExists, tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
+import { sendStaffInviteEmailCode } from "@/lib/manage-accessibility";
 
 export type ManageResourceContext = {
   source: string;
@@ -251,6 +252,19 @@ export async function saveStaffMember(slug: string, body: Record<string, string>
     await ensureStaffCanDeactivate(slug, id);
   }
 
+  // Capture the prior staff email and whether a login user already existed under it
+  // BEFORE we write — these drive the legacy staff-invite "Conferma email account"
+  // code email below (the legacy edit handler keys its email-change branch on the
+  // user found by the OLD email: `$oldUserId > 0 && oldEmail !== newEmail`).
+  const oldStaffRows = id > 0
+    ? await tenantSelect<RowDataPacket>({ slug, table: "staff", columns: "email", where: "id = ?", params: [id], limit: 1 }).catch(() => [])
+    : [];
+  const oldStaffEmail = normalizeEmail(String(oldStaffRows[0]?.email ?? ""));
+  const oldLoginUser = oldStaffEmail
+    ? await tenantSelect<RowDataPacket>({ slug, table: "users", columns: "id", where: "LOWER(email) = ?", params: [oldStaffEmail], limit: 1 }).catch(() => [])
+    : [];
+  const oldLoginUserId = Number(oldLoginUser[0]?.id ?? 0);
+
   const values = await filterColumns(table.name, {
     full_name: fullName,
     phone: phone || null,
@@ -269,6 +283,25 @@ export async function saveStaffMember(slug: string, body: Record<string, string>
   if (email) await upsertStaffLoginUser(slug, { staffId, fullName, email, role, password });
   else if (id > 0) await deleteLoginUserForStaffWithoutEmail(slug, id);
   await replaceOwnerLinks(slug, "staff_locations", "staff_id", staffId, "location_id", locationIds);
+
+  // Staff-invite email (port of the "Conferma email account" code mail in
+  // staff.php). It fires in the same two cases as the legacy handler:
+  //   - NEW staff with an email (a fresh login account)  -> updated=false intro;
+  //   - EDIT of an existing login user whose email changed -> updated=true intro.
+  // It is best-effort / tenant-scoped / SES-gated (see sendStaffInviteEmailCode):
+  // we resolve the user id AFTER the user row is written, never failing this flow.
+  if (email) {
+    const isNew = id <= 0;
+    const emailChangedOnEdit = !isNew && oldLoginUserId > 0 && oldStaffEmail !== "" && oldStaffEmail !== email;
+    if (isNew || emailChangedOnEdit) {
+      const userRows = await tenantSelect<RowDataPacket>({ slug, table: "users", columns: "id", where: "LOWER(email) = ?", params: [email], limit: 1 }).catch(() => []);
+      const userId = Number(userRows[0]?.id ?? 0);
+      if (userId > 0) {
+        await sendStaffInviteEmailCode({ slug, userId, email, updated: !isNew });
+      }
+    }
+  }
+
   return mustFindStaff(slug, staffId);
 }
 

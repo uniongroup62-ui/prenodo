@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { convertDbQuoteToSale, createDbQuote, listDbQuotes, updateDbQuoteStatus } from "@/lib/db-repositories";
+import { convertDbQuoteToSale, createDbQuote, listDbQuotes, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
@@ -50,7 +50,13 @@ export async function POST(request: Request) {
     if (id <= 0) return jsonError("ID preventivo mancante.");
 
     if (action === "send") {
+      // Port of quotes.php action=email: email the quote to the client (public +
+      // PDF links), then mark it sent. sendQuoteEmail is best-effort / SES-gated and
+      // also performs the legacy "mark sent" stamp on a successful send; we still
+      // flip the status first via updateDbQuoteStatus so the documented status
+      // transition is preserved even when SES is unconfigured (unchanged behaviour).
       const quote = await updateDbQuoteStatus(id, "sent", tenantSlug);
+      await sendQuoteEmail(id, tenantSlug, { toEmail: body.to_email, message: body.message });
       return Response.json({ ok: true, sourceMode: "database", quote, quotes: await listDbQuotes(tenantSlug) });
     }
     if (action === "accept") {

@@ -47,7 +47,8 @@ import type {
   WalletMovement,
   WalletMovementType,
 } from "@/lib/tenant-store";
-import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists } from "@/lib/tenant-db";
+import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbQuery, tableExists, tenantIdForSlug } from "@/lib/tenant-db";
+import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 
 export async function listDbLocations(slug: string): Promise<Location[]> {
   const table = await tenantTable(slug, "locations");
@@ -699,6 +700,189 @@ export async function updateDbQuoteStatus(id: number, status: QuoteStatus, slug:
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Preventivo non trovato.");
   return mapQuote(slug, rows[0]);
+}
+
+// Port of the quotes.php manual "Invia email" action (action=email): emails the
+// quote to the client with the public-page link and a PDF link, then marks the
+// quote sent. The Next quotes route previously only flipped the status via
+// updateDbQuoteStatus(), so the email was silent. This sends it for real.
+//
+// Tenant-scoped, gated on emailConfigured() (no-op when SES is off so the existing
+// status-only behaviour is preserved), runs AFTER the status write, and swallows
+// every error — a failed send must never fail the quotes flow (the legacy redirects
+// with an error but the row stays; here the caller already updated the status).
+//
+// Recipient resolution mirrors the PHP: explicit `toEmail` (the form's to_email),
+// else the quote's stored client_email, else the linked client's email.
+//
+// TODO (PDF): the legacy links a server-rendered PDF (QuotePdf.php) at
+// ?page=quote_public&token=...&format=pdf. There is no PDF renderer in Next yet, so
+// we keep the legacy public/PDF link shapes built against PRENODO_PUBLIC_BASE_URL
+// (the tenant's legacy public site still serves quote_public). Replace these with
+// the native public quote page + PDF once they exist in Next.
+type QuoteBranding = { name: string; email: string; logoUrl: string };
+
+async function quoteEmailBranding(slug: string): Promise<QuoteBranding> {
+  const empty: QuoteBranding = { name: "", email: "", logoUrl: "" };
+  try {
+    const tenantId = await tenantIdForSlug(slug);
+    if (!tenantId || !(await tableExists("businesses"))) return empty;
+    const hasLogo = await columnExists("businesses", "logo_path");
+    const hasQuoteName = await columnExists("businesses", "quote_company_name");
+    const hasQuoteEmail = await columnExists("businesses", "quote_email");
+    const cols = ["name", "email"];
+    if (hasQuoteName) cols.push("quote_company_name");
+    if (hasQuoteEmail) cols.push("quote_email");
+    if (hasLogo) cols.push("logo_path");
+    const rows = await dbQuery<RowDataPacket[]>(
+      `SELECT ${cols.join(", ")} FROM businesses WHERE tenant_id = ? ORDER BY id ASC LIMIT 1`,
+      [tenantId],
+    ).catch(() => [] as RowDataPacket[]);
+    const row = rows[0];
+    if (!row) return empty;
+    // The legacy quote header uses the quote-specific company name/email when set
+    // (quote_apply_location_snapshot_to_header), falling back to the business ones.
+    const name = String(row.quote_company_name ?? "").trim() || String(row.name ?? "");
+    const fromEmail = String(row.quote_email ?? "").trim() || String(row.email ?? "");
+    return {
+      name,
+      email: fromEmail,
+      logoUrl: hasLogo ? resolveQuoteLogoUrl(String(row.logo_path ?? "")) : "",
+    };
+  } catch {
+    return empty;
+  }
+}
+
+function resolveQuoteLogoUrl(logoPath: string): string {
+  const path = logoPath.trim();
+  if (!path) return "";
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  if (!base || !path.startsWith("/")) return "";
+  return `${base}${path}`;
+}
+
+// quote_public_url() / quote_public_pdf_url(): the legacy tenant public links.
+function quotePublicUrl(slug: string, token: string): string {
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  if (!base || !token) return "";
+  return `${base}/${encodeURIComponent(slug)}/index.php?page=quote_public&token=${encodeURIComponent(token)}&embed=1`;
+}
+function quotePublicPdfUrl(slug: string, token: string): string {
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  if (!base || !token) return "";
+  return `${base}/${encodeURIComponent(slug)}/index.php?page=quote_public&token=${encodeURIComponent(token)}&format=pdf`;
+}
+
+function escapeQuoteHtml(value: string): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// date('d/m/Y', strtotime($valid_until)) over a stored Y-m-d (or Y-m-d HH:MM:SS).
+function formatQuoteValidUntil(raw: unknown): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(raw ?? "").trim());
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
+}
+
+export async function sendQuoteEmail(
+  id: number,
+  slug: string,
+  opts: { toEmail?: string; message?: string } = {},
+): Promise<void> {
+  if (!emailConfigured()) return;
+  if (!Number.isFinite(id) || id <= 0) return;
+  try {
+    const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 }).catch(() => []);
+    const quote = rows[0];
+    if (!quote) return;
+
+    // Recipient: explicit to_email -> quote.client_email -> linked client email.
+    let to = String(opts.toEmail ?? "").trim();
+    if (!to) to = String(quote.client_email ?? "").trim();
+    if (!to) {
+      const clientId = Number(quote.client_id ?? 0);
+      if (clientId > 0) {
+        const clientRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "email", where: "id = ?", params: [clientId], limit: 1 }).catch(() => []);
+        to = String(clientRows[0]?.email ?? "").trim();
+      }
+    }
+    if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return;
+
+    const token = String(quote.public_token ?? "").trim();
+    const publicUrl = quotePublicUrl(slug, token);
+    const pdfUrl = quotePublicPdfUrl(slug, token);
+
+    const branding = await quoteEmailBranding(slug);
+    const bizName = branding.name.trim();
+    const number = String(quote.number ?? "");
+    const clientName = String(quote.client_name ?? "").trim();
+    const customMsg = String(opts.message ?? "").trim();
+
+    // Subject: 'Preventivo <number>' + ' - <bizName>' when present.
+    let subject = `Preventivo ${number}`.trim();
+    if (bizName !== "") subject += ` - ${bizName}`;
+
+    // Body: faithful HTML port of the quotes.php block (greeting, number, validity,
+    // optional custom message box, "Apri preventivo" button, PDF link).
+    let body = "";
+    body += clientName !== ""
+      ? `Ciao <strong>${escapeQuoteHtml(clientName)}</strong>,<br><br>`
+      : "Ciao,<br><br>";
+    body += `ti inviamo il tuo preventivo <strong>#${escapeQuoteHtml(number)}</strong>.`;
+    const validUntil = formatQuoteValidUntil(quote.valid_until);
+    if (validUntil !== "") {
+      body += `<br>Valido fino al: <strong>${escapeQuoteHtml(validUntil)}</strong>.`;
+    }
+    body += "<br><br>";
+    if (customMsg !== "") {
+      const safeMsg = escapeQuoteHtml(customMsg).replace(/(\r\n|\n\r|\n|\r)/g, "<br>$1");
+      body += `<div style="padding:10px 12px;border:1px solid #e5e7eb;border-radius:12px;background:#f9fafb;margin:10px 0;white-space:pre-wrap;">${safeMsg}</div>`;
+    }
+    if (publicUrl !== "") {
+      body += `<a href="${escapeQuoteHtml(publicUrl)}" style="display:inline-block;background:#4e6da5;color:#fff;text-decoration:none;padding:10px 14px;border-radius:10px;font-weight:600">Apri preventivo</a>`;
+      body += "<br><br>";
+    }
+    if (pdfUrl !== "") {
+      body += `Scarica PDF: <a href="${escapeQuoteHtml(pdfUrl)}">${escapeQuoteHtml(pdfUrl)}</a><br>`;
+    }
+
+    const { html, text } = buildModernEmailTemplate(subject, body, {
+      business_name: bizName,
+      business_email: branding.email,
+      business_logo_url: branding.logoUrl,
+    });
+    const res = await sendEmail({
+      to,
+      subject,
+      html,
+      text,
+      fromEmail: branding.email.trim() || undefined,
+      fromName: bizName || undefined,
+    });
+    if (!res.ok) {
+      console.error(`[db-repositories] quote email send failed for quote ${id} -> ${to}: ${res.error}`);
+      return;
+    }
+
+    // Legacy best-effort "mark sent": draft -> sent, stamp sent_at + sent_to_email.
+    const quoteTable = await tenantTable(slug, "quotes");
+    const values: Record<string, unknown> = {};
+    if (String(quote.status ?? "") === "draft") values.status = "sent";
+    if (await columnExists(quoteTable.name, "sent_at")) values.sent_at = new Date();
+    if (await columnExists(quoteTable.name, "sent_to_email")) values.sent_to_email = to;
+    if (await columnExists(quoteTable.name, "updated_at")) values.updated_at = new Date();
+    if (Object.keys(values).length > 0) {
+      await tenantUpdate({ slug, table: "quotes", id, values }).catch(() => undefined);
+    }
+  } catch (error) {
+    console.error("[db-repositories] quote email send error:", error);
+  }
 }
 
 export async function convertDbQuoteToSale(id: number, slug: string, locationId = 0): Promise<{ quote: Quote; sale: PosSale }> {

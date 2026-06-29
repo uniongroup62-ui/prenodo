@@ -62,6 +62,8 @@ import { PosContent } from "@/components/modules/pos-content";
 import { CalendarContent } from "@/components/modules/calendar-content";
 import { AppointmentsContent } from "@/components/modules/appointments-content";
 import { BookingFaithful } from "@/components/public/booking-faithful";
+import { GiftBoxVoucherFaithful } from "@/components/public/giftbox-voucher-faithful";
+import { GiftCardVoucherFaithful } from "@/components/public/giftcard-voucher-faithful";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
 
@@ -134,13 +136,24 @@ export default async function TenantIndexPhpPage({
   searchParams,
 }: {
   params: Promise<{ tenantSlug: string }>;
-  searchParams: Promise<{ page?: string; public?: string; location_id?: string; service?: string; tab?: string; action?: string }>;
+  searchParams: Promise<{ page?: string; public?: string; location_id?: string; service?: string; tab?: string; action?: string; token?: string; embed?: string }>;
 }) {
   const { tenantSlug } = await params;
   const query = await searchParams;
 
   if (query.page === "booking" && query.public === "1") {
     return <BookingFaithful slug={tenantSlug} />;
+  }
+
+  // Public GiftBox/GiftCard voucher viewers (gift email links):
+  //   index.php?page=giftbox_voucher&public=1&embed=1&token=<64hex>
+  //   index.php?page=giftcard_voucher&public=1&embed=1&token=<64hex>
+  // Token-only public access; the faithful component fetches the DB-backed API.
+  if (query.page === "giftbox_voucher" && query.public === "1") {
+    return <GiftBoxVoucherFaithful slug={tenantSlug} token={query.token ?? ""} embed={query.embed === "1"} />;
+  }
+  if (query.page === "giftcard_voucher" && query.public === "1") {
+    return <GiftCardVoucherFaithful slug={tenantSlug} token={query.token ?? ""} embed={query.embed === "1"} />;
   }
 
   const session = await currentManageSession(tenantSlug);

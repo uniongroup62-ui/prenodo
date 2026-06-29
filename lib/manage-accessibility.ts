@@ -3,9 +3,10 @@ import "server-only";
 import { createHash, randomInt } from "node:crypto";
 import bcrypt from "bcryptjs";
 import type { RowDataPacket } from "mysql2/promise";
-import { columnExists, dbExecute, dbQuery, tableExists, tenantSelect, tenantTable } from "@/lib/tenant-db";
+import { columnExists, dbExecute, dbQuery, tableExists, tenantIdForSlug, tenantSelect, tenantTable } from "@/lib/tenant-db";
 import { invalidateManagePasswordResets } from "@/lib/manage-password-reset";
 import { normalizeTenantSlug } from "@/lib/tenant-runtime";
+import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 
 const EMAIL_CODE_TTL_SECONDS = 15 * 60;
 const EMAIL_CODE_RESEND_SECONDS = 60;
@@ -225,6 +226,148 @@ async function ensureEmailCodeCooldown(slug: string, userId: number): Promise<vo
   const pending = await getEmailVerificationPending(slug, userId, true);
   if (!pending || pending.resendWaitSeconds <= 0) return;
   throw new Error(`Attendi ${pending.resendWaitSeconds} secondi prima di richiedere un nuovo codice.`);
+}
+
+// --- Staff invite (email-verification code) email --------------------------
+//
+// Port of the staff-create / email-change "Conferma email account" mail in
+// app/pages/staff.php (staff_prepare_email_verification / the inline blocks in the
+// new/edit handler). The legacy app inserts a 6-digit code into
+// user_email_verifications and mails it via mail_send_html; the operator must
+// enter the code (in Accessibilita) to activate/confirm the login email.
+//
+// In Next the staff create/update path (lib/manage-resources.ts) was creating the
+// login user but never issuing/sending that code, so the invite was silent. This
+// helper reproduces storeAndReturnCode()'s INSERT (so the code is a real,
+// verifiable code reused by confirmEmailCode) AND sends the branded email through
+// SES. It is tenant-scoped, gated on emailConfigured() (no-op when SES is off, so
+// behaviour is unchanged locally / when unconfigured), runs AFTER the user row is
+// written, and swallows every error — staff creation must never fail because of a
+// best-effort invite mail.
+
+type StaffInviteBranding = { name: string; email: string; logoUrl: string };
+
+// Per-tenant branding for the invite email, mirroring the cron / password-reset
+// readers: first businesses row (ORDER BY id ASC LIMIT 1), best-effort.
+async function staffInviteBranding(slug: string): Promise<StaffInviteBranding> {
+  const empty: StaffInviteBranding = { name: "", email: "", logoUrl: "" };
+  try {
+    const tenantId = await tenantIdForSlug(slug);
+    if (!tenantId || !(await tableExists("businesses"))) return empty;
+    const hasLogo = await columnExists("businesses", "logo_path");
+    const rows = await dbQuery<RowDataPacket[]>(
+      `SELECT name, email${hasLogo ? ", logo_path" : ""} FROM businesses WHERE tenant_id = ? ORDER BY id ASC LIMIT 1`,
+      [tenantId],
+    ).catch(() => [] as RowDataPacket[]);
+    const row = rows[0];
+    if (!row) return empty;
+    return {
+      name: String(row.name ?? ""),
+      email: String(row.email ?? ""),
+      logoUrl: hasLogo ? resolveStaffInviteLogoUrl(String(row.logo_path ?? "")) : "",
+    };
+  } catch {
+    return empty;
+  }
+}
+
+// Turn a stored logo_path into an absolute URL (same rule as the password-reset
+// reader). Absolute http(s) URL -> as-is; public path -> prefixed with
+// PRENODO_PUBLIC_BASE_URL; otherwise omit (template falls back to the brand name).
+function resolveStaffInviteLogoUrl(logoPath: string): string {
+  const path = logoPath.trim();
+  if (!path) return "";
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  if (!base || !path.startsWith("/")) return "";
+  return `${base}${path}`;
+}
+
+// Port of the legacy "Conferma email account" body (h() the code; HTML body fed to
+// email_build_modern_template). `updated` toggles the new-account vs email-changed
+// intro, exactly like staff_prepare_email_verification($updated).
+function buildStaffInviteEmailBody(code: string, updated: boolean): string {
+  const intro = updated
+    ? "la tua email di accesso e stata aggiornata. Confermala con questo codice:"
+    : "il tuo account e stato creato. Per completare l'attivazione inserisci questo codice:";
+  return (
+    "Ciao,<br><br>" + escapeInviteHtml(intro) + "<br><br>"
+    + `<div style="font-size:28px;font-weight:800;letter-spacing:2px">${escapeInviteHtml(code)}</div>`
+    + "<br>Il codice scade tra 15 minuti.<br><br>Se non sei stato tu, ignora questa email."
+  );
+}
+
+function escapeInviteHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// Issue a fresh email-verification code for `userId` (replacing any pending one,
+// like storeAndReturnCode) and email it to `email`, branded per tenant. Returns
+// silently on any failure: the login user is already persisted by the caller, and
+// the operator can re-trigger a code from the Accessibilita screen. When SES is
+// not configured this is a no-op (the code row is NOT written either, so we don't
+// leave an unconfirmable pending row that the caller can't surface).
+export async function sendStaffInviteEmailCode(args: {
+  slug: string;
+  userId: number;
+  email: string;
+  updated: boolean;
+}): Promise<void> {
+  if (!emailConfigured()) return;
+  const tenantSlug = normalizeTenantSlug(args.slug) ?? "";
+  const to = normalizeEmail(args.email);
+  if (!tenantSlug || args.userId <= 0 || !isValidEmail(to)) return;
+  try {
+    const code = String(randomInt(100000, 1000000));
+    const table = await ensureEmailVerificationTable(tenantSlug);
+    await deletePendingEmailVerification(tenantSlug, args.userId);
+    const includeTenant = table.mode === "shared" && await columnExists(table.name, "tenant_id");
+    await dbExecute(
+      `INSERT INTO \`${table.name}\` (${[
+        includeTenant ? "`tenant_id`" : "",
+        "`user_id`",
+        "`new_email`",
+        "`code_hash`",
+        "`expires_at`",
+        "`attempt_count`",
+      ].filter(Boolean).join(",")}) VALUES (${[
+        includeTenant ? "?" : "",
+        "?",
+        "?",
+        "?",
+        `NOW() + (${EMAIL_CODE_TTL_SECONDS} * interval '1 second')`,
+        "0",
+      ].filter(Boolean).join(",")})`,
+      [...(includeTenant ? [table.tenantId ?? 0] : []), args.userId, to, codeHash(code)],
+    );
+
+    const branding = await staffInviteBranding(tenantSlug);
+    const bizName = branding.name.trim();
+    const subject = "Conferma email account";
+    const { html, text } = buildModernEmailTemplate(subject, buildStaffInviteEmailBody(code, args.updated), {
+      business_name: bizName,
+      business_email: branding.email,
+      business_logo_url: branding.logoUrl,
+    });
+    const res = await sendEmail({
+      to,
+      subject,
+      html,
+      text,
+      fromEmail: branding.email.trim() || undefined,
+      fromName: bizName || undefined,
+    });
+    if (!res.ok) {
+      console.error(`[manage-accessibility] staff invite email send failed for ${to}: ${res.error}`);
+    }
+  } catch (error) {
+    console.error("[manage-accessibility] staff invite email send error:", error);
+  }
 }
 
 async function ensureEmailVerificationTable(slug: string): Promise<{ name: string; mode: string; tenantId: number | null }> {
