@@ -29,10 +29,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 //
 // MULTI-SERVICE: submit now sends ALL selected services (service_ids +
 // service_names, ordered) so the save route persists them as sequential
-// segments (each with the chosen operator/cabin). The per-service staff/cabin
-// PICKER UI (#qbMultiStaffPicker) is still TODO — the hidden #qb_staff_map /
-// #qb_cabin_map are forwarded as-is so a future picker that fills them works,
-// but today the single operator + cabin select drive every segment.
+// segments (each with the chosen operator/cabin). The per-service staff AND
+// cabin PICKER UI (#qbMultiStaffPicker) is wired: #qb_staff_map / #qb_cabin_map
+// are filled as {serviceId: id} JSON when 2+ services are selected (cleared
+// otherwise), so each segment gets its own operator + cabin; for a single
+// service the single operator + #qb_cabin_id select drive the booking.
+// TODO(cabin availability): the legacy lists only the FREE cabins after an
+// availability check (refreshCabinsForServices); no such engine is ported, so
+// the cabin lists here fall back to the cabins at the selected location.
 //
 // TODO (deep wiring left out, matches the SCOPE note): the redeem flows
 // (giftbox/gift/package/prepaid/giftcard), client history/residuals/card panels,
@@ -137,6 +141,14 @@ export function QuickBookingDrawer() {
   // the rest of this file). Only meaningful when 2+ services are selected.
   const [staffPicks, setStaffPicks] = useState<Record<number, string>>({});
 
+  // ---- Per-service cabin assignment (multi-service #qb_cabin_map) ----
+  // Explicit user picks only (serviceId -> cabinId string). The EFFECTIVE map
+  // written to #qb_cabin_map is DERIVED from these picks plus the cabins
+  // available at the chosen location + auto-select (see cabinMap memo below),
+  // mirroring the operator picker so there is no effect reconciling
+  // state-from-state. Only meaningful when 2+ services are selected.
+  const [cabinPicks, setCabinPicks] = useState<Record<number, string>>({});
+
   // ---- Date / time / location / cabin / status / notes ----
   const [date, setDate] = useState<string>(() => todayIso());
   const [startTime, setStartTime] = useState<string>("");
@@ -193,6 +205,7 @@ export function QuickBookingDrawer() {
     setClient(null);
     setSelectedServiceIds([]);
     setStaffPicks({});
+    setCabinPicks({});
     setMsOpen(false);
     setServiceSearch("");
     setDate(todayIso());
@@ -351,6 +364,81 @@ export function QuickBookingDrawer() {
     // Changing any operator invalidates a previously held slot (port: clear hold).
     setHoldToken("");
     setStaffPicks((prev) => ({ ...prev, [serviceId]: value }));
+  }, []);
+
+  // The date/availability/operator controls (and now the cabin select) stay
+  // gated until at least one service is selected (port of the start gate).
+  const startGateDisabled = selectedServiceIds.length === 0;
+
+  // ---- Cabin: cabins available at the selected location (#qb_cabin_id list) ----
+  // TODO(cabin availability): the legacy populates #qb_cabin_id with only the
+  // FREE cabins returned by the availability check (View.php ~1326-1333 +
+  // refreshCabinsForServices). The Next manage app has no free-cabin
+  // availability engine ported, so as the practical fallback we list the cabins
+  // whose locationId matches the chosen location (cabins with no locationId are
+  // always allowed; no location filter => all cabins).
+  const availableCabins = useMemo(
+    () => {
+      const locId = Number(locationId) || 0;
+      return cabins.filter((c) => !c.locationId || !locId || c.locationId === locId);
+    },
+    [cabins, locationId],
+  );
+
+  // The cabin select is usable once a service + (when relevant) location are
+  // chosen and there are cabins to pick (port: enabled after availability).
+  const cabinGateOpen = !startGateDisabled && availableCabins.length > 0;
+
+  // EFFECTIVE single cabin value for #qb_cabin_id (and the save's `cabin_id`),
+  // DERIVED from the explicit user pick (`cabinId`) + the available cabins,
+  // exactly like staffMap derives operators — no effect reconciling
+  // state-from-state (the file deliberately avoids cascading-render setState).
+  // Auto-selects when exactly one cabin is available (per the hint "se è libera
+  // solo una verrà selezionata automaticamente"); otherwise keeps the user's
+  // pick when it is still available, else "".
+  const effectiveCabinId = useMemo(() => {
+    if (availableCabins.length === 1) return String(availableCabins[0].id);
+    if (cabinId && availableCabins.some((c) => String(c.id) === cabinId)) return cabinId;
+    return "";
+  }, [availableCabins, cabinId]);
+
+  // EFFECTIVE per-service cabin map (serviceId -> cabinId string, "" = none),
+  // mirroring staffMap: derived from the selected services + the cabins
+  // available at the location + explicit user picks. Auto-selects when exactly
+  // one cabin is available (per the hint); otherwise keeps the user's pick when
+  // it is still available, else leaves it unselected. Empty (single/zero
+  // service) so the single #qb_cabin_id drives the assignment. Only emitted for
+  // 2+ services.
+  const cabinMap = useMemo<Record<number, string>>(() => {
+    if (!isMultiService || availableCabins.length === 0) return {};
+    const out: Record<number, string> = {};
+    for (const id of selectedServiceIds) {
+      if (availableCabins.length === 1) {
+        out[id] = String(availableCabins[0].id);
+      } else {
+        const pick = cabinPicks[id];
+        out[id] = pick && availableCabins.some((c) => String(c.id) === pick) ? pick : "";
+      }
+    }
+    return out;
+  }, [isMultiService, availableCabins, selectedServiceIds, cabinPicks]);
+
+  // Serialize cabinMap -> #qb_cabin_map JSON {serviceId: cabinId}. Only the
+  // chosen (non-empty) entries are emitted, matching staffMapJson. Empty string
+  // when <2 services or nothing chosen, so the input is cleared.
+  const cabinMapJson = useMemo(() => {
+    const out: Record<string, number | string> = {};
+    for (const [sid, val] of Object.entries(cabinMap)) {
+      const v = String(val ?? "").trim();
+      if (v) out[sid] = Number.parseInt(v, 10) || v;
+    }
+    return Object.keys(out).length ? JSON.stringify(out) : "";
+  }, [cabinMap]);
+
+  const setCabinForService = useCallback((serviceId: number, value: string) => {
+    // Changing any cabin invalidates a previously held slot (port: clear hold).
+    setHoldToken("");
+    setCabinPicks((prev) => ({ ...prev, [serviceId]: value }));
   }, []);
 
   // Changing services / location / date / start time invalidates any held slot
@@ -589,14 +677,14 @@ export function QuickBookingDrawer() {
         // ({serviceId: staffId} JSON) so each segment gets its own operator; for
         // a single service the whole-appointment operator (`staff_name`) drives
         // it and the map is empty. The explicit cabin (`cabin_id`) is the
-        // primary cabin.
-        // TODO(per-service CABIN map): #qb_cabin_map is still empty — in the
-        // legacy the per-service cabin selects are populated AFTER availability
-        // (refreshCabinsForServices) which needs the availability/cabin API that
-        // is not yet wired in the Next manage app. Read straight from the hidden
-        // input so a future picker that fills it keeps working.
+        // primary cabin; for 2+ services the per-service cabin picker fills
+        // `cabin_map` ({serviceId: cabinId} JSON) so each segment gets its cabin.
+        // TODO(cabin availability): the legacy populates the per-service cabin
+        // selects with only the FREE cabins from the availability check
+        // (refreshCabinsForServices) which needs the availability/cabin API not
+        // yet wired in the Next manage app; here we offer the location's cabins.
         const staffMapRaw = staffMapJson;
-        const cabinMapRaw = (document.getElementById("qb_cabin_map") as HTMLInputElement | null)?.value ?? "";
+        const cabinMapRaw = cabinMapJson;
         const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
@@ -609,7 +697,7 @@ export function QuickBookingDrawer() {
             staff_name: staffName,
             staff_map: staffMapRaw,
             cabin_map: cabinMapRaw,
-            cabin_id: cabinId,
+            cabin_id: effectiveCabinId,
             date,
             time: startTime,
             location_id: locationId,
@@ -633,11 +721,10 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, cabinId, staffNotes, customerNotes, holdToken, staffMapJson, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
-  const startGateDisabled = selectedServiceIds.length === 0;
 
   return (
     <>
@@ -871,7 +958,7 @@ export function QuickBookingDrawer() {
                   Prenotazione multi-servizio: seleziona un operatore per ogni servizio (se un servizio ha un solo operatore verrà selezionato automaticamente).
                 </div>
                 <input type="hidden" name="staff_map" id="qb_staff_map" value={staffMapJson} readOnly />
-                <input type="hidden" name="cabin_map" id="qb_cabin_map" value="" readOnly />
+                <input type="hidden" name="cabin_map" id="qb_cabin_map" value={cabinMapJson} readOnly />
                 <input type="hidden" name="appointment_hold_token" id="qb_appointment_hold_token" value={holdToken} readOnly />
                 <div id="qbMultiStaffPicker" className="mt-2" style={{ display: isMultiService ? "block" : "none" }}>
                   {isMultiService
@@ -902,10 +989,35 @@ export function QuickBookingDrawer() {
                               ))}
                             </select>
                           )}
-                          {/* TODO(per-service CABIN map): the legacy renders a
-                              qb-cabin-for-service select here too, populated AFTER
-                              availability (refreshCabinsForServices) which needs the
-                              cabin/availability API not yet wired in the Next app. */}
+                          {/* Per-service CABIN select, mirroring the operator
+                              select above. Populated with the cabins available at
+                              the chosen location; auto-selected + locked when only
+                              one cabin exists (per the hint). The chosen values are
+                              serialized to #qb_cabin_map as {serviceId: cabinId}.
+                              TODO(cabin availability): the legacy shows only the
+                              FREE cabins after an availability check
+                              (refreshCabinsForServices); the Next app has no
+                              free-cabin availability engine ported, so we list the
+                              location's cabins as the practical fallback. */}
+                          {availableCabins.length === 0 ? (
+                            <select className="form-select qb-cabin-for-service mt-1" data-service-id={row.id} disabled>
+                              <option value="">Nessuna cabina</option>
+                            </select>
+                          ) : (
+                            <select
+                              className="form-select qb-cabin-for-service mt-1"
+                              data-service-id={row.id}
+                              // Exactly one available cabin -> auto-selected + locked.
+                              disabled={availableCabins.length === 1}
+                              value={cabinMap[row.id] ?? ""}
+                              onChange={(e) => setCabinForService(row.id, e.target.value)}
+                            >
+                              {availableCabins.length === 1 ? null : <option value="">Seleziona cabina</option>}
+                              {availableCabins.map((c) => (
+                                <option value={c.id} key={c.id}>{c.name}</option>
+                              ))}
+                            </select>
+                          )}
                         </div>
                       ))
                     : null}
@@ -1014,20 +1126,36 @@ export function QuickBookingDrawer() {
             <div className="row g-2 mt-1">
               <div className="col-12">
                 <label className="form-label">Cabina</label>
+                {/* #qb_cabin_id: usable once a service (+ location) is chosen and
+                    cabins exist (port of the select enabled after availability).
+                    Lists the cabins available at the selected location; when only
+                    one is available it is auto-selected (see the effect above) and
+                    the select is locked, per the hint. The chosen value flows to
+                    the save as `cabin_id`.
+                    TODO(cabin availability): the legacy lists only the FREE cabins
+                    from the availability check (View.php ~1326-1333); no free-cabin
+                    availability engine is ported, so we list the location's cabins. */}
                 <select
                   className="form-select"
                   name="cabin_id"
                   id="qb_cabin_id"
-                  value={cabinId}
-                  onChange={(e) => setCabinId(e.target.value)}
-                  disabled={cabins.length === 0}
+                  value={effectiveCabinId}
+                  onChange={(e) => {
+                    setHoldToken("");
+                    setCabinId(e.target.value);
+                  }}
+                  disabled={!cabinGateOpen || availableCabins.length === 1}
                 >
-                  <option value="">{cabins.length ? "Nessuna cabina" : "Seleziona prima la disponibilità…"}</option>
-                  {cabins
-                    .filter((c) => !c.locationId || !Number(locationId) || c.locationId === Number(locationId))
-                    .map((c) => (
-                      <option value={c.id} key={c.id}>{c.name}</option>
-                    ))}
+                  <option value="">
+                    {!cabinGateOpen
+                      ? startGateDisabled
+                        ? "Seleziona prima un servizio"
+                        : "Nessuna cabina disponibile"
+                      : "Seleziona cabina"}
+                  </option>
+                  {availableCabins.map((c) => (
+                    <option value={c.id} key={c.id}>{c.name}</option>
+                  ))}
                 </select>
                 <div className="form-text" id="qb_cabin_hint">Se sono libere più cabine potrai scegliere; se è libera solo una verrà selezionata automaticamente.</div>
               </div>
