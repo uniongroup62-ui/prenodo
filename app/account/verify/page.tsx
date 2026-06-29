@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { PublicAccountPage } from "@/components/public-account-page";
+import { AccountVerifyFaithful } from "@/components/public/account-verify-faithful";
 
 export const metadata: Metadata = {
-  title: "Verifica email cliente | Prenodo",
+  title: "Verifica la tua email - BeautySuite",
 };
 
 export default function AccountVerifyPage() {
-  return <PublicAccountPage initialMode="verify" />;
+  return <AccountVerifyFaithful />;
 }

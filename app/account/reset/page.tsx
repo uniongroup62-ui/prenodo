@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { PublicAccountPage } from "@/components/public-account-page";
+import { AccountResetFaithful } from "@/components/public/account-reset-faithful";
 
 export const metadata: Metadata = {
-  title: "Reset password cliente | Prenodo",
+  title: "Reimposta password - BeautySuite",
 };
 
 export default function AccountResetPage() {
-  return <PublicAccountPage initialMode="reset" />;
+  return <AccountResetFaithful />;
 }

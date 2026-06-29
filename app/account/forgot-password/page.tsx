@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { PublicAccountPage } from "@/components/public-account-page";
+import { AccountForgotFaithful } from "@/components/public/account-forgot-faithful";
 
 export const metadata: Metadata = {
-  title: "Recupera password cliente | Prenodo",
+  title: "Recupera password - BeautySuite",
 };
 
 export default function AccountForgotPasswordPage() {
-  return <PublicAccountPage initialMode="forgot-password" />;
+  return <AccountForgotFaithful />;
 }

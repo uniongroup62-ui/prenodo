@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { PublicAccountPage } from "@/components/public-account-page";
+import { AccountRegisterFaithful } from "@/components/public/account-register-faithful";
 
 export const metadata: Metadata = {
-  title: "Registrazione cliente | Prenodo",
+  title: "Crea il tuo account - BeautySuite",
 };
 
 export default function AccountRegisterPage() {
-  return <PublicAccountPage initialMode="register" />;
+  return <AccountRegisterFaithful />;
 }
