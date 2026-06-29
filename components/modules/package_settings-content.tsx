@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 // Faithful port of the PHP package_settings page (app/pages/package_settings.php,
 // reached via index.php?page=packages&tab=settings -> page=package_settings):
@@ -35,8 +35,9 @@ export function PackageSettingsContent() {
 
   const [validityValue, setValidityValue] = useState("0");
   const [validityUnit, setValidityUnit] = useState("days");
+  const [feedback, setFeedback] = useState<{ type: "success" | "danger"; text: string } | null>(null);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     fetch(`/api/manage/configuration?module=package_settings&slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
     })
@@ -59,7 +60,35 @@ export function PackageSettingsContent() {
       .catch(() => {});
   }, [slug]);
 
-  const pageBase = `/${encodeURIComponent(slug)}/index.php?page=package_settings`;
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function saveValidity(): Promise<void> {
+    setFeedback(null);
+    try {
+      const res = await fetch(`/api/manage/configuration?module=package_settings&slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({
+          slug,
+          module: "package_settings",
+          action: "save_package_validity_default",
+          package_default_validity_value: validityValue,
+          package_default_validity_unit: validityUnit,
+        }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.ok === false) {
+        setFeedback({ type: "danger", text: String(j?.error ?? j?.message ?? "Errore.") });
+        return;
+      }
+      setFeedback({ type: "success", text: String(j?.message ?? "Impostazioni scadenza Pacchetti salvate.") });
+      load();
+    } catch {
+      setFeedback({ type: "danger", text: "Errore di rete." });
+    }
+  }
 
   return (
     <div className="container-fluid">
@@ -79,6 +108,12 @@ export function PackageSettingsContent() {
         </div>
       </div>
 
+      {feedback ? (
+        <div className={`alert alert-${feedback.type}`} role="alert">
+          {feedback.text}
+        </div>
+      ) : null}
+
       <div className="row g-3">
         <div className="col-lg-8">
           <div className="card p-4">
@@ -90,7 +125,14 @@ export function PackageSettingsContent() {
               significa nessuna scadenza automatica.
             </div>
 
-            <form method="post" action={`${pageBase}&action=save_package_validity_default`} className="border rounded-3 p-3 bg-light">
+            <form
+              method="post"
+              className="border rounded-3 p-3 bg-light"
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveValidity();
+              }}
+            >
               <input type="hidden" name="action" value="save_package_validity_default" />
 
               <div className="row g-3 package-settings-validity-row">

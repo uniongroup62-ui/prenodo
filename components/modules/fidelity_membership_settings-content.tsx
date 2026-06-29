@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 // Faithful port of the PHP page app/pages/fidelity_membership_settings.php
 // (?page=fidelity_membership_settings): Fidelity card validity / auto-renewal /
@@ -45,16 +45,18 @@ function unit(value: unknown, fallback: string): "days" | "months" | "years" {
 export function FidelityMembershipSettingsContent() {
   const slug = tenantSlug();
   const [settings, setSettings] = useState<InitialSettings>(DEFAULT_INITIAL_SETTINGS);
+  // Remount key for the uncontrolled form so a successful save re-seeds the
+  // defaultChecked/defaultValue inputs from the freshly loaded settings.
+  const [formKey, setFormKey] = useState(0);
+  const [feedback, setFeedback] = useState<{ type: "success" | "danger"; text: string } | null>(null);
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     fetch(`/api/manage/configuration?slug=${encodeURIComponent(slug)}&module=fidelity_membership`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
       .then((j) => {
-        // The DB module currently exposes only an empty `settings` object for
-        // fidelity_membership; merge any card-validity fields if they appear so
-        // the form pre-fills from the API once the backend surfaces them.
         const s = (j?.module?.settings ?? {}) as Record<string, unknown>;
         setSettings({
           expiryEnabled: num(s.expiryEnabled ?? s.fidelity_card_expiry_enabled, DEFAULT_INITIAL_SETTINGS.expiryEnabled),
@@ -68,14 +70,53 @@ export function FidelityMembershipSettingsContent() {
           restoreUnit: unit(s.restoreUnit, DEFAULT_INITIAL_SETTINGS.restoreUnit),
           restoreLabel: String(s.restoreLabel ?? DEFAULT_INITIAL_SETTINGS.restoreLabel),
         });
+        setFormKey((k) => k + 1);
       })
       .catch(() => {
         /* keep captured defaults */
       });
   }, [slug]);
 
-  const action = (suffix: string) =>
-    `/${encodeURIComponent(slug)}/index.php?page=fidelity_membership_settings${suffix}`;
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function handleSubmit(e: FormEvent<HTMLFormElement>): Promise<void> {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const fd = new FormData(form);
+    setSaving(true);
+    setFeedback(null);
+    try {
+      const res = await fetch(`/api/manage/configuration?slug=${encodeURIComponent(slug)}&module=fidelity_membership`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({
+          slug,
+          module: "fidelity_membership",
+          action: "save_fidelity_card_validity_default",
+          fidelity_card_expiry_enabled: fd.get("fidelity_card_expiry_enabled") ? "1" : "0",
+          fidelity_card_default_validity_value: String(fd.get("fidelity_card_default_validity_value") ?? ""),
+          fidelity_card_default_validity_unit: String(fd.get("fidelity_card_default_validity_unit") ?? "days"),
+          fidelity_card_renewal_enabled: fd.get("fidelity_card_renewal_enabled") ? "1" : "0",
+          fidelity_card_renewal_window_value: String(fd.get("fidelity_card_renewal_window_value") ?? ""),
+          fidelity_card_renewal_window_unit: String(fd.get("fidelity_card_renewal_window_unit") ?? "days"),
+          fidelity_card_expiry_reminder_days: String(fd.get("fidelity_card_expiry_reminder_days") ?? ""),
+        }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.ok === false) {
+        setFeedback({ type: "danger", text: String(j?.error ?? j?.message ?? "Errore.") });
+        return;
+      }
+      setFeedback({ type: "success", text: String(j?.message ?? "Impostazioni tessera Fidelity salvate.") });
+      load();
+    } catch {
+      setFeedback({ type: "danger", text: "Errore di rete." });
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="container-fluid">
@@ -99,6 +140,12 @@ export function FidelityMembershipSettingsContent() {
         </div>
       </div>
 
+      {feedback ? (
+        <div className={`alert alert-${feedback.type}`} role="alert">
+          {feedback.text}
+        </div>
+      ) : null}
+
       <div className="row g-3 fidelity-card-settings-anchor" id="fidelity_card_settings">
         <div className="col-lg-8">
           <div className="card p-4">
@@ -119,10 +166,11 @@ export function FidelityMembershipSettingsContent() {
             </div>
 
             <form
+              key={formKey}
               method="post"
               className="border rounded-3 p-3 bg-light"
               id="fidelityCardValidityForm"
-              action={action("&action=save_fidelity_card_validity_default")}
+              onSubmit={handleSubmit}
               data-initial-settings={JSON.stringify(settings)}
             >
               <input type="hidden" name="_mode" value="save_fidelity_card_validity_default" />
@@ -130,7 +178,7 @@ export function FidelityMembershipSettingsContent() {
                 type="hidden"
                 name="fidelity_card_apply_to_existing_confirmed"
                 id="fidelityCardApplyConfirm"
-                value="0"
+                value="1"
               />
 
               <div className="fw-semibold mb-2">Scadenza predefinita tessera</div>
@@ -291,9 +339,8 @@ export function FidelityMembershipSettingsContent() {
                   className="btn btn-primary btn-pill"
                   type="submit"
                   id="fidelityCardValiditySubmit"
-                  disabled
-                  aria-disabled="true"
-                  title="Nessuna modifica da salvare"
+                  disabled={saving}
+                  aria-disabled={saving}
                 >
                   <i className="bi bi-check2-circle me-1" />
                   Salva tessera Fidelity

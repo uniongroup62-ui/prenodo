@@ -3,7 +3,35 @@ import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { listDbConfigModule, toggleDbConfigRecord, touchDbConfigModule } from "@/lib/db-repositories";
 import { applyExistingPreorders, applyExistingPrepaids, getManagePosSettings, saveManagePosSettings } from "@/lib/manage-pos-settings";
+import {
+  getFidelityMembershipSettings,
+  getGiftboxSettings,
+  getGiftcardSettings,
+  getPackageSettings,
+  getQuoteSettings,
+  resetGiftboxTerms,
+  resetGiftcardTerms,
+  saveFidelityCardValidityDefault,
+  saveGiftboxTerms,
+  saveGiftboxValidityDefault,
+  saveGiftcardTerms,
+  saveGiftcardValidityDefault,
+  savePackageValidityDefault,
+  savePaymentMethods,
+  saveQuoteConditions,
+  saveQuoteProfile,
+} from "@/lib/manage-feature-settings";
 import { can, permissionForFeature } from "@/lib/role-permissions";
+
+// Settings modules persisted directly onto the `businesses` row (real save,
+// not the generic touch). Their GET returns current values for form prefill.
+const FEATURE_SETTINGS_GET: Record<string, (slug: string) => Promise<Awaited<ReturnType<typeof getGiftcardSettings>>>> = {
+  giftcard_settings: getGiftcardSettings,
+  giftbox_settings: getGiftboxSettings,
+  package_settings: getPackageSettings,
+  quote_settings: getQuoteSettings,
+  fidelity_membership: getFidelityMembershipSettings,
+};
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -18,9 +46,12 @@ export async function GET(request: Request) {
   if (!can(session.user.perms, permissionForFeature(moduleId))) return jsonError("Permesso configurazione mancante.", 403);
 
   try {
+    const featureGetter = FEATURE_SETTINGS_GET[moduleId];
     const moduleState = moduleId === "pos_settings"
       ? await getManagePosSettings(tenantSlug)
-      : await listDbConfigModule(moduleId, tenantSlug);
+      : featureGetter
+        ? await featureGetter(tenantSlug)
+        : await listDbConfigModule(moduleId, tenantSlug);
 
     return Response.json({
       ok: true,
@@ -67,6 +98,16 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, source: "pos_settings", sourceMode: "database", module: moduleState, records: moduleState.records });
     }
 
+    if (FEATURE_SETTINGS_GET[moduleId]) {
+      const saved = await saveFeatureSettings(moduleId, action, tenantSlug, body);
+      if (saved) {
+        return Response.json({ ok: true, source: `${moduleId}?action=${action}`, sourceMode: "database", message: saved.message, module: saved.module, records: saved.module.records });
+      }
+      // Unknown action for a settings module: return current state untouched.
+      const moduleState = await FEATURE_SETTINGS_GET[moduleId](tenantSlug);
+      return Response.json({ ok: true, source: moduleId, sourceMode: "database", module: moduleState, records: moduleState.records });
+    }
+
     if (action === "toggle") {
       const recordId = parseInteger(body.record_id ?? body.id);
       const active = ["1", "true", "yes", "on"].includes((body.active ?? "").toLowerCase());
@@ -79,4 +120,43 @@ export async function POST(request: Request) {
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore configurazione.");
   }
+}
+
+type FeatureSaveResult = { message: string; module: Awaited<ReturnType<typeof getGiftcardSettings>> };
+
+// Dispatch a settings-module save action to the matching persistence function.
+// Returns null when the action is not a recognized save for the module.
+async function saveFeatureSettings(
+  moduleId: string,
+  action: string,
+  slug: string,
+  body: Record<string, string>,
+): Promise<FeatureSaveResult | null> {
+  if (moduleId === "giftcard_settings") {
+    if (action === "save_giftcard_validity_default") return { message: "Impostazioni scadenza GiftCard salvate.", module: await saveGiftcardValidityDefault(slug, body) };
+    if (action === "save" || action === "save_giftcard_terms") return { message: "Condizioni GiftCard salvate.", module: await saveGiftcardTerms(slug, body) };
+    if (action === "reset_giftcard_terms") return { message: "Condizioni GiftCard ripristinate.", module: await resetGiftcardTerms(slug) };
+    return null;
+  }
+  if (moduleId === "giftbox_settings") {
+    if (action === "save_giftbox_validity_default") return { message: "Impostazioni scadenza GiftBox salvate.", module: await saveGiftboxValidityDefault(slug, body) };
+    if (action === "save" || action === "save_giftbox_terms") return { message: "Condizioni GiftBox salvate.", module: await saveGiftboxTerms(slug, body) };
+    if (action === "reset_giftbox_terms") return { message: "Condizioni GiftBox ripristinate.", module: await resetGiftboxTerms(slug) };
+    return null;
+  }
+  if (moduleId === "package_settings") {
+    if (action === "save" || action === "save_package_validity_default") return { message: "Impostazioni scadenza Pacchetti salvate.", module: await savePackageValidityDefault(slug, body) };
+    return null;
+  }
+  if (moduleId === "quote_settings") {
+    if (action === "save_quote_profile" || action === "save_profile_quote") return { message: "Dati anagrafici salvati.", module: await saveQuoteProfile(slug, body) };
+    if (action === "save_quote_conditions") return { message: "Condizioni preventivo salvate.", module: await saveQuoteConditions(slug, body) };
+    if (action === "save_payment_methods") return { message: "Metodi di pagamento salvati.", module: await savePaymentMethods(slug, body) };
+    return null;
+  }
+  if (moduleId === "fidelity_membership") {
+    if (action === "save" || action === "save_fidelity_card_validity_default") return { message: "Impostazioni tessera Fidelity salvate.", module: await saveFidelityCardValidityDefault(slug, body) };
+    return null;
+  }
+  return null;
 }

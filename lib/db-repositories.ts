@@ -47,7 +47,7 @@ import type {
   WalletMovement,
   WalletMovementType,
 } from "@/lib/tenant-store";
-import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbQuery, tableExists, tenantIdForSlug } from "@/lib/tenant-db";
+import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug } from "@/lib/tenant-db";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 
 export async function listDbLocations(slug: string): Promise<Location[]> {
@@ -413,6 +413,168 @@ export async function createDbAppointment({
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
   return mapAppointment(slug, rows[0]);
+}
+
+// Update an EXISTING appointment (by id, tenant-scoped). Mirrors
+// createDbAppointment's resolution logic — client, service, operator/staff,
+// date/time (+ recomputed end), location and notes — but replaces the snapshot
+// child rows (appointment_services / appointment_staff / appointment_locations /
+// appointment_segments) rather than appending. Guards that the appointment
+// belongs to the tenant before writing; throws "Appuntamento non trovato." when
+// it does not. Hold handling is unchanged from create: when a hold token is
+// supplied it is validated against the new slot and marked converted.
+export async function updateDbAppointment({
+  slug,
+  id,
+  clientName,
+  serviceName,
+  operator,
+  time,
+  date,
+  locationId,
+  holdToken,
+  staffNotes,
+  customerNotes,
+}: {
+  slug: string;
+  id: number;
+  clientName: string;
+  serviceName: string;
+  operator: string;
+  time: string;
+  date: string;
+  locationId: number | null;
+  holdToken?: string | null;
+  staffNotes?: string | null;
+  customerNotes?: string | null;
+}): Promise<AppointmentWithMeta> {
+  // Tenant-scoped existence guard: the SELECT only returns rows for this tenant,
+  // so a row from another tenant (or a missing id) yields no match.
+  const existingRows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id", where: "id = ?", params: [id], limit: 1 });
+  if (!existingRows[0]) throw new Error("Appuntamento non trovato.");
+
+  const client = await resolveClientForAppointment(slug, clientName, locationId);
+  const service = await resolveServiceForAppointment(slug, serviceName);
+  const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
+  const normalizedTime = normalizeTime(time);
+  const start = `${date} ${normalizedTime}:00`;
+  const duration = Number(service.duration_min ?? 30);
+  const end = addMinutesSqlDate(start, duration);
+  const token = (holdToken ?? "").trim();
+  if (token) {
+    await assertDbAppointmentHold({
+      slug,
+      token,
+      ownerKey: "manage",
+      startsAt: start,
+      serviceId: Number(service.id ?? 0),
+      staffId: staff ? Number(staff.id ?? 0) : null,
+      locationId,
+    });
+  }
+
+  await tenantUpdate({
+    slug,
+    table: "appointments",
+    id,
+    values: {
+      client_id: client.id,
+      service_id: service.id,
+      cabin_id: service.cabin_id ?? null,
+      starts_at: start,
+      ends_at: end,
+      location_id: locationId,
+      staff_notes: staffNotes || null,
+      customer_notes: customerNotes || null,
+    },
+  });
+
+  // Replace the snapshot child rows so the edit reflects the new
+  // service/staff/location/segment rather than stacking on the originals.
+  await deleteAppointmentChildren(slug, "appointment_services", id);
+  await deleteAppointmentChildren(slug, "appointment_staff", id);
+  await deleteAppointmentChildren(slug, "appointment_locations", id);
+  await deleteAppointmentChildren(slug, "appointment_segments", id);
+
+  await insertAppointmentService(slug, id, service);
+  if (staff) await insertAppointmentStaff(slug, id, staff.id);
+  if (locationId) await insertAppointmentLocation(slug, id, locationId);
+  await insertAppointmentSegment(slug, id, service, staff ? Number(staff.id ?? 0) : null, start, end, duration);
+  if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
+
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Appuntamento non trovato.");
+  return mapAppointment(slug, rows[0]);
+}
+
+// Snapshot of the customer-visible fields used to decide whether the legacy
+// 'modified' email should fire. The PHP signature is far richer, but the Next
+// edit path only touches date/time/services, so the route compares this compact
+// shape before/after the update (appointment_customer_change_signature subset).
+export type AppointmentCustomerVisibleSnapshot = {
+  date: string;
+  time: string;
+  serviceNames: string[];
+};
+
+// Build the customer-visible snapshot (date/time + the appointment's service
+// names) for an appointment, tenant-scoped. Returns null when the appointment
+// does not belong to the tenant / does not exist, so the route can skip the
+// 'modified' comparison entirely. Service names come from the appointment_services
+// snapshot table, sorted so ordering never produces a false-positive change.
+export async function getDbAppointmentCustomerVisibleSnapshot(slug: string, id: number): Promise<AppointmentCustomerVisibleSnapshot | null> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "starts_at", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const startsAt = toDate(rows[0].starts_at);
+  let serviceNames: string[] = [];
+  try {
+    const serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      columns: "service_name",
+      where: "appointment_id = ?",
+      params: [id],
+      orderBy: "service_name ASC, id ASC",
+    });
+    serviceNames = serviceRows.map((row) => String(row.service_name ?? "").trim()).filter(Boolean).sort();
+  } catch {
+    // Older installs without the snapshot table: fall back to an empty list so
+    // the comparison still works (only date/time changes will trigger the email).
+  }
+  return { date: dateIsoLocal(startsAt), time: timeLocal(startsAt), serviceNames };
+}
+
+// True when any customer-visible field differs between the before/after
+// snapshots — i.e. the date, the time, or the set of service names changed.
+// Mirrors automation_handle_customer_visible_change's "$after !== $before" gate,
+// restricted to the fields the Next edit path can touch.
+export function appointmentCustomerVisibleChanged(
+  before: AppointmentCustomerVisibleSnapshot,
+  after: AppointmentCustomerVisibleSnapshot,
+): boolean {
+  if (before.date !== after.date) return true;
+  if (before.time !== after.time) return true;
+  if (before.serviceNames.length !== after.serviceNames.length) return true;
+  return before.serviceNames.some((name, index) => name !== after.serviceNames[index]);
+}
+
+// Delete every child row for an appointment (by appointment_id, tenant-scoped),
+// used by updateDbAppointment to replace the service/staff/location/segment
+// snapshots. Errors are swallowed for compatibility with older installs that may
+// not have a given child table (matching the insertAppointment* helpers).
+async function deleteAppointmentChildren(slug: string, baseTable: string, appointmentId: number): Promise<void> {
+  try {
+    const target = await tenantTable(slug, baseTable);
+    const clauses = ["appointment_id = ?"];
+    const params: unknown[] = [appointmentId];
+    if (target.mode === "shared" && await columnExists(target.name, "tenant_id")) {
+      clauses.push("tenant_id = ?");
+      params.push(target.tenantId ?? 0);
+    }
+    await dbExecute(`DELETE FROM ${quoteIdentifier(target.name)} WHERE ${clauses.join(" AND ")}`, params);
+  } catch {
+    // compatibility: table may not exist in older installs.
+  }
 }
 
 export async function updateDbAppointmentStatus(slug: string, id: number, status: AppointmentStatus | string): Promise<AppointmentWithMeta> {

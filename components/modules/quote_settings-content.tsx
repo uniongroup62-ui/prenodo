@@ -23,7 +23,7 @@ type ConfigRecord = {
 type ConfigResponse = {
   ok: boolean;
   records?: ConfigRecord[];
-  module?: { records?: ConfigRecord[] };
+  module?: { records?: ConfigRecord[]; settings?: Record<string, unknown> };
 };
 
 type PaymentMethodRow = {
@@ -65,39 +65,99 @@ export function QuoteSettingsContent() {
   // Metodi di pagamento (sempre almeno una riga, come nel PHP).
   const [paymentMethods, setPaymentMethods] = useState<PaymentMethodRow[]>([{ name: "", details: "" }]);
 
+  const [feedback, setFeedback] = useState<{ type: "success" | "danger"; text: string } | null>(null);
+
   const load = useCallback(() => {
     fetch(`/api/manage/configuration?module=quote_settings&slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
       .then((j: ConfigResponse) => {
+        // Prefer the full `settings` object exposed by the route (all fiscal
+        // columns), falling back to the aggregated records for older shapes.
+        const s = (j.module?.settings ?? {}) as Record<string, unknown>;
+        const str = (key: string) => String(s[key] ?? "");
+        if (Object.keys(s).length > 0) {
+          setCompanyName(str("quote_company_name"));
+          setVatNumber(str("quote_vat_number"));
+          setTaxCode(str("quote_tax_code"));
+          setSdi(str("quote_sdi"));
+          setPec(str("quote_pec"));
+          setRegion(str("quote_region"));
+          setProvince(str("quote_province"));
+          setCity(str("quote_city"));
+          setCap(str("quote_cap"));
+          setAddress(str("quote_address"));
+          setPhone(str("quote_phone"));
+          setEmail(str("quote_email"));
+          setWebsite(str("quote_website"));
+          setTerms(str("quote_terms"));
+          setFooter(str("quote_footer"));
+          try {
+            const rows = JSON.parse(str("payment_methods_rows")) as PaymentMethodRow[];
+            if (Array.isArray(rows) && rows.length > 0) {
+              setPaymentMethods(rows.map((row) => ({ name: String(row.name ?? ""), details: String(row.details ?? "") })));
+            }
+          } catch {
+            /* keep the single empty row */
+          }
+          return;
+        }
+
         const records = j.records ?? j.module?.records ?? [];
         if (!Array.isArray(records)) return;
-
-        // Record "Intestazione": detail = quote_company_name || name, value = quote_email || email.
         const header = recordByTitle(records, "Intestazione");
         if (header) {
           setCompanyName(header.detail ?? "");
           setEmail(header.value ?? "");
         }
-        // Record "Dati fiscali": detail = vat / tax_code / sdi joined " / ", value = quote_city.
         const fiscal = recordByTitle(records, "Dati fiscali");
-        if (fiscal) {
-          setCity(fiscal.value ?? "");
-        }
-        // Record "Footer preventivo": detail = quote_footer, value = quote_terms.
+        if (fiscal) setCity(fiscal.value ?? "");
         const footerRec = recordByTitle(records, "Footer preventivo");
         if (footerRec) {
           setFooter(footerRec.detail ?? "");
           setTerms(footerRec.value ?? "");
         }
-        // Record "Metodi pagamento": value/detail = payment_methods raw (string),
-        // structure not recoverable here -> leave the editable row empty.
       })
       .catch(() => {
         /* leave defaults */
       });
   }, [slug]);
+
+  async function postAction(payload: Record<string, unknown>, successText: string): Promise<void> {
+    setFeedback(null);
+    try {
+      const res = await fetch(`/api/manage/configuration?module=quote_settings&slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ slug, module: "quote_settings", ...payload }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.ok === false) {
+        setFeedback({ type: "danger", text: String(j?.error ?? j?.message ?? "Errore.") });
+        return;
+      }
+      setFeedback({ type: "success", text: String(j?.message ?? successText) });
+      load();
+    } catch {
+      setFeedback({ type: "danger", text: "Errore di rete." });
+    }
+  }
+
+  // Build the raw `payment_methods` text (one "Nome: dettagli" line per method),
+  // matching the legacy storage format the preventivo reader expects.
+  function paymentMethodsRaw(): string {
+    return paymentMethods
+      .map((pm) => {
+        const name = pm.name.replace(/[\r\n]+/g, " ").trim();
+        const details = pm.details.replace(/[\r\n]+/g, " ").trim();
+        if (!name) return "";
+        return details ? `${name}: ${details}` : name;
+      })
+      .filter(Boolean)
+      .slice(0, 50)
+      .join("\n");
+  }
 
   useEffect(() => {
     load();
@@ -148,13 +208,40 @@ export function QuoteSettingsContent() {
         </div>
       </div>
 
+      {feedback ? (
+        <div className={`alert alert-${feedback.type}`} role="alert">
+          {feedback.text}
+        </div>
+      ) : null}
+
       <div className="row g-3 mb-3">
         <div className="col-12">
           <div className="card p-4">
             <form
               method="post"
               className="row g-3 align-items-end"
-              onSubmit={(e) => e.preventDefault()}
+              onSubmit={(e) => {
+                e.preventDefault();
+                postAction(
+                  {
+                    action: "save_quote_profile",
+                    quote_company_name: companyName,
+                    quote_vat_number: vatNumber,
+                    quote_tax_code: taxCode,
+                    quote_sdi: sdi,
+                    quote_pec: pec,
+                    quote_region: region,
+                    quote_province: province,
+                    quote_city: city,
+                    quote_cap: cap,
+                    quote_address: address,
+                    quote_phone: phone,
+                    quote_email: email,
+                    quote_website: website,
+                  },
+                  "Dati anagrafici salvati.",
+                );
+              }}
             >
               <input type="hidden" name="action" value="save_quote_profile" />
 
@@ -412,7 +499,17 @@ export function QuoteSettingsContent() {
               documento.
             </div>
 
-            <form method="post" className="row g-3" onSubmit={(e) => e.preventDefault()}>
+            <form
+              method="post"
+              className="row g-3"
+              onSubmit={(e) => {
+                e.preventDefault();
+                postAction(
+                  { action: "save_quote_conditions", quote_terms: terms, quote_footer: footer },
+                  "Condizioni preventivo salvate.",
+                );
+              }}
+            >
               <input type="hidden" name="action" value="save_quote_conditions" />
 
               <div className="col-12">
@@ -475,7 +572,17 @@ export function QuoteSettingsContent() {
               opzionalmente, dei <strong>dettagli</strong>.
             </div>
 
-            <form method="post" className="row g-3" onSubmit={(e) => e.preventDefault()}>
+            <form
+              method="post"
+              className="row g-3"
+              onSubmit={(e) => {
+                e.preventDefault();
+                postAction(
+                  { action: "save_payment_methods", payment_methods: paymentMethodsRaw() },
+                  "Metodi di pagamento salvati.",
+                );
+              }}
+            >
               <input type="hidden" name="action" value="save_payment_methods" />
 
               <div className="col-12">

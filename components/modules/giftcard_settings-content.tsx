@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 // Faithful port of the PHP GiftCard settings page
 // (app/pages/giftcard_settings.php, ?page=giftcard_settings).
@@ -58,8 +58,9 @@ export function GiftcardSettingsContent() {
   const [validityValue, setValidityValue] = useState("0");
   const [validityUnit, setValidityUnit] = useState("days");
   const [terms, setTerms] = useState(DEFAULT_GIFTCARD_TERMS);
+  const [feedback, setFeedback] = useState<{ type: "success" | "danger"; text: string } | null>(null);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     fetch(`/api/manage/configuration?module=giftcard_settings&slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
     })
@@ -75,13 +76,35 @@ export function GiftcardSettingsContent() {
         }
         // PHP pre-fills the stored terms; falls back to the default text when empty.
         const storedTerms = (termsRec?.detail ?? "").trim();
-        if (storedTerms) setTerms(termsRec?.detail ?? "");
+        setTerms(storedTerms ? (termsRec?.detail ?? "") : DEFAULT_GIFTCARD_TERMS);
       })
       .catch(() => {});
   }, [slug]);
 
-  const action = (a: string) =>
-    `/${encodeURIComponent(slug)}/index.php?page=giftcard_settings&action=${a}`;
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function postAction(payload: Record<string, unknown>, successText: string): Promise<void> {
+    setFeedback(null);
+    try {
+      const res = await fetch(`/api/manage/configuration?module=giftcard_settings&slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ slug, module: "giftcard_settings", ...payload }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.ok === false) {
+        setFeedback({ type: "danger", text: String(j?.error ?? j?.message ?? "Errore.") });
+        return;
+      }
+      setFeedback({ type: "success", text: String(j?.message ?? successText) });
+      load();
+    } catch {
+      setFeedback({ type: "danger", text: "Errore di rete." });
+    }
+  }
+
   const page = (p: string) => `/${encodeURIComponent(slug)}/index.php?page=${p}`;
 
   return (
@@ -108,6 +131,12 @@ export function GiftcardSettingsContent() {
         </div>
       </div>
 
+      {feedback ? (
+        <div className={`alert alert-${feedback.type}`} role="alert">
+          {feedback.text}
+        </div>
+      ) : null}
+
       <div className="row g-3">
         <div className="col-lg-8">
           <div className="card p-4">
@@ -118,7 +147,21 @@ export function GiftcardSettingsContent() {
               Imposta qui la durata predefinita: <strong>0</strong> significa nessuna scadenza automatica.
             </div>
 
-            <form method="post" className="border rounded-3 p-3 bg-light" action={action("save_giftcard_validity_default")}>
+            <form
+              method="post"
+              className="border rounded-3 p-3 bg-light"
+              onSubmit={(e) => {
+                e.preventDefault();
+                postAction(
+                  {
+                    action: "save_giftcard_validity_default",
+                    giftcard_default_validity_value: validityValue,
+                    giftcard_default_validity_unit: validityUnit,
+                  },
+                  "Impostazioni scadenza GiftCard salvate.",
+                );
+              }}
+            >
               <input type="hidden" name="action" value="save_giftcard_validity_default" />
 
               <div className="row g-2 align-items-end">
@@ -184,7 +227,14 @@ export function GiftcardSettingsContent() {
               Inserisci <strong>una riga per ogni condizione</strong>.
             </div>
 
-            <form method="post" className="row g-3" action={action("save_giftcard_terms")}>
+            <form
+              method="post"
+              className="row g-3"
+              onSubmit={(e) => {
+                e.preventDefault();
+                postAction({ action: "save_giftcard_terms", giftcard_terms: terms }, "Condizioni GiftCard salvate.");
+              }}
+            >
               <div className="col-12">
                 <label className="form-label">Testo condizioni</label>
                 <textarea
@@ -205,15 +255,13 @@ export function GiftcardSettingsContent() {
                 </button>
                 <button
                   className="btn btn-outline-danger btn-pill"
-                  type="submit"
+                  type="button"
                   name="action"
                   value="reset_giftcard_terms"
-                  formAction={action("reset_giftcard_terms")}
                   data-giftcard-settings-confirm="Ripristinare il testo predefinito delle condizioni GiftCard?"
-                  onClick={(e) => {
-                    if (!window.confirm("Ripristinare il testo predefinito delle condizioni GiftCard?")) {
-                      e.preventDefault();
-                    }
+                  onClick={() => {
+                    if (!window.confirm("Ripristinare il testo predefinito delle condizioni GiftCard?")) return;
+                    postAction({ action: "reset_giftcard_terms" }, "Condizioni GiftCard ripristinate.");
                   }}
                 >
                   <i className="bi bi-arrow-counterclockwise me-1" />

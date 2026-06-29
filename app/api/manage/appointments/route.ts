@@ -4,10 +4,13 @@ import {
 } from "@/lib/appointment-engine";
 import { emptyToNull, jsonError, parseRequestBody } from "@/lib/api-utils";
 import {
+  appointmentCustomerVisibleChanged,
   appointmentPhpStatus,
   createDbAppointment,
+  getDbAppointmentCustomerVisibleSnapshot,
   getDbAppointmentPhpStatus,
   listDbAppointments,
+  updateDbAppointment,
   updateDbAppointmentStatus,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
@@ -149,14 +152,15 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, sourceMode: "database", appointment, appointments: await listDbAppointments({ slug: tenantSlug }) });
     }
 
-    // save action. This route's save path ONLY creates new appointments
-    // (createDbAppointment) — it has no edit-existing-appointment branch. The
-    // legacy 'modified' email (automation_send_email('modified', id) via
-    // automation_handle_customer_visible_change) fires only when an EXISTING
-    // appointment's customer-visible data changes, never on first creation, so
-    // there is intentionally no lifecycle email here. If an edit path is added
-    // later, fire sendAppointmentLifecycleEmail({ ..., kind: "modified" }) after
-    // the update when the date/time/services changed.
+    // save action. A positive integer `id` edits an EXISTING appointment
+    // (updateDbAppointment); a missing/zero id creates a new one
+    // (createDbAppointment, unchanged). On creation no lifecycle email fires
+    // (legacy parity). On edit, the legacy 'modified' email
+    // (automation_send_email('modified', id) via
+    // automation_handle_customer_visible_change) fires AFTER a successful update
+    // when a customer-visible field (date/time/service names) changed.
+    const editId = Number.parseInt(String(body.id ?? "0"), 10);
+    const isEdit = Number.isFinite(editId) && editId > 0;
     const serviceName = String(body.service_name ?? body.service ?? "");
     const operator = String(body.staff_name ?? body.operator ?? "");
     const locationId = await resolveManageLocationId({
@@ -178,7 +182,27 @@ export async function POST(request: Request) {
       staffNotes: emptyToNull(String(body.staff_notes ?? "")),
       customerNotes: emptyToNull(String(body.customer_notes ?? body.notes ?? "")),
     };
-    const appointment = await createDbAppointment(dbAppointmentInput);
+
+    let appointment;
+    if (isEdit) {
+      // Snapshot the customer-visible fields BEFORE the write so we can detect a
+      // customer-visible change afterwards (a null snapshot means the row is not
+      // ours / does not exist — updateDbAppointment then throws the same guard).
+      const before = await getDbAppointmentCustomerVisibleSnapshot(tenantSlug, editId);
+      appointment = await updateDbAppointment({ ...dbAppointmentInput, id: editId });
+      // Fire the 'modified' email only when a customer-visible field changed,
+      // mirroring automation_handle_customer_visible_change. The helper is gated
+      // on emailConfigured() + the modified toggle and swallows every error, so a
+      // delivery problem never fails the save API and the response is unchanged.
+      if (before) {
+        const after = await getDbAppointmentCustomerVisibleSnapshot(tenantSlug, editId);
+        if (after && appointmentCustomerVisibleChanged(before, after)) {
+          await sendAppointmentLifecycleEmail({ slug: tenantSlug, appointmentId: editId, kind: "modified" });
+        }
+      }
+    } else {
+      appointment = await createDbAppointment(dbAppointmentInput);
+    }
 
     return Response.json({
       ok: true,

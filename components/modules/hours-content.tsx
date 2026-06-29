@@ -4,18 +4,45 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 // Faithful port of the PHP "Orari & chiusure" settings page (app/pages/hours.php),
 // reproducing the original Bootstrap markup verbatim: bs-page-header, nav-pills
-// tabs (Orari / Chiusure / Straordinari), and the weekly hours card form with
-// per-day main rows and (initially hidden) split rows.
+// tabs (Orari / Chiusure / Straordinari), the weekly hours card form, and the
+// Chiusure / Straordinari add+list cards.
 //
-// Data: the existing /api/manage/business-settings exposes the location list
-// (used here for the active location_id) but does NOT expose the per-weekday
-// business_hours / closures / exceptions rows. The form is therefore rendered
-// with the PHP default-empty values; saving still posts to the legacy endpoint.
+// Data: the DB-backed /api/manage/resources route (section=hours) returns the
+// location list, the per-weekday business_hours rows, the grouped `closures`
+// ranges and the grouped `exceptions` ranges. The Chiusure & Straordinari tabs
+// fetch that context and persist add/delete via JSON POSTs to the same route
+// (actions closure_save / closure_delete_range / exception_save /
+// exception_delete_range) instead of redirecting to the legacy PHP page.
 
 type ApiLocation = {
   id: number;
   name: string;
   isActive?: boolean;
+};
+
+type ClosureRange = {
+  start: string;
+  end: string;
+  reason: string;
+  ids: number[];
+};
+
+type ExceptionRange = {
+  start: string;
+  end: string;
+  opens: string;
+  closes: string;
+  opens2: string;
+  closes2: string;
+  note: string;
+};
+
+type ResourcesContext = {
+  ok?: boolean;
+  activeLocationId?: number;
+  locations?: ApiLocation[];
+  closures?: ClosureRange[];
+  exceptions?: ExceptionRange[];
 };
 
 // PHP renders days starting at DOW 0 = Domenica through DOW 6 = Sabato.
@@ -34,28 +61,79 @@ function tenantSlug(): string {
   return window.location.pathname.split("/")[1] || "";
 }
 
+// Format an ISO YYYY-MM-DD as the legacy d/m/Y display.
+function formatItalianDate(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
+  if (!m) return iso || "";
+  return `${m[3]}/${m[2]}/${m[1]}`;
+}
+
+function trimTime(value: string): string {
+  return String(value || "").slice(0, 5);
+}
+
 export function HoursContent() {
   const slug = tenantSlug();
-  const [locations, setLocations] = useState<ApiLocation[]>([]);
   const [locationId, setLocationId] = useState<number>(0);
   const [tab, setTab] = useState<"hours" | "closures" | "exceptions">("hours");
+  const [closures, setClosures] = useState<ClosureRange[]>([]);
+  const [exceptions, setExceptions] = useState<ExceptionRange[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>("");
 
   const load = useCallback(() => {
-    fetch(`/api/manage/business-settings?slug=${encodeURIComponent(slug)}`, {
+    // Note: `loading` starts true and is only cleared in .finally(); we avoid a
+    // synchronous setState here so the effect that calls load() stays side-effect
+    // free on the synchronous path.
+    const qs = new URLSearchParams({ slug, section: "hours" });
+    if (locationId > 0) qs.set("location_id", String(locationId));
+    fetch(`/api/manage/resources?${qs.toString()}`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
-      .then((j) => {
+      .then((j: ResourcesContext) => {
         const locs: ApiLocation[] = Array.isArray(j.locations) ? j.locations : [];
-        setLocations(locs);
-        setLocationId((prev) => (prev > 0 ? prev : Number(locs[0]?.id ?? 0)));
+        setClosures(Array.isArray(j.closures) ? j.closures : []);
+        setExceptions(Array.isArray(j.exceptions) ? j.exceptions : []);
+        setLocationId((prev) => (prev > 0 ? prev : Number(j.activeLocationId ?? locs[0]?.id ?? 0)));
       })
-      .catch(() => setLocations([]));
-  }, [slug]);
+      .catch(() => {
+        setClosures([]);
+        setExceptions([]);
+      })
+      .finally(() => setLoading(false));
+  }, [slug, locationId]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Shared JSON POST to /api/manage/resources (mirrors the roles-content style).
+  const postAction = useCallback(
+    async (body: Record<string, unknown>): Promise<boolean> => {
+      setError("");
+      try {
+        const res = await fetch(`/api/manage/resources?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify({ slug, location_id: locationId, ...body }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || json?.ok === false) {
+          setError(String(json?.error || "Operazione non riuscita."));
+          return false;
+        }
+        // The route returns the refreshed list; reflect it immediately.
+        if (Array.isArray(json?.closures)) setClosures(json.closures as ClosureRange[]);
+        if (Array.isArray(json?.exceptions)) setExceptions(json.exceptions as ExceptionRange[]);
+        return true;
+      } catch {
+        setError("Errore di rete.");
+        return false;
+      }
+    },
+    [slug, locationId],
+  );
 
   function pageHref(suffix: string): string {
     return `/${encodeURIComponent(slug)}/index.php?page=hours${suffix}`;
@@ -125,10 +203,18 @@ export function HoursContent() {
         </li>
       </ul>
 
+      {error ? (
+        <div className="alert alert-danger" role="alert">
+          {error}
+        </div>
+      ) : null}
+
       {tab === "hours" ? (
         <HoursTab locationId={locationId} />
+      ) : tab === "closures" ? (
+        <ClosuresTab loading={loading} closures={closures} onSave={postAction} />
       ) : (
-        <PlaceholderTab href={tabHref(tab)} />
+        <ExceptionsTab loading={loading} exceptions={exceptions} onSave={postAction} />
       )}
     </div>
   );
@@ -234,12 +320,415 @@ function HoursRow({ dow, label }: { dow: number; label: string }) {
   );
 }
 
-function PlaceholderTab({ href }: { href: string }) {
+function ClosuresTab({
+  loading,
+  closures,
+  onSave,
+}: {
+  loading: boolean;
+  closures: ClosureRange[];
+  onSave: (body: Record<string, unknown>) => Promise<boolean>;
+}) {
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [kind, setKind] = useState("Chiusura");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    const ok = await onSave({
+      action: "closure_save",
+      date_from: dateFrom,
+      date_to: dateTo,
+      kind,
+      note,
+    });
+    setSaving(false);
+    if (ok) {
+      setDateFrom("");
+      setDateTo("");
+      setKind("Chiusura");
+      setNote("");
+    }
+  }
+
+  async function remove(range: ClosureRange) {
+    if (!window.confirm("Eliminare questo periodo?")) return;
+    await onSave({
+      action: "closure_delete_range",
+      // Stored desc: end is the older bound, start the newer bound. The legacy
+      // delete link passes from=end & to=start; the lib re-orders internally.
+      from: range.end,
+      to: range.start,
+      reason: range.reason ?? "",
+    });
+  }
+
   return (
-    <div className="card p-3">
-      <div className="text-muted small">
-        Apri questa sezione nel gestionale.{" "}
-        <a href={href}>Continua</a>
+    <div className="row g-3">
+      <div className="col-lg-5">
+        <div className="card p-3">
+          <div className="fw-semibold mb-2">Aggiungi chiusura (ferie / chiusura negozio)</div>
+          <form method="post" onSubmit={submit}>
+            <div className="row g-2">
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Dal</label>
+                <input
+                  className="form-control"
+                  type="date"
+                  name="date_from"
+                  required
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                />
+              </div>
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Al (opz.)</label>
+                <input
+                  className="form-control"
+                  type="date"
+                  name="date_to"
+                  placeholder="Se vuoto = 1 giorno"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                />
+              </div>
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Tipo</label>
+                <select
+                  className="form-select"
+                  name="kind"
+                  required
+                  value={kind}
+                  onChange={(e) => setKind(e.target.value)}
+                >
+                  <option value="Chiusura">Chiusura negozio</option>
+                  <option value="Ferie">Ferie</option>
+                </select>
+              </div>
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Nota (opz.)</label>
+                <input
+                  className="form-control"
+                  name="note"
+                  placeholder="Es. Festività"
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                />
+              </div>
+            </div>
+            <button className="btn btn-primary mt-3" type="submit" disabled={saving}>
+              <i className="bi bi-check2-circle me-1" />
+              Salva
+            </button>
+          </form>
+        </div>
+      </div>
+      <div className="col-lg-7">
+        <div className="card">
+          <div className="card-header fw-semibold">Chiusure</div>
+          <div className="table-responsive">
+            <table className="table mb-0 align-middle">
+              <thead>
+                <tr>
+                  <th>Periodo</th>
+                  <th>Motivo</th>
+                  <th className="text-end"> </th>
+                </tr>
+              </thead>
+              <tbody>
+                {closures.map((r, i) => (
+                  <tr key={`${r.start}-${r.end}-${i}`}>
+                    <td className="fw-semibold">
+                      {r.start === r.end ? (
+                        formatItalianDate(r.start)
+                      ) : (
+                        <>
+                          {formatItalianDate(r.end)} → {formatItalianDate(r.start)}
+                        </>
+                      )}
+                    </td>
+                    <td className="text-muted">{r.reason || "—"}</td>
+                    <td className="text-end">
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline-danger"
+                        onClick={() => remove(r)}
+                      >
+                        Elimina
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {!loading && closures.length === 0 ? (
+                  <tr>
+                    <td colSpan={3} className="text-muted p-3">
+                      Nessuna chiusura.
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExceptionsTab({
+  loading,
+  exceptions,
+  onSave,
+}: {
+  loading: boolean;
+  exceptions: ExceptionRange[];
+  onSave: (body: Record<string, unknown>) => Promise<boolean>;
+}) {
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [note, setNote] = useState("");
+  const [opens, setOpens] = useState("");
+  const [closes, setCloses] = useState("");
+  const [opens2, setOpens2] = useState("");
+  const [closes2, setCloses2] = useState("");
+  const [splitOpen, setSplitOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    const ok = await onSave({
+      action: "exception_save",
+      date_from: dateFrom,
+      date_to: dateTo,
+      note,
+      opens,
+      closes,
+      opens2: splitOpen ? opens2 : "",
+      closes2: splitOpen ? closes2 : "",
+    });
+    setSaving(false);
+    if (ok) {
+      setDateFrom("");
+      setDateTo("");
+      setNote("");
+      setOpens("");
+      setCloses("");
+      setOpens2("");
+      setCloses2("");
+      setSplitOpen(false);
+    }
+  }
+
+  async function remove(range: ExceptionRange) {
+    if (!window.confirm("Eliminare questo periodo?")) return;
+    await onSave({
+      action: "exception_delete_range",
+      from: range.end,
+      to: range.start,
+    });
+  }
+
+  function removeSplit() {
+    if (!window.confirm("Rimuovere l'orario spezzato?")) return;
+    setSplitOpen(false);
+    setOpens2("");
+    setCloses2("");
+  }
+
+  function rangeHoursLabel(r: ExceptionRange): string {
+    const o1 = trimTime(r.opens);
+    const c1 = trimTime(r.closes);
+    const o2 = trimTime(r.opens2);
+    const c2 = trimTime(r.closes2);
+    let label = o1 && c1 ? `${o1} - ${c1}` : "—";
+    if (o2 && c2) label += ` / ${o2} - ${c2}`;
+    return label;
+  }
+
+  return (
+    <div className="row g-3">
+      <div className="col-lg-5">
+        <div className="card p-3">
+          <div className="fw-semibold mb-2">Aggiungi apertura straordinaria</div>
+          <form method="post" id="exceptionForm" onSubmit={submit}>
+            <div className="row g-2">
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Dal</label>
+                <input
+                  className="form-control"
+                  type="date"
+                  name="date_from"
+                  required
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                />
+              </div>
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Al (opz.)</label>
+                <input
+                  className="form-control"
+                  type="date"
+                  name="date_to"
+                  placeholder="Se vuoto = 1 giorno"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                />
+              </div>
+              <div className="col-md-6">
+                <label className="form-label small text-muted">Nota (opz.)</label>
+                <input
+                  className="form-control"
+                  name="note"
+                  placeholder="Es. Festività, evento"
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                />
+              </div>
+
+              <div className="col-12" id="exceptionHoursBox">
+                <div className="border rounded p-2">
+                  <div className="row g-2">
+                    <div className="col-md-6">
+                      <label className="form-label small text-muted">Apertura</label>
+                      <input
+                        className="form-control"
+                        type="time"
+                        name="opens"
+                        id="exceptionOpens"
+                        required
+                        value={opens}
+                        onChange={(e) => setOpens(e.target.value)}
+                      />
+                    </div>
+                    <div className="col-md-6">
+                      <label className="form-label small text-muted">Chiusura</label>
+                      <input
+                        className="form-control"
+                        type="time"
+                        name="closes"
+                        id="exceptionCloses"
+                        required
+                        value={closes}
+                        onChange={(e) => setCloses(e.target.value)}
+                      />
+                    </div>
+                    <div className="col-12 text-nowrap">
+                      <button
+                        type="button"
+                        className={`btn btn-sm btn-outline-secondary ${splitOpen ? "d-none" : ""}`}
+                        id="btnAddExceptionSplit"
+                        onClick={() => setSplitOpen(true)}
+                      >
+                        <i className="bi bi-plus-lg me-1" />
+                        Aggiungi orario spezzato
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn btn-sm btn-outline-danger ${splitOpen ? "" : "d-none"}`}
+                        id="btnRemoveExceptionSplit"
+                        onClick={removeSplit}
+                      >
+                        <i className="bi bi-x-lg me-1" />
+                        Rimuovi
+                      </button>
+                    </div>
+                    <div className={`col-12 ${splitOpen ? "" : "d-none"}`} id="exceptionSplitRow">
+                      <div className="row g-2">
+                        <div className="col-md-6">
+                          <label className="form-label small text-muted">Riapertura</label>
+                          <input
+                            className="form-control"
+                            type="time"
+                            name="opens2"
+                            id="exceptionOpens2"
+                            value={opens2}
+                            onChange={(e) => setOpens2(e.target.value)}
+                          />
+                        </div>
+                        <div className="col-md-6">
+                          <label className="form-label small text-muted">Chiusura 2</label>
+                          <input
+                            className="form-control"
+                            type="time"
+                            name="closes2"
+                            id="exceptionCloses2"
+                            value={closes2}
+                            onChange={(e) => setCloses2(e.target.value)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="small text-muted mt-2">
+                    Le aperture straordinarie hanno priorità sugli orari standard del tab <strong>Orari</strong>, ma non
+                    possono sovrapporsi alle date presenti nel tab <strong>Chiusure</strong>.
+                  </div>
+                </div>
+              </div>
+            </div>
+            <button className="btn btn-primary mt-3" type="submit" disabled={saving}>
+              <i className="bi bi-check2-circle me-1" />
+              Salva
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <div className="col-lg-7">
+        <div className="card">
+          <div className="card-header fw-semibold">Aperture straordinarie</div>
+          <div className="table-responsive">
+            <table className="table mb-0 align-middle">
+              <thead>
+                <tr>
+                  <th>Periodo</th>
+                  <th>Orario</th>
+                  <th>Nota</th>
+                  <th className="text-end"> </th>
+                </tr>
+              </thead>
+              <tbody>
+                {exceptions.map((r, i) => (
+                  <tr key={`${r.start}-${r.end}-${i}`}>
+                    <td className="fw-semibold">
+                      {r.start === r.end ? (
+                        formatItalianDate(r.start)
+                      ) : (
+                        <>
+                          {formatItalianDate(r.end)} → {formatItalianDate(r.start)}
+                        </>
+                      )}
+                    </td>
+                    <td className="text-muted">{rangeHoursLabel(r)}</td>
+                    <td className="text-muted">{r.note || "—"}</td>
+                    <td className="text-end">
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline-danger"
+                        onClick={() => remove(r)}
+                      >
+                        Elimina
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {!loading && exceptions.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="text-muted p-3">
+                      Nessuna apertura straordinaria.
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   );
