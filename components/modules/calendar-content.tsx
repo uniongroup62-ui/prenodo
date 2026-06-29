@@ -487,15 +487,10 @@ export function CalendarContent() {
     [date, minMin, maxMin, slug, loadContext],
   );
 
-  // Auto-open the quick-book modal when arrived via the global "+ Prenotazione"
-  // shell button, which navigates here with ?qbnew=1. Deferred so the static
-  // #apptModal markup + Bootstrap are ready.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (new URLSearchParams(window.location.search).get("qbnew") !== "1") return;
-    const timer = setTimeout(() => openQuickBook(minToTime(minMin), 0), 250);
-    return () => clearTimeout(timer);
-  }, [openQuickBook, minMin]);
+  // The global "+ Prenotazione" topbar button now opens the faithful global
+  // quick-booking offcanvas IN PLACE (components/quick-booking-drawer.tsx),
+  // so there is no longer a ?qbnew=1 navigation to auto-open here. The
+  // calendar's own empty-cell quick-book (openQuickBook) is unchanged.
 
   // CALENDAR NOTES: open the (static) #calendarNotesModal from the header "Note"
   // button and wire its form save/delete to /api/manage/calendar (note_save /

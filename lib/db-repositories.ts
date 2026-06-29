@@ -215,6 +215,33 @@ export async function deleteDbService(id: number, slug: string): Promise<{ delet
   return { deleted: false, deactivated: true, service: await getSingleService(slug, id), reason: "Servizio disattivato come nel gestionale quando ha storico collegato." };
 }
 
+export type QuickBookingCabin = {
+  id: number;
+  name: string;
+  locationId: number | null;
+};
+
+// Active cabins for the quick-booking offcanvas cabin select (tenant-scoped).
+// The cabins table is optional per tenant; a missing table yields an empty list
+// rather than an error so the drawer still works without cabins configured.
+export async function listQuickBookingCabins(slug: string): Promise<QuickBookingCabin[]> {
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "cabins",
+    where: "COALESCE(is_active, 1) = 1",
+    orderBy: "position ASC, id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  return rows
+    .map((row) => ({
+      id: Number(row.id ?? 0),
+      name: String(row.name ?? ""),
+      locationId: row.location_id === null || row.location_id === undefined || row.location_id === ""
+        ? null
+        : Number(row.location_id) || null,
+    }))
+    .filter((cabin) => cabin.id > 0);
+}
+
 export async function listDbProducts({
   slug,
   query = "",

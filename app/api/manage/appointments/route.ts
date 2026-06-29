@@ -27,6 +27,8 @@ import {
   renewPublicBookingHold,
   type PublicBookingContext,
 } from "@/lib/public-booking-db";
+import { listQuickBookingCabins } from "@/lib/db-repositories";
+import { getManageLocationContext } from "@/lib/manage-locations";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -39,6 +41,36 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const action = url.searchParams.get("action") ?? "list";
+
+  // Quick-booking context: everything the global "Nuova prenotazione" offcanvas
+  // needs to render (services grouped by category, staff, locations, cabins) in a
+  // single tenant-scoped GET. Mirrors the legacy quick-booking page setup
+  // (app/lib/View.php groups $services by $categories, reads $serviceLocationMap,
+  // and lists staff/cabins). Reuses publicBookingContext (services with
+  // categoryId/duration/price/noOperator/locationIds + categories + staff +
+  // locations) and adds cabins, which that context omits.
+  if (action === "context") {
+    try {
+      const [context, cabins, locationContext] = await Promise.all([
+        publicBookingContext(tenantSlug),
+        listQuickBookingCabins(tenantSlug),
+        getManageLocationContext(tenantSlug),
+      ]);
+      return Response.json({
+        ok: true,
+        source: "app/lib/View.php (#quickBooking) + app/pages/api_appointments.php",
+        sourceMode: "database",
+        currentLocationId: locationContext.currentLocationId,
+        categories: context.categories,
+        services: context.services,
+        staff: context.staff,
+        locations: context.locations,
+        cabins,
+      });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore contesto prenotazione.");
+    }
+  }
 
   if (action === "availability") {
     try {

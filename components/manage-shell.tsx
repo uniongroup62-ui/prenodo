@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { QuickBookingDrawer } from "@/components/quick-booking-drawer";
 
 // Faithful port of the PHP gestionale chrome (app/lib/View.php): app-shell ->
 // (app-sidebar + app-main -> (topbar + app-content)). Loads the SAME Bootstrap
@@ -334,9 +335,6 @@ export function ManageShell({
                 type="button"
                 data-qb-new="1"
                 aria-label="Nuova prenotazione"
-                onClick={() => {
-                  window.location.href = `${pageHref(slug, "calendar")}?qbnew=1`;
-                }}
               >
                 <i className="bi bi-plus-lg me-1" />
                 <span className="topbar-action-text">Prenotazione</span>
@@ -377,6 +375,11 @@ export function ManageShell({
           <main className="app-content">{children}</main>
         </div>
       </div>
+
+      {/* GLOBAL quick-booking offcanvas: present on every manage page so any
+          [data-qb-new] button (incl. the topbar "+ Prenotazione" above) opens it
+          IN PLACE, with no navigation. */}
+      <QuickBookingDrawer />
     </>
   );
 }
