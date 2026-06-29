@@ -1,0 +1,229 @@
+import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
+import {
+  cancelPublicCustomerEmailChange,
+  changePublicCustomerPassword,
+  clearPublicCustomerSession,
+  confirmPublicCustomerEmailChange,
+  currentPublicCustomerSession,
+  issuePublicCustomerVerificationCode,
+  loginPublicCustomer,
+  publicCustomerActivities,
+  publicCustomerFavoriteKeys,
+  publicCustomerFavorites,
+  registerPublicCustomer,
+  removePublicCustomerFavorite,
+  requestPublicCustomerEmailChange,
+  requestPublicCustomerPasswordReset,
+  resetPublicCustomerPassword,
+  startPublicCustomerSession,
+  togglePublicCustomerFavorite,
+  updatePublicCustomerProfile,
+  verifyPublicCustomerCode,
+  type PublicCustomer,
+} from "@/lib/public-customer-account";
+
+export async function GET() {
+  const account = await currentPublicCustomerSession();
+  return Response.json({
+    ok: true,
+    source: "app/lib/Marketplace.php::globalAccountFromSession",
+    ...(await accountState(account)),
+  });
+}
+
+export async function POST(request: Request) {
+  const body = await parseRequestBody(request);
+  const action = String(body.action ?? "login").trim();
+
+  try {
+    if (action === "login") {
+      const result = await loginPublicCustomer({ email: body.email ?? "", password: body.password ?? "" });
+      if (!result.ok) return jsonError(result.error, 401);
+      if ("requiresVerification" in result) {
+        return Response.json({
+          ok: true,
+          source: "app/lib/Marketplace.php::globalAccountForLogin",
+          requiresVerification: true,
+          accountId: result.accountId,
+          email: result.email,
+          devCode: result.devCode,
+        });
+      }
+      const account = await startPublicCustomerSession(result.account.id, request) ?? result.account;
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::startGlobalCustomerSessionByAccountId", ...(await accountState(account)) });
+    }
+
+    if (action === "register") {
+      if ((body.password ?? "") !== (body.password_confirm ?? body.confirm_password ?? "")) {
+        return jsonError("Le password non coincidono.");
+      }
+      const result = await registerPublicCustomer({
+        firstName: body.first_name ?? body.firstName ?? "",
+        lastName: body.last_name ?? body.lastName ?? "",
+        phone: body.phone ?? "",
+        email: body.email ?? "",
+        password: body.password ?? "",
+      });
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({
+        ok: true,
+        source: "app/lib/Marketplace.php::registerGlobalCustomer",
+        requiresVerification: true,
+        accountId: result.accountId,
+        email: result.email,
+        devCode: result.devCode,
+      });
+    }
+
+    if (action === "verify" || action === "verify_email") {
+      const accountId = parseInteger(body.account_id ?? body.accountId, 0);
+      const result = await verifyPublicCustomerCode(accountId, body.code ?? "");
+      if (!result.ok) return jsonError(result.error);
+      const account = await startPublicCustomerSession(result.account.id, request) ?? result.account;
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::verifyGlobalCustomerCode", ...(await accountState(account)) });
+    }
+
+    if (action === "resend_verification") {
+      const result = await issuePublicCustomerVerificationCode(parseInteger(body.account_id ?? body.accountId, 0), true);
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({
+        ok: true,
+        source: "app/lib/Marketplace.php::issueGlobalVerificationCode",
+        requiresVerification: result.requiresVerification,
+        email: result.email,
+        alreadySent: result.alreadySent,
+        devCode: result.devCode,
+      });
+    }
+
+    if (action === "forgot" || action === "request_password_reset") {
+      const result = await requestPublicCustomerPasswordReset(body.email ?? "");
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({
+        ok: true,
+        source: "app/lib/Marketplace.php::requestGlobalPasswordReset",
+        message: result.message,
+        devToken: result.devToken,
+      });
+    }
+
+    if (action === "reset" || action === "reset_password") {
+      const result = await resetPublicCustomerPassword({
+        email: body.email ?? "",
+        token: body.token ?? "",
+        password: body.password ?? "",
+      });
+      if (!result.ok) return jsonError(result.error);
+      const account = await startPublicCustomerSession(result.account.id, request) ?? result.account;
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::resetGlobalPassword", ...(await accountState(account)) });
+    }
+
+    if (action === "logout") {
+      await clearPublicCustomerSession();
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::clearGlobalCustomerSession", ...(await accountState(null)) });
+    }
+
+    const account = await currentPublicCustomerSession();
+    if (!account) return jsonError("Accesso cliente richiesto.", 401);
+
+    if (action === "update_profile") {
+      const result = await updatePublicCustomerProfile(account.id, {
+        firstName: body.first_name ?? body.firstName ?? "",
+        lastName: body.last_name ?? body.lastName ?? "",
+        phone: body.phone ?? "",
+      });
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::updateGlobalCustomerProfile", ...(await accountState(result.account)) });
+    }
+
+    if (action === "change_password") {
+      const result = await changePublicCustomerPassword(account.id, {
+        currentPassword: body.current_password ?? body.currentPassword ?? "",
+        newPassword: body.new_password ?? body.newPassword ?? "",
+        confirmPassword: body.confirm_password ?? body.confirmPassword ?? "",
+      });
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::changeGlobalCustomerPassword", ...(await accountState(result.account)) });
+    }
+
+    if (action === "request_email_change") {
+      const result = await requestPublicCustomerEmailChange(account.id, {
+        newEmail: body.new_email ?? body.newEmail ?? "",
+        currentPassword: body.current_password ?? body.currentPassword ?? "",
+      });
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::requestGlobalCustomerEmailChange", ...(await accountState(result.account)), devCode: result.devCode });
+    }
+
+    if (action === "confirm_email_change") {
+      const result = await confirmPublicCustomerEmailChange(account.id, body.code ?? "");
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::confirmGlobalCustomerEmailChange", ...(await accountState(result.account)) });
+    }
+
+    if (action === "cancel_email_change") {
+      const result = await cancelPublicCustomerEmailChange(account.id);
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({ ok: true, source: "app/lib/Marketplace.php::cancelGlobalCustomerEmailChange", ...(await accountState(result.account)) });
+    }
+
+    if (action === "toggle_favorite") {
+      const result = await togglePublicCustomerFavorite(account.id, {
+        tenantSlug: body.tenant_slug ?? body.tenantSlug ?? "",
+        locationId: parseInteger(body.location_id ?? body.locationId, 0),
+        locationSlug: body.location_slug ?? body.locationSlug ?? "",
+      });
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({
+        ok: true,
+        source: "app/lib/Marketplace.php::toggleGlobalCustomerFavorite",
+        active: result.active,
+        key: result.key,
+        favoriteKeys: await publicCustomerFavoriteKeys(account.id),
+      });
+    }
+
+    if (action === "remove_favorite") {
+      const result = await removePublicCustomerFavorite(
+        account.id,
+        body.tenant_slug ?? body.tenantSlug ?? "",
+        parseInteger(body.location_id ?? body.locationId, 0),
+      );
+      if (!result.ok) return jsonError(result.error);
+      return Response.json({
+        ok: true,
+        source: "app/lib/Marketplace.php::removeGlobalCustomerFavorite",
+        favoriteKeys: await publicCustomerFavoriteKeys(account.id),
+        favorites: await publicCustomerFavorites(account.id),
+      });
+    }
+
+    return jsonError("Azione account non riconosciuta.", 400);
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "Errore account cliente.", 400);
+  }
+}
+
+async function accountState(account: PublicCustomer | null) {
+  if (!account) {
+    return {
+      user: null,
+      favorites: [],
+      favoriteKeys: {},
+      activities: [],
+    };
+  }
+
+  const [favorites, favoriteKeys, activities] = await Promise.all([
+    publicCustomerFavorites(account.id),
+    publicCustomerFavoriteKeys(account.id),
+    publicCustomerActivities(account.id),
+  ]);
+
+  return {
+    user: account,
+    favorites,
+    favoriteKeys,
+    activities,
+  };
+}

@@ -1,0 +1,157 @@
+import fs from "node:fs";
+import path from "node:path";
+import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
+import { canManageSaasTenants, requireSaasAdminSession } from "@/lib/saas-admin-auth";
+import {
+  absoluteSaasBackupPath,
+  allTenantSmsDiagnostics,
+  createManualSmsTopUp,
+  createSaasTenantBackup,
+  latestEmailMovements,
+  latestSmsMovements,
+  listSaasTenantBackups,
+  saasBackupById,
+  saveSmsPlan,
+  saveSmsPricingSettings,
+  setSmsPlanActive,
+  smsOrders,
+  smsPlanEconomics,
+  smsPlans,
+  smsPricingSettings,
+  smsProviderDiagnostics,
+  smsSummary,
+  tenantWalletBalance,
+  moveSmsPlan,
+} from "@/lib/saas-operations";
+import { listSaasTenants, requireSaasTenant, tenantStatus } from "@/lib/saas-tenant-manager";
+
+export const dynamic = "force-dynamic";
+
+export async function GET(request: Request) {
+  try {
+    const session = await requireSaasAdminSession();
+    const url = new URL(request.url);
+    const section = url.searchParams.get("section") ?? "";
+
+    if (section === "controls") {
+      const checkEndpoint = url.searchParams.get("check_endpoint") !== "0";
+      const [provider, tenants] = await Promise.all([
+        smsProviderDiagnostics(checkEndpoint),
+        allTenantSmsDiagnostics(false),
+      ]);
+      return Response.json({ ok: true, provider, tenants });
+    }
+
+    if (section === "sms_plans") {
+      const [settings, plans, activePlans, summary, orders, tenants] = await Promise.all([
+        smsPricingSettings(),
+        smsPlans(true),
+        smsPlans(false),
+        smsSummary(),
+        smsOrders(40),
+        listSaasTenants(),
+      ]);
+      const tenantOptions = await Promise.all(
+        tenants
+          .filter((tenant) => tenantStatus(tenant) !== "deleted")
+          .map(async (tenant) => ({
+            id: Number(tenant.id),
+            slug: String(tenant.slug),
+            name: String(tenant.name ?? tenant.slug),
+            status: tenantStatus(tenant),
+            wallet_balance: await tenantWalletBalance(tenant).catch(() => 0),
+          })),
+      );
+      return Response.json({
+        ok: true,
+        settings,
+        suggested_credit_price: Number(settings.suggested_credit_price ?? 0),
+        plans: plans.map((plan) => ({ ...plan, economics: smsPlanEconomics(plan, settings) })),
+        activePlans,
+        summary,
+        orders,
+        tenants: tenantOptions,
+      });
+    }
+
+    if (section === "send_movements") {
+      const [sms, emails] = await Promise.all([latestSmsMovements(), latestEmailMovements()]);
+      return Response.json({ ok: true, sms, emails });
+    }
+
+    if (section === "backups") {
+      const tenant = await requireSaasTenant(url.searchParams.get("slug") ?? "");
+      return Response.json({ ok: true, backups: await listSaasTenantBackups(Number(tenant.id), 50) });
+    }
+
+    if (section === "backup_download") {
+      if (!canManageSaasTenants(session.user)) return jsonError("Permessi insufficienti per scaricare backup.", 403);
+      const tenant = await requireSaasTenant(url.searchParams.get("slug") ?? "");
+      const backup = await saasBackupById(parseInteger(url.searchParams.get("id"), 0), Number(tenant.id));
+      if (!backup) return jsonError("Backup non trovato.", 404);
+      const absolute = await absoluteSaasBackupPath(backup);
+      const bytes = await fs.promises.readFile(absolute);
+      return new Response(new Uint8Array(bytes), {
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": `attachment; filename="${path.basename(absolute).replace(/"/g, "")}"`,
+          "Content-Length": String(bytes.byteLength),
+        },
+      });
+    }
+
+    return jsonError("Sezione operativa non valida.", 400);
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "Operazione non riuscita.", 400);
+  }
+}
+
+export async function POST(request: Request) {
+  try {
+    const session = await requireSaasAdminSession();
+    if (!canManageSaasTenants(session.user)) return jsonError("Permessi insufficienti per operazioni SaaS.", 403);
+
+    const body = await parseRequestBody(request);
+    const action = body.action || "";
+
+    if (action === "sms_save_settings") {
+      await saveSmsPricingSettings(body);
+      return Response.json({ ok: true });
+    }
+
+    if (action === "sms_save_plan") {
+      const id = await saveSmsPlan(body);
+      return Response.json({ ok: true, id });
+    }
+
+    if (action === "sms_set_plan_active") {
+      await setSmsPlanActive(parseInteger(body.plan_id, 0), body.active === "1" || body.active === "true");
+      return Response.json({ ok: true });
+    }
+
+    if (action === "sms_move_plan") {
+      await moveSmsPlan(parseInteger(body.plan_id, 0), parseInteger(body.direction, 1));
+      return Response.json({ ok: true });
+    }
+
+    if (action === "sms_manual_topup") {
+      const id = await createManualSmsTopUp(
+        body.tenant_slug || body.slug || "",
+        parseInteger(body.credits, 0),
+        parseInteger(body.plan_id, 0) || null,
+        parseNumber(body.amount_gross, 0),
+        body.note || "",
+      );
+      return Response.json({ ok: true, id });
+    }
+
+    if (action === "backup_create") {
+      const result = await createSaasTenantBackup(body.slug || "", body.reason || "");
+      return Response.json({ ok: true, backup: result });
+    }
+
+    return jsonError("Azione operativa non valida.", 400);
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "Operazione non riuscita.", 400);
+  }
+}

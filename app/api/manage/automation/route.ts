@@ -1,0 +1,54 @@
+import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
+import { listDbAutomationRules, runDbAutomationRule, toggleDbAutomationRule } from "@/lib/db-repositories";
+import { currentManageSession } from "@/lib/manage-auth";
+import { manageTenantSlugFromRequest } from "@/lib/manage-request";
+import { can } from "@/lib/role-permissions";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+export async function GET(request: Request) {
+  const tenantSlug = manageTenantSlugFromRequest(request);
+  const session = await currentManageSession(tenantSlug);
+  if (!session) return jsonError("Sessione scaduta o non valida.", 401);
+  if (!can(session.user.perms, "automation.manage")) return jsonError("Permesso automazione mancante.", 403);
+
+  try {
+    return Response.json({
+      ok: true,
+      source: "app/pages/automation.php",
+      sourceMode: "database",
+      rules: await listDbAutomationRules(tenantSlug),
+    });
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "Errore automazione.");
+  }
+}
+
+export async function POST(request: Request) {
+  const tenantSlug = manageTenantSlugFromRequest(request);
+  const session = await currentManageSession(tenantSlug);
+  if (!session) return jsonError("Sessione scaduta o non valida.", 401);
+  if (!can(session.user.perms, "automation.manage")) return jsonError("Permesso automazione mancante.", 403);
+
+  const body = await parseRequestBody(request);
+  const action = body.action ?? "run";
+  const id = parseInteger(body.id);
+
+  try {
+    if (action === "toggle") {
+      const enabled = ["1", "true", "yes", "on"].includes((body.enabled ?? "").toLowerCase());
+      const rule = await toggleDbAutomationRule(id, enabled, tenantSlug);
+      return Response.json({ ok: true, source: "automation?action=toggle", sourceMode: "database", rule, rules: await listDbAutomationRules(tenantSlug) });
+    }
+
+    if (action === "run") {
+      const result = await runDbAutomationRule(id, tenantSlug);
+      return Response.json({ ok: true, source: "automation?action=run", sourceMode: "database", ...result, rules: await listDbAutomationRules(tenantSlug) });
+    }
+
+    return jsonError("Azione automazione non supportata.");
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "Errore automazione.");
+  }
+}

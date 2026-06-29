@@ -1,0 +1,759 @@
+import "server-only";
+
+import type { RowDataPacket } from "mysql2/promise";
+import { emptyToNull, parseInteger } from "@/lib/api-utils";
+import { getManageLocationContext } from "@/lib/manage-locations";
+import {
+  columnExists,
+  dbQuery,
+  quoteIdentifier,
+  tenantDelete,
+  tenantInsert,
+  tenantSelect,
+  tenantTable,
+  tenantUpdate,
+} from "@/lib/tenant-db";
+
+type TenantTarget = Awaited<ReturnType<typeof tenantTable>>;
+
+export type CostStatus = "open" | "overdue" | "paid";
+export type RecurrenceUnit = "day" | "week" | "month" | "year";
+
+export type ManageCostsContext = {
+  ok: true;
+  source: string;
+  sourceMode: "database";
+  activeLocationId: number;
+  filters: {
+    from: string;
+    to: string;
+    status: "open" | "overdue" | "paid" | "all";
+    query: string;
+    categoryId: number;
+  };
+  summary: {
+    open: number;
+    overdue: number;
+    paid: number;
+    dueAmount: number;
+    overdueAmount: number;
+    paidAmount: number;
+    remainingAmount: number;
+  };
+  costs: CostRow[];
+  categories: CostCategoryRow[];
+  suppliers: CostSupplierRow[];
+  locations: CostLocationRow[];
+};
+
+export type CostRow = {
+  id: number;
+  title: string;
+  categoryId: number | null;
+  categoryName: string;
+  categoryColor: string;
+  supplierId: number | null;
+  supplierName: string;
+  amount: number;
+  paidAmount: number;
+  remainingAmount: number;
+  vatPercent: number | null;
+  dueDate: string;
+  status: CostStatus;
+  isPaid: boolean;
+  isPartial: boolean;
+  paidAt: string;
+  paymentMethod: string;
+  docNumber: string;
+  docDate: string;
+  notes: string;
+  isRecurring: boolean;
+  recurrenceInterval: number;
+  recurrenceUnit: RecurrenceUnit;
+  recurrenceEndDate: string;
+  locationId: number | null;
+  locationName: string;
+  attachmentName: string;
+  attachmentSize: number;
+  createdAt: string;
+};
+
+export type CostCategoryRow = {
+  id: number;
+  name: string;
+  color: string;
+  isActive: boolean;
+  costCount: number;
+};
+
+export type CostSupplierRow = {
+  id: number;
+  name: string;
+  isActive: boolean;
+  isActiveCosts: boolean;
+  costLocationIds: number[];
+};
+
+export type CostLocationRow = {
+  id: number;
+  name: string;
+  isActive: boolean;
+};
+
+const sourceLabel = "app/pages/costs.php";
+
+export async function getManageCostsContext(
+  slug: string,
+  options: {
+    from?: string;
+    to?: string;
+    status?: string;
+    query?: string;
+    categoryId?: number;
+    locationId?: number;
+  } = {},
+): Promise<ManageCostsContext> {
+  const locations = await listCostLocations(slug);
+  const activeLocationId = normalizeLocationId(options.locationId ?? 0, locations);
+  const filters = normalizeCostFilters(options);
+  const [costs, categories, suppliers] = await Promise.all([
+    listCosts(slug, { ...filters, locationId: activeLocationId, locations }),
+    listCostCategories(slug),
+    listCostSuppliers(slug),
+  ]);
+
+  return {
+    ok: true,
+    source: sourceLabel,
+    sourceMode: "database",
+    activeLocationId,
+    filters,
+    summary: summarizeCosts(costs),
+    costs,
+    categories,
+    suppliers,
+    locations,
+  };
+}
+
+export async function saveCost(slug: string, body: Record<string, string>): Promise<ManageCostsContext> {
+  const table = await tenantTable(slug, "costs");
+  const id = parseInteger(body.id ?? body.cost_id, 0);
+  const existing = id > 0 ? await getCostById(slug, id) : null;
+  const input = await normalizeCostInput(slug, body, existing);
+  const values = await filterColumns(table.name, {
+    title: input.title,
+    category_id: input.categoryId,
+    supplier_id: input.supplierId,
+    location_id: input.locationId || null,
+    amount: input.amount,
+    paid_amount: input.paidAmount,
+    vat_percent: input.vatPercent,
+    due_date: input.dueDate,
+    is_paid: input.isPaid ? 1 : 0,
+    paid_at: input.isPaid ? (existing?.paid_at ?? new Date()) : null,
+    payment_method: emptyToNull(input.paymentMethod),
+    doc_number: emptyToNull(input.docNumber),
+    doc_date: input.docDate,
+    notes: emptyToNull(input.notes),
+    is_recurring: input.isRecurring ? 1 : 0,
+    recurrence_interval: input.recurrenceInterval,
+    recurrence_unit: input.recurrenceUnit,
+    recurrence_end_date: input.recurrenceEndDate,
+  });
+
+  if (id > 0) {
+    await tenantUpdate({ slug, table: "costs", id, values });
+  } else {
+    await tenantInsert(table, values);
+  }
+
+  return getManageCostsContext(slug, { locationId: input.locationId, status: "open" });
+}
+
+export async function deleteCost(slug: string, costId: number, locationId = 0): Promise<ManageCostsContext> {
+  if (costId <= 0) throw new Error("Costo non valido.");
+  await getCostById(slug, costId);
+  await tenantDelete({ slug, table: "costs", id: costId });
+  return getManageCostsContext(slug, { locationId, status: "open" });
+}
+
+export async function toggleCostPaid(slug: string, costId: number, locationId = 0): Promise<ManageCostsContext> {
+  const row = await getCostById(slug, costId);
+  const isPaid = Number(row.is_paid ?? 0) === 1;
+
+  if (isPaid) {
+    await tenantUpdate({ slug, table: "costs", id: costId, values: { is_paid: 0, paid_amount: 0, paid_at: null } });
+    return getManageCostsContext(slug, { locationId: locationId || Number(row.location_id ?? 0), status: "open" });
+  }
+
+  const amount = roundMoney(Number(row.amount ?? 0) || 0);
+  await tenantUpdate({ slug, table: "costs", id: costId, values: { is_paid: 1, paid_amount: amount, paid_at: new Date() } });
+  if (Number(row.is_recurring ?? 0) === 1) await createNextRecurringCost(slug, row);
+
+  return getManageCostsContext(slug, { locationId: locationId || Number(row.location_id ?? 0), status: "open" });
+}
+
+export async function saveCostCategory(slug: string, body: Record<string, string>): Promise<ManageCostsContext> {
+  const table = await tenantTable(slug, "cost_categories");
+  const id = parseInteger(body.id ?? body.category_id, 0);
+  const name = clean(body.name, 80);
+  const color = clean(body.color, 20);
+  if (!name) throw new Error("Nome categoria obbligatorio.");
+  if (color && !/^#[0-9A-Fa-f]{6}$/.test(color)) throw new Error("Colore categoria non valido.");
+  await ensureCostCategoryNameAvailable(slug, name, id);
+
+  const values = await filterColumns(table.name, {
+    name,
+    color: emptyToNull(color),
+    is_active: truthy(body.is_active ?? "1") ? 1 : 0,
+  });
+  if (id > 0) {
+    await tenantUpdate({ slug, table: "cost_categories", id, values });
+  } else {
+    await tenantInsert(table, values);
+  }
+  return getManageCostsContext(slug, { status: "open" });
+}
+
+export async function deleteCostCategory(slug: string, categoryId: number): Promise<ManageCostsContext> {
+  if (categoryId <= 0) throw new Error("Categoria non valida.");
+  const linked = await countRowsByColumn(slug, "costs", "category_id", categoryId);
+  if (linked > 0) throw new Error(`Categoria associata a ${linked} costi: disattivala per non usarla nei nuovi costi.`);
+  await tenantDelete({ slug, table: "cost_categories", id: categoryId });
+  return getManageCostsContext(slug, { status: "open" });
+}
+
+export async function toggleCostCategory(slug: string, categoryId: number): Promise<ManageCostsContext> {
+  if (categoryId <= 0) throw new Error("Categoria non valida.");
+  const row = await getCostCategoryById(slug, categoryId);
+  await tenantUpdate({ slug, table: "cost_categories", id: categoryId, values: { is_active: Number(row.is_active ?? 1) === 1 ? 0 : 1 } });
+  return getManageCostsContext(slug, { status: "open" });
+}
+
+async function listCosts(
+  slug: string,
+  options: {
+    from: string;
+    to: string;
+    status: "open" | "overdue" | "paid" | "all";
+    query: string;
+    categoryId: number;
+    locationId: number;
+    locations: CostLocationRow[];
+  },
+): Promise<CostRow[]> {
+  const table = await tenantTable(slug, "costs");
+  const categoryTable = await tenantTable(slug, "cost_categories").catch(() => null);
+  const supplierTable = await tenantTable(slug, "suppliers").catch(() => null);
+  const locationTable = await tenantTable(slug, "locations").catch(() => null);
+  const hasLocation = await columnExists(table.name, "location_id");
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
+    clauses.push("c.tenant_id=?");
+    params.push(table.tenantId ?? 0);
+  }
+
+  if (options.status === "open") {
+    clauses.push("c.due_date <= ? AND (c.due_date >= ? OR c.due_date < ?) AND COALESCE(c.is_paid,0)=0");
+    params.push(options.to, options.from, todayIso());
+  } else if (options.status === "overdue") {
+    clauses.push("c.due_date < ? AND COALESCE(c.is_paid,0)=0");
+    params.push(todayIso());
+  } else if (options.status === "paid") {
+    clauses.push("c.due_date BETWEEN ? AND ? AND COALESCE(c.is_paid,0)=1");
+    params.push(options.from, options.to);
+  } else {
+    clauses.push("c.due_date BETWEEN ? AND ?");
+    params.push(options.from, options.to);
+  }
+
+  if (options.categoryId > 0) {
+    clauses.push("c.category_id=?");
+    params.push(options.categoryId);
+  }
+
+  if (options.query) {
+    clauses.push("(LOWER(c.title) LIKE ? OR LOWER(COALESCE(c.doc_number,'')) LIKE ? OR LOWER(COALESCE(s.name,'')) LIKE ?)");
+    params.push(`%${options.query}%`, `%${options.query}%`, `%${options.query}%`);
+  }
+
+  if (hasLocation) {
+    const locationScope = buildLocationScope("c.location_id", options.locationId, options.locations);
+    if (locationScope.sql) {
+      clauses.push(locationScope.sql);
+      params.push(...locationScope.params);
+    }
+  }
+
+  const categoryJoin = categoryTable
+    ? `LEFT JOIN ${quoteIdentifier(categoryTable.name)} cat ON cat.id=c.category_id${categoryTable.mode === "shared" && await columnExists(categoryTable.name, "tenant_id") ? " AND cat.tenant_id=c.tenant_id" : ""}`
+    : "";
+  const supplierJoin = supplierTable
+    ? `LEFT JOIN ${quoteIdentifier(supplierTable.name)} s ON s.id=c.supplier_id${supplierTable.mode === "shared" && await columnExists(supplierTable.name, "tenant_id") ? " AND s.tenant_id=c.tenant_id" : ""}`
+    : "";
+  const locationJoin = locationTable && hasLocation
+    ? `LEFT JOIN ${quoteIdentifier(locationTable.name)} l ON l.id=c.location_id${locationTable.mode === "shared" && await columnExists(locationTable.name, "tenant_id") ? " AND l.tenant_id=c.tenant_id" : ""}`
+    : "";
+
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT c.*, cat.name AS category_name, cat.color AS category_color, s.name AS supplier_name, l.name AS location_name
+       FROM ${quoteIdentifier(table.name)} c
+       ${categoryJoin}
+       ${supplierJoin}
+       ${locationJoin}
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY c.due_date ASC, COALESCE(c.is_paid,0) ASC, c.id ASC`,
+    params,
+  );
+  return rows.map(mapCost);
+}
+
+async function listCostCategories(slug: string): Promise<CostCategoryRow[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cost_categories", columns: "*", orderBy: "name ASC, id ASC" }).catch(() => []);
+  const counts = await costCategoryCounts(slug, rows.map((row) => Number(row.id ?? 0)));
+  return rows.map((row) => {
+    const id = Number(row.id ?? 0);
+    return {
+      id,
+      name: String(row.name ?? ""),
+      color: String(row.color ?? "#0f766e"),
+      isActive: Number(row.is_active ?? 1) === 1,
+      costCount: counts.get(id) ?? 0,
+    };
+  });
+}
+
+async function listCostSuppliers(slug: string): Promise<CostSupplierRow[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "suppliers", columns: "id,name,is_active,is_active_costs", orderBy: "name ASC, id ASC" }).catch(() => []);
+  const locationMaps = await supplierCostLocationMaps(slug, rows.map((row) => Number(row.id ?? 0)));
+  return rows.map((row) => {
+    const id = Number(row.id ?? 0);
+    return {
+      id,
+      name: String(row.name ?? ""),
+      isActive: Number(row.is_active ?? 1) === 1,
+      isActiveCosts: Number(row.is_active_costs ?? row.is_active ?? 1) === 1,
+      costLocationIds: locationMaps.get(id) ?? [],
+    };
+  });
+}
+
+async function listCostLocations(slug: string): Promise<CostLocationRow[]> {
+  const context = await getManageLocationContext(slug);
+  return context.locations.map((location) => ({ id: location.id, name: location.name, isActive: true }));
+}
+
+function mapCost(row: RowDataPacket): CostRow {
+  const amount = roundMoney(Number(row.amount ?? 0) || 0);
+  const paidAmount = Math.min(amount, roundMoney(Number(row.paid_amount ?? (Number(row.is_paid ?? 0) === 1 ? amount : 0)) || 0));
+  const dueDate = dateString(row.due_date) || todayIso();
+  const isPaid = Number(row.is_paid ?? 0) === 1 || paidAmount >= amount;
+  const remainingAmount = isPaid ? 0 : roundMoney(Math.max(0, amount - paidAmount));
+  const status: CostStatus = isPaid ? "paid" : dueDate < todayIso() ? "overdue" : "open";
+  return {
+    id: Number(row.id ?? 0),
+    title: String(row.title ?? "Costo"),
+    categoryId: nullableNumber(row.category_id),
+    categoryName: String(row.category_name ?? "Generale"),
+    categoryColor: String(row.category_color ?? "#0f766e"),
+    supplierId: nullableNumber(row.supplier_id),
+    supplierName: String(row.supplier_name ?? ""),
+    amount,
+    paidAmount,
+    remainingAmount,
+    vatPercent: nullableNumber(row.vat_percent),
+    dueDate,
+    status,
+    isPaid,
+    isPartial: !isPaid && paidAmount > 0,
+    paidAt: dateTimeString(row.paid_at),
+    paymentMethod: String(row.payment_method ?? ""),
+    docNumber: String(row.doc_number ?? ""),
+    docDate: dateString(row.doc_date),
+    notes: String(row.notes ?? ""),
+    isRecurring: Number(row.is_recurring ?? 0) === 1,
+    recurrenceInterval: Math.max(1, Number(row.recurrence_interval ?? 1) || 1),
+    recurrenceUnit: normalizeRecurrenceUnit(row.recurrence_unit),
+    recurrenceEndDate: dateString(row.recurrence_end_date),
+    locationId: nullableNumber(row.location_id),
+    locationName: row.location_id ? String(row.location_name ?? `Sede #${row.location_id}`) : "Tutte le sedi",
+    attachmentName: String(row.attachment_name ?? ""),
+    attachmentSize: Number(row.attachment_size ?? 0) || 0,
+    createdAt: dateTimeString(row.created_at),
+  };
+}
+
+async function normalizeCostInput(slug: string, body: Record<string, string>, existing: RowDataPacket | null) {
+  const title = clean(body.title, 190);
+  if (!title) throw new Error("Titolo obbligatorio.");
+  const amount = parseMoney(body.amount);
+  if (amount < 0) throw new Error("Totale non valido.");
+  const vatPercent = clean(body.vat_percent, 20) ? parsePercent(body.vat_percent) : null;
+  if (vatPercent !== null && (vatPercent < 0 || vatPercent > 100)) throw new Error("IVA non valida.");
+  const dueDate = normalizeDate(body.due_date);
+  if (!dueDate) throw new Error("Data scadenza non valida.");
+  const docDate = normalizeDate(body.doc_date);
+  if (body.doc_date && !docDate) throw new Error("Data documento non valida.");
+  const locationId = await normalizeCostLocationId(slug, body.location_id);
+  const categoryId = parseInteger(body.category_id, 0) || null;
+  if (categoryId) await ensureCostCategoryUsable(slug, categoryId, existing);
+  const supplierId = parseInteger(body.supplier_id, 0) || null;
+  if (supplierId) await ensureSupplierUsable(slug, supplierId, locationId, existing);
+
+  const trackPayments = truthy(body.track_payments);
+  const rawPaid = trackPayments ? parseMoney(body.paid_amount, true) : 0;
+  let paidAmount = Math.min(amount, Math.max(0, rawPaid));
+  let isPaid = truthy(body.is_paid);
+  if (trackPayments) {
+    isPaid = paidAmount + 0.00001 >= amount;
+    if (isPaid) paidAmount = amount;
+  } else {
+    paidAmount = isPaid ? amount : 0;
+  }
+
+  const isRecurring = truthy(body.is_recurring);
+  const recurrenceInterval = Math.max(1, parseInteger(body.recurrence_interval, 1));
+  const recurrenceUnit = normalizeRecurrenceUnit(body.recurrence_unit);
+  const recurrenceEndDate = truthy(body.recurrence_end_never) ? null : normalizeDate(body.recurrence_end_date);
+  if (body.recurrence_end_date && !recurrenceEndDate && !truthy(body.recurrence_end_never)) throw new Error("Fine ricorrenza non valida.");
+  if (recurrenceEndDate && recurrenceEndDate < dueDate) throw new Error("Fine ricorrenza precedente alla scadenza.");
+
+  return {
+    title,
+    amount,
+    paidAmount,
+    vatPercent,
+    dueDate,
+    paymentMethod: clean(body.payment_method, 60),
+    docNumber: clean(body.doc_number, 80),
+    docDate,
+    notes: cleanLong(body.notes, 5000),
+    isPaid,
+    isRecurring,
+    recurrenceInterval,
+    recurrenceUnit,
+    recurrenceEndDate,
+    categoryId,
+    supplierId,
+    locationId,
+  };
+}
+
+async function normalizeCostLocationId(slug: string, value: unknown): Promise<number> {
+  const locations = await listCostLocations(slug);
+  const id = parseInteger(value, 0) || normalizeLocationId(0, locations);
+  if (id <= 0 || !locations.some((location) => location.id === id)) throw new Error("Sede non valida o non autorizzata.");
+  return id;
+}
+
+async function ensureCostCategoryUsable(slug: string, categoryId: number, existing: RowDataPacket | null): Promise<void> {
+  const row = await getCostCategoryById(slug, categoryId);
+  const keepsExisting = existing && Number(existing.category_id ?? 0) === categoryId;
+  if (Number(row.is_active ?? 1) !== 1 && !keepsExisting) {
+    throw new Error("Categoria disattivata: non puo essere usata su nuovi costi.");
+  }
+}
+
+async function ensureSupplierUsable(slug: string, supplierId: number, locationId: number, existing: RowDataPacket | null): Promise<void> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "suppliers", where: "id=?", params: [supplierId], limit: 1 }).catch(() => []);
+  const supplier = rows[0];
+  if (!supplier) throw new Error("Fornitore non valido.");
+  const keepsExisting = existing && Number(existing.supplier_id ?? 0) === supplierId && Number(existing.location_id ?? 0) === locationId;
+  if (!keepsExisting && Number(supplier.is_active_costs ?? supplier.is_active ?? 1) !== 1) {
+    throw new Error("Fornitore disattivato per Scadenziario e Costi.");
+  }
+  const maps = await supplierCostLocationMaps(slug, [supplierId]);
+  const allowed = maps.get(supplierId) ?? [];
+  if (!keepsExisting && allowed.length && locationId > 0 && !allowed.includes(locationId)) {
+    throw new Error("Fornitore non abilitato per questa sede.");
+  }
+}
+
+async function getCostById(slug: string, id: number): Promise<RowDataPacket> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "costs", where: "id=?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Costo non trovato.");
+  return rows[0];
+}
+
+async function getCostCategoryById(slug: string, id: number): Promise<RowDataPacket> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cost_categories", where: "id=?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Categoria non trovata.");
+  return rows[0];
+}
+
+async function createNextRecurringCost(slug: string, row: RowDataPacket): Promise<void> {
+  const dueDate = dateString(row.due_date);
+  if (!dueDate) return;
+  const next = nextDueDate(dueDate, Math.max(1, Number(row.recurrence_interval ?? 1) || 1), normalizeRecurrenceUnit(row.recurrence_unit));
+  const endDate = dateString(row.recurrence_end_date);
+  if (endDate && next > endDate) return;
+  if (await recurringCostExists(slug, row, next)) return;
+
+  const table = await tenantTable(slug, "costs");
+  await tenantInsert(table, await filterColumns(table.name, {
+    title: row.title,
+    category_id: row.category_id ?? null,
+    supplier_id: row.supplier_id ?? null,
+    location_id: row.location_id ?? null,
+    amount: row.amount,
+    paid_amount: 0,
+    vat_percent: row.vat_percent ?? null,
+    due_date: next,
+    is_paid: 0,
+    paid_at: null,
+    payment_method: row.payment_method ?? null,
+    doc_number: null,
+    doc_date: null,
+    notes: row.notes ?? null,
+    is_recurring: 1,
+    recurrence_interval: Math.max(1, Number(row.recurrence_interval ?? 1) || 1),
+    recurrence_unit: normalizeRecurrenceUnit(row.recurrence_unit),
+    recurrence_end_date: row.recurrence_end_date ?? null,
+  }));
+}
+
+async function recurringCostExists(slug: string, row: RowDataPacket, dueDate: string): Promise<boolean> {
+  const table = await tenantTable(slug, "costs");
+  const clauses = [
+    "title=?",
+    "due_date=?",
+    "COALESCE(is_recurring,0)=1",
+    "recurrence_interval=?",
+    "recurrence_unit=?",
+    "ABS(amount - ?) < 0.005",
+  ];
+  const params: unknown[] = [
+    String(row.title ?? ""),
+    dueDate,
+    Math.max(1, Number(row.recurrence_interval ?? 1) || 1),
+    normalizeRecurrenceUnit(row.recurrence_unit),
+    Number(row.amount ?? 0) || 0,
+  ];
+  addNullableClause(clauses, params, "category_id", row.category_id);
+  addNullableClause(clauses, params, "supplier_id", row.supplier_id);
+  if (await columnExists(table.name, "location_id")) addNullableClause(clauses, params, "location_id", row.location_id);
+  const scope = await tenantScope(table, clauses, params);
+  const rows = await dbQuery<RowDataPacket[]>(`SELECT 1 FROM ${quoteIdentifier(table.name)}${scope.where} LIMIT 1`, scope.params);
+  return rows.length > 0;
+}
+
+function addNullableClause(clauses: string[], params: unknown[], column: string, value: unknown): void {
+  const numeric = nullableNumber(value);
+  if (numeric === null) {
+    clauses.push(`${quoteIdentifier(column)} IS NULL`);
+  } else {
+    clauses.push(`${quoteIdentifier(column)}=?`);
+    params.push(numeric);
+  }
+}
+
+async function ensureCostCategoryNameAvailable(slug: string, name: string, id: number): Promise<void> {
+  const clauses = ["LOWER(name)=LOWER(?)"];
+  const params: unknown[] = [name];
+  if (id > 0) {
+    clauses.push("id<>?");
+    params.push(id);
+  }
+  const target = await tenantTable(slug, "cost_categories");
+  const scope = await tenantScope(target, clauses, params);
+  const rows = await dbQuery<RowDataPacket[]>(`SELECT id FROM ${quoteIdentifier(target.name)}${scope.where} LIMIT 1`, scope.params);
+  if (rows[0]) throw new Error("Esiste gia una categoria con questo nome.");
+}
+
+async function costCategoryCounts(slug: string, ids: number[]): Promise<Map<number, number>> {
+  const uniqueIds = ids.filter((id) => id > 0);
+  const out = new Map<number, number>();
+  if (!uniqueIds.length) return out;
+  const table = await tenantTable(slug, "costs");
+  const scope = await tenantScope(table, [`category_id IN (${uniqueIds.map(() => "?").join(",")})`], uniqueIds);
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT category_id, COUNT(*) AS count FROM ${quoteIdentifier(table.name)}${scope.where} GROUP BY category_id`,
+    scope.params,
+  ).catch(() => []);
+  for (const row of rows) out.set(Number(row.category_id ?? 0), Number(row.count ?? 0) || 0);
+  return out;
+}
+
+async function supplierCostLocationMaps(slug: string, supplierIds: number[]): Promise<Map<number, number[]>> {
+  const ids = supplierIds.filter((id) => id > 0);
+  const map = new Map<number, number[]>();
+  if (!ids.length) return map;
+  const table = await tenantTable(slug, "supplier_locations").catch(() => null);
+  if (!table) return map;
+  const scope = await tenantScope(table, [`supplier_id IN (${ids.map(() => "?").join(",")})`, "COALESCE(costs_enabled,1)=1"], ids);
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT supplier_id, location_id FROM ${quoteIdentifier(table.name)}${scope.where}`,
+    scope.params,
+  ).catch(() => []);
+  for (const row of rows) {
+    const supplierId = Number(row.supplier_id ?? 0);
+    const locationId = Number(row.location_id ?? 0);
+    if (supplierId <= 0 || locationId <= 0) continue;
+    const list = map.get(supplierId) ?? [];
+    list.push(locationId);
+    map.set(supplierId, list);
+  }
+  return map;
+}
+
+async function countRowsByColumn(slug: string, tableName: string, column: string, value: number): Promise<number> {
+  const table = await tenantTable(slug, tableName);
+  const scope = await tenantScope(table, [`${quoteIdentifier(column)}=?`], [value]);
+  const rows = await dbQuery<RowDataPacket[]>(`SELECT COUNT(*) AS count FROM ${quoteIdentifier(table.name)}${scope.where}`, scope.params).catch(() => []);
+  return Number(rows[0]?.count ?? 0) || 0;
+}
+
+async function filterColumns(table: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const entries = await Promise.all(
+    Object.entries(values).map(async ([key, value]) => [key, value, await columnExists(table, key)] as const),
+  );
+  return Object.fromEntries(entries.filter(([, value, exists]) => exists && value !== undefined).map(([key, value]) => [key, value]));
+}
+
+async function tenantScope(target: TenantTarget, clauses: string[], params: unknown[]) {
+  const scopedClauses = [...clauses];
+  const scopedParams = [...params];
+  if (target.mode === "shared" && await columnExists(target.name, "tenant_id")) {
+    scopedClauses.unshift("tenant_id=?");
+    scopedParams.unshift(target.tenantId ?? 0);
+  }
+  return {
+    where: scopedClauses.length ? ` WHERE ${scopedClauses.join(" AND ")}` : "",
+    params: scopedParams,
+  };
+}
+
+function buildLocationScope(columnSql: string, locationId: number, locations: CostLocationRow[]): { sql: string; params: unknown[] } {
+  const allowedIds = locations.map((location) => location.id).filter((id) => id > 0);
+  if (locationId > 0) return { sql: `${columnSql}=?`, params: [locationId] };
+  if (!allowedIds.length) return { sql: "", params: [] };
+  return {
+    sql: `(${columnSql} IN (${allowedIds.map(() => "?").join(",")}) OR ${columnSql} IS NULL)`,
+    params: allowedIds,
+  };
+}
+
+function normalizeCostFilters(options: { from?: string; to?: string; status?: string; query?: string; categoryId?: number }) {
+  const now = new Date();
+  const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+  const monthEndDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  const monthEnd = dateString(monthEndDate);
+  const status = ["open", "overdue", "paid", "all"].includes(String(options.status ?? "")) ? String(options.status) as "open" | "overdue" | "paid" | "all" : "open";
+  return {
+    from: normalizeDate(options.from) ?? monthStart,
+    to: normalizeDate(options.to) ?? monthEnd,
+    status,
+    query: clean(options.query, 120).toLowerCase(),
+    categoryId: Math.max(0, Math.round(options.categoryId ?? 0)),
+  };
+}
+
+function summarizeCosts(costs: CostRow[]): ManageCostsContext["summary"] {
+  return {
+    open: costs.filter((cost) => cost.status === "open").length,
+    overdue: costs.filter((cost) => cost.status === "overdue").length,
+    paid: costs.filter((cost) => cost.status === "paid").length,
+    dueAmount: roundMoney(costs.filter((cost) => cost.status !== "paid").reduce((sum, cost) => sum + cost.remainingAmount, 0)),
+    overdueAmount: roundMoney(costs.filter((cost) => cost.status === "overdue").reduce((sum, cost) => sum + cost.remainingAmount, 0)),
+    paidAmount: roundMoney(costs.filter((cost) => cost.status === "paid").reduce((sum, cost) => sum + cost.amount, 0)),
+    remainingAmount: roundMoney(costs.reduce((sum, cost) => sum + cost.remainingAmount, 0)),
+  };
+}
+
+function normalizeLocationId(value: number, locations: CostLocationRow[]): number {
+  if (value > 0 && locations.some((location) => location.id === value)) return value;
+  return locations.length === 1 ? locations[0]?.id ?? 0 : locations[0]?.id ?? 0;
+}
+
+function nextDueDate(value: string, interval: number, unit: RecurrenceUnit): string {
+  const [year, month, day] = value.split("-").map((part) => Number.parseInt(part, 10));
+  const date = new Date(year, month - 1, day);
+  if (unit === "day") date.setDate(date.getDate() + interval);
+  if (unit === "week") date.setDate(date.getDate() + interval * 7);
+  if (unit === "month") date.setMonth(date.getMonth() + interval);
+  if (unit === "year") date.setFullYear(date.getFullYear() + interval);
+  return dateString(date);
+}
+
+function normalizeRecurrenceUnit(value: unknown): RecurrenceUnit {
+  const unit = String(value ?? "month").toLowerCase();
+  if (unit === "day" || unit === "week" || unit === "month" || unit === "year") return unit;
+  if (unit === "monthly") return "month";
+  if (unit === "yearly") return "year";
+  return "month";
+}
+
+function normalizeDate(value: unknown): string | null {
+  const raw = String(value ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const [year, month, day] = raw.split("-").map((part) => Number.parseInt(part, 10));
+  const date = new Date(year, month - 1, day);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return null;
+  return raw;
+}
+
+function dateString(value: unknown): string {
+  if (!value) return "";
+  if (value instanceof Date) {
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  }
+  return String(value).slice(0, 10);
+}
+
+function dateTimeString(value: unknown): string {
+  if (!value) return "";
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+function todayIso(): string {
+  return dateString(new Date());
+}
+
+function parseMoney(value: unknown, allowBlank = false): number {
+  let raw = String(value ?? "").trim().replace(/\s/g, "");
+  if (!raw) {
+    if (allowBlank) return 0;
+    throw new Error("Importo non valido.");
+  }
+  const comma = raw.lastIndexOf(",");
+  const dot = raw.lastIndexOf(".");
+  if (comma >= 0 && dot >= 0) {
+    raw = comma > dot ? raw.replace(/\./g, "").replace(",", ".") : raw.replace(/,/g, "");
+  } else if (comma >= 0) {
+    raw = raw.replace(",", ".");
+  }
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed)) throw new Error("Importo non valido.");
+  return roundMoney(parsed);
+}
+
+function parsePercent(value: unknown): number {
+  const parsed = Number.parseFloat(String(value ?? "").replace(",", "."));
+  if (!Number.isFinite(parsed)) throw new Error("IVA non valida.");
+  return Math.round(parsed * 100) / 100;
+}
+
+function roundMoney(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function nullableNumber(value: unknown): number | null {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function clean(value: unknown, max: number): string {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function cleanLong(value: unknown, max: number): string {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function truthy(value: unknown): boolean {
+  return ["1", "true", "yes", "on", "si"].includes(String(value ?? "").toLowerCase());
+}
