@@ -97,10 +97,46 @@ export function ManageShell({
   currentPage?: string;
   children: React.ReactNode;
 }) {
+  // Port of the app.js sidebar behaviors: desktop collapse (persisted in
+  // localStorage) and the mobile off-canvas (sidebar-open + backdrop).
   useEffect(() => {
     const previous = document.body.className;
-    document.body.className = "";
+    let collapsed = false;
+    try {
+      collapsed = localStorage.getItem("beautysuite_sidebar_collapsed") === "1";
+    } catch {
+      collapsed = false;
+    }
+    document.body.className = collapsed ? "sidebar-collapsed" : "";
+    document.documentElement.classList.remove("sidebar-collapsed-initial");
+
+    const desktopToggle = document.getElementById("sidebarDesktopToggle");
+    const openBtn = document.getElementById("sidebarOpen");
+    const closeBtn = document.getElementById("sidebarClose");
+    const backdrop = document.getElementById("sidebarBackdrop");
+
+    const onDesktopToggle = () => {
+      const next = !document.body.classList.contains("sidebar-collapsed");
+      document.body.classList.toggle("sidebar-collapsed", next);
+      try {
+        localStorage.setItem("beautysuite_sidebar_collapsed", next ? "1" : "0");
+      } catch {
+        // ignore storage failures, like the PHP app
+      }
+    };
+    const openSidebar = () => document.body.classList.add("sidebar-open");
+    const closeSidebar = () => document.body.classList.remove("sidebar-open");
+
+    desktopToggle?.addEventListener("click", onDesktopToggle);
+    openBtn?.addEventListener("click", openSidebar);
+    closeBtn?.addEventListener("click", closeSidebar);
+    backdrop?.addEventListener("click", closeSidebar);
+
     return () => {
+      desktopToggle?.removeEventListener("click", onDesktopToggle);
+      openBtn?.removeEventListener("click", openSidebar);
+      closeBtn?.removeEventListener("click", closeSidebar);
+      backdrop?.removeEventListener("click", closeSidebar);
       document.body.className = previous;
     };
   }, []);
