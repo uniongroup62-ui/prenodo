@@ -5,6 +5,7 @@ import {
   createDbClient,
   deleteDbClient,
   listDbClients,
+  quickBookClientContext,
   updateDbClient,
 } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -27,6 +28,28 @@ export async function GET(request: Request) {
     raw: url.searchParams.get("location_id"),
     fallbackCurrent: true,
   });
+
+  // Quick-booking drawer CLIENT HISTORY + RESIDUALS panels. Single GET that
+  // returns BOTH the legacy `action=history` (summary) and `action=residuals`
+  // (summary=1) payloads for one client, so the drawer can populate both boxes
+  // with a single fetch. Port of api_clients.php history/residuals summaries.
+  if (url.searchParams.get("action") === "quickbook_client_context") {
+    const clientId = parseInteger(url.searchParams.get("client_id"));
+    if (clientId <= 0) return jsonError("client_id mancante.");
+    try {
+      const context = await quickBookClientContext({ slug: tenantSlug, clientId, locationId });
+      return Response.json({
+        ok: true,
+        source: "app/pages/api_clients.php action=history + action=residuals (summary)",
+        sourceMode: "database",
+        summary: context.history,
+        residuals: context.residuals,
+      });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");
+    }
+  }
+
   const args = {
     slug: tenantSlug,
     query: url.searchParams.get("q") ?? "",

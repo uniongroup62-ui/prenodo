@@ -3775,3 +3775,283 @@ function phpStatus(status: AppointmentStatus | string): string {
   if (normalized === "no_show" || normalized === "no show") return "no_show";
   return "scheduled";
 }
+
+// ===================== QUICK-BOOKING CLIENT CONTEXT =====================
+// Faithful port of `api_clients.php` action=history (summary) + action=residuals
+// (summary=1), the two payloads the quick-booking drawer's CLIENT HISTORY and
+// RESIDUALS panels consume (assets/js/app.js qbLoadClientHistory /
+// qbLoadClientResiduals). Both are tenant-scoped via `tenantSelect`, and every
+// residual block is guarded so a missing table/column simply yields count 0
+// (mirrors the legacy `try/catch` + `table_exists()`/`column_exists()` checks).
+
+export type QuickBookClientHistorySummary = {
+  total: number;
+  last_visit: string | null;
+  next_visit: string | null;
+  sales_total: number;
+};
+
+export type QuickBookClientResidualsSummary = {
+  services_count: number;
+  gifts_count: number;
+  giftboxes_count: number;
+  giftcards_count: number;
+  packages_count: number;
+  credit_count: number;
+  credit_available: number;
+  total: number;
+};
+
+export type QuickBookClientContext = {
+  history: QuickBookClientHistorySummary;
+  residuals: QuickBookClientResidualsSummary;
+};
+
+// History summary — port of api_clients.php lines ~3926-3958:
+//   total      = COUNT(*) of ALL appointments for the client (no status filter)
+//   last_visit = MAX(starts_at) where starts_at < NOW() (any status)
+//   next_visit = MIN(starts_at) where starts_at >= NOW() AND status IN ('pending','scheduled')
+//   sales_total= SUM(total) of the client's sales, excluding cancelled when a
+//                sales.status column exists (legacy $salesWhereStatus).
+async function quickBookClientHistorySummary(slug: string, clientId: number): Promise<QuickBookClientHistorySummary> {
+  const out: QuickBookClientHistorySummary = { total: 0, last_visit: null, next_visit: null, sales_total: 0 };
+
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointments",
+      columns:
+        "COUNT(*) AS total, " +
+        "MAX(CASE WHEN starts_at < NOW() THEN starts_at ELSE NULL END) AS last_visit, " +
+        "MIN(CASE WHEN starts_at >= NOW() AND status IN ('pending','scheduled') THEN starts_at ELSE NULL END) AS next_visit",
+      where: "client_id = ?",
+      params: [clientId],
+    });
+    const row = rows[0] ?? {};
+    out.total = Number(row.total ?? 0) || 0;
+    out.last_visit = row.last_visit ? String(row.last_visit) : null;
+    out.next_visit = row.next_visit ? String(row.next_visit) : null;
+  } catch {
+    // tolerate missing appointments table
+  }
+
+  try {
+    const salesTable = await tenantTable(slug, "sales");
+    const hasStatus = await columnExists(salesTable.name, "status");
+    const where = hasStatus
+      ? "client_id = ? AND (status IS NULL OR status NOT IN ('cancelled','canceled'))"
+      : "client_id = ?";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "sales",
+      columns: "COALESCE(SUM(total), 0) AS t",
+      where,
+      params: [clientId],
+    });
+    out.sales_total = roundMoney(Number(rows[0]?.t ?? 0));
+  } catch {
+    out.sales_total = 0;
+  }
+
+  return out;
+}
+
+// Residuals summary — port of api_clients.php lines ~1800-1973 (the summary=1
+// branch). Each ACTIVE/unconsumed item type is counted independently and any
+// missing table/column degrades to 0. `locationId` only narrows the count when
+// > 0 (the legacy applies the per-location service-allow filter only then; the
+// Next manage app has no ported per-location service map, so the location is
+// accepted but does not further filter — documented as a TODO).
+async function quickBookClientResidualsSummary(
+  slug: string,
+  clientId: number,
+): Promise<QuickBookClientResidualsSummary> {
+  const out: QuickBookClientResidualsSummary = {
+    services_count: 0,
+    gifts_count: 0,
+    giftboxes_count: 0,
+    giftcards_count: 0,
+    packages_count: 0,
+    credit_count: 0,
+    credit_available: 0,
+    total: 0,
+  };
+
+  // Credito cliente — clients.credit_balance (legacy api_clients_credit_residual_data:
+  // credit_count = 1 when available > 0, credit_available = the balance).
+  try {
+    const { credit } = await dbWalletBalance(clientId, slug);
+    out.credit_available = roundMoney(Math.max(0, credit));
+    out.credit_count = out.credit_available > 0.00001 ? 1 : 0;
+  } catch {
+    out.credit_available = 0;
+    out.credit_count = 0;
+  }
+
+  // Servizi prepagati — ClientPrepaidServices::listAvailableForClient:
+  //   client_prepaid_services WHERE client_id=? AND status='active' AND remaining_qty > 0
+  //   (+ expires_at IS NULL OR expires_at >= CURDATE() when the column exists).
+  try {
+    const prepaidTable = await tenantTable(slug, "client_prepaid_services");
+    const hasExpiry = await columnExists(prepaidTable.name, "expires_at");
+    const where = hasExpiry
+      ? "client_id = ? AND status = 'active' AND remaining_qty > 0 AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)"
+      : "client_id = ? AND status = 'active' AND remaining_qty > 0";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_prepaid_services",
+      columns: "COUNT(*) AS c",
+      where,
+      params: [clientId],
+    });
+    out.services_count = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+  } catch {
+    out.services_count = 0;
+  }
+
+  // GiftCard — legacy giftcards WHERE (recipient_client_id | client_id)
+  //   AND status='active' AND balance > 0 AND (expires_at IS NULL OR expires_at >= CURDATE()).
+  try {
+    const giftcardTable = await tenantTable(slug, "giftcards");
+    const hasRecipient = await columnExists(giftcardTable.name, "recipient_client_id");
+    const hasExpiry = await columnExists(giftcardTable.name, "expires_at");
+    const target = hasRecipient ? "recipient_client_id = ?" : "client_id = ?";
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftcards",
+      columns: "COUNT(*) AS c",
+      where: `${target} AND status = 'active' AND balance > 0${expiry}`,
+      params: [clientId],
+    });
+    out.giftcards_count = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+  } catch {
+    out.giftcards_count = 0;
+  }
+
+  // Pacchetti — legacy client_packages WHERE client_id=? AND status='active'
+  //   AND sessions_remaining > 0 AND (expires_at IS NULL OR expires_at >= CURDATE()).
+  try {
+    const packageTable = await tenantTable(slug, "client_packages");
+    const hasExpiry = await columnExists(packageTable.name, "expires_at");
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_packages",
+      columns: "COUNT(*) AS c",
+      where: `client_id = ? AND status = 'active' AND sessions_remaining > 0${expiry}`,
+      params: [clientId],
+    });
+    out.packages_count = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+  } catch {
+    out.packages_count = 0;
+  }
+
+  // GiftBox — legacy counts issued, not-expired instances whose
+  //   (total_qty - redeemed_qty) > 0. We reuse the same residual maths the
+  //   Next giftbox mapper uses (giftbox_instance_items qty - redemptions) per
+  //   instance, counting instances with a positive remainder. Tolerates the
+  //   giftbox tables being absent (count 0).
+  try {
+    const hasInstances = await tableExists((await tenantTable(slug, "giftbox_instances")).name);
+    if (hasInstances) {
+      const instanceTable = await tenantTable(slug, "giftbox_instances");
+      const hasRecipient = await columnExists(instanceTable.name, "recipient_client_id");
+      const hasExpiry = await columnExists(instanceTable.name, "expires_at");
+      const target = hasRecipient
+        ? "(recipient_client_id = ? OR (recipient_client_id IS NULL AND client_id = ?))"
+        : "client_id = ?";
+      const params = hasRecipient ? [clientId, clientId] : [clientId];
+      const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= NOW())" : "";
+      const instances = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instances",
+        columns: "id",
+        where: `${target} AND status = 'issued'${expiry}`,
+        params,
+      });
+      let count = 0;
+      for (const inst of instances) {
+        const instanceId = Number(inst.id ?? 0);
+        if (instanceId <= 0) continue;
+        try {
+          const items = await tenantSelect<RowDataPacket>({
+            slug,
+            table: "giftbox_instance_items",
+            columns: "qty",
+            where: "instance_id = ?",
+            params: [instanceId],
+          });
+          const totalQty = items.reduce((sum, item) => sum + Math.max(0, Number(item.qty ?? 0)), 0);
+          const redeemed = await giftBoxRedeemedUnits(slug, instanceId);
+          if (totalQty - redeemed > 0) count += 1;
+        } catch {
+          // tolerate giftbox item/redemption tables being absent
+        }
+      }
+      out.giftboxes_count = Math.max(0, count);
+    }
+  } catch {
+    out.giftboxes_count = 0;
+  }
+
+  // Omaggi (gifts) — the legacy sums qty_remaining of SERVICE reward items
+  //   (Gifts::countAvailableServiceRewardsForClient), which needs the
+  //   gifts.reward_items_json + per-reward redemption tracking not ported here.
+  //   TODO(gifts-detail): port the reward-item maths; for now we count
+  //   instance-level availability (gift_instances state='disponibile',
+  //   active, not expired) — the closest tractable definition and what
+  //   Gifts::clientAvailableInstances filters on at the instance level.
+  try {
+    const giftTable = await tenantTable(slug, "gift_instances");
+    const hasState = await columnExists(giftTable.name, "state");
+    const hasActive = await columnExists(giftTable.name, "is_active");
+    const hasExpiry = await columnExists(giftTable.name, "expires_at");
+    const clauses = ["client_id = ?"];
+    if (hasState) clauses.push("state = 'disponibile'");
+    if (hasActive && hasState) clauses.push("(is_active = 1 OR state IN ('disponibile','riscattato'))");
+    else if (hasActive) clauses.push("is_active = 1");
+    if (hasExpiry) clauses.push("(expires_at IS NULL OR expires_at >= CURRENT_DATE)");
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "gift_instances",
+      columns: "COUNT(*) AS c",
+      where: clauses.join(" AND "),
+      params: [clientId],
+    });
+    out.gifts_count = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+  } catch {
+    out.gifts_count = 0;
+  }
+
+  out.total =
+    out.services_count +
+    out.gifts_count +
+    out.giftboxes_count +
+    out.giftcards_count +
+    out.packages_count +
+    out.credit_count;
+  return out;
+}
+
+// Combined quick-booking client context (history + residuals summaries),
+// tenant-scoped + session-gated by the API route. Mirrors the two legacy
+// endpoints the drawer calls when a client is selected.
+export async function quickBookClientContext({
+  slug,
+  clientId,
+}: {
+  slug: string;
+  clientId: number;
+  // location_id is accepted by the route for parity with the legacy residuals
+  // endpoint, but the Next manage app has no ported per-location service map, so
+  // it does not further narrow the counts (TODO: port the per-location filter).
+  locationId?: number;
+}): Promise<QuickBookClientContext> {
+  if (clientId <= 0) throw new Error("client_id mancante");
+  const [history, residuals] = await Promise.all([
+    quickBookClientHistorySummary(slug, clientId),
+    quickBookClientResidualsSummary(slug, clientId),
+  ]);
+  return { history, residuals };
+}

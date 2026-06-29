@@ -38,8 +38,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // availability check (refreshCabinsForServices); no such engine is ported, so
 // the cabin lists here fall back to the cabins at the selected location.
 //
+// CLIENT HISTORY + RESIDUALS: when a client is selected, #qbClientHistoryBox and
+// #qbClientResidualsBox are populated from the new
+// /api/manage/clients?action=quickbook_client_context endpoint (port of the
+// legacy api_clients.php action=history + action=residuals summaries). The
+// history line and the soft residual badges reproduce the legacy display
+// verbatim; a req-id guard discards stale responses (qbHistoryReqId pattern).
+//
 // TODO (deep wiring left out, matches the SCOPE note): the redeem flows
-// (giftbox/gift/package/prepaid/giftcard), client history/residuals/card panels,
+// (giftbox/gift/package/prepaid/giftcard), the client card popup, the
+// residuals-detail popup ("Apri scheda" on residuals is a no-op for now),
 // the per-service staff/cabin picker + the multi-service summary, the
 // price-details / coupon / fidelity / discount block, hold countdown/renewal,
 // and edit/delete of an existing appointment. Their markup is present but the
@@ -118,6 +126,90 @@ function lower(value: string): string {
   return value.trim().toLowerCase();
 }
 
+// EUR formatting, faithful to app.js fmtEUR ("€ 1.234,56", it-IT).
+function fmtEUR(value: number): string {
+  const num = Number(value || 0);
+  try {
+    return "€ " + num.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  } catch {
+    return "€ " + (Math.round(num * 100) / 100).toFixed(2).replace(".", ",");
+  }
+}
+
+// SQL date/datetime -> "dd/mm/yyyy hh:mm" (it-IT), port of app.js
+// fmtDateTimeFromSql (local-time parse to avoid timezone shifts).
+function fmtDateTimeFromSql(value: string): string {
+  const s = String(value || "").trim();
+  if (!s) return "";
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(s);
+  let d: Date;
+  if (m) {
+    d = new Date(
+      Number(m[1]),
+      Math.max(0, Number(m[2]) - 1),
+      Number(m[3]),
+      m[4] !== undefined ? Number(m[4]) : 0,
+      m[5] !== undefined ? Number(m[5]) : 0,
+      m[6] !== undefined ? Number(m[6]) : 0,
+    );
+  } else {
+    d = new Date(s.includes("T") ? s : s.replace(" ", "T"));
+  }
+  if (!(d instanceof Date) || String(d) === "Invalid Date") return s;
+  try {
+    return d.toLocaleString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return s;
+  }
+}
+
+// Quick-booking client-context payload (port of api_clients.php history +
+// residuals summaries; see /api/manage/clients?action=quickbook_client_context).
+type QbHistorySummary = { total?: number; last_visit?: string | null; next_visit?: string | null; sales_total?: number };
+type QbResidualsSummary = {
+  services_count?: number;
+  gifts_count?: number;
+  giftboxes_count?: number;
+  giftcards_count?: number;
+  packages_count?: number;
+  credit_count?: number;
+  credit_available?: number;
+};
+type QbClientContextResponse = { ok?: boolean; summary?: QbHistorySummary; residuals?: QbResidualsSummary };
+
+// History summary line, EXACT port of qbLoadClientHistory: "Appuntamenti: N •
+// Ultimo: … • Prossimo: …" (+ " • Vendite: €…" when sales_total > 0).
+function buildHistoryLine(summary: QbHistorySummary): string {
+  const total = Number(summary.total || 0);
+  const last = summary.last_visit ? fmtDateTimeFromSql(String(summary.last_visit)) : "—";
+  const next = summary.next_visit ? fmtDateTimeFromSql(String(summary.next_visit)) : "—";
+  const parts = [`Appuntamenti: ${total}`, `Ultimo: ${last}`, `Prossimo: ${next}`];
+  const salesTot = Number(summary.sales_total || 0);
+  if (Number.isFinite(salesTot) && salesTot > 0) parts.push(`Vendite: ${fmtEUR(salesTot)}`);
+  return parts.join(" • ");
+}
+
+// Residuals soft badges, EXACT port of qbLoadClientResiduals: "Servizi (n)",
+// "Omaggi (n)", "GiftBox (n)", "GiftCard (n)", "Pacchetti (n)", "Credito (€…)".
+type QbResidualBadge = { key: string; label: string };
+function buildResidualBadges(residuals: QbResidualsSummary): QbResidualBadge[] {
+  const ps = Number(residuals.services_count ?? 0);
+  const og = Number(residuals.gifts_count ?? 0);
+  const gb = Number(residuals.giftboxes_count ?? 0);
+  const gc = Number(residuals.giftcards_count ?? 0);
+  const pk = Number(residuals.packages_count ?? 0);
+  const cr = Number(residuals.credit_count ?? 0);
+  const crAvail = Number(residuals.credit_available ?? 0);
+  const badges: QbResidualBadge[] = [];
+  if (ps > 0) badges.push({ key: "services", label: `Servizi (${ps})` });
+  if (og > 0) badges.push({ key: "gifts", label: `Omaggi (${og})` });
+  if (gb > 0) badges.push({ key: "giftboxes", label: `GiftBox (${gb})` });
+  if (gc > 0) badges.push({ key: "giftcards", label: `GiftCard (${gc})` });
+  if (pk > 0) badges.push({ key: "packages", label: `Pacchetti (${pk})` });
+  if (cr > 0) badges.push({ key: "credit", label: `Credito (${fmtEUR(crAvail)})` });
+  return badges;
+}
+
 export function QuickBookingDrawer() {
   const slug = useMemo(() => tenantSlug(), []);
 
@@ -127,6 +219,19 @@ export function QuickBookingDrawer() {
 
   // ---- Selected client (#qb_client_id + #qbSelectedClientBox) ----
   const [client, setClient] = useState<QbClient | null>(null);
+
+  // ---- Client HISTORY + RESIDUALS panels (#qbClientHistoryBox / #qbClientResidualsBox) ----
+  // Populated when a client is selected, from the new
+  // /api/manage/clients?action=quickbook_client_context endpoint (port of the
+  // legacy api_clients.php action=history + action=residuals summaries). A
+  // monotonically increasing req-id guards against stale responses, matching the
+  // legacy qbHistoryReqId / qbResidualsReqId pattern. `null` while loading/errored.
+  const [historySummary, setHistorySummary] = useState<QbHistorySummary | null>(null);
+  const [historyError, setHistoryError] = useState<string>("");
+  const [residualsSummary, setResidualsSummary] = useState<QbResidualsSummary | null>(null);
+  const [residualsError, setResidualsError] = useState<string>("");
+  const [contextLoading, setContextLoading] = useState(false);
+  const contextReqRef = useRef(0);
 
   // ---- Services multiselect state ----
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([]);
@@ -203,6 +308,14 @@ export function QuickBookingDrawer() {
   // Reset the whole form to "new appointment" defaults (port of qbResetForm).
   const resetForm = useCallback(() => {
     setClient(null);
+    // Hide + reset the client history/residuals boxes and drop any in-flight
+    // context fetch (port: the boxes only show for a selected client).
+    contextReqRef.current += 1;
+    setHistorySummary(null);
+    setHistoryError("");
+    setResidualsSummary(null);
+    setResidualsError("");
+    setContextLoading(false);
     setSelectedServiceIds([]);
     setStaffPicks({});
     setCabinPicks({});
@@ -492,6 +605,62 @@ export function QuickBookingDrawer() {
 
   const needle = lower(serviceSearch);
 
+  // ---- Client HISTORY + RESIDUALS fetch (port of qbLoadClientHistory + qbLoadClientResiduals) ----
+  // Driven from the client select/clear flow (NOT an effect) so it never calls
+  // setState synchronously inside an effect body — matching this file's
+  // deliberate avoidance of cascading-render setState. A monotonically
+  // increasing req-id discards stale responses (the legacy qbHistoryReqId /
+  // qbResidualsReqId pattern). The current sede is captured in the callback's
+  // closure, like the legacy reads locationSel.value when a client is chosen.
+  const clientId = client?.id ?? "";
+
+  const clearClientContext = useCallback(() => {
+    contextReqRef.current += 1; // invalidate any in-flight request
+    setHistorySummary(null);
+    setHistoryError("");
+    setResidualsSummary(null);
+    setResidualsError("");
+    setContextLoading(false);
+  }, []);
+
+  const loadClientContext = useCallback(
+    (id: string) => {
+      const myReq = ++contextReqRef.current;
+      setContextLoading(true);
+      setHistorySummary(null);
+      setHistoryError("");
+      setResidualsSummary(null);
+      setResidualsError("");
+
+      const params = new URLSearchParams({ slug, action: "quickbook_client_context", client_id: id });
+      const locId = String(locationId || "").trim();
+      if (locId) params.set("location_id", locId);
+
+      fetch(`/api/manage/clients?${params.toString()}`, { headers: { "x-tenant-slug": slug } })
+        .then((r) => r.json())
+        .then((data: QbClientContextResponse) => {
+          if (myReq !== contextReqRef.current) return; // stale
+          if (!data || data.ok === false) {
+            setHistoryError("Storico non disponibile.");
+            setResidualsError("Residui non disponibili.");
+            return;
+          }
+          setHistorySummary(data.summary ?? {});
+          setResidualsSummary(data.residuals ?? {});
+        })
+        .catch(() => {
+          if (myReq !== contextReqRef.current) return;
+          setHistoryError("Errore nel caricamento storico.");
+          setResidualsError("Errore nel caricamento residui.");
+        })
+        .finally(() => {
+          if (myReq !== contextReqRef.current) return;
+          setContextLoading(false);
+        });
+    },
+    [slug, locationId],
+  );
+
   // ---- Find client (debounced search of /api/manage/clients?q=) ----
   // Driven from the search input's onChange (not an effect) so it doesn't call
   // setState synchronously inside an effect body. 200ms debounce (port of app.js).
@@ -524,12 +693,17 @@ export function QuickBookingDrawer() {
     [slug],
   );
 
-  const selectClient = useCallback((c: QbClient) => {
-    setClient(c);
-    const el = document.getElementById("qbClientFindModal");
-    const api = bootstrap()?.Modal;
-    if (el && api) api.getOrCreateInstance(el).hide();
-  }, []);
+  const selectClient = useCallback(
+    (c: QbClient) => {
+      setClient(c);
+      // Load + show the history/residuals boxes for the chosen client.
+      loadClientContext(c.id);
+      const el = document.getElementById("qbClientFindModal");
+      const api = bootstrap()?.Modal;
+      if (el && api) api.getOrCreateInstance(el).hide();
+    },
+    [loadClientContext],
+  );
 
   const openFindClient = useCallback(() => {
     setFindQuery("");
@@ -547,6 +721,18 @@ export function QuickBookingDrawer() {
     const api = bootstrap()?.Modal;
     if (el && api) api.getOrCreateInstance(el).show();
   }, []);
+
+  // The history "Apri scheda" link -> the clean client view URL (port: opens the
+  // client card). Residuals "Apri scheda" is a no-op (#) for now, matching the
+  // SCOPE note (the residuals-detail popup is not yet ported).
+  const historyOpenHref = clientId
+    ? `/${encodeURIComponent(slug)}/index.php?page=clients&action=view&id=${encodeURIComponent(clientId)}`
+    : "#";
+
+  // Derived display state for the two boxes (no extra render-state).
+  const historyLine = historySummary ? buildHistoryLine(historySummary) : "";
+  const residualBadges = residualsSummary ? buildResidualBadges(residualsSummary) : [];
+  const hasResiduals = residualBadges.length > 0;
 
   // Create a new client (port of qbSubmitClientCreate). Posts to the existing
   // manage clients route (action=create); on success it becomes the selected
@@ -783,6 +969,8 @@ export function QuickBookingDrawer() {
                   onClick={(e) => {
                     e.preventDefault();
                     setClient(null);
+                    // Hide + reset the history/residuals boxes (port: client cleared).
+                    clearClientContext();
                   }}
                 >
                   annulla
@@ -790,22 +978,64 @@ export function QuickBookingDrawer() {
               </div>
             </div>
 
-            {/* Storico cliente (quick booking) — TODO: depends on client-history API */}
-            <div id="qbClientHistoryBox" className="card p-2 mb-2" style={{ display: "none" }}>
+            {/* Storico cliente (quick booking) — wired to quickbook_client_context.
+                Shows the "•"-joined history line (port of qbLoadClientHistory). */}
+            <div id="qbClientHistoryBox" className="card p-2 mb-2" style={{ display: client ? "block" : "none" }}>
               <div className="d-flex justify-content-between align-items-center">
                 <div className="fw-semibold">Storico cliente</div>
-                <a href="#" id="qbClientHistoryOpen" className="small text-decoration-none">Apri scheda</a>
+                <a
+                  href={historyOpenHref}
+                  id="qbClientHistoryOpen"
+                  className="small text-decoration-none"
+                  data-client-id={clientId || undefined}
+                >
+                  Apri scheda
+                </a>
               </div>
-              <div className="small text-muted mt-1" id="qbClientHistorySummary" />
+              <div className="small text-muted mt-1" id="qbClientHistorySummary">
+                {contextLoading && !historySummary && !historyError
+                  ? "Caricamento..."
+                  : historyError
+                    ? historyError
+                    : historyLine}
+              </div>
             </div>
 
-            {/* Residui (quick booking) — TODO: depends on residuals/giftcard/credit APIs */}
-            <div id="qbClientResidualsBox" className="card p-2 mb-2" style={{ display: "none" }}>
+            {/* Residui (quick booking) — wired to quickbook_client_context. Shows
+                the soft badges or the empty/error states (port of qbLoadClientResiduals). */}
+            <div id="qbClientResidualsBox" className="card p-2 mb-2" style={{ display: client ? "block" : "none" }}>
               <div className="d-flex justify-content-between align-items-center">
                 <div className="fw-semibold">Residui</div>
-                <a href="#" id="qbClientResidualsOpen" className="small text-decoration-none">Apri scheda</a>
+                <a
+                  href="#"
+                  id="qbClientResidualsOpen"
+                  className="small text-decoration-none"
+                  data-client-id={clientId || undefined}
+                  style={{ display: hasResiduals ? "" : "none" }}
+                  onClick={(e) => e.preventDefault()}
+                >
+                  Apri scheda
+                </a>
               </div>
-              <div className="small mt-2" id="qbClientResidualsList" />
+              <div className="small mt-2" id="qbClientResidualsList">
+                {contextLoading && !residualsSummary && !residualsError ? (
+                  "Caricamento..."
+                ) : residualsError ? (
+                  <div className="text-danger small">{residualsError}</div>
+                ) : !hasResiduals ? (
+                  <div className="text-muted">Nessun residuo disponibile.</div>
+                ) : (
+                  <>
+                    <div className="text-muted small">Questo cliente ha residui:</div>
+                    <div className="d-flex flex-wrap gap-2 mt-1">
+                      {residualBadges.map((b) => (
+                        <span className="badge badge-soft" key={b.key}>{b.label}</span>
+                      ))}
+                    </div>
+                    <div className="text-muted small mt-2">Apri la scheda per vedere i dettagli.</div>
+                  </>
+                )}
+              </div>
             </div>
 
             <div id="qbNewClientBox" className="qb-client-actions mb-3">
