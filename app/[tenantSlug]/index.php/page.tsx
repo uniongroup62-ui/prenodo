@@ -1,9 +1,17 @@
 import { redirect } from "next/navigation";
 import { ManagementApp } from "@/components/management-app";
 import { ManageOnboardingApp } from "@/components/manage-onboarding-app";
+import { ManageShell } from "@/components/manage-shell";
+import { ClientsContent } from "@/components/modules/clients-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
+
+// Modules already ported to the faithful Path A UI (ManageShell + content).
+// Everything else still falls back to the legacy ManagementApp.
+const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
+  clients: ClientsContent,
+};
 
 export default async function TenantIndexPhpPage({
   params,
@@ -29,6 +37,15 @@ export default async function TenantIndexPhpPage({
 
   if (await shouldPromptOnboarding(tenantSlug, session.user.role.toLowerCase() === "admin")) {
     redirect(`/${encodeURIComponent(tenantSlug)}/index.php?page=onboarding`);
+  }
+
+  const FaithfulContent = query.page ? FAITHFUL_MODULES[query.page] : undefined;
+  if (FaithfulContent && !query.action && !query.tab) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={query.page}>
+        <FaithfulContent />
+      </ManageShell>
+    );
   }
 
   if (query.page) {
