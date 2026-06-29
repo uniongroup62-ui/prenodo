@@ -315,8 +315,12 @@ function getPool(): pg.Pool {
   pool = new pg.Pool({
     connectionString: cs,
     ssl: { rejectUnauthorized: false },
-    max: 5,
-    idleTimeoutMillis: 10000,
+    max: 8,
+    // Keep connections warm so we re-resolve/reconnect to the Supabase pooler
+    // far less often — fewer new connections means fewer transient
+    // getaddrinfo ENOTFOUND DNS hiccups that would otherwise surface as errors.
+    idleTimeoutMillis: 60000,
+    keepAlive: true,
     connectionTimeoutMillis: 15000,
   });
   globalForTenantDb.__prenodoPgPool = pool;
