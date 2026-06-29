@@ -3,32 +3,33 @@
 import { useState } from "react";
 import { ManageAuthShell } from "@/components/manage-auth-shell";
 
-// Pixel-faithful port of the PHP /manage/login page (app/pages/manage_account.php).
-// Submits to the existing JSON auth API instead of the PHP form post.
-export function ManageLoginFaithful({ initialSlug }: { initialSlug: string }) {
+// Pixel-faithful port of the PHP /manage/forgot-password page.
+export function ManageForgotPasswordFaithful({ initialSlug }: { initialSlug: string }) {
   const [slug, setSlug] = useState(initialSlug);
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
     setLoading(true);
     setError("");
+    setMessage("");
     try {
-      const res = await fetch("/api/manage/auth/login", {
+      const res = await fetch("/api/manage/auth/forgot-password", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug, email, password }),
+        body: JSON.stringify({ slug, email }),
       });
       const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setError(data.error || "Credenziali non valide.");
+      if (!res.ok || data.ok === false) {
+        setError(data.error || "Impossibile inviare il link.");
         setLoading(false);
         return;
       }
-      window.location.href = data.redirectTo || `/${encodeURIComponent(slug)}/dashboard`;
+      setMessage(data.message || "Se l'attivita e l'email sono corretti, riceverai un link sicuro per reimpostare la password.");
+      setLoading(false);
     } catch {
       setError("Servizio non disponibile. Riprova.");
       setLoading(false);
@@ -39,16 +40,17 @@ export function ManageLoginFaithful({ initialSlug }: { initialSlug: string }) {
     <ManageAuthShell>
       <section className="auth-card">
         {error ? <div className="alert">{error}</div> : null}
+        {message ? <div className="alert alert-success">{message}</div> : null}
 
-        <h1>Accedi al gestionale</h1>
-        <p className="lead">Entra con URL attivita, email e password.</p>
+        <h1>Recupera password</h1>
+        <p className="lead">Inserisci URL attivita ed email per ricevere il link sicuro.</p>
 
         <form className="form" method="post" onSubmit={onSubmit}>
           <label>
             URL attivita
             <input
               type="text"
-              name="login_slug"
+              name="reset_slug"
               value={slug}
               onChange={(e) => setSlug(e.target.value)}
               placeholder="centroesteticoelite"
@@ -60,31 +62,18 @@ export function ManageLoginFaithful({ initialSlug }: { initialSlug: string }) {
             Email
             <input
               type="email"
-              name="login_email"
+              name="reset_email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               autoComplete="email"
               required
             />
           </label>
-          <label>
-            Password
-            <input
-              type="password"
-              name="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="current-password"
-              required
-            />
-          </label>
           <button className="auth-submit" type="submit" disabled={loading}>
-            {loading ? "Accesso…" : "Accedi"}
+            {loading ? "Invio…" : "Invia link"}
           </button>
           <div className="links">
-            <a href="/manage/register">Registrati</a>
-            <span>|</span>
-            <a href="/manage/forgot-password">Password dimenticata?</a>
+            <a href="/manage/login">Torna al login</a>
           </div>
         </form>
       </section>

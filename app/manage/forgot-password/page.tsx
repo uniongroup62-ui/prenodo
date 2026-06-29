@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { ManageAccountPage } from "@/components/manage-account-page";
+import { ManageForgotPasswordFaithful } from "@/components/manage-forgot-password-faithful";
 
 export const metadata: Metadata = {
-  title: "Recupera password | Prenodo",
+  title: "Recupera password - BeautySuite",
 };
 
 export default async function ManageForgotPasswordPage({
@@ -11,5 +11,5 @@ export default async function ManageForgotPasswordPage({
   searchParams: Promise<{ slug?: string }>;
 }) {
   const { slug } = await searchParams;
-  return <ManageAccountPage initialMode="forgot-password" initialSlug={slug || "centroesteticoelite"} />;
+  return <ManageForgotPasswordFaithful initialSlug={slug || ""} />;
 }
