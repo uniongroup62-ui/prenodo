@@ -1,5 +1,11 @@
 {
   "crons": [
-    { "path": "/api/cron/quotes", "schedule": "0 2 * * *" }
+    { "path": "/api/cron/reminders", "schedule": "*/10 * * * *" },
+    { "path": "/api/cron/giftbox-send", "schedule": "*/30 * * * *" },
+    { "path": "/api/cron/giftcard-send", "schedule": "*/30 * * * *" },
+    { "path": "/api/cron/quotes", "schedule": "0 2 * * *" },
+    { "path": "/api/cron/fidelity-expire", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/fidelity-reconcile-lots", "schedule": "0 4 * * 0" },
+    { "path": "/api/cron/saas-tenant-health", "schedule": "0 5 * * *" }
   ]
 }
