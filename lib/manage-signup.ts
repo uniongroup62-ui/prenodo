@@ -541,7 +541,7 @@ async function provisionTenantFromSignup(signup: SignupRow, verifiedAt: string):
       admin_email: ownerEmail,
       admin_name: ownerName,
       current_location_id: locationId,
-      redirectTo: `/${encodeURIComponent(slug)}/index.php?page=onboarding`,
+      redirectTo: `/${encodeURIComponent(slug)}/onboarding`,
     };
   } catch (error) {
     await cleanupFailedTenant(tenantId, slug, error instanceof Error ? error.message : "Provisioning fallito.");

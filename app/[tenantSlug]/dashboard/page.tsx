@@ -19,7 +19,7 @@ export default async function TenantDashboardPage({
   const session = await currentManageSession(tenantSlug);
   if (!session) redirect(`/manage/login?slug=${encodeURIComponent(tenantSlug)}`);
   if (await shouldPromptOnboarding(tenantSlug, session.user.role.toLowerCase() === "admin")) {
-    redirect(`/${encodeURIComponent(tenantSlug)}/index.php?page=onboarding`);
+    redirect(`/${encodeURIComponent(tenantSlug)}/onboarding`);
   }
 
   let sedeName: string | undefined;
