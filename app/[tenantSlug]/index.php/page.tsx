@@ -29,6 +29,14 @@ import { FidelityContent } from "@/components/modules/fidelity-content";
 import { PosHistoryContent } from "@/components/modules/pos_history-content";
 import { ReportsContent } from "@/components/modules/reports-content";
 import { StockMovesContent } from "@/components/modules/stock_moves-content";
+import { BusinessProfileContent } from "@/components/modules/business_profile-content";
+import { FidelityPointsContent } from "@/components/modules/fidelity_points-content";
+import { FidelityMembershipContent } from "@/components/modules/fidelity_membership-content";
+import { PosSettingsContent } from "@/components/modules/pos_settings-content";
+import { PosPrepaidsContent } from "@/components/modules/pos_prepaids-content";
+import { PosPreordersContent } from "@/components/modules/pos_preorders-content";
+import { StaffAvailabilityContent } from "@/components/modules/staff_availability-content";
+import { AppointmentsPlanContent } from "@/components/modules/appointments_plan-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -63,6 +71,14 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   pos_history: PosHistoryContent,
   fidelity: FidelityContent,
   booking: BookingSettingsContent,
+  business_profile: BusinessProfileContent,
+  fidelity_points: FidelityPointsContent,
+  fidelity_membership: FidelityMembershipContent,
+  pos_settings: PosSettingsContent,
+  pos_prepaids: PosPrepaidsContent,
+  pos_preorders: PosPreordersContent,
+  staff_availability: StaffAvailabilityContent,
+  appointments_plan: AppointmentsPlanContent,
 };
 
 export default async function TenantIndexPhpPage({
