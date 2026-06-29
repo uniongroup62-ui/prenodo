@@ -13,7 +13,7 @@ import {
 } from "@/lib/saas-admin-auth";
 import { onboardingSteps } from "@/lib/manage-onboarding";
 import type { ManageSession } from "@/lib/manage-auth";
-import { dbExecute, dbQuery, quoteIdentifier } from "@/lib/tenant-db";
+import { dbExecute, dbQuery, quoteIdentifier, tableExists } from "@/lib/tenant-db";
 import { normalizeTenantSlug, tenantPrefix } from "@/lib/tenant-runtime";
 
 export type SaasTenantStatus = "provisioning" | "active" | "suspended" | "failed" | "deleted";
@@ -473,7 +473,7 @@ export async function deleteSaasTenant(slug: string, confirmation: string): Prom
   const tenantId = Number(tenant.id);
 
   try {
-    await dbExecute("SET FOREIGN_KEY_CHECKS=0");
+    await dbExecute("SET session_replication_role = 'replica'").catch(() => undefined);
     for (const table of TENANT_DELETE_TABLES) {
       if (!await freshTableExists(table) || !await freshColumnExists(table, "tenant_id")) continue;
       const result = await dbExecute(`DELETE FROM ${quoteIdentifier(table)} WHERE tenant_id=?`, [tenantId]).catch((error) => {
@@ -483,9 +483,9 @@ export async function deleteSaasTenant(slug: string, confirmation: string): Prom
       if (result) sharedRowsDeleted += Number(result.affectedRows ?? 0);
     }
     await dbExecute("DELETE FROM `saas_professional_signups` WHERE slug=? OR tenant_id=?", [slug, tenantId]).catch(() => undefined);
-    await dbExecute("DELETE FROM `saas_tenants` WHERE id=? AND slug=? LIMIT 1", [tenantId, slug]);
+    await dbExecute("DELETE FROM `saas_tenants` WHERE id=? AND slug=?", [tenantId, slug]);
   } finally {
-    await dbExecute("SET FOREIGN_KEY_CHECKS=1").catch(() => undefined);
+    await dbExecute("SET session_replication_role = 'origin'").catch(() => undefined);
   }
 
   await logSaasTenantAudit("tenant.delete_complete", tenant, "Tenant eliminato definitivamente", { shared_rows_deleted: sharedRowsDeleted, warnings });
@@ -683,6 +683,7 @@ export async function logSaasTenantAudit(action: string, tenant: AuditTenant | n
 }
 
 export async function ensureSupportAccessSchema(): Promise<void> {
+  if (await tableExists(SUPPORT_TABLE)) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${SUPPORT_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -769,8 +770,7 @@ export async function revokeSupportToken(tokenId: number, slug: string): Promise
       WHERE id=?
         AND tenant_id=?
         AND used_at IS NULL
-        AND revoked_at IS NULL
-      LIMIT 1`,
+        AND revoked_at IS NULL`,
     [tokenId, Number(tenant.id)],
   );
   await logSaasTenantAudit("support.token_revoke", tenant, "Token accesso supporto revocato", { support_token_id: tokenId });
@@ -833,7 +833,7 @@ export async function consumeSupportAccessToken({
   await dbExecute(
     `UPDATE \`${SUPPORT_TABLE}\`
         SET used_at=NOW(), used_ip=?, used_user_agent=?
-      WHERE id=? LIMIT 1`,
+      WHERE id=?`,
     [truncate(ip ?? "", 45) || null, truncate(userAgent ?? "", 255) || null, Number(row.id)],
   );
   await logSaasTenantAudit("support.token_consume", tenant, "Accesso supporto usato", {
@@ -895,7 +895,7 @@ export async function updateSaasAdmin(id: number, input: Record<string, string>,
 
   const duplicate = await dbQuery<RowDataPacket[]>("SELECT id FROM `saas_admins` WHERE email=? AND id<>? LIMIT 1", [email, id]);
   if (duplicate.length) throw new Error("Email gia assegnata a un altro admin SaaS.");
-  await dbExecute("UPDATE `saas_admins` SET name=?, email=?, role=?, is_active=? WHERE id=? LIMIT 1", [name, email, role, active, id]);
+  await dbExecute("UPDATE `saas_admins` SET name=?, email=?, role=?, is_active=? WHERE id=?", [name, email, role, active, id]);
   await logSaasTenantAudit("saas_admin.update", null, "Admin SaaS aggiornato", { admin_id: id, email, role, is_active: active });
 }
 
@@ -903,7 +903,7 @@ export async function resetSaasAdminPassword(id: number, password: string): Prom
   await ensureSaasAuthSchema();
   const admin = await requireAdminRecord(id);
   if (!password.trim()) throw new Error("Password obbligatoria.");
-  await dbExecute("UPDATE `saas_admins` SET password_hash=? WHERE id=? LIMIT 1", [await bcrypt.hash(password, 10), id]);
+  await dbExecute("UPDATE `saas_admins` SET password_hash=? WHERE id=?", [await bcrypt.hash(password, 10), id]);
   await logSaasTenantAudit("saas_admin.password_reset", null, "Password admin SaaS aggiornata", { admin_id: id, email: admin.email });
 }
 
@@ -1083,18 +1083,19 @@ async function initializeOnboarding(tenantId: number, reset: boolean): Promise<v
     await dbExecute(
       `INSERT INTO \`${ONBOARDING_TABLE}\`(tenant_id,status,current_step,completed_steps_json,skipped_steps_json,meta_json,started_at,completed_at,dismissed_at)
        VALUES(?,?,?,?,?,NULL,NULL,NULL,NULL)
-       ON DUPLICATE KEY UPDATE status=VALUES(status), current_step=VALUES(current_step), completed_steps_json=VALUES(completed_steps_json), skipped_steps_json=VALUES(skipped_steps_json), meta_json=NULL, started_at=NULL, completed_at=NULL, dismissed_at=NULL, updated_at=NOW()`,
+       ON CONFLICT (tenant_id) DO UPDATE SET status=EXCLUDED.status, current_step=EXCLUDED.current_step, completed_steps_json=EXCLUDED.completed_steps_json, skipped_steps_json=EXCLUDED.skipped_steps_json, meta_json=NULL, started_at=NULL, completed_at=NULL, dismissed_at=NULL, updated_at=NOW()`,
       [tenantId, "not_started", "business", "[]", "[]"],
     );
     return;
   }
   await dbExecute(
-    `INSERT IGNORE INTO \`${ONBOARDING_TABLE}\`(tenant_id,status,current_step,completed_steps_json,skipped_steps_json) VALUES(?,?,?,?,?)`,
+    `INSERT INTO \`${ONBOARDING_TABLE}\`(tenant_id,status,current_step,completed_steps_json,skipped_steps_json) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING`,
     [tenantId, "not_started", "business", "[]", "[]"],
   );
 }
 
 async function ensureOnboardingTable(): Promise<void> {
+  if (await tableExists(ONBOARDING_TABLE)) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${ONBOARDING_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -1117,6 +1118,7 @@ async function ensureOnboardingTable(): Promise<void> {
 }
 
 async function ensureAuditTable(): Promise<void> {
+  if (await tableExists(AUDIT_TABLE)) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${AUDIT_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -1140,6 +1142,7 @@ async function ensureAuditTable(): Promise<void> {
 }
 
 async function ensureHealthCheckTable(): Promise<void> {
+  if (await tableExists(HEALTH_TABLE)) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${HEALTH_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -1208,7 +1211,7 @@ async function insertKnown(table: string, values: Record<string, unknown>, ignor
   const entries = Object.entries(filtered).filter(([, value]) => value !== undefined);
   if (!entries.length) throw new Error(`Nessun campo compatibile per ${table}.`);
   const result = await dbExecute(
-    `INSERT ${ignore ? "IGNORE " : ""}INTO ${quoteIdentifier(table)} (${entries.map(([key]) => quoteIdentifier(key)).join(",")}) VALUES (${entries.map(() => "?").join(",")})`,
+    `INSERT INTO ${quoteIdentifier(table)} (${entries.map(([key]) => quoteIdentifier(key)).join(",")}) VALUES (${entries.map(() => "?").join(",")})${ignore ? " ON CONFLICT DO NOTHING" : ""}`,
     entries.map(([, value]) => value),
   );
   return Number(result.insertId ?? 0);
@@ -1229,10 +1232,10 @@ async function updateKnown(table: string, where: Record<string, unknown>, values
 
 async function filterColumns(table: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
   const rows = await dbQuery<RowDataPacket[]>(
-    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
+    "SELECT COLUMN_NAME AS column_name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
     [table],
   );
-  const columns = new Set(rows.map((row) => String(row.COLUMN_NAME)));
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
 }
 
@@ -1259,11 +1262,11 @@ async function addColumnIfMissing(table: string, column: string, definition: str
 
 async function addIndexIfMissing(table: string, index: string, columns: string): Promise<void> {
   const rows = await dbQuery<RowDataPacket[]>(
-    "SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=? LIMIT 1",
+    "SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND tablename=? AND indexname=? LIMIT 1",
     [table, index],
   ).catch(() => []);
   if (rows.length > 0) return;
-  await dbExecute(`ALTER TABLE ${quoteIdentifier(table)} ADD INDEX ${quoteIdentifier(index)} (${columns})`).catch(() => undefined);
+  await dbExecute(`CREATE INDEX IF NOT EXISTS ${quoteIdentifier(index)} ON ${quoteIdentifier(table)} (${columns})`).catch(() => undefined);
 }
 
 async function usesSharedTenantSchema(): Promise<boolean> {

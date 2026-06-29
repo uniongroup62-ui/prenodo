@@ -1,6 +1,18 @@
-import mysql, { type Pool, type RowDataPacket, type ResultSetHeader } from "mysql2/promise";
+import pg from "pg";
+import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { normalizeTenantSlug, tenantPrefix } from "@/lib/tenant-runtime";
-import { loadMysqlConfig } from "@/lib/xampp-config";
+
+// Data layer: Supabase Postgres. Replaces the legacy MySQL/mysql2 layer.
+// The mysql2 types (RowDataPacket/ResultSetHeader) are kept only as structural
+// types so the ~20 callers compile unchanged; nothing from mysql2 runs.
+//
+// dbQuery/dbExecute keep the legacy signatures but translate the SQL on the fly:
+//  - `?` positional placeholders  -> `$1..$n`
+//  - MySQL backtick identifiers    -> Postgres "double quotes"
+//  - DATABASE()                    -> current_schema()
+//  - INSERT (without RETURNING)    -> RETURNING id, to recover insertId
+// The migrated schema carries BEFORE INSERT triggers that fill tenant_id from
+// current_setting('app.tenant_id'); use withTenant() to set it per connection.
 
 type TableMode = "prefixed" | "shared" | "base";
 
@@ -11,12 +23,13 @@ type TenantTable = {
 };
 
 const globalForTenantDb = globalThis as typeof globalThis & {
-  __prenodoMysqlPool?: Pool | null;
-  __prenodoMysqlPoolError?: string | null;
+  __prenodoPgPool?: pg.Pool | null;
+  __prenodoPgPoolError?: string | null;
+  __prenodoPgParsers?: boolean;
 };
 
-let pool: Pool | null = globalForTenantDb.__prenodoMysqlPool ?? null;
-let poolError: string | null = globalForTenantDb.__prenodoMysqlPoolError ?? null;
+let pool: pg.Pool | null = globalForTenantDb.__prenodoPgPool ?? null;
+let poolError: string | null = globalForTenantDb.__prenodoPgPoolError ?? null;
 const tableExistsCache = new Map<string, boolean>();
 const columnExistsCache = new Map<string, boolean>();
 let sharedTenantTablesCache: boolean | null = null;
@@ -29,10 +42,12 @@ export type DatabaseStatus = {
   mode?: "shared" | "prefixed" | "base";
 };
 
-export async function databaseStatus(slug = "centroesteticoelite"): Promise<DatabaseStatus> {
-  const config = loadMysqlConfig();
-  if (!config) return { available: false, configured: false, error: "Database non configurato." };
+function connectionString(): string | null {
+  return process.env.PRENODO_DATABASE_URL || process.env.SUPA_URL || process.env.DATABASE_URL || null;
+}
 
+export async function databaseStatus(slug = "centroesteticoelite"): Promise<DatabaseStatus> {
+  if (!connectionString()) return { available: false, configured: false, error: "Database non configurato." };
   try {
     const table = await tenantTable(slug, "users");
     return { available: true, configured: true, mode: table.mode };
@@ -41,16 +56,66 @@ export async function databaseStatus(slug = "centroesteticoelite"): Promise<Data
   }
 }
 
+// ---- SQL dialect translation (MySQL -> Postgres) ----
+export function toPostgresSql(sql: string): string {
+  let out = "";
+  let placeholder = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < sql.length; i += 1) {
+    const ch = sql[i];
+    if (inSingle) {
+      out += ch;
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      out += ch;
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "'") { inSingle = true; out += ch; continue; }
+    if (ch === '"') { inDouble = true; out += ch; continue; }
+    if (ch === "`") { out += '"'; continue; }
+    if (ch === "?") { placeholder += 1; out += `$${placeholder}`; continue; }
+    out += ch;
+  }
+  return out.replace(/\bDATABASE\(\)/gi, "current_schema()");
+}
+
 export async function dbQuery<T extends RowDataPacket[] = RowDataPacket[]>(sql: string, params: unknown[] = []): Promise<T> {
-  const activePool = getPool();
-  const [rows] = await activePool.query<T>(sql, params as never[]);
-  return rows;
+  const res = await getPool().query(toPostgresSql(sql), params as unknown[]);
+  return res.rows as unknown as T;
 }
 
 export async function dbExecute(sql: string, params: unknown[] = []): Promise<ResultSetHeader> {
-  const activePool = getPool();
-  const [result] = await activePool.execute<ResultSetHeader>(sql, params as never[]);
-  return result;
+  const text = toPostgresSql(sql);
+  const isInsert = /^\s*insert\s/i.test(text) && !/\breturning\b/i.test(text);
+  try {
+    const res = await getPool().query(isInsert ? `${text} RETURNING id` : text, params as unknown[]);
+    const insertId = Number((res.rows?.[0] as { id?: number } | undefined)?.id ?? 0) || 0;
+    return { affectedRows: res.rowCount ?? 0, insertId } as unknown as ResultSetHeader;
+  } catch (error) {
+    // Table without an `id` column: retry without RETURNING.
+    if (isInsert && error instanceof Error && /column "id"|does not exist/i.test(error.message)) {
+      const res = await getPool().query(text, params as unknown[]);
+      return { affectedRows: res.rowCount ?? 0, insertId: 0 } as unknown as ResultSetHeader;
+    }
+    throw error;
+  }
+}
+
+// Run a callback with app.tenant_id set on a dedicated connection, so the
+// BEFORE INSERT triggers fill tenant_id for any write that omits it.
+export async function withTenant<T>(tenantId: number | null, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await getPool().connect();
+  try {
+    await client.query("SELECT set_config('app.tenant_id', $1, false)", [String(tenantId ?? 0)]);
+    return await fn(client);
+  } finally {
+    await client.query("SELECT set_config('app.tenant_id', '0', false)").catch(() => {});
+    client.release();
+  }
 }
 
 export async function tenantTable(slug: string, baseTable: string): Promise<TenantTable> {
@@ -165,7 +230,7 @@ export async function tableExists(table: string): Promise<boolean> {
   if (tableExistsCache.has(safe)) return tableExistsCache.get(safe) ?? false;
 
   const rows = await dbQuery<RowDataPacket[]>(
-    "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1",
+    "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ? LIMIT 1",
     [safe],
   );
   const exists = rows.length > 0;
@@ -181,7 +246,7 @@ export async function columnExists(table: string, column: string): Promise<boole
   if (columnExistsCache.has(key)) return columnExistsCache.get(key) ?? false;
 
   const rows = await dbQuery<RowDataPacket[]>(
-    "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1",
+    "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? AND column_name = ? LIMIT 1",
     [safeTable, safeColumn],
   );
   const exists = rows.length > 0;
@@ -217,38 +282,44 @@ export async function tenantIdForSlug(slug: string): Promise<number | null> {
 export function quoteIdentifier(identifier: string): string {
   const safe = sanitizeIdentifier(identifier);
   if (!safe) throw new Error("Identificatore SQL non valido.");
-  return `\`${safe.replace(/`/g, "``")}\``;
+  return `"${safe}"`;
 }
 
 export function sanitizeIdentifier(identifier: string): string {
   return identifier.replace(/[^A-Za-z0-9_]/g, "");
 }
 
-function getPool(): Pool {
+function getPool(): pg.Pool {
   if (pool) return pool;
   if (poolError) throw new Error(poolError);
 
-  const config = loadMysqlConfig();
-  if (!config) {
+  const cs = connectionString();
+  if (!cs) {
     poolError = "Database non configurato.";
-    globalForTenantDb.__prenodoMysqlPoolError = poolError;
+    globalForTenantDb.__prenodoPgPoolError = poolError;
     throw new Error(poolError);
   }
 
-  pool = mysql.createPool({
-    host: config.host,
-    database: config.database,
-    user: config.user,
-    password: config.password,
-    charset: config.charset,
-    waitForConnections: true,
-    connectionLimit: 5,
-    maxIdle: 1,
-    idleTimeout: 10000,
-    timezone: "+02:00",
-    namedPlaceholders: false,
+  if (!globalForTenantDb.__prenodoPgParsers) {
+    // Return timestamp/date/time as raw strings (no tz shift), matching the
+    // legacy mysql2 dateStrings behaviour the app code expects.
+    const asString = (v: string) => v;
+    pg.types.setTypeParser(1114, asString); // timestamp without time zone
+    pg.types.setTypeParser(1082, asString); // date
+    pg.types.setTypeParser(1083, asString); // time
+    pg.types.setTypeParser(1184, asString); // timestamptz
+    pg.types.setTypeParser(1700, asString); // numeric (keep precision as string)
+    globalForTenantDb.__prenodoPgParsers = true;
+  }
+
+  pool = new pg.Pool({
+    connectionString: cs,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 15000,
   });
-  globalForTenantDb.__prenodoMysqlPool = pool;
+  globalForTenantDb.__prenodoPgPool = pool;
 
   return pool;
 }

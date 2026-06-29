@@ -2,7 +2,7 @@ import "server-only";
 
 import type { RowDataPacket } from "mysql2/promise";
 import { listDbAppointments, listDbLocations, listDbServices } from "@/lib/db-repositories";
-import { dbExecute, dbQuery, quoteIdentifier, columnExists, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
+import { dbExecute, dbQuery, quoteIdentifier, columnExists, tableExists, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
 
 export type ManageCalendarStaff = {
   id: number;
@@ -242,7 +242,7 @@ export async function deleteCalendarNote({
     clauses.push("tenant_id = ?");
     params.push(notesTable.tenantId ?? 0);
   }
-  await dbExecute(`DELETE FROM ${quoteIdentifier(notesTable.name)} WHERE ${clauses.join(" AND ")} LIMIT 1`, params);
+  await dbExecute(`DELETE FROM ${quoteIdentifier(notesTable.name)} WHERE ${clauses.join(" AND ")}`, params);
 }
 
 export async function getCalendarDayStaffOrder(slug: string, userId = 1): Promise<number[]> {
@@ -269,7 +269,7 @@ export async function setCalendarDayStaffOrder(slug: string, userId: number, ord
   await tenantUpdate({ slug, table: "users", id: targetUserId, values: { calendar_day_staff_order: JSON.stringify(normalized) } })
     .catch(async () => {
       await dbExecute(
-        `UPDATE ${quoteIdentifier(users.name)} SET calendar_day_staff_order=? WHERE id=? LIMIT 1`,
+        `UPDATE ${quoteIdentifier(users.name)} SET calendar_day_staff_order=? WHERE id=?`,
         [JSON.stringify(normalized), targetUserId],
       );
     });
@@ -348,28 +348,30 @@ async function ensureCalendarNotesTable(slug: string): Promise<TenantTableLike> 
     : users.mode === "shared"
       ? { name: "calendar_notes", mode: "shared", tenantId: users.tenantId }
       : { name: "calendar_notes", mode: "base", tenantId: null };
-  const tenantColumn = table.mode === "shared" ? "`tenant_id` INT(11) NULL DEFAULT NULL," : "";
-  const tenantKey = table.mode === "shared" ? "KEY `idx_calendar_notes_tenant_date` (`tenant_id`,`note_date`)," : "";
+  if (!await tableExists(table.name)) {
+    const tenantColumn = table.mode === "shared" ? "`tenant_id` INT(11) NULL DEFAULT NULL," : "";
+    const tenantKey = table.mode === "shared" ? "KEY `idx_calendar_notes_tenant_date` (`tenant_id`,`note_date`)," : "";
 
-  await dbExecute(
-    `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(table.name)} (
-      \`id\` INT(11) NOT NULL AUTO_INCREMENT,
-      ${tenantColumn}
-      \`note_date\` DATE NOT NULL,
-      \`title\` VARCHAR(190) NULL DEFAULT NULL,
-      \`note_text\` TEXT NOT NULL,
-      \`created_by\` INT(11) NULL DEFAULT NULL,
-      \`updated_by\` INT(11) NULL DEFAULT NULL,
-      \`created_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      \`updated_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (\`id\`),
-      ${tenantKey}
-      KEY \`idx_calendar_notes_date\` (\`note_date\`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
-  );
+    await dbExecute(
+      `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(table.name)} (
+        \`id\` INT(11) NOT NULL AUTO_INCREMENT,
+        ${tenantColumn}
+        \`note_date\` DATE NOT NULL,
+        \`title\` VARCHAR(190) NULL DEFAULT NULL,
+        \`note_text\` TEXT NOT NULL,
+        \`created_by\` INT(11) NULL DEFAULT NULL,
+        \`updated_by\` INT(11) NULL DEFAULT NULL,
+        \`created_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        ${tenantKey}
+        KEY \`idx_calendar_notes_date\` (\`note_date\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
+    );
+  }
 
   if (table.mode === "shared") {
-    await addColumnIfMissing(table.name, "tenant_id", "`tenant_id` INT(11) NULL DEFAULT NULL AFTER `id`");
+    await addColumnIfMissing(table.name, "tenant_id", `${quoteIdentifier("tenant_id")} INTEGER NULL DEFAULT NULL`);
   }
 
   return table;
@@ -377,15 +379,11 @@ async function ensureCalendarNotesTable(slug: string): Promise<TenantTableLike> 
 
 async function ensureUserCalendarOrderColumn(slug: string): Promise<void> {
   const users = await tenantTable(slug, "users");
-  await addColumnIfMissing(users.name, "calendar_day_staff_order", "`calendar_day_staff_order` TEXT NULL DEFAULT NULL");
+  await addColumnIfMissing(users.name, "calendar_day_staff_order", `${quoteIdentifier("calendar_day_staff_order")} TEXT NULL DEFAULT NULL`);
 }
 
 async function addColumnIfMissing(table: string, column: string, definition: string): Promise<void> {
-  const exists = await dbQuery<RowDataPacket[]>(
-    "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1",
-    [table, column],
-  );
-  if (exists.length) return;
+  if (await columnExists(table, column)) return;
   await dbExecute(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${definition}`).catch(() => undefined);
 }
 

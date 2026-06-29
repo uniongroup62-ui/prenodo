@@ -605,14 +605,14 @@ async function busyRangesForDate(slug: string, date: string): Promise<BusyRange[
     tenantSelect<RowDataPacket>({
       slug,
       table: "appointments",
-      where: "DATE(starts_at) = ? AND status NOT IN ('canceled','cancelled')",
+      where: "starts_at::date = ? AND status NOT IN ('canceled','cancelled')",
       params: [date],
       orderBy: "starts_at ASC",
     }).catch(() => [] as RowDataPacket[]),
     tenantSelect<RowDataPacket>({
       slug,
       table: "appointment_holds",
-      where: "DATE(starts_at) = ? AND status = 'active' AND expires_at > NOW()",
+      where: "starts_at::date = ? AND status = 'active' AND expires_at > NOW()",
       params: [date],
       orderBy: "starts_at ASC",
     }).catch(() => [] as RowDataPacket[]),

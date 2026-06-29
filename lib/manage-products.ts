@@ -935,7 +935,7 @@ async function filterColumns(table: string, values: Record<string, unknown>): Pr
     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
     [table],
   );
-  const columns = new Set(rows.map((row) => String(row.COLUMN_NAME)));
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
 }
 

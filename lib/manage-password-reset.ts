@@ -3,7 +3,7 @@ import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
 import type { RowDataPacket } from "mysql2/promise";
-import { dbExecute, dbQuery, tenantSelect, tenantTable, columnExists } from "@/lib/tenant-db";
+import { dbExecute, dbQuery, tenantSelect, tenantTable, columnExists, tableExists } from "@/lib/tenant-db";
 import { normalizeTenantSlug } from "@/lib/tenant-runtime";
 
 const TOKEN_TTL_MINUTES = 60;
@@ -84,7 +84,7 @@ export async function requestManagePasswordReset({
       "?",
       "?",
       "?",
-      `DATE_ADD(NOW(), INTERVAL ${TOKEN_TTL_MINUTES} MINUTE)`,
+      `NOW() + (${TOKEN_TTL_MINUTES} * interval '1 minute')`,
       "?",
       "?",
     ].filter(Boolean).join(",")})`,
@@ -159,7 +159,7 @@ export async function resetManagePassword({
     userClauses.push("tenant_id = ?");
     userParams.push(users.tenantId ?? 0);
   }
-  await dbExecute(`UPDATE \`${users.name}\` SET password_hash = ? WHERE ${userClauses.join(" AND ")} LIMIT 1`, userParams);
+  await dbExecute(`UPDATE \`${users.name}\` SET password_hash = ? WHERE ${userClauses.join(" AND ")}`, userParams);
 
   await markResetUsed(tenantSlug, info.resetId);
   await invalidatePendingResets(tenantSlug, info.userId);
@@ -205,7 +205,7 @@ export async function changeManagePassword({
     clauses.push("tenant_id = ?");
     params.push(table.tenantId ?? 0);
   }
-  await dbExecute(`UPDATE \`${table.name}\` SET password_hash = ? WHERE ${clauses.join(" AND ")} LIMIT 1`, params);
+  await dbExecute(`UPDATE \`${table.name}\` SET password_hash = ? WHERE ${clauses.join(" AND ")}`, params);
   await invalidatePendingResets(tenantSlug, userId);
   return { ok: true };
 }
@@ -225,6 +225,7 @@ async function ensurePasswordResetsTable(slug: string): Promise<{ name: string; 
       tenantId: users.tenantId,
     };
   });
+  if (await tableExists(table.name)) return table;
   const tenantColumn = table.mode === "shared" ? "`tenant_id` INT(11) NULL DEFAULT NULL," : "";
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${table.name}\` (
@@ -251,7 +252,7 @@ async function ensurePasswordResetsTable(slug: string): Promise<{ name: string; 
 
 async function cleanupPasswordResets(slug: string): Promise<void> {
   const table = await ensurePasswordResetsTable(slug);
-  const clauses = ["(used_at IS NOT NULL OR expires_at < NOW() - INTERVAL 7 DAY)"];
+  const clauses = ["(used_at IS NOT NULL OR expires_at < NOW() - (7 * interval '1 day'))"];
   const params: unknown[] = [];
   if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
     clauses.unshift("tenant_id = ?");
@@ -262,7 +263,7 @@ async function cleanupPasswordResets(slug: string): Promise<void> {
 
 async function hasRecentResetRequest(slug: string, userId: number): Promise<boolean> {
   const table = await ensurePasswordResetsTable(slug);
-  const clauses = ["user_type = ?", "user_id = ?", "used_at IS NULL", "created_at > (NOW() - INTERVAL 2 MINUTE)"];
+  const clauses = ["user_type = ?", "user_id = ?", "used_at IS NULL", "created_at > (NOW() - (2 * interval '1 minute'))"];
   const params: unknown[] = [RESET_TYPE_ADMIN, userId];
   if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
     clauses.unshift("tenant_id = ?");
@@ -291,7 +292,7 @@ async function markResetUsed(slug: string, resetId: number): Promise<void> {
     clauses.push("tenant_id = ?");
     params.push(table.tenantId ?? 0);
   }
-  await dbExecute(`UPDATE \`${table.name}\` SET used_at = NOW() WHERE ${clauses.join(" AND ")} LIMIT 1`, params).catch(() => undefined);
+  await dbExecute(`UPDATE \`${table.name}\` SET used_at = NOW() WHERE ${clauses.join(" AND ")}`, params).catch(() => undefined);
 }
 
 function genericResetResult(): PasswordResetRequestResult {

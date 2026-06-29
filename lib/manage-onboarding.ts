@@ -345,18 +345,19 @@ async function initializeOnboarding(tenantId: number, reset: boolean): Promise<v
     await dbExecute(
       `INSERT INTO \`${ONBOARDING_TABLE}\`(tenant_id,status,current_step,completed_steps_json,skipped_steps_json,meta_json,started_at,completed_at,dismissed_at)
        VALUES(?,?,?,?,?,NULL,NULL,NULL,NULL)
-       ON DUPLICATE KEY UPDATE status=VALUES(status), current_step=VALUES(current_step), completed_steps_json=VALUES(completed_steps_json), skipped_steps_json=VALUES(skipped_steps_json), meta_json=NULL, started_at=NULL, completed_at=NULL, dismissed_at=NULL, updated_at=NOW()`,
+       ON CONFLICT (tenant_id) DO UPDATE SET status=EXCLUDED.status, current_step=EXCLUDED.current_step, completed_steps_json=EXCLUDED.completed_steps_json, skipped_steps_json=EXCLUDED.skipped_steps_json, meta_json=NULL, started_at=NULL, completed_at=NULL, dismissed_at=NULL, updated_at=NOW()`,
       [tenantId, "not_started", "business", "[]", "[]"],
     );
     return;
   }
   await dbExecute(
-    `INSERT IGNORE INTO \`${ONBOARDING_TABLE}\`(tenant_id,status,current_step,completed_steps_json,skipped_steps_json) VALUES(?,?,?,?,?)`,
+    `INSERT INTO \`${ONBOARDING_TABLE}\`(tenant_id,status,current_step,completed_steps_json,skipped_steps_json) VALUES(?,?,?,?,?) ON CONFLICT (tenant_id) DO NOTHING`,
     [tenantId, "not_started", "business", "[]", "[]"],
   );
 }
 
 async function ensureOnboardingTable(): Promise<void> {
+  if (await tableExists(ONBOARDING_TABLE)) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${ONBOARDING_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -403,7 +404,7 @@ async function updateCentralTenant(tenantId: number, values: Record<string, unkn
   const entries = Object.entries(filtered);
   if (!entries.length) return;
   const assignments = entries.map(([key]) => `${quoteIdentifier(key)}=?`).join(",");
-  await dbExecute(`UPDATE \`saas_tenants\` SET ${assignments}, updated_at=NOW() WHERE id=? LIMIT 1`, [...entries.map(([, value]) => value), tenantId]);
+  await dbExecute(`UPDATE \`saas_tenants\` SET ${assignments}, updated_at=NOW() WHERE id=?`, [...entries.map(([, value]) => value), tenantId]);
 }
 
 async function filterColumns(table: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -411,7 +412,7 @@ async function filterColumns(table: string, values: Record<string, unknown>): Pr
     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
     [table],
   );
-  const columns = new Set(rows.map((row) => String(row.COLUMN_NAME)));
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
 }
 
@@ -421,7 +422,7 @@ async function insertKnown(table: string, values: Record<string, unknown>, ignor
   const entries = Object.entries(filtered);
   if (!entries.length) return 0;
   const result = await dbExecute(
-    `INSERT ${ignore ? "IGNORE " : ""}INTO ${quoteIdentifier(table)} (${entries.map(([key]) => quoteIdentifier(key)).join(",")}) VALUES (${entries.map(() => "?").join(",")})`,
+    `INSERT INTO ${quoteIdentifier(table)} (${entries.map(([key]) => quoteIdentifier(key)).join(",")}) VALUES (${entries.map(() => "?").join(",")})${ignore ? " ON CONFLICT DO NOTHING" : ""}`,
     entries.map(([, value]) => value),
   );
   return result.insertId;

@@ -903,7 +903,7 @@ async function nextCategorySortOrder(slug: string): Promise<number> {
 
 async function nextServiceSortOrder(slug: string, categoryId: number | null): Promise<number> {
   const table = await tenantTable(slug, "services");
-  const scope = await tenantScope(table, ["category_id <=> ?"], [categoryId]);
+  const scope = await tenantScope(table, ["category_id IS NOT DISTINCT FROM ?"], [categoryId]);
   const rows = await dbQuery<RowDataPacket[]>(
     `SELECT COALESCE(MAX(sort_order),-1)+1 AS next_sort FROM ${quoteIdentifier(table.name)}${scope.where}`,
     scope.params,
@@ -998,11 +998,11 @@ async function saveServiceCategoryMarketplaceMapping(slug: string, tenantCategor
     `INSERT INTO marketplace_service_category_mappings
       (tenant_id,tenant_slug,tenant_category_id,tenant_category_name,marketplace_category_id,marketplace_category_slug)
      VALUES (?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE
-      tenant_slug=VALUES(tenant_slug),
-      tenant_category_name=VALUES(tenant_category_name),
-      marketplace_category_id=VALUES(marketplace_category_id),
-      marketplace_category_slug=VALUES(marketplace_category_slug)`,
+     ON CONFLICT (tenant_id,tenant_category_id) DO UPDATE SET
+      tenant_slug=EXCLUDED.tenant_slug,
+      tenant_category_name=EXCLUDED.tenant_category_name,
+      marketplace_category_id=EXCLUDED.marketplace_category_id,
+      marketplace_category_slug=EXCLUDED.marketplace_category_slug`,
     [
       tenantId,
       tenantSlug,
@@ -1048,19 +1048,17 @@ export async function syncTenantDirectoryServices(slug: string): Promise<void> {
       `INSERT INTO tenant_directory_services
         (tenant_id,tenant_slug,service_id,service_name,service_category_id,service_category_name,marketplace_category_id,marketplace_category_slug,marketplace_category_name,is_active,booking_enabled,search_text)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE
-        tenant_id=VALUES(tenant_id),
-        tenant_slug=VALUES(tenant_slug),
-        service_id=VALUES(service_id),
-        service_name=VALUES(service_name),
-        service_category_id=VALUES(service_category_id),
-        service_category_name=VALUES(service_category_name),
-        marketplace_category_id=VALUES(marketplace_category_id),
-        marketplace_category_slug=VALUES(marketplace_category_slug),
-        marketplace_category_name=VALUES(marketplace_category_name),
-        is_active=VALUES(is_active),
-        booking_enabled=VALUES(booking_enabled),
-        search_text=VALUES(search_text)`,
+       ON CONFLICT (tenant_id,service_id) DO UPDATE SET
+        tenant_slug=EXCLUDED.tenant_slug,
+        service_name=EXCLUDED.service_name,
+        service_category_id=EXCLUDED.service_category_id,
+        service_category_name=EXCLUDED.service_category_name,
+        marketplace_category_id=EXCLUDED.marketplace_category_id,
+        marketplace_category_slug=EXCLUDED.marketplace_category_slug,
+        marketplace_category_name=EXCLUDED.marketplace_category_name,
+        is_active=EXCLUDED.is_active,
+        booking_enabled=EXCLUDED.booking_enabled,
+        search_text=EXCLUDED.search_text`,
       [
         tenantId,
         tenantSlug,
@@ -1147,7 +1145,7 @@ async function filterColumns(table: string, values: Record<string, unknown>): Pr
     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
     [table],
   );
-  const columns = new Set(rows.map((row) => String(row.COLUMN_NAME)));
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
 }
 

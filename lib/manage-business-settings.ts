@@ -626,34 +626,34 @@ async function syncMarketplaceProfile(slug: string, publicOrigin = "") {
   await dbExecute(
     `INSERT INTO tenant_directory_profiles
       (tenant_id,tenant_slug,is_visible,status,title,subtitle,description,category_text,city,province,region,address,phone,email,website,logo_image,cover_image,logo_position_x,logo_position_y,cover_position_x,cover_position_y,booking_url,search_text,featured,sort_order,published_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, IF(?='published' AND ?=1, NOW(), NULL))
-     ON DUPLICATE KEY UPDATE
-      tenant_id=VALUES(tenant_id),
-      tenant_slug=VALUES(tenant_slug),
-      is_visible=VALUES(is_visible),
-      status=VALUES(status),
-      title=VALUES(title),
-      subtitle=VALUES(subtitle),
-      description=VALUES(description),
-      category_text=VALUES(category_text),
-      city=VALUES(city),
-      province=VALUES(province),
-      region=VALUES(region),
-      address=VALUES(address),
-      phone=VALUES(phone),
-      email=VALUES(email),
-      website=VALUES(website),
-      logo_image=VALUES(logo_image),
-      cover_image=VALUES(cover_image),
-      logo_position_x=VALUES(logo_position_x),
-      logo_position_y=VALUES(logo_position_y),
-      cover_position_x=VALUES(cover_position_x),
-      cover_position_y=VALUES(cover_position_y),
-      booking_url=VALUES(booking_url),
-      search_text=VALUES(search_text),
-      featured=VALUES(featured),
-      sort_order=VALUES(sort_order),
-      published_at=IF(VALUES(status)='published' AND VALUES(is_visible)=1 AND published_at IS NULL, NOW(), published_at)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, CASE WHEN ?='published' AND ?=1 THEN NOW() ELSE NULL END)
+     ON CONFLICT (tenant_id) DO UPDATE SET
+      tenant_id=EXCLUDED.tenant_id,
+      tenant_slug=EXCLUDED.tenant_slug,
+      is_visible=EXCLUDED.is_visible,
+      status=EXCLUDED.status,
+      title=EXCLUDED.title,
+      subtitle=EXCLUDED.subtitle,
+      description=EXCLUDED.description,
+      category_text=EXCLUDED.category_text,
+      city=EXCLUDED.city,
+      province=EXCLUDED.province,
+      region=EXCLUDED.region,
+      address=EXCLUDED.address,
+      phone=EXCLUDED.phone,
+      email=EXCLUDED.email,
+      website=EXCLUDED.website,
+      logo_image=EXCLUDED.logo_image,
+      cover_image=EXCLUDED.cover_image,
+      logo_position_x=EXCLUDED.logo_position_x,
+      logo_position_y=EXCLUDED.logo_position_y,
+      cover_position_x=EXCLUDED.cover_position_x,
+      cover_position_y=EXCLUDED.cover_position_y,
+      booking_url=EXCLUDED.booking_url,
+      search_text=EXCLUDED.search_text,
+      featured=EXCLUDED.featured,
+      sort_order=EXCLUDED.sort_order,
+      published_at=CASE WHEN EXCLUDED.status='published' AND EXCLUDED.is_visible=1 AND tenant_directory_profiles.published_at IS NULL THEN NOW() ELSE tenant_directory_profiles.published_at END`,
     Object.values(values),
   );
   await syncDirectoryLocations(slug, { ...profile, isVisible, status, title: profile.title }, publicOrigin);
@@ -756,33 +756,33 @@ async function syncDirectoryLocations(slug: string, profile: Record<string, unkn
       `INSERT INTO tenant_directory_locations
         (tenant_id,tenant_slug,location_id,location_slug,is_visible,status,tenant_title,location_name,city,province,region,address,phone,whatsapp,facebook_url,instagram_url,tiktok_url,email,booking_url,booking_enabled,marketplace_enabled,primary_category_slug,primary_category_name,category_text,search_text,sort_order)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE
-        tenant_id=VALUES(tenant_id),
-        tenant_slug=VALUES(tenant_slug),
-        location_id=VALUES(location_id),
-        location_slug=VALUES(location_slug),
-        is_visible=VALUES(is_visible),
-        status=VALUES(status),
-        tenant_title=VALUES(tenant_title),
-        location_name=VALUES(location_name),
-        city=VALUES(city),
-        province=VALUES(province),
-        region=VALUES(region),
-        address=VALUES(address),
-        phone=VALUES(phone),
-        whatsapp=VALUES(whatsapp),
-        facebook_url=VALUES(facebook_url),
-        instagram_url=VALUES(instagram_url),
-        tiktok_url=VALUES(tiktok_url),
-        email=VALUES(email),
-        booking_url=VALUES(booking_url),
-        booking_enabled=VALUES(booking_enabled),
-        marketplace_enabled=VALUES(marketplace_enabled),
-        primary_category_slug=VALUES(primary_category_slug),
-        primary_category_name=VALUES(primary_category_name),
-        category_text=VALUES(category_text),
-        search_text=VALUES(search_text),
-        sort_order=VALUES(sort_order)`,
+       ON CONFLICT (tenant_id, location_id) DO UPDATE SET
+        tenant_id=EXCLUDED.tenant_id,
+        tenant_slug=EXCLUDED.tenant_slug,
+        location_id=EXCLUDED.location_id,
+        location_slug=EXCLUDED.location_slug,
+        is_visible=EXCLUDED.is_visible,
+        status=EXCLUDED.status,
+        tenant_title=EXCLUDED.tenant_title,
+        location_name=EXCLUDED.location_name,
+        city=EXCLUDED.city,
+        province=EXCLUDED.province,
+        region=EXCLUDED.region,
+        address=EXCLUDED.address,
+        phone=EXCLUDED.phone,
+        whatsapp=EXCLUDED.whatsapp,
+        facebook_url=EXCLUDED.facebook_url,
+        instagram_url=EXCLUDED.instagram_url,
+        tiktok_url=EXCLUDED.tiktok_url,
+        email=EXCLUDED.email,
+        booking_url=EXCLUDED.booking_url,
+        booking_enabled=EXCLUDED.booking_enabled,
+        marketplace_enabled=EXCLUDED.marketplace_enabled,
+        primary_category_slug=EXCLUDED.primary_category_slug,
+        primary_category_name=EXCLUDED.primary_category_name,
+        category_text=EXCLUDED.category_text,
+        search_text=EXCLUDED.search_text,
+        sort_order=EXCLUDED.sort_order`,
       locationValues,
     );
 
@@ -795,13 +795,13 @@ async function syncDirectoryLocations(slug: string, profile: Record<string, unkn
         `INSERT INTO tenant_directory_location_categories
           (tenant_id,tenant_slug,location_id,location_slug,marketplace_category_id,marketplace_category_slug,marketplace_category_name,is_primary,sort_order)
          VALUES (?,?,?,?,?,?,?,?,?)
-         ON DUPLICATE KEY UPDATE
-          tenant_slug=VALUES(tenant_slug),
-          location_slug=VALUES(location_slug),
-          marketplace_category_slug=VALUES(marketplace_category_slug),
-          marketplace_category_name=VALUES(marketplace_category_name),
-          is_primary=VALUES(is_primary),
-          sort_order=VALUES(sort_order)`,
+         ON CONFLICT (tenant_id, location_id, marketplace_category_id) DO UPDATE SET
+          tenant_slug=EXCLUDED.tenant_slug,
+          location_slug=EXCLUDED.location_slug,
+          marketplace_category_slug=EXCLUDED.marketplace_category_slug,
+          marketplace_category_name=EXCLUDED.marketplace_category_name,
+          is_primary=EXCLUDED.is_primary,
+          sort_order=EXCLUDED.sort_order`,
         [tenant.id, tenant.slug, locationId, locationSlug, categoryId, categorySlug, categoryName, Number(activityRow.is_primary ?? 0) ? 1 : 0, Number(activityRow.sort_order ?? 0)],
       );
     }
@@ -1010,35 +1010,39 @@ async function tenantScope(target: TenantTarget, clauses: string[], params: unkn
 
 async function ensureLocationDeletionLogTables(slug: string) {
   const locations = await tenantTable(slug, "locations");
-  const tenantColumn = locations.mode === "shared" ? "`tenant_id` INT(11) NULL DEFAULT NULL," : "";
+  const tenantColumn = locations.mode === "shared" ? "`tenant_id` INT NULL DEFAULT NULL," : "";
   const logsTable = locations.mode === "prefixed" ? locations.name.replace(/locations$/, "location_deletion_logs") : "location_deletion_logs";
   const itemsTable = locations.mode === "prefixed" ? locations.name.replace(/locations$/, "location_deletion_log_items") : "location_deletion_log_items";
-  await dbExecute(
-    `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(logsTable)} (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      ${tenantColumn}
-      location_id INT NOT NULL,
-      location_name VARCHAR(190) NULL,
-      reason TEXT NULL,
-      summary_json LONGTEXT NULL,
-      deleted_by INT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-  );
-  await dbExecute(
-    `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(itemsTable)} (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      ${tenantColumn}
-      log_id INT NOT NULL,
-      group_name VARCHAR(80) NULL,
-      table_name VARCHAR(80) NULL,
-      entity_id INT NULL,
-      entity_label VARCHAR(255) NULL,
-      action VARCHAR(80) NULL,
-      meta_json LONGTEXT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-  );
+  if (!await tableExists(logsTable)) {
+    await dbExecute(
+      `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(logsTable)} (
+        id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        ${tenantColumn}
+        location_id INT NOT NULL,
+        location_name VARCHAR(190) NULL,
+        reason TEXT NULL,
+        summary_json TEXT NULL,
+        deleted_by INT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+    );
+  }
+  if (!await tableExists(itemsTable)) {
+    await dbExecute(
+      `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(itemsTable)} (
+        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        ${tenantColumn}
+        log_id INT NOT NULL,
+        group_name VARCHAR(80) NULL,
+        table_name VARCHAR(80) NULL,
+        entity_id INT NULL,
+        entity_label VARCHAR(255) NULL,
+        action VARCHAR(80) NULL,
+        meta_json TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+    );
+  }
 }
 
 async function insertLocationDeletionLog(slug: string, locationId: number, locationName: string, reason: string, preview: unknown) {
@@ -1057,10 +1061,10 @@ async function ensureMarketplaceDirectoryTables() {
   if (!await tableExists("tenant_directory_profiles")) {
     await dbExecute(
       `CREATE TABLE IF NOT EXISTS tenant_directory_profiles (
-        id INT AUTO_INCREMENT PRIMARY KEY,
+        id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
         tenant_id INT NOT NULL,
         tenant_slug VARCHAR(80) NOT NULL,
-        is_visible TINYINT(1) NOT NULL DEFAULT 0,
+        is_visible SMALLINT NOT NULL DEFAULT 0,
         status VARCHAR(20) NOT NULL DEFAULT 'draft',
         title VARCHAR(190) NULL,
         subtitle VARCHAR(255) NULL,
@@ -1077,31 +1081,31 @@ async function ensureMarketplaceDirectoryTables() {
         website VARCHAR(255) NULL,
         logo_image VARCHAR(255) NULL,
         cover_image VARCHAR(255) NULL,
-        logo_position_x TINYINT UNSIGNED NOT NULL DEFAULT 50,
-        logo_position_y TINYINT UNSIGNED NOT NULL DEFAULT 50,
-        cover_position_x TINYINT UNSIGNED NOT NULL DEFAULT 50,
-        cover_position_y TINYINT UNSIGNED NOT NULL DEFAULT 50,
+        logo_position_x SMALLINT NOT NULL DEFAULT 50,
+        logo_position_y SMALLINT NOT NULL DEFAULT 50,
+        cover_position_x SMALLINT NOT NULL DEFAULT 50,
+        cover_position_y SMALLINT NOT NULL DEFAULT 50,
         booking_url VARCHAR(255) NULL,
         search_text TEXT NULL,
-        featured TINYINT(1) NOT NULL DEFAULT 0,
+        featured SMALLINT NOT NULL DEFAULT 0,
         sort_order INT NOT NULL DEFAULT 0,
-        published_at DATETIME NULL,
+        published_at TIMESTAMP NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY uq_tenant_directory_profiles_tenant (tenant_id),
-        UNIQUE KEY uq_tenant_directory_profiles_slug (tenant_slug)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_tenant_directory_profiles_tenant UNIQUE (tenant_id),
+        CONSTRAINT uq_tenant_directory_profiles_slug UNIQUE (tenant_slug)
+      )`,
     );
   }
   if (!await tableExists("tenant_directory_locations")) {
     await dbExecute(
       `CREATE TABLE IF NOT EXISTS tenant_directory_locations (
-        id INT AUTO_INCREMENT PRIMARY KEY,
+        id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
         tenant_id INT NOT NULL,
         tenant_slug VARCHAR(80) NOT NULL,
         location_id INT NOT NULL,
         location_slug VARCHAR(160) NOT NULL,
-        is_visible TINYINT(1) NOT NULL DEFAULT 1,
+        is_visible SMALLINT NOT NULL DEFAULT 1,
         status VARCHAR(20) NOT NULL DEFAULT 'published',
         tenant_title VARCHAR(190) NULL,
         location_name VARCHAR(190) NULL,
@@ -1116,24 +1120,24 @@ async function ensureMarketplaceDirectoryTables() {
         tiktok_url VARCHAR(255) NULL,
         email VARCHAR(190) NULL,
         booking_url VARCHAR(255) NULL,
-        booking_enabled TINYINT(1) NOT NULL DEFAULT 1,
-        marketplace_enabled TINYINT(1) NOT NULL DEFAULT 1,
+        booking_enabled SMALLINT NOT NULL DEFAULT 1,
+        marketplace_enabled SMALLINT NOT NULL DEFAULT 1,
         primary_category_slug VARCHAR(120) NULL,
         primary_category_name VARCHAR(190) NULL,
         category_text VARCHAR(255) NULL,
         search_text TEXT NULL,
         sort_order INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY uq_tenant_directory_locations_location (tenant_id, location_id),
-        UNIQUE KEY uq_tenant_directory_locations_slug (tenant_slug, location_slug)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_tenant_directory_locations_location UNIQUE (tenant_id, location_id),
+        CONSTRAINT uq_tenant_directory_locations_slug UNIQUE (tenant_slug, location_slug)
+      )`,
     );
   }
   if (!await tableExists("tenant_directory_location_categories")) {
     await dbExecute(
       `CREATE TABLE IF NOT EXISTS tenant_directory_location_categories (
-        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
         tenant_id INT NOT NULL,
         tenant_slug VARCHAR(80) NOT NULL,
         location_id INT NOT NULL,
@@ -1141,12 +1145,12 @@ async function ensureMarketplaceDirectoryTables() {
         marketplace_category_id INT NOT NULL,
         marketplace_category_slug VARCHAR(120) NOT NULL,
         marketplace_category_name VARCHAR(190) NOT NULL,
-        is_primary TINYINT(1) NOT NULL DEFAULT 0,
+        is_primary SMALLINT NOT NULL DEFAULT 0,
         sort_order INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY uq_tenant_directory_location_category (tenant_id, location_id, marketplace_category_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_tenant_directory_location_category UNIQUE (tenant_id, location_id, marketplace_category_id)
+      )`,
     );
   }
 }

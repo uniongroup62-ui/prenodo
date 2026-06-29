@@ -139,6 +139,7 @@ export const PUBLIC_CUSTOMER_SESSION_COOKIE = "beautysuite_customer_session";
 const CUSTOMER_SESSION_DAYS = 60;
 
 export async function ensurePublicCustomerSchema(): Promise<void> {
+  if (!(await tableExists("public_customer_accounts"))) {
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`public_customer_accounts\` (
       \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -166,7 +167,9 @@ export async function ensurePublicCustomerSchema(): Promise<void> {
       UNIQUE KEY \`uq_public_customer_accounts_email\` (\`email\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
+  }
 
+  if (!(await tableExists("public_customer_tenant_links"))) {
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`public_customer_tenant_links\` (
       \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -184,7 +187,9 @@ export async function ensurePublicCustomerSchema(): Promise<void> {
       KEY \`idx_public_customer_account\` (\`account_id\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
+  }
 
+  if (!(await tableExists("public_customer_favorites"))) {
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`public_customer_favorites\` (
       \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -200,7 +205,9 @@ export async function ensurePublicCustomerSchema(): Promise<void> {
       KEY \`idx_public_customer_favorites_tenant\` (\`tenant_slug\`, \`location_id\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
+  }
 
+  if (!(await tableExists("public_customer_sessions"))) {
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`public_customer_sessions\` (
       \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -217,6 +224,7 @@ export async function ensurePublicCustomerSchema(): Promise<void> {
       KEY \`idx_public_customer_sessions_expires\` (\`expires_at\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
+  }
 
   const accountColumns: Array<[string, string]> = [
     ["pending_email", "`pending_email` VARCHAR(190) NULL DEFAULT NULL"],
@@ -366,7 +374,7 @@ export async function issuePublicCustomerVerificationCode(
     `UPDATE \`public_customer_accounts\`
         SET email_verification_hash=?,
             email_verification_sent_at=NOW(),
-            email_verification_expires_at=DATE_ADD(NOW(), INTERVAL 15 MINUTE)
+            email_verification_expires_at=NOW() + (15 * interval '1 minute')
       WHERE id=?`,
     [codeHash(code), accountId],
   );
@@ -429,7 +437,7 @@ export async function requestPublicCustomerPasswordReset(
       `UPDATE \`public_customer_accounts\`
           SET password_reset_hash=?,
               password_reset_sent_at=NOW(),
-              password_reset_expires_at=DATE_ADD(NOW(), INTERVAL 30 MINUTE)
+              password_reset_expires_at=NOW() + (30 * interval '1 minute')
         WHERE id=?`,
       [sha256(token), Number(rows[0].id)],
     );
@@ -640,7 +648,7 @@ export async function requestPublicCustomerEmailChange(
     `UPDATE \`public_customer_accounts\`
         SET pending_email=?,
             pending_email_verification_hash=?,
-            pending_email_verification_expires_at=DATE_ADD(NOW(), INTERVAL 15 MINUTE),
+            pending_email_verification_expires_at=NOW() + (15 * interval '1 minute'),
             pending_email_verification_sent_at=NOW(),
             updated_at=NOW()
       WHERE id=?`,
@@ -758,7 +766,7 @@ export async function togglePublicCustomerFavorite(
     `INSERT INTO \`public_customer_favorites\`
       (account_id,tenant_id,tenant_slug,location_id,location_slug)
      VALUES(?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE location_slug=VALUES(location_slug)`,
+     ON CONFLICT (account_id,tenant_slug,location_id) DO UPDATE SET location_slug=EXCLUDED.location_slug`,
     [accountId, target.tenantId, target.tenantSlug, target.locationId, target.locationSlug || null],
   );
   return { ok: true, active: true, key };
@@ -953,11 +961,11 @@ export async function upsertPublicCustomerFromBooking(input: {
     `INSERT INTO \`public_customer_tenant_links\`
       (account_id,tenant_id,tenant_slug,client_id,booking_user_id,last_seen_at)
      VALUES(?,?,?,?,?,NOW())
-     ON DUPLICATE KEY UPDATE
-       account_id=VALUES(account_id),
-       tenant_slug=VALUES(tenant_slug),
-       client_id=VALUES(client_id),
-       booking_user_id=VALUES(booking_user_id),
+     ON CONFLICT (tenant_id,client_id) DO UPDATE SET
+       account_id=EXCLUDED.account_id,
+       tenant_slug=EXCLUDED.tenant_slug,
+       client_id=EXCLUDED.client_id,
+       booking_user_id=EXCLUDED.booking_user_id,
        last_seen_at=NOW()`,
     [accountId, Number(tenant.id), String(tenant.slug), clientId, bookingUserId],
   );
@@ -1307,11 +1315,7 @@ async function updateTenantClientEmail(slug: string, clientId: number, oldEmail:
 }
 
 async function addColumnIfMissing(table: string, column: string, definition: string): Promise<void> {
-  const rows = await dbQuery<RowDataPacket[]>(
-    "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1",
-    [table, column],
-  );
-  if (rows.length) return;
+  if (await columnExists(table, column)) return;
   await dbExecute(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${definition}`).catch(() => undefined);
 }
 

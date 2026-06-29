@@ -217,7 +217,7 @@ async function listPosSales(slug: string, options: { locationId: number; include
   if (!options.includeCancelled) clauses.push("LOWER(COALESCE(s.status,'')) NOT IN ('cancelled','canceled','annullata','annullato')");
   const query = clean(options.query, 120).toLowerCase();
   if (query) {
-    clauses.push("(LOWER(COALESCE(c.full_name,'')) LIKE ? OR LOWER(COALESCE(s.notes,'')) LIKE ? OR CAST(s.id AS CHAR) LIKE ?)");
+    clauses.push("(LOWER(COALESCE(c.full_name,'')) LIKE ? OR LOWER(COALESCE(s.notes,'')) LIKE ? OR CAST(s.id AS TEXT) LIKE ?)");
     params.push(`%${query}%`, `%${query}%`, `%${query}%`);
   }
   const clientJoin = clientsTable

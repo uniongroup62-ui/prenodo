@@ -49,7 +49,7 @@ async function marketplaceProfiles(): Promise<{ profiles: MarketplaceProfile[]; 
       COALESCE(NULLIF(MIN(l.name), ''), 'Sede principale') AS first_location_name,
       COALESCE(NULLIF(MIN(l.address), ''), NULLIF(MAX(b.site_address), ''), NULLIF(MAX(b.address), ''), '') AS first_address,
       MIN(s.price) AS price_from,
-      GROUP_CONCAT(DISTINCT COALESCE(NULLIF(sc.name, ''), NULLIF(s.name, '')) ORDER BY sc.sort_order ASC, sc.name ASC SEPARATOR '||') AS service_labels,
+      string_agg(DISTINCT COALESCE(NULLIF(sc.name, ''), NULLIF(s.name, ''))::text, '||' ORDER BY COALESCE(NULLIF(sc.name, ''), NULLIF(s.name, ''))::text ASC) AS service_labels,
       COUNT(DISTINCT l.id) AS location_count,
       COUNT(DISTINCT s.id) AS service_count
     FROM saas_tenants t
@@ -62,7 +62,7 @@ async function marketplaceProfiles(): Promise<{ profiles: MarketplaceProfile[]; 
       AND t.status = 'active'
       AND COALESCE(t.marketplace_public_allowed, 1) = 1
     GROUP BY t.id, t.slug, t.name
-    HAVING location_count > 0 OR service_count > 0
+    HAVING COUNT(DISTINCT l.id) > 0 OR COUNT(DISTINCT s.id) > 0
     ORDER BY business_name ASC, t.id ASC
   `);
 

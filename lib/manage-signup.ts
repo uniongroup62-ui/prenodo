@@ -94,6 +94,7 @@ let signupSchemaEnsured = false;
 export async function ensureManageSignupSchema(): Promise<void> {
   if (signupSchemaEnsured) return;
 
+  if (!await tableExists("saas_tenants")) {
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`saas_tenants\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -131,7 +132,9 @@ export async function ensureManageSignupSchema(): Promise<void> {
       KEY \`idx_saas_tenants_status\` (\`status\`, \`is_active\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
+  }
 
+  if (!await tableExists(SIGNUPS_TABLE)) {
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${SIGNUPS_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -163,6 +166,7 @@ export async function ensureManageSignupSchema(): Promise<void> {
       KEY \`idx_prof_signup_tenant\` (\`tenant_id\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
+  }
 
   await ensureSaasTenantColumns();
   await ensureOnboardingTable();
@@ -274,7 +278,7 @@ export async function registerManageSignup(input: RegisterSignupInput): Promise<
   const result = await dbExecute(
     `INSERT INTO \`${SIGNUPS_TABLE}\`
       (business_name,slug,owner_name,owner_email,owner_phone,password_hash,status,verification_hash,verification_expires_at,verification_sent_at,verification_attempts,verification_locked_until,terms_accepted_at,marketing_opt_in,request_ip,user_agent)
-     VALUES(?,?,?,?,?,?,'pending_verification',?,DATE_ADD(NOW(), INTERVAL ? MINUTE),NOW(),0,NULL,NOW(),?,?,?)`,
+     VALUES(?,?,?,?,?,?,'pending_verification',?,NOW() + (? * interval '1 minute'),NOW(),0,NULL,NOW(),?,?,?)`,
     [
       businessName,
       slug,
@@ -322,12 +326,12 @@ export async function resendManageSignupCode(signupId: number, email: string): P
   await dbExecute(
     `UPDATE \`${SIGNUPS_TABLE}\`
         SET verification_hash=?,
-            verification_expires_at=DATE_ADD(NOW(), INTERVAL ? MINUTE),
+            verification_expires_at=NOW() + (? * interval '1 minute'),
             verification_sent_at=NOW(),
             verification_attempts=0,
             verification_locked_until=NULL,
             provisioning_error=NULL
-      WHERE id=? LIMIT 1`,
+      WHERE id=?`,
     [hashVerificationCode(verificationCode), CODE_TTL_MINUTES, Number(signup.id)],
   );
 
@@ -374,14 +378,14 @@ export async function verifyManageSignupAndProvision(signupId: number, email: st
       await dbExecute(
         `UPDATE \`${SIGNUPS_TABLE}\`
             SET verification_attempts=?,
-                verification_locked_until=DATE_ADD(NOW(), INTERVAL ? MINUTE)
-          WHERE id=? LIMIT 1`,
+                verification_locked_until=NOW() + (? * interval '1 minute')
+          WHERE id=?`,
         [attempts, CODE_LOCK_MINUTES, Number(signup.id)],
       );
       throw new Error("Codice non corretto. Hai superato i tentativi disponibili: richiedi un nuovo codice tra qualche minuto.");
     }
 
-    await dbExecute(`UPDATE \`${SIGNUPS_TABLE}\` SET verification_attempts=? WHERE id=? LIMIT 1`, [attempts, Number(signup.id)]);
+    await dbExecute(`UPDATE \`${SIGNUPS_TABLE}\` SET verification_attempts=? WHERE id=?`, [attempts, Number(signup.id)]);
     throw new Error("Codice non corretto.");
   }
 
@@ -395,21 +399,21 @@ export async function verifyManageSignupAndProvision(signupId: number, email: st
             verification_attempts=0,
             verification_locked_until=NULL,
             provisioning_error=NULL
-      WHERE id=? LIMIT 1`,
+      WHERE id=?`,
     [verifiedAt, Number(signup.id)],
   );
 
   try {
     const provisioned = await provisionTenantFromSignup(signup, verifiedAt);
     await dbExecute(
-      `UPDATE \`${SIGNUPS_TABLE}\` SET status='active', tenant_id=?, provisioning_error=NULL WHERE id=? LIMIT 1`,
+      `UPDATE \`${SIGNUPS_TABLE}\` SET status='active', tenant_id=?, provisioning_error=NULL WHERE id=?`,
       [provisioned.tenant_id, Number(signup.id)],
     );
     return provisioned;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Provisioning non riuscito.";
     await dbExecute(
-      `UPDATE \`${SIGNUPS_TABLE}\` SET status='failed', provisioning_error=? WHERE id=? LIMIT 1`,
+      `UPDATE \`${SIGNUPS_TABLE}\` SET status='failed', provisioning_error=? WHERE id=?`,
       [message, Number(signup.id)],
     );
     throw error;
@@ -632,7 +636,6 @@ async function initializeOnboarding(tenantId: number): Promise<void> {
 
 async function cleanupFailedTenant(tenantId: number, slug: string, message: string): Promise<void> {
   try {
-    await dbExecute("SET FOREIGN_KEY_CHECKS=0");
     for (const table of TENANT_BOOTSTRAP_TABLES) {
       if (!await tableExists(table) || !await freshColumnExists(table, "tenant_id")) continue;
       await dbExecute(`DELETE FROM ${quoteIdentifier(table)} WHERE tenant_id=?`, [tenantId]);
@@ -645,9 +648,9 @@ async function cleanupFailedTenant(tenantId: number, slug: string, message: stri
       status: "failed",
       provisioning_error: message,
     });
-    await dbExecute("DELETE FROM `saas_tenants` WHERE id=? AND slug=? LIMIT 1", [tenantId, slug]);
+    await dbExecute("DELETE FROM `saas_tenants` WHERE id=? AND slug=?", [tenantId, slug]);
   } finally {
-    await dbExecute("SET FOREIGN_KEY_CHECKS=1").catch(() => undefined);
+    // FOREIGN_KEY_CHECKS is MySQL-only; Postgres has no per-session equivalent here.
   }
 }
 
@@ -665,7 +668,7 @@ async function insertKnown(table: string, values: Record<string, unknown>, optio
   const placeholders = entries.map(() => "?").join(",");
   const params = entries.map(([, value]) => value);
   const result = await dbExecute(
-    `INSERT ${options.ignore ? "IGNORE " : ""}INTO ${quoteIdentifier(table)} (${columns}) VALUES (${placeholders})`,
+    `INSERT INTO ${quoteIdentifier(table)} (${columns}) VALUES (${placeholders})${options.ignore ? " ON CONFLICT DO NOTHING" : ""}`,
     params,
   );
   return Number(result.insertId ?? 0);
@@ -714,7 +717,7 @@ async function pendingSlugExists(slug: string): Promise<boolean> {
       WHERE s.slug=?
         AND (
           (s.status='pending_verification' AND s.verification_expires_at > NOW())
-          OR (s.status IN ('verified','provisioning') AND s.updated_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE))
+          OR (s.status IN ('verified','provisioning') AND s.updated_at > NOW() - (30 * interval '1 minute'))
           OR (s.status='active' AND t.id IS NOT NULL)
         )
       LIMIT 1`,
@@ -870,6 +873,7 @@ async function ensureSaasTenantColumns(): Promise<void> {
 }
 
 async function ensureOnboardingTable(): Promise<void> {
+  if (await tableExists("tenant_onboarding_progress")) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`tenant_onboarding_progress\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,

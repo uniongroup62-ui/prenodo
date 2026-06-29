@@ -1106,10 +1106,10 @@ async function ensureResourceColumns(slug: string): Promise<void> {
     tenantTable(slug, "cabins").catch(() => null),
   ]);
   if (staff) {
-    await addColumnIfMissing(staff.name, "calendar_color", "`calendar_color` VARCHAR(16) NULL DEFAULT NULL");
-    await addColumnIfMissing(staff.name, "photo_path", "`photo_path` VARCHAR(255) NULL DEFAULT NULL");
+    await addColumnIfMissing(staff.name, "calendar_color", "`calendar_color` VARCHAR(16) DEFAULT NULL");
+    await addColumnIfMissing(staff.name, "photo_path", "`photo_path` VARCHAR(255) DEFAULT NULL");
   }
-  if (cabins) await addColumnIfMissing(cabins.name, "location_id", "`location_id` INT(11) NULL DEFAULT NULL");
+  if (cabins) await addColumnIfMissing(cabins.name, "location_id", "`location_id` INTEGER DEFAULT NULL");
 }
 
 async function addColumnIfMissing(table: string, column: string, definition: string): Promise<void> {
@@ -1122,7 +1122,7 @@ async function filterColumns(table: string, values: Record<string, unknown>): Pr
     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
     [table],
   );
-  const columns = new Set(rows.map((row) => String(row.COLUMN_NAME)));
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
 }
 

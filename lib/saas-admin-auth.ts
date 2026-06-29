@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import { cookies } from "next/headers";
 import type { RowDataPacket } from "mysql2/promise";
-import { dbExecute, dbQuery, quoteIdentifier } from "@/lib/tenant-db";
+import { dbExecute, dbQuery, quoteIdentifier, tableExists, columnExists } from "@/lib/tenant-db";
 import { tenantSessionSuffix } from "@/lib/tenant-runtime";
 
 export type SaasAdminRole = "owner" | "admin" | "viewer";
@@ -42,8 +42,9 @@ const LOGIN_RATE_LIMIT_WINDOW_SECONDS = 15 * 60;
 const LOGIN_RATE_LIMIT_MAX_FAILURES = 10;
 
 export async function ensureSaasAuthSchema(): Promise<void> {
-  await dbExecute(
-    `CREATE TABLE IF NOT EXISTS \`saas_admins\` (
+  if (!(await tableExists("saas_admins"))) {
+    await dbExecute(
+      `CREATE TABLE IF NOT EXISTS \`saas_admins\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`name\` VARCHAR(120) NOT NULL,
       \`email\` VARCHAR(190) NOT NULL,
@@ -56,10 +57,12 @@ export async function ensureSaasAuthSchema(): Promise<void> {
       PRIMARY KEY (\`id\`),
       UNIQUE KEY \`uq_saas_admins_email\` (\`email\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
-  );
+    );
+  }
 
-  await dbExecute(
-    `CREATE TABLE IF NOT EXISTS \`saas_tenants\` (
+  if (!(await tableExists("saas_tenants"))) {
+    await dbExecute(
+      `CREATE TABLE IF NOT EXISTS \`saas_tenants\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`slug\` VARCHAR(80) NOT NULL,
       \`name\` VARCHAR(190) NOT NULL,
@@ -70,10 +73,12 @@ export async function ensureSaasAuthSchema(): Promise<void> {
       PRIMARY KEY (\`id\`),
       UNIQUE KEY \`uq_saas_tenants_slug\` (\`slug\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
-  );
+    );
+  }
 
-  await dbExecute(
-    `CREATE TABLE IF NOT EXISTS \`saas_admin_login_attempts\` (
+  if (!(await tableExists("saas_admin_login_attempts"))) {
+    await dbExecute(
+      `CREATE TABLE IF NOT EXISTS \`saas_admin_login_attempts\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`email\` VARCHAR(190) NULL DEFAULT NULL,
       \`ip\` VARCHAR(45) NULL DEFAULT NULL,
@@ -84,7 +89,8 @@ export async function ensureSaasAuthSchema(): Promise<void> {
       KEY \`idx_ip_time\` (\`ip\`, \`attempted_at\`),
       KEY \`idx_success_time\` (\`success\`, \`attempted_at\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
-  );
+    );
+  }
 
   await addColumnIfMissing("saas_admins", "role", "`role` ENUM('owner','admin','viewer') NOT NULL DEFAULT 'admin' AFTER `password_hash`");
   await addColumnIfMissing("saas_admins", "is_active", "`is_active` TINYINT(1) NOT NULL DEFAULT 1 AFTER `role`");
@@ -223,7 +229,7 @@ async function isRateLimited(email: string, ip: string): Promise<boolean> {
     `SELECT COUNT(*) AS count
        FROM \`saas_admin_login_attempts\`
       WHERE success=0
-        AND attempted_at >= DATE_SUB(NOW(), INTERVAL ? SECOND)
+        AND attempted_at >= (NOW() - (? * interval '1 second'))
         AND (${identityClauses.join(" OR ")})`,
     params,
   ).catch(() => []);
@@ -238,6 +244,7 @@ async function recordLoginAttempt(email: string, ip: string, success: boolean): 
 }
 
 async function addColumnIfMissing(table: string, column: string, definition: string): Promise<void> {
+  if (await columnExists(table, column)) return;
   const rows = await dbQuery<RowDataPacket[]>(
     "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1",
     [table, column],

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { RowDataPacket } from "mysql2/promise";
 import { currentSaasAdminSession } from "@/lib/saas-admin-auth";
-import { dbExecute, dbQuery, quoteIdentifier, tenantTable, usesSharedTenantTables } from "@/lib/tenant-db";
+import { dbExecute, dbQuery, quoteIdentifier, tableExists, tenantTable, usesSharedTenantTables } from "@/lib/tenant-db";
 import { logSaasTenantAudit, listSaasTenants, requireSaasTenant, tenantStatus, type SaasTenantRow } from "@/lib/saas-tenant-manager";
 import { tenantPrefix } from "@/lib/tenant-runtime";
 import { xamppRoot } from "@/lib/xampp-config";
@@ -150,6 +150,7 @@ const CENTRAL_BACKUP_EXCLUDES = new Set([
 ]);
 
 export async function ensureSaasBackupSchema(): Promise<void> {
+  if (await tableExists(BACKUP_TABLE)) return;
   await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`${BACKUP_TABLE}\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
@@ -234,7 +235,7 @@ export async function absoluteSaasBackupPath(backup: SaasBackupRow): Promise<str
 }
 
 export async function ensureSaasSmsSchema(): Promise<void> {
-  await dbExecute(
+  if (!await tableExists("saas_sms_pricing_settings")) await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`saas_sms_pricing_settings\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`provider_cost_per_segment\` DECIMAL(10,4) NOT NULL DEFAULT 0.0490,
@@ -249,7 +250,7 @@ export async function ensureSaasSmsSchema(): Promise<void> {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
 
-  await dbExecute(
+  if (!await tableExists("saas_sms_plans")) await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`saas_sms_plans\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`name\` VARCHAR(120) NOT NULL,
@@ -268,7 +269,7 @@ export async function ensureSaasSmsSchema(): Promise<void> {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
 
-  await dbExecute(
+  if (!await tableExists("saas_sms_orders")) await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`saas_sms_orders\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`tenant_id\` INT(11) NOT NULL,
@@ -293,7 +294,7 @@ export async function ensureSaasSmsSchema(): Promise<void> {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci`,
   );
 
-  await dbExecute(
+  if (!await tableExists("saas_sms_order_events")) await dbExecute(
     `CREATE TABLE IF NOT EXISTS \`saas_sms_order_events\` (
       \`id\` INT(11) NOT NULL AUTO_INCREMENT,
       \`order_id\` INT(11) NOT NULL,
@@ -836,7 +837,7 @@ async function ensureTenantSmsCreditTables(tenant: Pick<SaasTenantRow, "id" | "s
   const movementsTable = shared ? "sms_credit_movements" : `${tenantPrefix(String(tenant.slug))}sms_credit_movements`;
   const tenantColumn = shared ? "`tenant_id` INT(11) NULL DEFAULT NULL," : "";
   const tenantIndex = shared ? "KEY `idx_sms_credit_wallet_tenant` (`tenant_id`)," : "";
-  await dbExecute(
+  if (!await tableExists(walletTable)) await dbExecute(
     `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(walletTable)} (
       \`id\` INT AUTO_INCREMENT PRIMARY KEY,
       ${tenantColumn}
@@ -847,7 +848,7 @@ async function ensureTenantSmsCreditTables(tenant: Pick<SaasTenantRow, "id" | "s
       KEY \`idx_sms_credit_wallet_updated\` (\`updated_at\`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   );
-  await dbExecute(
+  if (!await tableExists(movementsTable)) await dbExecute(
     `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(movementsTable)} (
       \`id\` INT AUTO_INCREMENT PRIMARY KEY,
       ${tenantColumn}
@@ -1098,7 +1099,7 @@ async function filterColumns(table: string, values: Record<string, unknown>): Pr
     "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
     [table],
   ).catch(() => []);
-  const columns = new Set(rows.map((row) => String(row.COLUMN_NAME)));
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
 }
 
