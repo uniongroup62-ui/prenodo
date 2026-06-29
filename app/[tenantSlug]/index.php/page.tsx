@@ -58,6 +58,9 @@ import { ClientConsentsContent } from "@/components/modules/client_consents-cont
 import { ClientSheetTemplatesContent } from "@/components/modules/client_sheet_templates-content";
 import { FidelityLevelsContent } from "@/components/modules/fidelity_levels-content";
 import { FidelityMembershipSettingsContent } from "@/components/modules/fidelity_membership_settings-content";
+import { PosContent } from "@/components/modules/pos-content";
+import { CalendarContent } from "@/components/modules/calendar-content";
+import { AppointmentsContent } from "@/components/modules/appointments-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -121,6 +124,9 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   client_sheet_templates: ClientSheetTemplatesContent,
   fidelity_levels: FidelityLevelsContent,
   fidelity_membership_settings: FidelityMembershipSettingsContent,
+  pos: PosContent,
+  calendar: CalendarContent,
+  appointments: AppointmentsContent,
 };
 
 export default async function TenantIndexPhpPage({

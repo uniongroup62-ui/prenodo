@@ -31,9 +31,9 @@ async function shoot(base, target, mode) {
     ]);
     await page.waitForTimeout(1000);
   }
-  await page.goto(`${base}${target}`, { waitUntil: "networkidle", timeout: 45000 });
-  await page.addStyleTag({ content: "*{animation:none!important;transition:none!important;caret-color:transparent!important}" });
-  await page.waitForTimeout(1200);
+  await page.goto(`${base}${target}`, { waitUntil: "domcontentloaded", timeout: 45000 });
+  await page.addStyleTag({ content: "*{animation:none!important;transition:none!important;caret-color:transparent!important}" }).catch(() => {});
+  await page.waitForTimeout(3000);
   const buf = await page.screenshot({ clip: { x: 0, y: 0, width: W, height: H } });
   await ctx.close();
   return buf;
