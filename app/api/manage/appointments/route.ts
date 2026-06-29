@@ -8,6 +8,7 @@ import {
   appointmentPhpStatus,
   createDbAppointment,
   getDbAppointmentCustomerVisibleSnapshot,
+  getDbAppointmentMoveSnapshot,
   getDbAppointmentPhpStatus,
   listDbAppointments,
   updateDbAppointment,
@@ -152,6 +153,94 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, sourceMode: "database", appointment, appointments: await listDbAppointments({ slug: tenantSlug }) });
     }
 
+    // Calendar drag/move (port of api_appointments.php action='move'). A move only
+    // changes the slot — new date/time and, in the staff-columns view, optionally the
+    // operator (and location). Client/service/notes are preserved by re-feeding the
+    // existing snapshot to updateDbAppointment, which recomputes the end from the
+    // service duration (so the visible duration is preserved on a move). The legacy
+    // accepts full `starts_at`/`ends_at` datetimes; we accept the same plus the
+    // lighter `date`+`time`, deriving date/time from `starts_at` when only that is sent.
+    if (action === "move") {
+      const id = Number.parseInt(String(body.id ?? "0"), 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return Response.json({ ok: false, error: "Dati mancanti" }, { status: 400 });
+      }
+
+      // Resolve the new slot: prefer explicit date/time, else split a MySQL/ISO
+      // `starts_at` ("YYYY-MM-DD HH:MM[:SS]" or with a 'T") into date + HH:MM.
+      const startsAt = String(body.starts_at ?? "");
+      const slot = parseStartsAt(startsAt);
+      const date = String(body.date ?? slot.date ?? "");
+      const time = String(body.time ?? slot.time ?? "");
+      if (!date || !time) {
+        return Response.json({ ok: false, error: "Data/ora non valida" }, { status: 400 });
+      }
+
+      // Tenant-scoped snapshot of the preserved fields (+ current status). A null
+      // snapshot means the row is not the tenant's / does not exist.
+      const snapshot = await getDbAppointmentMoveSnapshot(tenantSlug, id);
+      if (!snapshot) {
+        return Response.json({ ok: false, error: "Appuntamento non trovato." }, { status: 400 });
+      }
+      // Legacy guard: only pending/scheduled appointments are movable from the calendar.
+      if (snapshot.phpStatus !== "pending" && snapshot.phpStatus !== "scheduled") {
+        return Response.json({ ok: false, error: "La prenotazione non e modificabile da calendario." }, { status: 400 });
+      }
+
+      // Operator: an explicit staff_name/operator (staff-columns drag between columns)
+      // overrides; an empty string clears the assignment; omitted keeps the current one.
+      const hasStaffParam = body.staff_name !== undefined || body.operator !== undefined;
+      const operator = hasStaffParam ? String(body.staff_name ?? body.operator ?? "") : snapshot.operator;
+
+      // Location: an explicit location_id resolves to the tenant location; otherwise
+      // keep the appointment's current location.
+      const locationId = body.location_id === undefined
+        ? snapshot.locationId
+        : (await resolveManageLocationId({ slug: tenantSlug, raw: String(body.location_id), fallbackCurrent: true })) || null;
+
+      const before = await getDbAppointmentCustomerVisibleSnapshot(tenantSlug, id);
+      const appointment = await updateDbAppointment({
+        slug: tenantSlug,
+        id,
+        clientName: snapshot.clientName,
+        serviceName: snapshot.serviceName,
+        operator,
+        time,
+        date,
+        locationId,
+        staffNotes: snapshot.staffNotes,
+        customerNotes: snapshot.customerNotes,
+      });
+
+      // Fire the 'modified' email only when a customer-visible field actually changed
+      // (date/time will change on a move), mirroring the save edit path. Gated +
+      // error-swallowed inside the helper, so a delivery problem never fails the move.
+      if (before) {
+        const after = await getDbAppointmentCustomerVisibleSnapshot(tenantSlug, id);
+        if (after && appointmentCustomerVisibleChanged(before, after)) {
+          await sendAppointmentLifecycleEmail({ slug: tenantSlug, appointmentId: id, kind: "modified" });
+        }
+      }
+
+      return Response.json({
+        ok: true,
+        source: "app/pages/api_appointments.php?action=move",
+        sourceMode: "database",
+        appointment,
+        appointments: await listDbAppointments({ slug: tenantSlug }),
+      });
+    }
+
+    // RESIZE (duration change) is intentionally NOT wired as a write action.
+    // updateDbAppointment always recomputes ends_at from the SERVICE duration and
+    // ignores any caller-supplied end, so it cannot persist a custom duration. The
+    // legacy resize also routes through action='move' but the DB UPDATE there writes
+    // the dragged ends_at directly; reproducing that faithfully would require either
+    // rewriting updateDbAppointment (out of scope) or a dedicated duration-aware path.
+    // TODO(resize): add a duration-aware update (e.g. updateDbAppointmentSlot that
+    // writes starts_at/ends_at + segment without recomputing from service duration)
+    // and a `resize` action that calls it. Left inert for now.
+
     // save action. A positive integer `id` edits an EXISTING appointment
     // (updateDbAppointment); a missing/zero id creates a new one
     // (createDbAppointment, unchanged). On creation no lifecycle email fires
@@ -220,6 +309,15 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
+}
+
+// Split a "starts_at" datetime ("YYYY-MM-DD HH:MM[:SS]" or "...THH:MM...") into a
+// local date (YYYY-MM-DD) and HH:MM time. Used by the calendar move action so the
+// legacy `starts_at` payload still works alongside the lighter date+time payload.
+function parseStartsAt(value: string): { date: string; time: string } {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(value.trim());
+  if (!m) return { date: "", time: "" };
+  return { date: m[1], time: m[2] };
 }
 
 function parseServiceNames(params: URLSearchParams): string[] {

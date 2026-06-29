@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // Faithful port of the PHP calendar page (app/pages/calendar.php / ?page=calendar),
 // fed by the existing DB-backed /api/manage/calendar and /api/manage/appointments.
@@ -13,11 +13,19 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 //   the SAME markup/classes (the FullCalendar header toolbar uses .fc-* classes so the
 //   page CSS at /assets/css/pages/calendar.css applies) and render a real
 //   staff-columns x time-rows agenda from the API, positioning appointment blocks by
-//   time. The FullCalendar-style drag/drop & resize from calendar.js are NOT wired —
-//   the controls render and the view tabs / filters drive React state, but moving or
-//   resizing a block, and clicking an empty cell to quick-book, are intentionally inert
-//   (they open the existing index.php page instead). Modals are reproduced verbatim as
-//   static Bootstrap markup (no JS controller attached).
+//   time. Interaction parity (added on top of the unchanged rendering):
+//     - MOVE: appointment blocks are HTML5-draggable within the Giorno grid; dropping
+//       on a staff column computes the target time (snapped to SNAP_MIN, like
+//       calendar.js snapDuration 00:05:00) and target operator, optimistically updates,
+//       POSTs action=move, and reconciles with the server (reverts on error).
+//     - QUICK-BOOK: clicking an empty cell prefills + opens the existing static
+//       #apptModal (date/time/operator) and wires its Save button to a minimal
+//       action=save create, then refreshes. No new chrome is added — only behavior.
+//     - RESIZE (duration change) is left INERT (see route TODO): updateDbAppointment
+//       recomputes the end from the service duration, so a custom duration cannot be
+//       persisted without a dedicated path.
+//   Modals are reproduced verbatim as static Bootstrap markup; only the #apptModal
+//   Save/quick-book behavior above is attached, the others remain controller-less.
 
 type CalendarStaff = {
   id: number;
@@ -131,6 +139,39 @@ function timeToMin(time: string): number | null {
   return Number(m[1]) * 60 + Number(m[2]);
 }
 
+// Split a datetime-local value ("YYYY-MM-DDTHH:MM") into date / HH:MM parts.
+function parseLocalDate(value: string): string {
+  const m = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}/.exec(value || "");
+  return m ? m[1] : "";
+}
+function parseLocalTime(value: string): string {
+  const m = /^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2})/.exec(value || "");
+  return m ? m[1] : "";
+}
+
+// Bootstrap modal helpers for the static #apptModal. Bootstrap's bundle is already
+// loaded by the manage shell (the page uses data-bs-* modals elsewhere); we just
+// drive show/hide programmatically for quick-book. Falls back to a no-op when the
+// API is unavailable so quick-book degrades to "nothing happens" rather than crashing.
+type BootstrapModalApi = {
+  getOrCreateInstance: (el: Element) => { show: () => void; hide: () => void };
+};
+function bootstrapModal(): BootstrapModalApi | null {
+  if (typeof window === "undefined") return null;
+  const bs = (window as unknown as { bootstrap?: { Modal?: BootstrapModalApi } }).bootstrap;
+  return bs?.Modal ?? null;
+}
+function showApptModal(): void {
+  const el = typeof document !== "undefined" ? document.getElementById("apptModal") : null;
+  const api = bootstrapModal();
+  if (el && api) api.getOrCreateInstance(el).show();
+}
+function hideApptModal(): void {
+  const el = typeof document !== "undefined" ? document.getElementById("apptModal") : null;
+  const api = bootstrapModal();
+  if (el && api) api.getOrCreateInstance(el).hide();
+}
+
 // Map the Italian status label returned by /api/manage/appointments back to the
 // legacy calendar badge key (see calendar.js status map).
 function statusKeyFromLabel(label: string): { key: string; label: string } {
@@ -152,6 +193,26 @@ const SLOT_MIN_PER_ROW = 30;
 const ROW_HEIGHT = 48; // px per 30-min row
 const PX_PER_MIN = ROW_HEIGHT / SLOT_MIN_PER_ROW;
 const DEFAULT_DURATION_MIN = 60;
+// Snap step for drag-move / quick-book, matching calendar.js snapDuration 00:05:00
+// (AXIS_STEP_MINUTES = 5). A dropped/clicked Y position is rounded to this step.
+const SNAP_MIN = 5;
+
+function minToTime(min: number): string {
+  const clamped = Math.max(0, min);
+  return `${pad(Math.floor(clamped / 60))}:${pad(clamped % 60)}`;
+}
+
+function snapMin(min: number, step: number): number {
+  return Math.round(min / step) * step;
+}
+
+// Drag payload moved between an appointment block and a staff/grid drop target.
+type CalendarDrag = {
+  id: number;
+  // Pointer offset (px) from the top of the dragged block to the grab point, so the
+  // drop maps the block's TOP (its start time), not the cursor, to the new slot.
+  grabOffsetPx: number;
+};
 
 export function CalendarContent() {
   const slug = tenantSlug();
@@ -169,6 +230,11 @@ export function CalendarContent() {
   const [filterStaff, setFilterStaff] = useState("");
   const [filterService, setFilterService] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
+
+  // Drag-move state. dragRef holds the in-flight payload (the dragged appointment id
+  // and the grab offset within the block); a non-null moveError surfaces a revert.
+  const dragRef = useRef<CalendarDrag | null>(null);
+  const [moveError, setMoveError] = useState("");
 
   const loadContext = useCallback(
     (forDate: string) => {
@@ -266,6 +332,154 @@ export function CalendarContent() {
     setDate((d) => addDays(d, deltaDays));
   }
 
+  // Map a Y offset (px, relative to the top of a column's slot body) to a snapped
+  // time string, clamped to the visible business-hours window. The slot body starts
+  // at minMin, ROW_HEIGHT px per SLOT_MIN_PER_ROW (PX_PER_MIN px per minute).
+  const timeFromY = useCallback(
+    (offsetPx: number): string => {
+      const rawMin = minMin + offsetPx / PX_PER_MIN;
+      const snapped = snapMin(rawMin, SNAP_MIN);
+      const clamped = Math.min(Math.max(snapped, minMin), maxMin);
+      return minToTime(clamped);
+    },
+    [minMin, maxMin],
+  );
+
+  // POST action=move with optimistic update + reconcile. The list is optimistically
+  // patched (new time/operator) so the block jumps immediately; on success the server
+  // list replaces local state, on error we revert by reloading the day. Tenant-scoped
+  // via the slug query + x-tenant-slug header, like the other calendar fetches.
+  const moveAppointment = useCallback(
+    async (id: number, newTime: string, newOperator: string) => {
+      setMoveError("");
+      const prev = appointments;
+      const target = prev.find((a) => a.id === id);
+      if (!target) return;
+      if (target.time === newTime && (target.operator || "").trim().toLowerCase() === newOperator.trim().toLowerCase()) {
+        return; // no-op drop on the same slot/column
+      }
+
+      // Optimistic patch.
+      setAppointments((list) => list.map((a) => (a.id === id ? { ...a, time: newTime, operator: newOperator } : a)));
+
+      try {
+        const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify({
+            action: "move",
+            id,
+            date,
+            time: newTime,
+            staff_name: newOperator,
+          }),
+        });
+        const json: { ok?: boolean; error?: string; appointments?: Appointment[] } = await res.json().catch(() => ({}));
+        if (!res.ok || json.ok === false || json.error) {
+          setAppointments(prev); // revert
+          setMoveError(String(json.error || "Impossibile spostare l'appuntamento."));
+          return;
+        }
+        // Reconcile with the authoritative server list when provided.
+        if (Array.isArray(json.appointments)) setAppointments(json.appointments);
+        else loadContext(date);
+      } catch {
+        setAppointments(prev); // revert on network error
+        setMoveError("Errore di rete durante lo spostamento.");
+      }
+    },
+    [appointments, date, loadContext, slug],
+  );
+
+  // QUICK-BOOK: prefill + open the existing static #apptModal for the clicked cell,
+  // then wire its (otherwise inert) Save button to a minimal action=save create. Uses
+  // the modal markup verbatim — only behavior is attached — and shows it via the
+  // already-loaded Bootstrap. The create posts client_name (free text taken from the
+  // modal's existing "Nuovo cliente" field, surfaced for quick-book), service_name and
+  // staff_name; the route resolves/creates the client and recomputes the end.
+  const openQuickBook = useCallback(
+    (cellTime: string, staffId: number) => {
+      if (typeof document === "undefined") return;
+      const modalEl = document.getElementById("apptModal");
+      if (!modalEl) return;
+
+      // Prefill the modal fields (verbatim markup; we only set values).
+      const startsAt = modalEl.querySelector<HTMLInputElement>("#starts_at");
+      const endsAt = modalEl.querySelector<HTMLInputElement>("#ends_at");
+      const staffSel = modalEl.querySelector<HTMLSelectElement>("#staff_id");
+      const idField = modalEl.querySelector<HTMLInputElement>("#appt_id");
+      const newClientBox = modalEl.querySelector<HTMLElement>("#newClientBox");
+      const newClientName = modalEl.querySelector<HTMLInputElement>('input[name="new_full_name"]');
+      const titleEl = modalEl.querySelector<HTMLElement>("#modalTitle");
+
+      const startLocal = `${date}T${cellTime}`;
+      const endMin = Math.min((timeToMin(cellTime) ?? minMin) + DEFAULT_DURATION_MIN, maxMin);
+      if (startsAt) startsAt.value = startLocal;
+      if (endsAt) endsAt.value = `${date}T${minToTime(endMin)}`;
+      if (staffSel) staffSel.value = staffId > 0 ? String(staffId) : "";
+      if (idField) idField.value = ""; // create (no id)
+      if (titleEl) titleEl.textContent = "Nuovo appuntamento";
+      // Surface the inline "Nuovo cliente" field so quick-book can capture a name
+      // (the route's create resolves/creates the client from client_name).
+      if (newClientBox) newClientBox.hidden = false;
+      if (newClientName) {
+        newClientName.value = "";
+        // Defer focus until the modal is shown.
+        setTimeout(() => newClientName.focus(), 150);
+      }
+
+      // Wire the Save button once (idempotent): submit a minimal create then refresh.
+      const saveBtn = modalEl.querySelector<HTMLButtonElement>("#btnSave");
+      if (saveBtn && !saveBtn.dataset.qbWired) {
+        saveBtn.dataset.qbWired = "1";
+        saveBtn.addEventListener("click", async () => {
+          const startVal = String(startsAt?.value ?? "");
+          const sd = parseLocalDate(startVal);
+          const st = parseLocalTime(startVal);
+          const clientName = String(newClientName?.value ?? "").trim();
+          // Service: use the selected option's name (text before the " • duration"),
+          // empty when "(nessuno)" so the route falls back to the first active service.
+          const serviceSel = modalEl.querySelector<HTMLSelectElement>("#service_id");
+          const serviceName = serviceSel && serviceSel.value
+            ? (serviceSel.selectedOptions[0]?.textContent ?? "").split("•")[0].trim()
+            : "";
+          // Operator: the selected staff's name, empty when "(non assegnato)".
+          const operatorName = staffSel && staffSel.value ? (staffSel.selectedOptions[0]?.textContent ?? "").trim() : "";
+          if (!sd || !st) return;
+          try {
+            const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+              body: JSON.stringify({
+                action: "save",
+                client_name: clientName,
+                service_name: serviceName,
+                staff_name: operatorName,
+                date: sd,
+                time: st,
+              }),
+            });
+            const json: { ok?: boolean; error?: string } = await res.json().catch(() => ({}));
+            if (!res.ok || json.ok === false || json.error) {
+              setMoveError(String(json.error || "Impossibile creare l'appuntamento."));
+              return;
+            }
+            hideApptModal();
+            // Reload the day the appointment was created for (read from the live
+            // input via `sd`, never the closure `date`, so a wired-once handler stays
+            // correct after the user navigates to another day).
+            loadContext(sd);
+          } catch {
+            setMoveError("Errore di rete durante la creazione.");
+          }
+        });
+      }
+
+      showApptModal();
+    },
+    [date, minMin, maxMin, slug, loadContext],
+  );
+
   function viewBtn(target: CalendarView, label: string) {
     const active = view === target;
     return (
@@ -350,6 +564,16 @@ export function CalendarContent() {
             </select>
           </div>
         </div>
+
+        {/* Move/quick-book error surface — only rendered on failure (additive; the
+            static layout is unchanged when there is no error). */}
+        {moveError ? (
+          <div className="alert alert-danger alert-dismissible d-flex align-items-center gap-2 py-2 px-3" role="alert">
+            <i className="bi bi-exclamation-triangle" />
+            <span className="small">{moveError}</span>
+            <button type="button" className="btn-close ms-auto" aria-label="Chiudi" onClick={() => setMoveError("")} />
+          </div>
+        ) : null}
 
         <div className="calendar-shell calendar-shell--agenda">
           {/*
@@ -469,8 +693,37 @@ export function CalendarContent() {
                                   </div>
                                 </div>
 
-                                {/* Slot rows (background) */}
-                                <div style={{ position: "relative", height: gridHeight }}>
+                                {/* Slot rows (background). Doubles as the staff column's
+                                    drop target (MOVE) and quick-book surface (empty-cell
+                                    click). The handlers compute the Y offset within this
+                                    body, which starts at minMin. */}
+                                <div
+                                  style={{ position: "relative", height: gridHeight }}
+                                  onDragOver={(e) => {
+                                    // Required so the browser fires onDrop on this element.
+                                    if (dragRef.current) {
+                                      e.preventDefault();
+                                      e.dataTransfer.dropEffect = "move";
+                                    }
+                                  }}
+                                  onDrop={(e) => {
+                                    const drag = dragRef.current;
+                                    if (!drag) return;
+                                    e.preventDefault();
+                                    const rect = e.currentTarget.getBoundingClientRect();
+                                    // Map the block TOP (cursor - grab offset), not the cursor.
+                                    const topPx = e.clientY - rect.top - drag.grabOffsetPx;
+                                    void moveAppointment(drag.id, timeFromY(topPx), s.name);
+                                    dragRef.current = null;
+                                  }}
+                                  onClick={(e) => {
+                                    // Quick-book only on the empty background, never on a block
+                                    // (blocks stopPropagation). Ignore right after a drag.
+                                    if (dragRef.current) return;
+                                    const rect = e.currentTarget.getBoundingClientRect();
+                                    openQuickBook(timeFromY(e.clientY - rect.top), s.id);
+                                  }}
+                                >
                                   {rows.map((m) => (
                                     <div
                                       key={m}
@@ -492,6 +745,27 @@ export function CalendarContent() {
                                         href={href(`appointments&action=view&id=${a.id}`)}
                                         className="fc-event fc-timegrid-event appt-soft-event"
                                         title={`${a.time} ${a.client} • ${a.service}`}
+                                        draggable
+                                        onDragStart={(e) => {
+                                          // Record the grabbed appointment + the pointer offset
+                                          // from the block top, so the drop maps the block start.
+                                          const rect = e.currentTarget.getBoundingClientRect();
+                                          dragRef.current = { id: a.id, grabOffsetPx: e.clientY - rect.top };
+                                          e.dataTransfer.effectAllowed = "move";
+                                          // Some browsers require data to start a drag.
+                                          try { e.dataTransfer.setData("text/plain", String(a.id)); } catch { /* ignore */ }
+                                        }}
+                                        onDragEnd={() => {
+                                          // Clear shortly after so the synthetic click that follows
+                                          // a drag does not trigger quick-book on the column.
+                                          setTimeout(() => { dragRef.current = null; }, 0);
+                                        }}
+                                        onClick={(e) => {
+                                          // Keep the block from bubbling to the column's quick-book
+                                          // click; suppress the navigation when a drag just happened.
+                                          e.stopPropagation();
+                                          if (dragRef.current) e.preventDefault();
+                                        }}
                                         style={{
                                           position: "absolute",
                                           top,

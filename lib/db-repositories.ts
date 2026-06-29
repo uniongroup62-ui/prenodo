@@ -544,6 +544,50 @@ export async function getDbAppointmentCustomerVisibleSnapshot(slug: string, id: 
   return { date: dateIsoLocal(startsAt), time: timeLocal(startsAt), serviceNames };
 }
 
+// Move-snapshot: the fields a calendar drag/move needs to PRESERVE while only the
+// slot (date/time/staff/location) changes. The calendar move action does not touch
+// client/service/notes, so it re-feeds these existing values to updateDbAppointment
+// (which keeps notes and recomputes the end from the service duration). Returns null
+// when the appointment is not the tenant's / does not exist, plus the current PHP
+// status so the route can mirror the legacy guard (only pending/scheduled movable).
+export type AppointmentMoveSnapshot = {
+  clientName: string;
+  serviceName: string;
+  operator: string;
+  locationId: number | null;
+  staffNotes: string | null;
+  customerNotes: string | null;
+  phpStatus: string;
+};
+
+export async function getDbAppointmentMoveSnapshot(slug: string, id: number): Promise<AppointmentMoveSnapshot | null> {
+  // Tenant-scoped read: only returns the row when it belongs to this tenant.
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, client_id, service_id, location_id, status, staff_notes, customer_notes",
+    where: "id = ?",
+    params: [id],
+    limit: 1,
+  });
+  const row = rows[0];
+  if (!row) return null;
+
+  const clientName = await appointmentClientName(slug, Number(row.client_id ?? 0));
+  const service = await appointmentService(slug, row);
+  const operator = await appointmentStaffName(slug, Number(row.id ?? 0));
+
+  return {
+    clientName,
+    serviceName: service.name,
+    operator,
+    locationId: row.location_id === null || row.location_id === undefined ? null : Number(row.location_id),
+    staffNotes: row.staff_notes === null || row.staff_notes === undefined ? null : String(row.staff_notes),
+    customerNotes: row.customer_notes === null || row.customer_notes === undefined ? null : String(row.customer_notes),
+    phpStatus: phpStatus(String(row.status ?? "")),
+  };
+}
+
 // True when any customer-visible field differs between the before/after
 // snapshots — i.e. the date, the time, or the set of service names changed.
 // Mirrors automation_handle_customer_visible_change's "$after !== $before" gate,
