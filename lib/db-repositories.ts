@@ -421,6 +421,23 @@ export async function updateDbAppointmentStatus(slug: string, id: number, status
   return mapAppointment(slug, rows[0]);
 }
 
+// Returns the appointment's current PHP-normalized status code ('pending',
+// 'scheduled', 'canceled', 'done', 'no_show', ...) or null when not found. Used
+// by the manage route to detect the status transition that triggers the
+// approved/rejected lifecycle email, before updateDbAppointmentStatus writes the
+// new status.
+export async function getDbAppointmentPhpStatus(slug: string, id: number): Promise<string | null> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "status", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  return phpStatus(String(rows[0].status ?? ""));
+}
+
+// Exported so the manage route can normalize the incoming target status to the
+// same PHP code the DB write uses, then map old->new to a lifecycle email kind.
+export function appointmentPhpStatus(status: AppointmentStatus | string): string {
+  return phpStatus(status);
+}
+
 export async function listDbSales({
   slug,
   locationId = 0,

@@ -3,7 +3,14 @@ import {
   todayIso,
 } from "@/lib/appointment-engine";
 import { emptyToNull, jsonError, parseRequestBody } from "@/lib/api-utils";
-import { createDbAppointment, listDbAppointments, updateDbAppointmentStatus } from "@/lib/db-repositories";
+import {
+  appointmentPhpStatus,
+  createDbAppointment,
+  getDbAppointmentPhpStatus,
+  listDbAppointments,
+  updateDbAppointmentStatus,
+} from "@/lib/db-repositories";
+import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
@@ -126,10 +133,30 @@ export async function POST(request: Request) {
     if (action === "status") {
       const id = Number.parseInt(String(body.id ?? "0"), 10);
       const status = normalizeAppointmentStatus(body.status);
+      // Capture the prior PHP status BEFORE the write so we can map the
+      // transition (pending->scheduled = 'approved', pending->canceled =
+      // 'rejected') to the lifecycle email, matching the legacy PHP callers.
+      const oldPhpStatus = await getDbAppointmentPhpStatus(tenantSlug, id);
       const appointment = await updateDbAppointmentStatus(tenantSlug, id, status);
+      // Port of automation_send_email('approved'|'rejected', id): fire AFTER the
+      // DB write, gated on emailConfigured() + the kind's toggle (all handled
+      // inside the helper). Errors are swallowed there so a delivery problem
+      // never fails the status API; the response shape is unchanged.
+      if (oldPhpStatus) {
+        const kind = lifecycleKindForStatusChange(oldPhpStatus, appointmentPhpStatus(status));
+        if (kind) await sendAppointmentLifecycleEmail({ slug: tenantSlug, appointmentId: id, kind });
+      }
       return Response.json({ ok: true, sourceMode: "database", appointment, appointments: await listDbAppointments({ slug: tenantSlug }) });
     }
 
+    // save action. This route's save path ONLY creates new appointments
+    // (createDbAppointment) — it has no edit-existing-appointment branch. The
+    // legacy 'modified' email (automation_send_email('modified', id) via
+    // automation_handle_customer_visible_change) fires only when an EXISTING
+    // appointment's customer-visible data changes, never on first creation, so
+    // there is intentionally no lifecycle email here. If an edit path is added
+    // later, fire sendAppointmentLifecycleEmail({ ..., kind: "modified" }) after
+    // the update when the date/time/services changed.
     const serviceName = String(body.service_name ?? body.service ?? "");
     const operator = String(body.staff_name ?? body.operator ?? "");
     const locationId = await resolveManageLocationId({

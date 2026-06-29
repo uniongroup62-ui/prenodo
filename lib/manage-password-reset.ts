@@ -3,8 +3,9 @@ import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
 import type { RowDataPacket } from "mysql2/promise";
-import { dbExecute, dbQuery, tenantSelect, tenantTable, columnExists, tableExists } from "@/lib/tenant-db";
+import { dbExecute, dbQuery, tenantSelect, tenantTable, columnExists, tableExists, tenantIdForSlug } from "@/lib/tenant-db";
 import { normalizeTenantSlug } from "@/lib/tenant-runtime";
+import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 
 const TOKEN_TTL_MINUTES = 60;
 const MIN_PASSWORD_ADMIN = 8;
@@ -25,6 +26,110 @@ export type PasswordResetInfo = {
   email: string;
   expiresAt: string;
 };
+
+// Per-tenant business branding used to brand the staff reset email, mirroring the
+// legacy PasswordReset::request() which read setting_get('name')/setting_get('email')
+// (the businesses row). Like the cron routes, we resolve the tenant_id from the slug
+// and read the first businesses row (ORDER BY id ASC LIMIT 1). All fields are
+// best-effort: missing branding just means the template renders its default brand.
+type ManageResetBranding = {
+  name: string;
+  email: string;
+  logoUrl: string;
+};
+
+async function manageResetBranding(slug: string): Promise<ManageResetBranding> {
+  const empty: ManageResetBranding = { name: "", email: "", logoUrl: "" };
+  try {
+    const tenantId = await tenantIdForSlug(slug);
+    if (!tenantId || !(await tableExists("businesses"))) return empty;
+    const hasLogo = await columnExists("businesses", "logo_path");
+    const rows = await dbQuery<RowDataPacket[]>(
+      `SELECT name, email${hasLogo ? ", logo_path" : ""} FROM businesses WHERE tenant_id = ? ORDER BY id ASC LIMIT 1`,
+      [tenantId],
+    ).catch(() => [] as RowDataPacket[]);
+    const row = rows[0];
+    if (!row) return empty;
+    return {
+      name: String(row.name ?? ""),
+      email: String(row.email ?? ""),
+      logoUrl: hasLogo ? resolveLogoUrl(String(row.logo_path ?? "")) : "",
+    };
+  } catch {
+    return empty;
+  }
+}
+
+// Turn a stored logo_path into an absolute URL for the email. If it is already an
+// absolute http(s) URL use it as-is; if it is a public path (e.g. /uploads/...)
+// prefix it with PRENODO_PUBLIC_BASE_URL. Otherwise omit it — the email template
+// falls back to rendering the brand name, identical to the no-logo PHP path.
+function resolveLogoUrl(logoPath: string): string {
+  const path = logoPath.trim();
+  if (!path) return "";
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  if (!base || !path.startsWith("/")) return "";
+  return `${base}${path}`;
+}
+
+// Port of PasswordReset::request()'s admin/"Gestionale" reset email body: an h3
+// title, a short intro, the "Reimposta password" button, the expiry note and the
+// "ignore if it wasn't you" line. Subject is "<biz> — Reimposta la password (Gestionale)".
+function buildManageResetEmailBody(resetUrl: string): string {
+  const title = "Reimposta la password — Gestionale";
+  return (
+    `<h3 style="margin:0 0 12px 0">${escapeHtml(title)}</h3>`
+    + '<p style="margin:0 0 12px 0">Hai richiesto la reimpostazione della password. Premi il pulsante qui sotto:</p>'
+    + `<p style="margin:16px 0"><a href="${escapeHtml(resetUrl)}" style="display:inline-block;background:#0d6efd;color:#fff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:800">Reimposta password</a></p>`
+    + `<p style="margin:0 0 10px 0;color:#6b7280">Il link scade tra ${TOKEN_TTL_MINUTES} minuti.</p>`
+    + '<p style="margin:12px 0 0 0;color:#6b7280">Se non sei stato tu, ignora questa email.</p>'
+  );
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// Sends the staff/business-user reset email, branded per-tenant (from the businesses
+// row), through SES. Gated on emailConfigured(): when SES is unconfigured this is a
+// no-op so local dev keeps working (the caller still stored the token hash and may
+// expose the reset URL via PRENODO_EXPOSE_RESET_LINK). Send errors are logged and
+// swallowed — delivery is a best-effort side-effect that must never fail the
+// (deliberately generic) forgot-password response; the user can re-request a link.
+async function sendManageResetEmail(slug: string, recipient: string, resetUrl: string): Promise<void> {
+  if (!emailConfigured()) return;
+  const to = recipient.trim();
+  if (!to) return;
+  try {
+    const branding = await manageResetBranding(slug);
+    const bizName = branding.name.trim();
+    const subject = `${bizName ? `${bizName} — ` : ""}Reimposta la password (Gestionale)`;
+    const { html, text } = buildModernEmailTemplate(subject, buildManageResetEmailBody(resetUrl), {
+      business_name: bizName,
+      business_email: branding.email,
+      business_logo_url: branding.logoUrl,
+    });
+    const res = await sendEmail({
+      to,
+      subject,
+      html,
+      text,
+      fromEmail: branding.email.trim() || undefined,
+      fromName: bizName || undefined,
+    });
+    if (!res.ok) {
+      console.error(`[manage-password-reset] email send failed for ${to}: ${res.error}`);
+    }
+  } catch (error) {
+    console.error("[manage-password-reset] email send error:", error);
+  }
+}
 
 export async function requestManagePasswordReset({
   slug,
@@ -99,10 +204,17 @@ export async function requestManagePasswordReset({
     ],
   );
 
+  // Send the reset email AFTER the token hash is persisted so the link is valid even
+  // on a transient send error. The link points at the same /manage/reset-password page
+  // the legacy PasswordReset::buildResetLink() targets for the admin/"Gestionale" type.
+  // Best-effort and tenant-scoped (see sendManageResetEmail); never fails this flow.
+  const resetUrl = manageResetUrl(origin, tenantSlug, token);
+  await sendManageResetEmail(tenantSlug, normalizedEmail, resetUrl);
+
   return {
     ...generic,
     sent: true,
-    resetUrl: exposeResetUrl() ? manageResetUrl(origin, tenantSlug, token) : undefined,
+    resetUrl: exposeResetUrl() ? resetUrl : undefined,
   };
 }
 

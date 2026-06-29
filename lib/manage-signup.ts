@@ -6,6 +6,7 @@ import type { RowDataPacket } from "mysql2/promise";
 import { allAssignablePermissions, permissionDefinitions } from "@/lib/role-permissions";
 import { dbExecute, dbQuery, quoteIdentifier, tableExists } from "@/lib/tenant-db";
 import { tenantPrefix } from "@/lib/tenant-runtime";
+import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 
 const SIGNUPS_TABLE = "saas_professional_signups";
 const CODE_TTL_MINUTES = 15;
@@ -294,6 +295,10 @@ export async function registerManageSignup(input: RegisterSignupInput): Promise<
     ],
   );
 
+  // Send the verification code AFTER persisting its hash so the code is valid even on a
+  // transient send error. Platform-branded, best-effort; never fails the registration.
+  await sendSignupVerificationEmail(ownerEmail, ownerName, businessName, verificationCode);
+
   const localCode = exposeSignupCodes() ? verificationCode : undefined;
   return {
     ok: true,
@@ -334,6 +339,9 @@ export async function resendManageSignupCode(signupId: number, email: string): P
       WHERE id=?`,
     [hashVerificationCode(verificationCode), CODE_TTL_MINUTES, Number(signup.id)],
   );
+
+  // Resend the new code AFTER persisting its hash; platform-branded, best-effort.
+  await sendSignupVerificationEmail(String(signup.owner_email), String(signup.owner_name), String(signup.business_name), verificationCode);
 
   const localCode = exposeSignupCodes() ? verificationCode : undefined;
   return {
@@ -919,6 +927,71 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 function exposeSignupCodes(): boolean {
   return process.env.NODE_ENV !== "production" || process.env.PRENODO_EXPOSE_SIGNUP_CODE === "1";
+}
+
+// Platform brand for signup emails. At signup time no tenant/businesses row exists
+// yet (it is created during provisioning), so — unlike the per-tenant reset email —
+// these are PLATFORM emails sent from the default SES sender, branded with
+// PRENODO_PUBLIC_BRAND (default "Prenodo"), mirroring the public-account model.
+function signupBrandName(): string {
+  return String(process.env.PRENODO_PUBLIC_BRAND ?? "").trim() || "Prenodo";
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// Builds the "Inserisci codice" button link to /manage/verify?email=... (the Next
+// equivalent of the legacy manageUrl('/manage/verify', ...)). Needs an absolute base
+// (PRENODO_PUBLIC_BASE_URL); when unset we omit the button and rely on the code text.
+function signupVerifyLink(email: string): string {
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  if (!base) return "";
+  return `${base}/manage/verify?email=${encodeURIComponent(email)}`;
+}
+
+// Port of SaasProfessionalSignup::sendVerificationCodeEmail(): greeting, the
+// "use this code to verify and create the gestionale for <business>" line, the
+// large 6-digit code, an optional "Inserisci codice" button and the expiry note.
+function buildSignupVerificationBody(name: string, businessName: string, code: string, verifyUrl: string): string {
+  let body = `<p>Ciao ${escapeHtml(name)},</p>`;
+  body += `<p>usa questo codice per verificare la tua email e creare il gestionale di <strong>${escapeHtml(businessName)}</strong>.</p>`;
+  body += `<p style="font-size:28px;letter-spacing:6px;font-weight:800;margin:18px 0;color:#0f172a">${escapeHtml(code)}</p>`;
+  if (verifyUrl) {
+    body += `<p><a href="${escapeHtml(verifyUrl)}" style="display:inline-block;background:#1f7fb7;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:600">Inserisci codice</a></p>`;
+  }
+  body += `<p>Il codice scade tra ${CODE_TTL_MINUTES} minuti. Se non hai richiesto tu questa registrazione, ignora questa email.</p>`;
+  return body;
+}
+
+// Sends the signup email-verification code via SES, branded as the platform. Gated on
+// emailConfigured(): a no-op when SES is unconfigured so local dev keeps working (the
+// caller still stored the code hash and may expose the code via exposeSignupCodes()).
+// Send errors are logged and swallowed — issuance must not fail just because delivery
+// had a transient problem; the user can resend the code. (NOTE: this is more lenient
+// than the legacy PHP, which marked the signup 'failed' on send failure; we keep the
+// codebase's best-effort convention so a transient SES error doesn't strand the signup.)
+async function sendSignupVerificationEmail(email: string, name: string, businessName: string, code: string): Promise<void> {
+  if (!emailConfigured()) return;
+  const to = email.trim();
+  if (!to) return;
+  try {
+    const brand = signupBrandName();
+    const subject = `Conferma email - ${brand}`;
+    const body = buildSignupVerificationBody(name, businessName, code, signupVerifyLink(to));
+    const { html, text } = buildModernEmailTemplate(subject, body, { business_name: brand });
+    const res = await sendEmail({ to, subject, html, text });
+    if (!res.ok) {
+      console.error(`[manage-signup] verification email send failed for ${to}: ${res.error}`);
+    }
+  } catch (error) {
+    console.error("[manage-signup] verification email send error:", error);
+  }
 }
 
 function normalizeEmail(email: string): string {
