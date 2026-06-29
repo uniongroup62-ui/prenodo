@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { PublicCenterPage } from "@/components/public-center-page";
+import { MarketplaceDetailFaithful } from "@/components/public/marketplace-detail-faithful";
 import { centerBySlug } from "@/lib/demo-data";
 
 export async function generateMetadata({
@@ -24,5 +24,5 @@ export default async function AttivitaDetailPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  return <PublicCenterPage slug={slug} />;
+  return <MarketplaceDetailFaithful slug={slug} />;
 }
