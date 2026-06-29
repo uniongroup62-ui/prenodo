@@ -171,6 +171,11 @@ function hideApptModal(): void {
   const api = bootstrapModal();
   if (el && api) api.getOrCreateInstance(el).hide();
 }
+function showNotesModal(): void {
+  const el = typeof document !== "undefined" ? document.getElementById("calendarNotesModal") : null;
+  const api = bootstrapModal();
+  if (el && api) api.getOrCreateInstance(el).show();
+}
 
 // Map the Italian status label returned by /api/manage/appointments back to the
 // legacy calendar badge key (see calendar.js status map).
@@ -235,6 +240,8 @@ export function CalendarContent() {
   // and the grab offset within the block); a non-null moveError surfaces a revert.
   const dragRef = useRef<CalendarDrag | null>(null);
   const [moveError, setMoveError] = useState("");
+  // Surfaced inside #calendarNotesAlert when a note save/delete fails.
+  const [notesError, setNotesError] = useState("");
 
   const loadContext = useCallback(
     (forDate: string) => {
@@ -490,6 +497,133 @@ export function CalendarContent() {
     return () => clearTimeout(timer);
   }, [openQuickBook, minMin]);
 
+  // CALENDAR NOTES: open the (static) #calendarNotesModal from the header "Note"
+  // button and wire its form save/delete to /api/manage/calendar (note_save /
+  // note_delete). Markup is verbatim — only behavior is attached. The note list is
+  // rendered by React from `notes`; saving/deleting reloads the day to refresh it.
+  const notesModalRef = useRef<HTMLDivElement | null>(null);
+
+  // Reset the notes form to "new note" mode for the current day (clears id, hides
+  // the Delete button) — mirrors the legacy #calendarNotesNewBtn behavior.
+  const resetNotesForm = useCallback(() => {
+    if (typeof document === "undefined") return;
+    const root = notesModalRef.current ?? document.getElementById("calendarNotesModal");
+    if (!root) return;
+    const idEl = root.querySelector<HTMLInputElement>("#calendar_note_id");
+    const dateEl = root.querySelector<HTMLInputElement>("#calendar_note_date");
+    const titleEl = root.querySelector<HTMLInputElement>("#calendar_note_title");
+    const textEl = root.querySelector<HTMLTextAreaElement>("#calendar_note_text");
+    const deleteBtn = root.querySelector<HTMLButtonElement>("#calendarNoteDeleteBtn");
+    if (idEl) idEl.value = "";
+    if (dateEl) dateEl.value = date;
+    if (titleEl) titleEl.value = "";
+    if (textEl) textEl.value = "";
+    deleteBtn?.classList.add("d-none");
+  }, [date]);
+
+  const postNote = useCallback(
+    async (payload: Record<string, unknown>): Promise<boolean> => {
+      try {
+        const res = await fetch(`/api/manage/calendar?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify({ slug, ...payload }),
+        });
+        const json: { ok?: boolean; error?: string } = await res.json().catch(() => ({}));
+        if (!res.ok || json.ok === false || json.error) {
+          setNotesError(String(json.error || "Operazione non riuscita."));
+          return false;
+        }
+        setNotesError("");
+        loadContext(date);
+        return true;
+      } catch {
+        setNotesError("Errore di rete.");
+        return false;
+      }
+    },
+    [slug, date, loadContext],
+  );
+
+  // Attach the notes form submit / delete / "Nuova" / card-click handlers once the
+  // static modal is in the DOM. Re-runs when `notes` change so card clicks always
+  // reference the freshest list, and is idempotent (listeners removed on cleanup).
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.getElementById("calendarNotesModal");
+    if (!root) return;
+    notesModalRef.current = root as HTMLDivElement;
+
+    const form = root.querySelector<HTMLFormElement>("#calendarNotesForm");
+    const newBtn = root.querySelector<HTMLButtonElement>("#calendarNotesNewBtn");
+    const deleteBtn = root.querySelector<HTMLButtonElement>("#calendarNoteDeleteBtn");
+    const idEl = root.querySelector<HTMLInputElement>("#calendar_note_id");
+    const dateEl = root.querySelector<HTMLInputElement>("#calendar_note_date");
+    const titleEl = root.querySelector<HTMLInputElement>("#calendar_note_title");
+    const textEl = root.querySelector<HTMLTextAreaElement>("#calendar_note_text");
+    const list = root.querySelector<HTMLElement>("#calendarNotesList");
+
+    const onSubmit = async (e: Event) => {
+      e.preventDefault();
+      const noteDate = String(dateEl?.value ?? "").trim();
+      const noteText = String(textEl?.value ?? "").trim();
+      if (!noteDate || !noteText) {
+        setNotesError("Inserisci giorno e testo della nota.");
+        return;
+      }
+      const ok = await postNote({
+        action: "note_save",
+        id: Number(idEl?.value ?? 0) || 0,
+        note_date: noteDate,
+        title: String(titleEl?.value ?? "").trim(),
+        note_text: noteText,
+      });
+      if (ok) resetNotesForm();
+    };
+
+    const onDelete = async () => {
+      const id = Number(idEl?.value ?? 0) || 0;
+      if (id <= 0) return;
+      if (!window.confirm("Eliminare questa nota?")) return;
+      const ok = await postNote({ action: "note_delete", id });
+      if (ok) resetNotesForm();
+    };
+
+    const onNew = () => resetNotesForm();
+
+    // Load an existing note into the form for editing when its card is clicked.
+    const onCardClick = (e: Event) => {
+      const card = (e.target as HTMLElement)?.closest<HTMLElement>(".calendar-note-card[data-note-id]");
+      if (!card) return;
+      const id = Number(card.dataset.noteId ?? 0) || 0;
+      const note = notes.find((n) => n.id === id);
+      if (!note) return;
+      if (idEl) idEl.value = String(note.id);
+      if (dateEl) dateEl.value = note.noteDate;
+      if (titleEl) titleEl.value = note.title ?? "";
+      if (textEl) textEl.value = note.noteText ?? "";
+      deleteBtn?.classList.remove("d-none");
+    };
+
+    form?.addEventListener("submit", onSubmit);
+    deleteBtn?.addEventListener("click", onDelete);
+    newBtn?.addEventListener("click", onNew);
+    list?.addEventListener("click", onCardClick);
+    return () => {
+      form?.removeEventListener("submit", onSubmit);
+      deleteBtn?.removeEventListener("click", onDelete);
+      newBtn?.removeEventListener("click", onNew);
+      list?.removeEventListener("click", onCardClick);
+    };
+  }, [notes, postNote, resetNotesForm]);
+
+  // Open the notes modal from the header button, starting in "new note" mode.
+  const openNotesModal = useCallback(() => {
+    resetNotesForm();
+    setNotesError("");
+    showNotesModal();
+  }, [resetNotesForm]);
+
   function viewBtn(target: CalendarView, label: string) {
     const active = view === target;
     return (
@@ -515,7 +649,7 @@ export function CalendarContent() {
           <div className="bs-page-subtitle">Consulta disponibilita, appuntamenti e note della sede.</div>
         </div>
         <div className="bs-page-actions">
-          <button type="button" className="btn btn-outline-secondary btn-sm calendar-notes-top-btn" id="calendarNotesBtn">
+          <button type="button" className="btn btn-outline-secondary btn-sm calendar-notes-top-btn" id="calendarNotesBtn" onClick={openNotesModal}>
             <i className="bi bi-stickies me-1" />
             Note
             <span
@@ -843,10 +977,41 @@ export function CalendarContent() {
                     <div className="d-flex justify-content-between align-items-center">
                       <label className="form-label mb-0">Cliente</label>
                       <div className="d-flex gap-3 small">
-                        <a href="#" id="linkNewClient" className="text-decoration-none">
+                        <a
+                          href="#"
+                          id="linkNewClient"
+                          className="text-decoration-none"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            // Legacy intent: switch to "new client" — select the inline
+                            // new-client option and reveal #newClientBox for free-text entry.
+                            const sel = document.getElementById("client_id") as HTMLSelectElement | null;
+                            if (sel) sel.value = "__new__";
+                            const box = document.getElementById("newClientBox") as HTMLElement | null;
+                            if (box) box.hidden = false;
+                            const nameInput = document.querySelector<HTMLInputElement>('#newClientBox input[name="new_full_name"]');
+                            nameInput?.focus();
+                          }}
+                        >
                           <i className="bi bi-plus-lg" /> Nuovo
                         </a>
-                        <a href="#" id="linkFindClient" className="text-decoration-none">
+                        <a
+                          href="#"
+                          id="linkFindClient"
+                          className="text-decoration-none"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            // Legacy intent: switch back to "existing client" — hide the
+                            // new-client box and focus the existing client search field.
+                            const box = document.getElementById("newClientBox") as HTMLElement | null;
+                            if (box) box.hidden = true;
+                            const sel = document.getElementById("client_id") as HTMLSelectElement | null;
+                            if (sel) {
+                              if (sel.value === "__new__") sel.value = "";
+                              sel.focus();
+                            }
+                          }}
+                        >
                           <i className="bi bi-search" /> Trova
                         </a>
                       </div>
@@ -1035,7 +1200,13 @@ export function CalendarContent() {
             <div className="modal-body">
               <div className="row g-4">
                 <div className="col-lg-5">
-                  <div id="calendarNotesAlert" />
+                  <div id="calendarNotesAlert">
+                    {notesError ? (
+                      <div className="alert alert-danger py-2 px-3 mb-3" role="alert">
+                        {notesError}
+                      </div>
+                    ) : null}
+                  </div>
                   <form id="calendarNotesForm" className="vstack gap-3">
                     <input type="hidden" id="calendar_note_id" name="id" defaultValue="" />
                     <div>

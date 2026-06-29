@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 // Faithful port of the PHP gestionale chrome (app/lib/View.php): app-shell ->
 // (app-sidebar + app-main -> (topbar + app-content)). Loads the SAME Bootstrap
@@ -98,6 +98,23 @@ function pageHref(slug: string, page: string): string {
   return url + hash;
 }
 
+// Flat, searchable index of every menu function (used by the topbar "Cerca..."
+// jump-to-function search). Each entry keeps the original page key (so pageHref
+// builds the same clean URL the sidebar uses) plus its group label for context.
+type FunctionEntry = { page: string; label: string; icon: string; group: string };
+const FUNCTION_INDEX: FunctionEntry[] = MENU.flatMap((group) =>
+  group.items.map((item) => ({ page: item.page, label: item.label, icon: item.icon, group: group.label ?? "" })),
+);
+
+function normalize(value: string): string {
+  // Lowercase + strip combining diacritics (U+0300–U+036F) so "attività" matches
+  // a typed "attivita" and "disponibilità" matches "disponibilita".
+  return value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/gu, "");
+}
+
 export function ManageShell({
   slug,
   userName,
@@ -154,6 +171,58 @@ export function ManageShell({
   }, []);
 
   const basePage = currentPage.split("&")[0];
+
+  // Topbar "Cerca..." jump-to-function search over the MENU items. Filters the flat
+  // FUNCTION_INDEX as you type and shows a lightweight dropdown of matches; Enter or
+  // a click navigates to the matching page via pageHref (the same clean URL the
+  // sidebar uses). Keyboard: ArrowUp/Down move the highlight, Escape closes.
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  const searchMatches = useMemo(() => {
+    const q = normalize(searchQuery.trim());
+    if (!q) return [] as FunctionEntry[];
+    return FUNCTION_INDEX.filter((entry) => {
+      const haystack = normalize(`${entry.label} ${entry.group} ${entry.page}`);
+      return haystack.includes(q);
+    }).slice(0, 8);
+  }, [searchQuery]);
+
+  // Close the dropdown when clicking outside the search box.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
+        setSearchOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [searchOpen]);
+
+  const goToFunction = (entry: FunctionEntry | undefined) => {
+    if (!entry) return;
+    setSearchOpen(false);
+    window.location.href = pageHref(slug, entry.page);
+  };
+
+  const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSearchOpen(true);
+      setActiveIndex((i) => Math.min(i + 1, Math.max(searchMatches.length - 1, 0)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      goToFunction(searchMatches[activeIndex] ?? searchMatches[0]);
+    } else if (e.key === "Escape") {
+      setSearchOpen(false);
+    }
+  };
 
   return (
     <>
@@ -212,9 +281,51 @@ export function ManageShell({
               <i className="bi bi-list" />
             </button>
 
-            <div className="search d-none d-md-block">
+            <div className="search d-none d-md-block" ref={searchBoxRef}>
               <i className="bi bi-search" />
-              <input type="search" placeholder="Cerca..." />
+              <input
+                type="search"
+                placeholder="Cerca..."
+                value={searchQuery}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setSearchOpen(true);
+                  setActiveIndex(0);
+                }}
+                onFocus={() => {
+                  if (searchQuery.trim()) setSearchOpen(true);
+                }}
+                onKeyDown={onSearchKeyDown}
+                role="combobox"
+                aria-expanded={searchOpen && searchMatches.length > 0}
+                aria-controls="topbarFunctionSearchMenu"
+                aria-autocomplete="list"
+              />
+              {searchOpen && searchMatches.length > 0 ? (
+                <ul
+                  className="dropdown-menu show w-100 mt-1"
+                  id="topbarFunctionSearchMenu"
+                  style={{ position: "absolute", top: "100%", left: 0, maxHeight: "60vh", overflowY: "auto", zIndex: 1080 }}
+                >
+                  {searchMatches.map((entry, i) => (
+                    <li key={entry.page}>
+                      <button
+                        type="button"
+                        className={`dropdown-item d-flex align-items-center gap-2${i === activeIndex ? " active" : ""}`}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          goToFunction(entry);
+                        }}
+                        onMouseEnter={() => setActiveIndex(i)}
+                      >
+                        <i className={`bi bi-${entry.icon}`} />
+                        <span className="flex-grow-1 text-truncate">{entry.label}</span>
+                        {entry.group ? <small className="text-muted">{entry.group}</small> : null}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
             </div>
 
             <div className="actions ms-auto">

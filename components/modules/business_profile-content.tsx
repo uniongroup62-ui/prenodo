@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 // Faithful port of the PHP business profile page (app/pages/business_profile.php):
 // public profile name + "Chi siamo" text, logo branding (position + upload/delete)
@@ -54,6 +54,15 @@ export function BusinessProfileContent() {
   const [coverPositionX, setCoverPositionX] = useState("50");
   const [coverPositionY, setCoverPositionY] = useState("50");
 
+  // Branding upload state: the chosen File enables the (otherwise disabled) Save
+  // button and surfaces its name in the "selezionato" form-text. The hidden file
+  // inputs stay verbatim; the visible .branding-dropzone proxies the click.
+  const logoFileInputRef = useRef<HTMLInputElement | null>(null);
+  const coverFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [logoFile, setLogoFile] = useState<File | null>(null);
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [uploadingKind, setUploadingKind] = useState<"logo" | "cover" | null>(null);
+
   const load = useCallback(() => {
     fetch(`/api/manage/business-settings?slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
@@ -98,6 +107,45 @@ export function BusinessProfileContent() {
       load();
     } catch {
       setFeedback({ type: "danger", text: "Errore di rete." });
+    }
+  }
+
+  // Upload a chosen logo/cover via multipart/form-data — matches the route's
+  // `upload_logo`/`upload_cover` branch (file under business_logo/business_cover,
+  // plus action + kind). On success refresh the preview and clear the selection.
+  async function uploadBranding(kind: "logo" | "cover"): Promise<void> {
+    const file = kind === "logo" ? logoFile : coverFile;
+    if (!file) return;
+    setFeedback(null);
+    setUploadingKind(kind);
+    try {
+      const form = new FormData();
+      form.append("action", kind === "logo" ? "upload_logo" : "upload_cover");
+      form.append("kind", kind);
+      form.append(kind === "logo" ? "business_logo" : "business_cover", file);
+      const res = await fetch(`/api/manage/business-settings?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "x-tenant-slug": slug },
+        body: form,
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.ok === false) {
+        setFeedback({ type: "danger", text: String(j?.error ?? j?.message ?? "Errore.") });
+        return;
+      }
+      setFeedback({ type: "success", text: String(j?.message ?? (kind === "logo" ? "Logo caricato." : "Copertina caricata.")) });
+      if (kind === "logo") {
+        setLogoFile(null);
+        if (logoFileInputRef.current) logoFileInputRef.current.value = "";
+      } else {
+        setCoverFile(null);
+        if (coverFileInputRef.current) coverFileInputRef.current.value = "";
+      }
+      load();
+    } catch {
+      setFeedback({ type: "danger", text: "Errore di rete." });
+    } finally {
+      setUploadingKind(null);
     }
   }
 
@@ -252,29 +300,58 @@ export function BusinessProfileContent() {
                 ) : null}
 
                 <label className="form-label" data-branding-visible-without-image="logo">Carica logo (JPG/PNG)</label>
-                <div className="branding-dropzone" data-branding-uploader="logo" data-branding-visible-without-image="logo">
+                <div
+                  className="branding-dropzone"
+                  data-branding-uploader="logo"
+                  data-branding-visible-without-image="logo"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => logoFileInputRef.current?.click()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      logoFileInputRef.current?.click();
+                    }
+                  }}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files?.[0] ?? null;
+                    if (file) setLogoFile(file);
+                  }}
+                >
                   <div>
                     <div className="fw-semibold">Trascina qui il logo</div>
                     <div className="text-muted small">oppure clicca per selezionarlo (max 5 MB)</div>
                   </div>
                 </div>
                 <input
+                  ref={logoFileInputRef}
                   className="d-none"
                   type="file"
                   data-branding-file-input="logo"
                   data-branding-visible-without-image="logo"
                   accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+                  onChange={(e) => setLogoFile(e.target.files?.[0] ?? null)}
                 />
                 <div className="form-text" data-branding-visible-without-image="logo">
                   Suggerito: logo orizzontale. Viene ridimensionato se necessario.
                 </div>
                 <div className="branding-upload-list" data-branding-upload-list="logo" data-branding-visible-without-image="logo" />
                 <div className="d-flex flex-wrap align-items-center gap-2 mt-2" data-branding-visible-without-image="logo">
-                  <button className="btn btn-primary btn-pill" type="button" data-branding-save="logo" disabled>
+                  <button
+                    className="btn btn-primary btn-pill"
+                    type="button"
+                    data-branding-save="logo"
+                    disabled={!logoFile || uploadingKind === "logo"}
+                    onClick={() => uploadBranding("logo")}
+                  >
                     <i className="bi bi-upload me-1" />
                     Salva logo
                   </button>
-                  <div className="form-text m-0" data-branding-selected="logo">Nessun nuovo logo selezionato.</div>
+                  <div className="form-text m-0" data-branding-selected="logo">
+                    {logoFile ? logoFile.name : "Nessun nuovo logo selezionato."}
+                  </div>
                 </div>
 
                 <form
@@ -406,27 +483,56 @@ export function BusinessProfileContent() {
                 </form>
 
                 <label className="form-label" data-branding-visible-without-image="cover">Carica copertina (JPG/PNG/WEBP)</label>
-                <div className="branding-dropzone" data-branding-uploader="cover" data-branding-visible-without-image="cover">
+                <div
+                  className="branding-dropzone"
+                  data-branding-uploader="cover"
+                  data-branding-visible-without-image="cover"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => coverFileInputRef.current?.click()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      coverFileInputRef.current?.click();
+                    }
+                  }}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files?.[0] ?? null;
+                    if (file) setCoverFile(file);
+                  }}
+                >
                   <div>
                     <div className="fw-semibold">Trascina qui la copertina</div>
                     <div className="text-muted small">oppure clicca per selezionarla (max 5 MB)</div>
                   </div>
                 </div>
                 <input
+                  ref={coverFileInputRef}
                   className="d-none"
                   type="file"
                   data-branding-file-input="cover"
                   data-branding-visible-without-image="cover"
                   accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                  onChange={(e) => setCoverFile(e.target.files?.[0] ?? null)}
                 />
                 <div className="form-text" data-branding-visible-without-image="cover">Max 5 MB. Verra ridimensionata se necessario.</div>
                 <div className="branding-upload-list" data-branding-upload-list="cover" data-branding-visible-without-image="cover" />
                 <div className="d-flex flex-wrap align-items-center gap-2 mt-2" data-branding-visible-without-image="cover">
-                  <button className="btn btn-primary btn-pill" type="button" data-branding-save="cover" disabled>
+                  <button
+                    className="btn btn-primary btn-pill"
+                    type="button"
+                    data-branding-save="cover"
+                    disabled={!coverFile || uploadingKind === "cover"}
+                    onClick={() => uploadBranding("cover")}
+                  >
                     <i className="bi bi-upload me-1" />
                     Salva copertina
                   </button>
-                  <div className="form-text m-0" data-branding-selected="cover">Nessuna nuova copertina selezionata.</div>
+                  <div className="form-text m-0" data-branding-selected="cover">
+                    {coverFile ? coverFile.name : "Nessuna nuova copertina selezionata."}
+                  </div>
                 </div>
 
                 <form
