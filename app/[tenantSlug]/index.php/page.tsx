@@ -53,6 +53,11 @@ import { PackageSettingsContent } from "@/components/modules/package_settings-co
 import { MarketplaceSettingsContent } from "@/components/modules/marketplace-content";
 import { FidelityWalletContent } from "@/components/modules/fidelity_wallet-content";
 import { CreditMovementsContent } from "@/components/modules/credit_movements-content";
+import { ClientSheetsContent } from "@/components/modules/client_sheets-content";
+import { ClientConsentsContent } from "@/components/modules/client_consents-content";
+import { ClientSheetTemplatesContent } from "@/components/modules/client_sheet_templates-content";
+import { FidelityLevelsContent } from "@/components/modules/fidelity_levels-content";
+import { FidelityMembershipSettingsContent } from "@/components/modules/fidelity_membership_settings-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -111,6 +116,11 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   marketplace: MarketplaceSettingsContent,
   fidelity_wallet: FidelityWalletContent,
   credit_movements: CreditMovementsContent,
+  client_sheets: ClientSheetsContent,
+  client_consents: ClientConsentsContent,
+  client_sheet_templates: ClientSheetTemplatesContent,
+  fidelity_levels: FidelityLevelsContent,
+  fidelity_membership_settings: FidelityMembershipSettingsContent,
 };
 
 export default async function TenantIndexPhpPage({
