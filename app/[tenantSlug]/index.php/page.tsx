@@ -37,6 +37,14 @@ import { PosPrepaidsContent } from "@/components/modules/pos_prepaids-content";
 import { PosPreordersContent } from "@/components/modules/pos_preorders-content";
 import { StaffAvailabilityContent } from "@/components/modules/staff_availability-content";
 import { AppointmentsPlanContent } from "@/components/modules/appointments_plan-content";
+import { NotificationsContent } from "@/components/modules/notifications-content";
+import { NotificationsBirthdaysContent } from "@/components/modules/notifications_birthdays-content";
+import { NotificationsInstallmentsContent } from "@/components/modules/notifications_installments-content";
+import { NotificationsQuotesContent } from "@/components/modules/notifications_quotes-content";
+import { RolesContent } from "@/components/modules/roles-content";
+import { GiftcardSettingsContent } from "@/components/modules/giftcard_settings-content";
+import { GiftboxSettingsContent } from "@/components/modules/giftbox_settings-content";
+import { QuoteSettingsContent } from "@/components/modules/quote_settings-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -79,6 +87,14 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   pos_preorders: PosPreordersContent,
   staff_availability: StaffAvailabilityContent,
   appointments_plan: AppointmentsPlanContent,
+  notifications: NotificationsContent,
+  notifications_birthdays: NotificationsBirthdaysContent,
+  notifications_installments: NotificationsInstallmentsContent,
+  notifications_quotes: NotificationsQuotesContent,
+  roles: RolesContent,
+  giftcard_settings: GiftcardSettingsContent,
+  giftbox_settings: GiftboxSettingsContent,
+  quote_settings: QuoteSettingsContent,
 };
 
 export default async function TenantIndexPhpPage({
