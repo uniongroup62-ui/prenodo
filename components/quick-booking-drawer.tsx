@@ -129,6 +129,14 @@ export function QuickBookingDrawer() {
   const [msOpen, setMsOpen] = useState(false);
   const [serviceSearch, setServiceSearch] = useState("");
 
+  // ---- Per-service operator assignment (multi-service #qbMultiStaffPicker) ----
+  // Explicit user picks only (serviceId -> staffId string). The EFFECTIVE map
+  // shown in the picker / written to #qb_staff_map is DERIVED from these picks
+  // plus eligibility + auto-select (see staffMap memo below), so there is no
+  // effect reconciling state-from-state (avoids cascading-render setState, like
+  // the rest of this file). Only meaningful when 2+ services are selected.
+  const [staffPicks, setStaffPicks] = useState<Record<number, string>>({});
+
   // ---- Date / time / location / cabin / status / notes ----
   const [date, setDate] = useState<string>(() => todayIso());
   const [startTime, setStartTime] = useState<string>("");
@@ -184,6 +192,7 @@ export function QuickBookingDrawer() {
   const resetForm = useCallback(() => {
     setClient(null);
     setSelectedServiceIds([]);
+    setStaffPicks({});
     setMsOpen(false);
     setServiceSearch("");
     setDate(todayIso());
@@ -253,6 +262,96 @@ export function QuickBookingDrawer() {
     if (startMin === null || totalDuration <= 0) return "";
     return minToTime(startMin + totalDuration);
   }, [startTime, totalDuration]);
+
+  // ---- Multi-service operator picker (port of renderMultiStaffPicker) ----
+  // The legacy fetches eligible staff per service from the
+  // `staff_for_services` API; here the eligibility is computed client-side from
+  // the context staff exactly as the SCOPE note specifies: a service's eligible
+  // operators are the staff whose serviceIds include that service id. Services
+  // flagged noOperator have no eligible staff (skipped — no select to fill).
+  const eligibleStaffForService = useCallback(
+    (svc: QbService): QbStaff[] => {
+      if (svc.noOperator) return [];
+      return staff.filter((st) => st.active !== false && st.serviceIds.includes(svc.id));
+    },
+    [staff],
+  );
+
+  // Multi-service mode is on when 2+ services are selected (setMultiStaffMode).
+  const isMultiService = selectedServiceIds.length >= 2;
+
+  // The rows rendered into #qbMultiStaffPicker: one per selected service, in the
+  // selection order, each with its eligible operators (port of the html build).
+  const staffPickerRows = useMemo(
+    () =>
+      selectedServiceIds.map((id) => {
+        const svc = services.find((s) => s.id === id);
+        const eligible = svc ? eligibleStaffForService(svc) : [];
+        return {
+          id,
+          name: svc?.name ?? `Servizio #${id}`,
+          eligible,
+          onlyOne: eligible.length === 1,
+          noOperator: !svc || svc.noOperator,
+        };
+      }),
+    [selectedServiceIds, services, eligibleStaffForService],
+  );
+
+  // EFFECTIVE per-service operator map (serviceId -> staffId string, "" = none):
+  // derived from the rows + explicit user picks. Auto-selects when a service has
+  // exactly one eligible operator; otherwise keeps the user's pick when it is
+  // still eligible, else leaves it unselected. noOperator / no-eligible rows are
+  // skipped. Port of renderMultiStaffPicker's per-row value resolution. Empty
+  // (single/zero service) so the single select drives the assignment.
+  const staffMap = useMemo<Record<number, string>>(() => {
+    if (!isMultiService) return {};
+    const out: Record<number, string> = {};
+    for (const row of staffPickerRows) {
+      if (row.noOperator || row.eligible.length === 0) continue;
+      if (row.onlyOne) {
+        out[row.id] = String(row.eligible[0].id);
+      } else {
+        const pick = staffPicks[row.id];
+        out[row.id] = pick && row.eligible.some((st) => String(st.id) === pick) ? pick : "";
+      }
+    }
+    return out;
+  }, [isMultiService, staffPickerRows, staffPicks]);
+
+  // Serialize staffMap -> #qb_staff_map JSON {serviceId: staffId}. Only the
+  // chosen (non-empty) entries are emitted, matching syncStaffMapFromPicker.
+  const staffMapJson = useMemo(() => {
+    const out: Record<string, number | string> = {};
+    for (const [sid, val] of Object.entries(staffMap)) {
+      const v = String(val ?? "").trim();
+      if (v) out[sid] = Number.parseInt(v, 10) || v;
+    }
+    return Object.keys(out).length ? JSON.stringify(out) : "";
+  }, [staffMap]);
+
+  // Summary box text: the distinct chosen operator names (port: names.join(', ')).
+  const staffSummaryText = useMemo(() => {
+    if (!isMultiService) return "";
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const row of staffPickerRows) {
+      const chosen = staffMap[row.id];
+      if (!chosen) continue;
+      const nm = row.eligible.find((st) => String(st.id) === chosen)?.name?.trim();
+      if (nm && !seen.has(nm)) {
+        seen.add(nm);
+        names.push(nm);
+      }
+    }
+    return names.length ? names.join(", ") : "(seleziona operatori)";
+  }, [isMultiService, staffPickerRows, staffMap]);
+
+  const setStaffForService = useCallback((serviceId: number, value: string) => {
+    // Changing any operator invalidates a previously held slot (port: clear hold).
+    setHoldToken("");
+    setStaffPicks((prev) => ({ ...prev, [serviceId]: value }));
+  }, []);
 
   // Changing services / location / date / start time invalidates any held slot
   // (port of qbReleaseAvailabilityHold). We drop the token locally inside the
@@ -485,17 +584,18 @@ export function QuickBookingDrawer() {
       try {
         const staffName = staffId ? staff.find((s) => String(s.id) === staffId)?.name ?? "" : "";
         // MULTI-SERVICE: send ALL selected service names (ordered) so the save
-        // route lays them out as sequential segments. The whole-appointment
-        // operator (`staff_name`) applies to every segment and the explicit
-        // cabin (`cabin_id`) is the primary cabin. The per-service maps
-        // (#qb_staff_map / #qb_cabin_map) are read straight from the hidden
-        // inputs and forwarded as JSON so a future per-service picker that
-        // fills them keeps working — today the drawer leaves them empty and the
-        // single operator/cabin above drive every segment.
-        // TODO(per-service maps UI): wire #qbMultiStaffPicker so the staff/cabin
-        // maps are populated per service (cross-segment availability holds,
-        // redemptions, discounts also still TODO).
-        const staffMapRaw = (document.getElementById("qb_staff_map") as HTMLInputElement | null)?.value ?? "";
+        // route lays them out as sequential segments. For 2+ services the
+        // per-service operator picker (#qbMultiStaffPicker) fills `staff_map`
+        // ({serviceId: staffId} JSON) so each segment gets its own operator; for
+        // a single service the whole-appointment operator (`staff_name`) drives
+        // it and the map is empty. The explicit cabin (`cabin_id`) is the
+        // primary cabin.
+        // TODO(per-service CABIN map): #qb_cabin_map is still empty — in the
+        // legacy the per-service cabin selects are populated AFTER availability
+        // (refreshCabinsForServices) which needs the availability/cabin API that
+        // is not yet wired in the Next manage app. Read straight from the hidden
+        // input so a future picker that fills it keeps working.
+        const staffMapRaw = staffMapJson;
         const cabinMapRaw = (document.getElementById("qb_cabin_map") as HTMLInputElement | null)?.value ?? "";
         const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
           method: "POST",
@@ -533,7 +633,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, cabinId, staffNotes, customerNotes, holdToken, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, cabinId, staffNotes, customerNotes, holdToken, staffMapJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -756,21 +856,67 @@ export function QuickBookingDrawer() {
             <div className="row g-2">
               <div className="col-12">
                 <label className="form-label">Operatore</label>
-                {/* Multi-servizio: la select non rappresenta univocamente l'assegnazione. */}
-                <div id="qbStaffSummaryBox" className="form-control" style={{ display: "none", background: "#f8fafc" }} />
-                <div id="qbStaffSummaryHint" className="form-text" style={{ display: "none" }}>
+                {/* Multi-servizio: la select non rappresenta univocamente l'assegnazione.
+                    Quando sono selezionati 2+ servizi mostriamo un operatore per ogni
+                    servizio (#qbMultiStaffPicker) e un riepilogo, e disabilitiamo la
+                    select singola. Port di setMultiStaffMode/renderMultiStaffPicker. */}
+                <div
+                  id="qbStaffSummaryBox"
+                  className="form-control"
+                  style={{ display: isMultiService ? "block" : "none", background: "#f8fafc" }}
+                >
+                  {isMultiService ? staffSummaryText : ""}
+                </div>
+                <div id="qbStaffSummaryHint" className="form-text" style={{ display: isMultiService ? "block" : "none" }}>
                   Prenotazione multi-servizio: seleziona un operatore per ogni servizio (se un servizio ha un solo operatore verrà selezionato automaticamente).
                 </div>
-                <input type="hidden" name="staff_map" id="qb_staff_map" value="" readOnly />
+                <input type="hidden" name="staff_map" id="qb_staff_map" value={staffMapJson} readOnly />
                 <input type="hidden" name="cabin_map" id="qb_cabin_map" value="" readOnly />
                 <input type="hidden" name="appointment_hold_token" id="qb_appointment_hold_token" value={holdToken} readOnly />
-                <div id="qbMultiStaffPicker" className="mt-2" style={{ display: "none" }} />
+                <div id="qbMultiStaffPicker" className="mt-2" style={{ display: isMultiService ? "block" : "none" }}>
+                  {isMultiService
+                    ? staffPickerRows.map((row) => (
+                        <div className="mb-3" key={row.id}>
+                          <label className="form-label small mb-1">{row.name}</label>
+                          {row.noOperator ? (
+                            // noOperator service: no operator to assign (port: skipped/disabled).
+                            <select className="form-select qb-staff-for-service" data-service-id={row.id} disabled>
+                              <option value="">Senza operatore</option>
+                            </select>
+                          ) : row.eligible.length === 0 ? (
+                            <select className="form-select qb-staff-for-service" data-service-id={row.id} disabled>
+                              <option value="">Nessun operatore disponibile</option>
+                            </select>
+                          ) : (
+                            <select
+                              className="form-select qb-staff-for-service"
+                              data-service-id={row.id}
+                              // Exactly one eligible operator -> auto-selected + locked.
+                              disabled={row.onlyOne}
+                              value={staffMap[row.id] ?? ""}
+                              onChange={(e) => setStaffForService(row.id, e.target.value)}
+                            >
+                              {row.onlyOne ? null : <option value="">(seleziona)</option>}
+                              {row.eligible.map((st) => (
+                                <option value={st.id} key={st.id}>{st.name}</option>
+                              ))}
+                            </select>
+                          )}
+                          {/* TODO(per-service CABIN map): the legacy renders a
+                              qb-cabin-for-service select here too, populated AFTER
+                              availability (refreshCabinsForServices) which needs the
+                              cabin/availability API not yet wired in the Next app. */}
+                        </div>
+                      ))
+                    : null}
+                </div>
                 <select
                   className="form-select"
                   name="staff_id"
                   value={staffId}
                   onChange={(e) => setStaffId(e.target.value)}
-                  disabled={startGateDisabled}
+                  disabled={startGateDisabled || isMultiService}
+                  style={isMultiService ? { display: "none" } : undefined}
                 >
                   <option value="">{startGateDisabled ? "Seleziona prima un servizio" : "Operatore automatico"}</option>
                   {staff.map((st) => (
