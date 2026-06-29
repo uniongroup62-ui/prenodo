@@ -1,11 +1,13 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
-import { ManagementApp } from "@/components/management-app";
+import { DashboardContent } from "@/components/dashboard-content";
+import { ManageShell } from "@/components/manage-shell";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
+import { tenantSelect } from "@/lib/tenant-db";
 
 export const metadata: Metadata = {
-  title: "Dashboard gestionale | Prenodo",
+  title: "Dashboard",
 };
 
 export default async function TenantDashboardPage({
@@ -20,5 +22,26 @@ export default async function TenantDashboardPage({
     redirect(`/${encodeURIComponent(tenantSlug)}/index.php?page=onboarding`);
   }
 
-  return <ManagementApp currentUser={session.user} tenantSlug={tenantSlug} />;
+  let sedeName: string | undefined;
+  try {
+    if (session.user.currentLocationId) {
+      const rows = await tenantSelect({
+        slug: tenantSlug,
+        table: "locations",
+        columns: "name",
+        where: "id = ?",
+        params: [session.user.currentLocationId],
+        limit: 1,
+      });
+      sedeName = (rows[0] as { name?: string } | undefined)?.name;
+    }
+  } catch {
+    // best effort; subtitle just omits the sede name
+  }
+
+  return (
+    <ManageShell slug={tenantSlug} userName={session.user.name} currentPage="dashboard">
+      <DashboardContent sedeName={sedeName} />
+    </ManageShell>
+  );
 }
