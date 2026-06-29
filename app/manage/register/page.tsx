@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { ManageAccountPage } from "@/components/manage-account-page";
+import { ManageRegisterFaithful } from "@/components/manage-register-faithful";
 
 export const metadata: Metadata = {
-  title: "Crea gestionale | Prenodo",
+  title: "Crea il tuo gestionale - BeautySuite",
 };
 
 export default function ManageRegisterPage() {
-  return <ManageAccountPage initialMode="register" initialSlug="centroesteticoelite" />;
+  return <ManageRegisterFaithful initialStep="register" />;
 }

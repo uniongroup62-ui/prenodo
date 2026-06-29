@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { ManageAccountPage } from "@/components/manage-account-page";
+import { ManageResetPasswordFaithful } from "@/components/manage-reset-password-faithful";
 
 export const metadata: Metadata = {
-  title: "Reimposta password | Prenodo",
+  title: "Reimposta password - BeautySuite",
 };
 
 export default async function ManageResetPasswordPage({
@@ -11,5 +11,5 @@ export default async function ManageResetPasswordPage({
   searchParams: Promise<{ slug?: string; token?: string }>;
 }) {
   const { slug, token } = await searchParams;
-  return <ManageAccountPage initialMode="reset-password" initialSlug={slug || "centroesteticoelite"} initialToken={token || ""} />;
+  return <ManageResetPasswordFaithful initialSlug={slug || ""} initialToken={token || ""} />;
 }

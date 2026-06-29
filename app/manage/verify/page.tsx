@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { ManageAccountPage } from "@/components/manage-account-page";
+import { ManageRegisterFaithful } from "@/components/manage-register-faithful";
 
 export const metadata: Metadata = {
-  title: "Verifica email | Prenodo",
+  title: "Verifica la tua email - BeautySuite",
 };
 
 export default async function ManageVerifyPage({
@@ -12,9 +12,9 @@ export default async function ManageVerifyPage({
 }) {
   const { slug, email, signup_id: signupId } = await searchParams;
   return (
-    <ManageAccountPage
-      initialMode="verify"
-      initialSlug={slug || "centroesteticoelite"}
+    <ManageRegisterFaithful
+      initialStep="verify"
+      initialSlug={slug || ""}
       initialEmail={email || ""}
       initialSignupId={Number.parseInt(signupId || "", 10) || 0}
     />
