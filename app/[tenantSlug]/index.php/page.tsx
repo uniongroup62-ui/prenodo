@@ -3,6 +3,14 @@ import { ManagementApp } from "@/components/management-app";
 import { ManageOnboardingApp } from "@/components/manage-onboarding-app";
 import { ManageShell } from "@/components/manage-shell";
 import { ClientsContent } from "@/components/modules/clients-content";
+import { CommissionsContent } from "@/components/modules/commissions-content";
+import { CostsContent } from "@/components/modules/costs-content";
+import { CouponsContent } from "@/components/modules/coupons-content";
+import { LocationsContent } from "@/components/modules/locations-content";
+import { PromotionsContent } from "@/components/modules/promotions-content";
+import { QuotesContent } from "@/components/modules/quotes-content";
+import { RechargesContent } from "@/components/modules/recharges-content";
+import { SuppliersContent } from "@/components/modules/suppliers-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -11,6 +19,14 @@ import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
 // Everything else still falls back to the legacy ManagementApp.
 const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   clients: ClientsContent,
+  suppliers: SuppliersContent,
+  coupons: CouponsContent,
+  costs: CostsContent,
+  commissions: CommissionsContent,
+  quotes: QuotesContent,
+  promotions: PromotionsContent,
+  locations: LocationsContent,
+  recharges: RechargesContent,
 };
 
 export default async function TenantIndexPhpPage({
