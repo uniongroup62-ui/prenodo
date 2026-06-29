@@ -27,12 +27,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 //     action=hold_availability; fills start/end + hold token.
 //   - Submit ("Crea prenotazione") -> POST /api/manage/appointments action=save.
 //
+// MULTI-SERVICE: submit now sends ALL selected services (service_ids +
+// service_names, ordered) so the save route persists them as sequential
+// segments (each with the chosen operator/cabin). The per-service staff/cabin
+// PICKER UI (#qbMultiStaffPicker) is still TODO — the hidden #qb_staff_map /
+// #qb_cabin_map are forwarded as-is so a future picker that fills them works,
+// but today the single operator + cabin select drive every segment.
+//
 // TODO (deep wiring left out, matches the SCOPE note): the redeem flows
 // (giftbox/gift/package/prepaid/giftcard), client history/residuals/card panels,
-// per-service staff/cabin maps + the multi-service summary, the price-details /
-// coupon / fidelity / discount block, hold countdown/renewal, and edit/delete of
-// an existing appointment. Their markup is present but the deep logic depends on
-// many sub-APIs that do not yet exist in the Next manage app.
+// the per-service staff/cabin picker + the multi-service summary, the
+// price-details / coupon / fidelity / discount block, hold countdown/renewal,
+// and edit/delete of an existing appointment. Their markup is present but the
+// deep logic depends on many sub-APIs that do not yet exist in the Next manage app.
 
 type QbCategory = { id: number; name: string };
 type QbService = {
@@ -477,18 +484,32 @@ export function QuickBookingDrawer() {
       setSubmitting(true);
       try {
         const staffName = staffId ? staff.find((s) => String(s.id) === staffId)?.name ?? "" : "";
-        // NOTE: the manage save route resolves the client by NAME and supports a
-        // single service. We send the selected client's name (it resolves to the
-        // existing client) and the FIRST selected service. Multi-service +
-        // per-service staff/cabin are a route limitation (TODO below).
+        // MULTI-SERVICE: send ALL selected service names (ordered) so the save
+        // route lays them out as sequential segments. The whole-appointment
+        // operator (`staff_name`) applies to every segment and the explicit
+        // cabin (`cabin_id`) is the primary cabin. The per-service maps
+        // (#qb_staff_map / #qb_cabin_map) are read straight from the hidden
+        // inputs and forwarded as JSON so a future per-service picker that
+        // fills them keeps working — today the drawer leaves them empty and the
+        // single operator/cabin above drive every segment.
+        // TODO(per-service maps UI): wire #qbMultiStaffPicker so the staff/cabin
+        // maps are populated per service (cross-segment availability holds,
+        // redemptions, discounts also still TODO).
+        const staffMapRaw = (document.getElementById("qb_staff_map") as HTMLInputElement | null)?.value ?? "";
+        const cabinMapRaw = (document.getElementById("qb_cabin_map") as HTMLInputElement | null)?.value ?? "";
         const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
           body: JSON.stringify({
             action: "save",
             client_name: client.full_name,
-            service_name: names[0],
+            // Send ids (robust, ordered) AND names (the route prefers ids).
+            service_ids: selectedServiceIds.join(","),
+            service_names: names,
             staff_name: staffName,
+            staff_map: staffMapRaw,
+            cabin_map: cabinMapRaw,
+            cabin_id: cabinId,
             date,
             time: startTime,
             location_id: locationId,
@@ -512,7 +533,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, staffNotes, customerNotes, holdToken, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, cabinId, staffNotes, customerNotes, holdToken, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).

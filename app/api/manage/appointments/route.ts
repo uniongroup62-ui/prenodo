@@ -282,7 +282,6 @@ export async function POST(request: Request) {
     // when a customer-visible field (date/time/service names) changed.
     const editId = Number.parseInt(String(body.id ?? "0"), 10);
     const isEdit = Number.isFinite(editId) && editId > 0;
-    const serviceName = String(body.service_name ?? body.service ?? "");
     const operator = String(body.staff_name ?? body.operator ?? "");
     const locationId = await resolveManageLocationId({
       slug: tenantSlug,
@@ -291,10 +290,38 @@ export async function POST(request: Request) {
     }) || null;
     const date = String(body.date ?? todayIso());
     const holdToken = emptyToNull(String(body.appointment_hold_token ?? body.hold_token ?? ""));
+
+    // MULTI-SERVICE: the drawer may send `service_ids` (ordered, robust) and/or
+    // `service_names` (ordered array or comma-joined string), plus per-service
+    // `staff_map` / `cabin_map` (serviceId -> staffId / cabinId) and an explicit
+    // `cabin_id`. We prefer `service_ids` (resolving them to names against the
+    // tenant context so createDbAppointment can resolve them by name as before),
+    // falling back to `service_names`. When no multi-service data is present we
+    // fall back to the single `service_name` (single-service path unchanged).
+    const staffMap = parseIdMap(body.staff_map);
+    const cabinMap = parseIdMap(body.cabin_map);
+    const explicitCabinId = parseOptionalId(body.cabin_id);
+    const serviceIds = parseIdList(body.service_ids);
+    let serviceNames = parseServiceNamesFromBody(body);
+    if (serviceIds.length > 0) {
+      // `service_ids` is unambiguous (no comma-in-name issue) so it wins when sent.
+      const context = await publicBookingContext(tenantSlug);
+      serviceNames = serviceIds
+        .map((id) => context.services.find((svc) => svc.id === id)?.name ?? "")
+        .filter(Boolean);
+      if (serviceNames.length !== serviceIds.length) throw new Error("Servizio non trovato o non prenotabile.");
+    }
+    // Primary service name kept for the single-service fallback (first selected).
+    const serviceName = serviceNames[0] ?? String(body.service_name ?? body.service ?? "");
+
     const dbAppointmentInput = {
       slug: tenantSlug,
       clientName: String(body.client_name ?? body.client ?? ""),
       serviceName,
+      serviceNames,
+      staffMap,
+      cabinMap,
+      cabinId: explicitCabinId,
       operator,
       time: String(body.time ?? ""),
       date,
@@ -366,12 +393,91 @@ function parseServiceNames(params: URLSearchParams): string[] {
   return [serviceName ?? ""].filter(Boolean);
 }
 
-function parseServiceNamesFromBody(body: Record<string, string>): string[] {
+function parseServiceNamesFromBody(body: Record<string, unknown>): string[] {
   const raw = body.service_names ?? body.service_name ?? body.service ?? "";
+  // Tolerate a JSON/array of names or a comma-joined string.
+  if (Array.isArray(raw)) {
+    return raw.map((item) => String(item).trim()).filter(Boolean);
+  }
   return String(raw)
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+// Parse an ordered list of positive integer ids from an array, a JSON string, or
+// a comma-joined string ("3,7" / [3,7] / "[3,7]"). Preserves order, drops
+// non-positive/duplicate ids (mirrors the legacy unique_int_list_preserve_order).
+function parseIdList(raw: unknown): number[] {
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        source = JSON.parse(trimmed);
+      } catch {
+        source = trimmed;
+      }
+    }
+  }
+  const parts = Array.isArray(source)
+    ? source
+    : String(source ?? "").split(",");
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const part of parts) {
+    const id = Number.parseInt(String(part).trim(), 10);
+    if (Number.isFinite(id) && id > 0 && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+// Parse a serviceId -> id map (staff_map / cabin_map). Tolerates a JSON object
+// ({"3":7}), a plain object, or "sid:val" pairs joined by comma/semicolon
+// ("3:7,8:2") — the shapes the legacy parse_staff_map / parse_cabin_map accept.
+function parseIdMap(raw: unknown): Record<number, number> {
+  const out: Record<number, number> = {};
+  if (raw === null || raw === undefined || raw === "") return out;
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return out;
+    if (trimmed.startsWith("{")) {
+      try {
+        source = JSON.parse(trimmed);
+      } catch {
+        source = trimmed;
+      }
+    }
+    if (typeof source === "string") {
+      // "sid:val" pairs separated by comma or semicolon.
+      for (const pair of source.split(/[,;]/)) {
+        const [k, v] = pair.split(":");
+        const key = Number.parseInt(String(k ?? "").trim(), 10);
+        const val = Number.parseInt(String(v ?? "").trim(), 10);
+        if (Number.isFinite(key) && key > 0 && Number.isFinite(val) && val > 0) out[key] = val;
+      }
+      return out;
+    }
+  }
+  if (source && typeof source === "object") {
+    for (const [k, v] of Object.entries(source as Record<string, unknown>)) {
+      const key = Number.parseInt(k, 10);
+      const val = Number.parseInt(String(v), 10);
+      if (Number.isFinite(key) && key > 0 && Number.isFinite(val) && val > 0) out[key] = val;
+    }
+  }
+  return out;
+}
+
+// Parse an optional positive integer id (cabin_id); returns null when absent/0.
+function parseOptionalId(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const id = Number.parseInt(String(raw).trim(), 10);
+  return Number.isFinite(id) && id > 0 ? id : null;
 }
 
 function resolveServiceIds(context: PublicBookingContext, serviceNames: string[]): number[] {

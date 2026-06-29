@@ -376,6 +376,112 @@ export async function listDbAppointments({
   return Promise.all(rows.map((row) => mapAppointment(slug, row)));
 }
 
+// Optional MULTI-SERVICE inputs shared by create/update. When `serviceNames`
+// is non-empty the appointment is laid out as SEQUENTIAL segments (port of the
+// legacy api_appointments.php save action). `staffMap`/`cabinMap` are keyed by
+// service id (serviceId -> staffId / serviceId -> cabinId), `cabinId` is the
+// explicit drawer cabin (appointments.cabin_id primary). When `serviceNames` is
+// empty everything falls back to the single `serviceName` path unchanged.
+export type MultiServiceAppointmentInput = {
+  serviceNames?: string[];
+  cabinId?: number | null;
+  staffMap?: Record<number, number>;
+  cabinMap?: Record<number, number>;
+};
+
+// Resolved multi-service plan: the ordered services, the per-position segment
+// layout (sequential in time, each with its own service/staff/cabin), the
+// primary service/cabin, total duration, and the distinct staff ids to write to
+// appointment_staff. Mirrors calc_total_duration_and_primary + rebuild_segments_for_appointment.
+type AppointmentServicePlan = {
+  services: RowDataPacket[];
+  segments: Array<{
+    service: RowDataPacket;
+    staffId: number | null;
+    cabinId: number | null;
+    startsAt: string;
+    endsAt: string;
+    durationMinutes: number;
+  }>;
+  primaryService: RowDataPacket;
+  primaryCabinId: number | null;
+  totalDuration: number;
+  end: string;
+  staffIds: number[];
+};
+
+// Resolve the ordered service list (multi when serviceNames is given, else the
+// single serviceName). Then build the sequential segment layout: segment k runs
+// from the cumulative cursor to cursor + that service's duration, carrying its
+// own staff (staffMap[serviceId], else the single operator) and cabin
+// (cabinMap[serviceId], else the explicit cabinId, else the service's cabin).
+// The primary service is the FIRST one; the primary cabin is the explicit
+// cabinId when provided, else the first service's cabin. Tenant-scoped via the
+// resolve* helpers.
+async function planAppointmentServices({
+  slug,
+  serviceName,
+  serviceNames,
+  operatorStaffId,
+  cabinId,
+  staffMap,
+  cabinMap,
+  start,
+}: {
+  slug: string;
+  serviceName: string;
+  serviceNames: string[];
+  operatorStaffId: number | null;
+  cabinId: number | null;
+  staffMap: Record<number, number>;
+  cabinMap: Record<number, number>;
+  start: string;
+}): Promise<AppointmentServicePlan> {
+  // Resolve services in order. Backward compatible: when serviceNames is empty
+  // fall back to the single serviceName (single-service path unchanged).
+  const orderedNames = serviceNames.length > 0 ? serviceNames : [serviceName];
+  const services: RowDataPacket[] = [];
+  for (const name of orderedNames) {
+    services.push(await resolveServiceForAppointment(slug, name));
+  }
+
+  const primaryService = services[0];
+  const primaryCabinId = cabinId ?? (primaryService.cabin_id === null || primaryService.cabin_id === undefined ? null : Number(primaryService.cabin_id) || null);
+
+  const segments: AppointmentServicePlan["segments"] = [];
+  const staffIdSet = new Set<number>();
+  let cursor = start;
+  let totalDuration = 0;
+  for (const service of services) {
+    const serviceId = Number(service.id ?? 0);
+    const duration = Number(service.duration_min ?? 30);
+    // Per-service staff: the explicit staffMap entry wins, else the single
+    // operator (single-service path). 0 means "unassigned" → null segment staff.
+    const mappedStaff = Number(staffMap[serviceId] ?? 0) || 0;
+    const segStaffId = mappedStaff > 0 ? mappedStaff : operatorStaffId;
+    // Per-service cabin: cabinMap entry, else the explicit drawer cabin, else
+    // the service's own cabin (mirrors the legacy candidate fallback chain).
+    const mappedCabin = Number(cabinMap[serviceId] ?? 0) || 0;
+    const serviceCabin = service.cabin_id === null || service.cabin_id === undefined ? null : Number(service.cabin_id) || null;
+    const segCabinId = mappedCabin > 0 ? mappedCabin : (cabinId ?? serviceCabin);
+    const segEnd = addMinutesSqlDate(cursor, duration);
+    segments.push({ service, staffId: segStaffId, cabinId: segCabinId, startsAt: cursor, endsAt: segEnd, durationMinutes: duration });
+    if (segStaffId && segStaffId > 0) staffIdSet.add(segStaffId);
+    cursor = segEnd;
+    totalDuration += duration;
+  }
+
+  return {
+    services,
+    segments,
+    primaryService,
+    primaryCabinId,
+    totalDuration,
+    end: cursor,
+    staffIds: Array.from(staffIdSet),
+  };
+}
+
 export async function createDbAppointment({
   slug,
   clientName,
@@ -387,6 +493,10 @@ export async function createDbAppointment({
   holdToken,
   staffNotes,
   customerNotes,
+  serviceNames = [],
+  cabinId = null,
+  staffMap = {},
+  cabinMap = {},
 }: {
   slug: string;
   clientName: string;
@@ -398,14 +508,23 @@ export async function createDbAppointment({
   holdToken?: string | null;
   staffNotes?: string | null;
   customerNotes?: string | null;
-}): Promise<AppointmentWithMeta> {
+} & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   const client = await resolveClientForAppointment(slug, clientName, locationId);
-  const service = await resolveServiceForAppointment(slug, serviceName);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
+  const operatorStaffId = staff ? Number(staff.id ?? 0) : null;
   const normalizedTime = normalizeTime(time);
   const start = `${date} ${normalizedTime}:00`;
-  const duration = Number(service.duration_min ?? 30);
-  const end = addMinutesSqlDate(start, duration);
+  const plan = await planAppointmentServices({
+    slug,
+    serviceName,
+    serviceNames,
+    operatorStaffId,
+    cabinId,
+    staffMap,
+    cabinMap,
+    start,
+  });
+  const end = plan.end;
   const token = (holdToken ?? "").trim();
   if (token) {
     await assertDbAppointmentHold({
@@ -413,16 +532,16 @@ export async function createDbAppointment({
       token,
       ownerKey: "manage",
       startsAt: start,
-      serviceId: Number(service.id ?? 0),
-      staffId: staff ? Number(staff.id ?? 0) : null,
+      serviceId: Number(plan.primaryService.id ?? 0),
+      staffId: operatorStaffId,
       locationId,
     });
   }
   const appointments = await tenantTable(slug, "appointments");
   const id = await tenantInsert(appointments, {
     client_id: client.id,
-    service_id: service.id,
-    cabin_id: service.cabin_id ?? null,
+    service_id: plan.primaryService.id,
+    cabin_id: plan.primaryCabinId,
     starts_at: start,
     ends_at: end,
     status: "pending",
@@ -432,10 +551,15 @@ export async function createDbAppointment({
     customer_notes: customerNotes || null,
   });
 
-  await insertAppointmentService(slug, id, service);
-  if (staff) await insertAppointmentStaff(slug, id, staff.id);
+  // One appointment_services snapshot row per selected service (ordered).
+  for (const service of plan.services) await insertAppointmentService(slug, id, service);
+  // Distinct staff across all services (single operator + per-service staff).
+  for (const staffId of plan.staffIds) await insertAppointmentStaff(slug, id, staffId);
   if (locationId) await insertAppointmentLocation(slug, id, locationId);
-  await insertAppointmentSegment(slug, id, service, staff ? Number(staff.id ?? 0) : null, start, end, duration);
+  // Sequential segments: position 0..n, each from cursor to cursor+duration.
+  for (const [position, seg] of plan.segments.entries()) {
+    await insertAppointmentSegment(slug, id, seg.service, seg.staffId, seg.startsAt, seg.endsAt, seg.durationMinutes, position, seg.cabinId);
+  }
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
@@ -462,6 +586,10 @@ export async function updateDbAppointment({
   holdToken,
   staffNotes,
   customerNotes,
+  serviceNames = [],
+  cabinId = null,
+  staffMap = {},
+  cabinMap = {},
 }: {
   slug: string;
   id: number;
@@ -474,19 +602,28 @@ export async function updateDbAppointment({
   holdToken?: string | null;
   staffNotes?: string | null;
   customerNotes?: string | null;
-}): Promise<AppointmentWithMeta> {
+} & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   // Tenant-scoped existence guard: the SELECT only returns rows for this tenant,
   // so a row from another tenant (or a missing id) yields no match.
   const existingRows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id", where: "id = ?", params: [id], limit: 1 });
   if (!existingRows[0]) throw new Error("Appuntamento non trovato.");
 
   const client = await resolveClientForAppointment(slug, clientName, locationId);
-  const service = await resolveServiceForAppointment(slug, serviceName);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
+  const operatorStaffId = staff ? Number(staff.id ?? 0) : null;
   const normalizedTime = normalizeTime(time);
   const start = `${date} ${normalizedTime}:00`;
-  const duration = Number(service.duration_min ?? 30);
-  const end = addMinutesSqlDate(start, duration);
+  const plan = await planAppointmentServices({
+    slug,
+    serviceName,
+    serviceNames,
+    operatorStaffId,
+    cabinId,
+    staffMap,
+    cabinMap,
+    start,
+  });
+  const end = plan.end;
   const token = (holdToken ?? "").trim();
   if (token) {
     await assertDbAppointmentHold({
@@ -494,8 +631,8 @@ export async function updateDbAppointment({
       token,
       ownerKey: "manage",
       startsAt: start,
-      serviceId: Number(service.id ?? 0),
-      staffId: staff ? Number(staff.id ?? 0) : null,
+      serviceId: Number(plan.primaryService.id ?? 0),
+      staffId: operatorStaffId,
       locationId,
     });
   }
@@ -506,8 +643,8 @@ export async function updateDbAppointment({
     id,
     values: {
       client_id: client.id,
-      service_id: service.id,
-      cabin_id: service.cabin_id ?? null,
+      service_id: plan.primaryService.id,
+      cabin_id: plan.primaryCabinId,
       starts_at: start,
       ends_at: end,
       location_id: locationId,
@@ -523,10 +660,15 @@ export async function updateDbAppointment({
   await deleteAppointmentChildren(slug, "appointment_locations", id);
   await deleteAppointmentChildren(slug, "appointment_segments", id);
 
-  await insertAppointmentService(slug, id, service);
-  if (staff) await insertAppointmentStaff(slug, id, staff.id);
+  // One appointment_services snapshot row per selected service (ordered).
+  for (const service of plan.services) await insertAppointmentService(slug, id, service);
+  // Distinct staff across all services (single operator + per-service staff).
+  for (const staffId of plan.staffIds) await insertAppointmentStaff(slug, id, staffId);
   if (locationId) await insertAppointmentLocation(slug, id, locationId);
-  await insertAppointmentSegment(slug, id, service, staff ? Number(staff.id ?? 0) : null, start, end, duration);
+  // Sequential segments: position 0..n, each from cursor to cursor+duration.
+  for (const [position, seg] of plan.segments.entries()) {
+    await insertAppointmentSegment(slug, id, seg.service, seg.staffId, seg.startsAt, seg.endsAt, seg.durationMinutes, position, seg.cabinId);
+  }
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
@@ -3304,6 +3446,11 @@ async function insertAppointmentLocation(slug: string, appointmentId: number, lo
   }
 }
 
+// Insert one appointment_segments row. `position` is the 0-based sequential index
+// (legacy rebuild_segments_for_appointment uses a 0-based cursor); `cabinId`, when
+// provided, overrides the service's own cabin (per-service cabin map / explicit
+// drawer cabin). Both default to the single-service behaviour (position 0, service
+// cabin) for backward compatibility.
 async function insertAppointmentSegment(
   slug: string,
   appointmentId: number,
@@ -3312,6 +3459,8 @@ async function insertAppointmentSegment(
   startsAt: string,
   endsAt: string,
   durationMinutes: number,
+  position = 0,
+  cabinId?: number | null,
 ): Promise<void> {
   try {
     await tenantInsert(await tenantTable(slug, "appointment_segments"), {
@@ -3319,11 +3468,11 @@ async function insertAppointmentSegment(
       service_id: Number(service.id ?? 0),
       service_name: String(service.name ?? ""),
       staff_id: staffId ?? 0,
-      position: 1,
+      position,
       starts_at: startsAt,
       ends_at: endsAt,
       duration_minutes: durationMinutes,
-      cabin_id: service.cabin_id ?? null,
+      cabin_id: cabinId === undefined ? (service.cabin_id ?? null) : cabinId,
     });
   } catch {
     // compatibility
