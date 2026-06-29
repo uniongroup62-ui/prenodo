@@ -11,6 +11,12 @@ import { PromotionsContent } from "@/components/modules/promotions-content";
 import { QuotesContent } from "@/components/modules/quotes-content";
 import { RechargesContent } from "@/components/modules/recharges-content";
 import { SuppliersContent } from "@/components/modules/suppliers-content";
+import { CabinsContent } from "@/components/modules/cabins-content";
+import { GiftcardContent } from "@/components/modules/giftcard-content";
+import { GiftsContent } from "@/components/modules/gifts-content";
+import { HoursContent } from "@/components/modules/hours-content";
+import { ProductsContent } from "@/components/modules/products-content";
+import { StaffContent } from "@/components/modules/staff-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -27,6 +33,12 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   promotions: PromotionsContent,
   locations: LocationsContent,
   recharges: RechargesContent,
+  products: ProductsContent,
+  cabins: CabinsContent,
+  staff: StaffContent,
+  hours: HoursContent,
+  gifts: GiftsContent,
+  giftcard: GiftcardContent,
 };
 
 export default async function TenantIndexPhpPage({
