@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import { PublicAccountPage } from "@/components/public-account-page";
+import { AccountLoginFaithful } from "@/components/public/account-login-faithful";
 
 export const metadata: Metadata = {
-  title: "Account cliente | Prenodo",
+  title: "Accedi al tuo account - BeautySuite",
 };
 
 export default function AccountLoginPage() {
-  return <PublicAccountPage initialMode="login" />;
+  return <AccountLoginFaithful />;
 }
