@@ -6,8 +6,10 @@ import { QuickBookingDrawer } from "@/components/quick-booking-drawer";
 // Faithful port of the PHP gestionale chrome (app/lib/View.php): app-shell ->
 // (app-sidebar + app-main -> (topbar + app-content)). Loads the SAME Bootstrap
 // 5.3.3 + Bootstrap Icons + Chart.js + app.css the PHP dashboard uses.
-// app.js behaviors (sidebar collapse, notifications polling, quick-booking
-// drawer) are not wired yet.
+// Ported app.js behaviors: sidebar collapse, sidebar submenu expand/collapse,
+// notification bell counts, the topbar location switcher, the support/closure
+// sticky alerts, the #appToastContainer + global window.notify(), and the
+// quick-booking drawer (in components/quick-booking-drawer.tsx).
 
 type Item = { page: string; icon: string; label: string; sub?: boolean };
 type Group = { label?: string; items: Item[] };
@@ -83,6 +85,31 @@ const MENU: Group[] = [
   },
 ];
 
+// A rendered menu entry: a top-level item plus the consecutive sub-items that
+// follow it (its submenu children). Faithful port of buildSidebarSubmenus() in
+// assets/js/app.js, which groups each run of `.nav-subitem` after a parent
+// `.nav-item` into a collapsible `.sidebar-submenu` wrapper. This MUST happen
+// because app.css hides any `.nav-subitem` left as a direct child of
+// `.nav-section` (`.app-sidebar .nav-section > .nav-subitem{display:none}`).
+type RenderedItem = { item: Item; children: Item[] };
+type RenderedGroup = { label?: string; entries: RenderedItem[] };
+
+function buildRenderedMenu(groups: Group[]): RenderedGroup[] {
+  return groups.map((group) => {
+    const entries: RenderedItem[] = [];
+    for (const item of group.items) {
+      if (item.sub && entries.length > 0) {
+        entries[entries.length - 1].children.push(item);
+      } else {
+        entries.push({ item, children: [] });
+      }
+    }
+    return { label: group.label, entries };
+  });
+}
+
+const RENDERED_MENU: RenderedGroup[] = buildRenderedMenu(MENU);
+
 // Build a clean manage URL from a menu page key. The key may embed a legacy
 // query (`costs&tab=categories`, `products&action=categories`) or hash anchor
 // (`fidelity_points#livelli-card`); the page becomes the path segment and the
@@ -107,6 +134,21 @@ const FUNCTION_INDEX: FunctionEntry[] = MENU.flatMap((group) =>
   group.items.map((item) => ({ page: item.page, label: item.label, icon: item.icon, group: group.label ?? "" })),
 );
 
+// Shell-context shapes returned by /api/manage/shell-context.
+type NotifCounts = { count: number; quotes: number; installments: number; birthdays: number };
+type ShellLocation = { id: number; name: string };
+type ShellSupport = { created_by_email?: string; reason?: string; expires_at?: string };
+type ShellClosure = { start: string; end: string };
+
+// Bootstrap's global, loaded by the CDN <script> in the shell. Only the Toast
+// API surface notify() needs is declared, to stay strict-mode clean.
+type BootstrapToast = { show: () => void };
+type BootstrapGlobal = {
+  Toast?: {
+    getOrCreateInstance: (el: Element, options?: { delay?: number }) => BootstrapToast;
+  };
+};
+
 function normalize(value: string): string {
   // Lowercase + strip combining diacritics (U+0300–U+036F) so "attività" matches
   // a typed "attivita" and "disponibilità" matches "disponibilita".
@@ -114,6 +156,23 @@ function normalize(value: string): string {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[̀-ͯ]/gu, "");
+}
+
+// Port of the View.php closure-alert date format: "YYYY-MM-DD" -> "d/m/Y",
+// falling back to the raw value when it can't be parsed.
+function formatClosureDate(value: string): string {
+  const m = String(value ?? "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : String(value ?? "");
+}
+
+// Port of $supportExpiresLabel: "YYYY-MM-DD HH:MM:SS" -> "d/m/Y H:i".
+function formatSupportExpires(value?: string): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (m) return `${m[3]}/${m[2]}/${m[1]} ${m[4]}:${m[5]}`;
+  const dm = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return dm ? `${dm[3]}/${dm[2]}/${dm[1]}` : raw;
 }
 
 export function ManageShell({
@@ -173,6 +232,119 @@ export function ManageShell({
 
   const basePage = currentPage.split("&")[0];
 
+  // Shell context (notification bell counts, location selector options, and the
+  // support/closure sticky alerts) fetched once on mount from the new
+  // /api/manage/shell-context route — a port of the View.php topbar context.
+  // The legacy chrome computes these server-side at render with no polling, so a
+  // single fetch matches its semantics.
+  const [notif, setNotif] = useState<NotifCounts>({ count: 0, quotes: 0, installments: 0, birthdays: 0 });
+  const [locations, setLocations] = useState<ShellLocation[]>([]);
+  const [currentLocationId, setCurrentLocationId] = useState(0);
+  const [supportAccess, setSupportAccess] = useState<ShellSupport | null>(null);
+  const [closureRange, setClosureRange] = useState<ShellClosure | null>(null);
+  const supportExpiresLabel = formatSupportExpires(supportAccess?.expires_at);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(`/api/manage/shell-context?slug=${encodeURIComponent(slug)}`, {
+      credentials: "include",
+      signal: controller.signal,
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data || data.ok === false) return;
+        const n = data.notif ?? {};
+        setNotif({
+          count: Number(n.count ?? 0),
+          quotes: Number(n.quotes ?? 0),
+          installments: Number(n.installments ?? 0),
+          birthdays: Number(n.birthdays ?? 0),
+        });
+        setLocations(Array.isArray(data.locations) ? data.locations : []);
+        setCurrentLocationId(Number(data.currentLocationId ?? 0));
+        setSupportAccess(data.supportAccess ?? null);
+        setClosureRange(data.closureRange ?? null);
+      })
+      .catch(() => {
+        // best effort, like the PHP chrome which silently renders 0 on failure
+      });
+    return () => controller.abort();
+  }, [slug]);
+
+  // Submenu expand/collapse state. Port of app.js's setExpandedSubmenu(): a run
+  // opens by default when it contains the active child (so the active deep link
+  // stays revealed on load); the chevron toggles it. We track only explicit user
+  // toggles and derive the effective open state, so no setState-in-effect is
+  // needed (and the default re-resolves if the active page changes).
+  const [submenuToggles, setSubmenuToggles] = useState<Record<string, boolean>>({});
+  const toggleSubmenu = (page: string, defaultOpen: boolean) => {
+    setSubmenuToggles((prev) => ({ ...prev, [page]: !(prev[page] ?? defaultOpen) }));
+  };
+
+  // Change the current location and reload, like the legacy #topbarLocationSwitch
+  // (which navigates with ?set_location_id=<id>). The Next equivalent persists
+  // the choice on the manage session via POST /api/manage/locations, then
+  // reloads so every server component re-reads the new current location.
+  const switchLocation = async (locationId: number) => {
+    if (!locationId || locationId === currentLocationId) return;
+    try {
+      await fetch(`/api/manage/locations?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ location_id: locationId }),
+      });
+    } catch {
+      // fall through to reload; the server keeps the prior location on failure
+    }
+    window.location.reload();
+  };
+
+  // Expose a global notify(message, variant) toast helper — a faithful port of
+  // the legacy notify() in assets/js/app.js: appends a Bootstrap toast to
+  // #appToastContainer with a 4.5s auto-dismiss, removing it on hide. Page code
+  // calls window.notify(...) just like it called the global notify() in PHP.
+  useEffect(() => {
+    const escHtml = (s: unknown): string =>
+      String(s ?? "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m] ?? m));
+    const VARIANTS = ["primary", "secondary", "success", "danger", "warning", "info", "light", "dark"];
+
+    const notify = (message: string, variant = "info") => {
+      const container = document.getElementById("appToastContainer") ?? document.body;
+      const v = String(variant || "info");
+      const bgClass = VARIANTS.includes(v) ? `text-bg-${v}` : "text-bg-info";
+
+      const el = document.createElement("div");
+      el.className = `toast align-items-center ${bgClass} border-0 app-toast`;
+      el.setAttribute("role", "alert");
+      el.setAttribute("aria-live", "assertive");
+      el.setAttribute("aria-atomic", "true");
+      el.innerHTML = `
+      <div class="d-flex">
+        <div class="toast-body">${escHtml(message)}</div>
+        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Chiudi"></button>
+      </div>`;
+      container.appendChild(el);
+
+      const bootstrap = (window as unknown as { bootstrap?: BootstrapGlobal }).bootstrap;
+      try {
+        if (!bootstrap?.Toast) throw new Error("bootstrap-unavailable");
+        const toast = bootstrap.Toast.getOrCreateInstance(el, { delay: 4500 });
+        el.addEventListener("hidden.bs.toast", () => el.remove());
+        toast.show();
+      } catch {
+        // Fallback (bootstrap JS not yet loaded): show plainly, auto-remove.
+        el.style.display = "block";
+        window.setTimeout(() => el.remove(), 4500);
+      }
+    };
+
+    (window as unknown as { notify?: typeof notify }).notify = notify;
+    return () => {
+      delete (window as unknown as { notify?: typeof notify }).notify;
+    };
+  }, []);
+
   // Topbar "Cerca..." jump-to-function search over the MENU items. Filters the flat
   // FUNCTION_INDEX as you type and shows a lightweight dropdown of matches; Enter or
   // a click navigates to the matching page via pageHref (the same clean URL the
@@ -207,6 +379,25 @@ export function ManageShell({
     if (!entry) return;
     setSearchOpen(false);
     window.location.href = pageHref(slug, entry.page);
+  };
+
+  // Render a notification bell driven by a real count: `has-notifications` on
+  // the anchor when count>0, and a `bell-badge` (hidden when 0, "99+" capped).
+  // Faithful port of the View.php topbar bells.
+  const renderBell = (page: string, icon: string, label: string, count: number) => {
+    const hasCount = count > 0;
+    const display = count > 99 ? "99+" : String(count);
+    return (
+      <a
+        className={`icon-btn position-relative notification-bell${hasCount ? " has-notifications" : ""}`}
+        href={pageHref(slug, page)}
+        title={hasCount ? `${count} ${label.toLowerCase()}` : label}
+        aria-label={hasCount ? `${label}: ${count}` : label}
+      >
+        <i className={`bi bi-${icon}`} />
+        <span className={`bell-badge${hasCount ? "" : " d-none"}`}>{display}</span>
+      </a>
+    );
   };
 
   const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -249,19 +440,68 @@ export function ManageShell({
             </button>
           </div>
 
-          {MENU.map((group, gi) => (
+          {RENDERED_MENU.map((group, gi) => (
             <div className="nav-section" key={gi}>
               {group.label ? <div className="nav-label">{group.label}</div> : null}
-              {group.items.map((item) => (
-                <a
-                  key={item.page}
-                  className={`nav-item ${item.sub ? "nav-subitem " : ""}${basePage === item.page.split("&")[0] ? "active" : ""}`.trim()}
-                  href={pageHref(slug, item.page)}
-                >
-                  <i className={`bi bi-${item.icon}`} />
-                  {item.label}
-                </a>
-              ))}
+              {group.entries.map((entry) => {
+                const { item, children } = entry;
+                const hasSubmenu = children.length > 0;
+                const hasActiveChild = children.some((child) => basePage === child.page.split("&")[0]);
+                const open = submenuToggles[item.page] ?? hasActiveChild;
+                const parentClasses = [
+                  "nav-item",
+                  basePage === item.page.split("&")[0] ? "active" : "",
+                  hasSubmenu ? "has-submenu" : "",
+                  hasSubmenu && hasActiveChild ? "has-active-child" : "",
+                  hasSubmenu && open ? "is-submenu-open" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ");
+                return (
+                  <div key={item.page} style={{ display: "contents" }}>
+                    <a
+                      className={parentClasses}
+                      href={pageHref(slug, item.page)}
+                      data-label={item.label}
+                      title={item.label}
+                      aria-haspopup={hasSubmenu ? "true" : undefined}
+                      aria-expanded={hasSubmenu ? (open ? "true" : "false") : undefined}
+                    >
+                      <i className={`bi bi-${item.icon}`} />
+                      {item.label}
+                      {hasSubmenu ? (
+                        <span
+                          className="sidebar-chevron"
+                          aria-hidden="true"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            toggleSubmenu(item.page, hasActiveChild);
+                          }}
+                        >
+                          <i className={`bi bi-chevron-${open ? "up" : "down"}`} />
+                        </span>
+                      ) : null}
+                    </a>
+                    {hasSubmenu ? (
+                      <div className={`sidebar-submenu${open ? " is-open" : ""}`} hidden={!open}>
+                        {children.map((child) => (
+                          <a
+                            key={child.page}
+                            className={`nav-item nav-subitem submenu-child ${basePage === child.page.split("&")[0] ? "active" : ""}`.trim()}
+                            href={pageHref(slug, child.page)}
+                            data-label={child.label}
+                            title={child.label}
+                          >
+                            <i className={`bi bi-${child.icon}`} />
+                            {child.label}
+                          </a>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
           ))}
 
@@ -330,6 +570,24 @@ export function ManageShell({
             </div>
 
             <div className="actions ms-auto">
+              {locations.length > 1 && currentLocationId > 0 ? (
+                <select
+                  className="form-select form-select-sm"
+                  id="topbarLocationSwitch"
+                  style={{ width: "auto", minWidth: 180 }}
+                  title="Sede corrente"
+                  value={currentLocationId}
+                  onChange={(e) => switchLocation(Number(e.target.value))}
+                >
+                  {locations
+                    .filter((loc) => loc.id > 0)
+                    .map((loc) => (
+                      <option key={loc.id} value={loc.id}>
+                        {loc.name || `Sede #${loc.id}`}
+                      </option>
+                    ))}
+                </select>
+              ) : null}
               <button
                 className="btn btn-primary btn-pill"
                 type="button"
@@ -339,22 +597,10 @@ export function ManageShell({
                 <i className="bi bi-plus-lg me-1" />
                 <span className="topbar-action-text">Prenotazione</span>
               </button>
-              <a className="icon-btn position-relative notification-bell" href={pageHref(slug, "notifications_birthdays")} title="Compleanni clienti" aria-label="Compleanni clienti">
-                <i className="bi bi-cake2" />
-                <span className="bell-badge d-none">0</span>
-              </a>
-              <a className="icon-btn position-relative notification-bell" href={pageHref(slug, "notifications_installments")} title="Rate in scadenza / scadute" aria-label="Rate in scadenza / scadute">
-                <i className="bi bi-cash-stack" />
-                <span className="bell-badge d-none">0</span>
-              </a>
-              <a className="icon-btn position-relative notification-bell" href={pageHref(slug, "notifications_quotes")} title="Preventivi" aria-label="Preventivi">
-                <i className="bi bi-file-earmark-text" />
-                <span className="bell-badge d-none">0</span>
-              </a>
-              <a className="icon-btn position-relative notification-bell" href={pageHref(slug, "notifications")} title="Notifiche" aria-label="Notifiche">
-                <i className="bi bi-bell" />
-                <span className="bell-badge d-none">0</span>
-              </a>
+              {renderBell("notifications_birthdays", "cake2", "Compleanni clienti", notif.birthdays)}
+              {renderBell("notifications_installments", "cash-stack", "Rate in scadenza / scadute", notif.installments)}
+              {renderBell("notifications_quotes", "file-earmark-text", "Preventivi", notif.quotes)}
+              {renderBell("notifications", "bell", "Notifiche", notif.count)}
               <div className="dropdown">
                 <button className="icon-btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Account">
                   <i className="bi bi-person-circle" />
@@ -372,9 +618,67 @@ export function ManageShell({
             </div>
           </header>
 
+          {/* SUPPORT ACCESS sticky alert (verbatim port of View.php) — shown when
+              an operator is acting through a support session. */}
+          {supportAccess ? (
+            <div className="alert alert-info border-0 rounded-0 mb-0 py-2" style={{ position: "sticky", top: 64, zIndex: 1021 }}>
+              <div className="container-fluid">
+                <div className="d-flex align-items-center gap-2">
+                  <i className="bi bi-shield-check" />
+                  <div className="flex-grow-1">
+                    <strong>Accesso supporto attivo.</strong>
+                    {supportAccess.created_by_email ? <> Generato da {supportAccess.created_by_email}.</> : null}
+                    {supportAccess.reason ? <> Motivo: {supportAccess.reason}.</> : null}
+                    {supportExpiresLabel ? <> Scade: {supportExpiresLabel}.</> : null}
+                  </div>
+                  <a className="btn btn-sm btn-outline-primary" href={`/${encodeURIComponent(slug)}/index.php?page=logout`}>
+                    Termina accesso
+                  </a>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {/* STORE CLOSURE sticky alert (verbatim port of View.php) — nearest
+              upcoming closure window; offset by 40px when support alert is shown. */}
+          {closureRange ? (
+            <div
+              className="alert alert-warning border-0 rounded-0 mb-0 py-2"
+              style={{ position: "sticky", top: supportAccess ? 104 : 64, zIndex: 1020 }}
+            >
+              <div className="container-fluid">
+                <div className="d-flex align-items-center gap-2">
+                  <i className="bi bi-exclamation-triangle-fill" />
+                  <div className="flex-grow-1">
+                    {closureRange.start === closureRange.end ? (
+                      <>
+                        <strong>Chiusura negozio:</strong> il negozio sarà chiuso il{" "}
+                        <strong>{formatClosureDate(closureRange.start)}</strong>.
+                      </>
+                    ) : (
+                      <>
+                        <strong>Chiusura negozio:</strong> il negozio sarà chiuso dal{" "}
+                        <strong>{formatClosureDate(closureRange.start)}</strong> al{" "}
+                        <strong>{formatClosureDate(closureRange.end)}</strong>.
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           <main className="app-content">{children}</main>
         </div>
       </div>
+
+      {/* GLOBAL toast container — target for the window.notify() port of the
+          legacy assets/js/app.js notify()/#appToastContainer. */}
+      <div
+        id="appToastContainer"
+        className="toast-container position-fixed bottom-0 end-0 p-3"
+        style={{ zIndex: 1080 }}
+      />
 
       {/* GLOBAL quick-booking offcanvas: present on every manage page so any
           [data-qb-new] button (incl. the topbar "+ Prenotazione" above) opens it
