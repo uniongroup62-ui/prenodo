@@ -17,6 +17,8 @@ import { GiftsContent } from "@/components/modules/gifts-content";
 import { HoursContent } from "@/components/modules/hours-content";
 import { ProductsContent } from "@/components/modules/products-content";
 import { StaffContent } from "@/components/modules/staff-content";
+import { ResourcesContent } from "@/components/modules/resources-content";
+import { GiftboxContent } from "@/components/modules/giftbox-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -39,6 +41,8 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   hours: HoursContent,
   gifts: GiftsContent,
   giftcard: GiftcardContent,
+  resources: ResourcesContent,
+  giftbox: GiftboxContent,
 };
 
 export default async function TenantIndexPhpPage({
