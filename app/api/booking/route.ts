@@ -1,4 +1,4 @@
-import { buildSlots, createAppointmentHold, todayIso } from "@/lib/appointment-engine";
+import { buildSlots, todayIso } from "@/lib/appointment-engine";
 import { parseRequestBody } from "@/lib/api-utils";
 import { dbFirstValue } from "@/lib/db-first";
 import {
@@ -75,15 +75,15 @@ export async function POST(request: Request) {
       const staffId = parseOptionalId(body.staff_id);
       const locationId = parseOptionalId(body.location_id);
       const ownerKey = ownerKeyForRequest(request, body.owner_key);
-      const { value: hold, sourceMode } = await dbFirstValue(
-        () => holdPublicBookingSlot({ slug, date, time, serviceIds, staffId, locationId, ownerKey }),
-        () => demoHold({ date, time, serviceIds }),
-      );
+      // Write action: never fake a hold on a DB failure — surface the error so
+      // the client can retry (a fake demo hold would let confirm "succeed" with
+      // no real reservation).
+      const hold = await holdPublicBookingSlot({ slug, date, time, serviceIds, staffId, locationId, ownerKey });
 
       return Response.json({
         ok: true,
         source: "app/pages/booking.php?mode=hold_slot",
-        sourceMode,
+        sourceMode: "database",
         hold,
       });
     }
@@ -100,45 +100,37 @@ export async function POST(request: Request) {
 
     const benefit = parseBenefit(body.benefit_id);
     const ownerKey = ownerKeyForRequest(request, body.owner_key);
-    const { value: confirmation, sourceMode } = await dbFirstValue(
-      () => confirmPublicBooking({
-        slug,
-        date: String(body.date ?? todayIso()),
-        time: String(body.time ?? ""),
-        serviceIds: parseIdList(body.service_ids ?? body.services),
-        staffId: parseOptionalId(body.staff_id),
-        locationId: parseOptionalId(body.location_id),
-        ownerKey,
-        holdToken: String(body.hold_token ?? body.appointment_hold_token ?? "") || null,
-        clientName: String(body.client_name ?? body.customer_name ?? ""),
-        clientEmail: String(body.client_email ?? body.email ?? ""),
-        clientPhone: String(body.client_phone ?? body.phone ?? ""),
-        couponCode: String(body.coupon_code ?? benefit.couponCode ?? ""),
-        promotionId: parseOptionalId(body.promotion_id) ?? benefit.promotionId,
-        notes: String(body.notes ?? ""),
-      }),
-      () => demoConfirmation({
-        date: String(body.date ?? todayIso()),
-        time: String(body.time ?? ""),
-        serviceIds: parseIdList(body.service_ids ?? body.services),
-        staffId: parseOptionalId(body.staff_id),
-        locationId: parseOptionalId(body.location_id),
-      }),
-    );
-    const linkedAccount = sourceMode === "database"
-      ? await upsertPublicCustomerFromBooking({
-        tenantSlug: slug,
-        clientId: confirmation.clientId,
-        email: String(body.client_email ?? body.email ?? ""),
-        fullName: String(body.client_name ?? body.customer_name ?? ""),
-        phone: String(body.client_phone ?? body.phone ?? ""),
-      }).catch(() => null)
-      : null;
+    // Write action: a real booking must hit the DB. On failure, surface the
+    // error (the outer catch returns {ok:false,error}) instead of confirming a
+    // fake demo appointment the customer would believe was booked.
+    const confirmation = await confirmPublicBooking({
+      slug,
+      date: String(body.date ?? todayIso()),
+      time: String(body.time ?? ""),
+      serviceIds: parseIdList(body.service_ids ?? body.services),
+      staffId: parseOptionalId(body.staff_id),
+      locationId: parseOptionalId(body.location_id),
+      ownerKey,
+      holdToken: String(body.hold_token ?? body.appointment_hold_token ?? "") || null,
+      clientName: String(body.client_name ?? body.customer_name ?? ""),
+      clientEmail: String(body.client_email ?? body.email ?? ""),
+      clientPhone: String(body.client_phone ?? body.phone ?? ""),
+      couponCode: String(body.coupon_code ?? benefit.couponCode ?? ""),
+      promotionId: parseOptionalId(body.promotion_id) ?? benefit.promotionId,
+      notes: String(body.notes ?? ""),
+    });
+    const linkedAccount = await upsertPublicCustomerFromBooking({
+      tenantSlug: slug,
+      clientId: confirmation.clientId,
+      email: String(body.client_email ?? body.email ?? ""),
+      fullName: String(body.client_name ?? body.customer_name ?? ""),
+      phone: String(body.client_phone ?? body.phone ?? ""),
+    }).catch(() => null);
 
     return Response.json({
       ok: true,
       source: "app/pages/booking.php?mode=confirm",
-      sourceMode,
+      sourceMode: "database",
       confirmation,
       accountLinked: Boolean(linkedAccount),
     });
@@ -203,54 +195,6 @@ function demoSlots({ date, serviceIds }: { date: string; serviceIds: number[] })
     staffName: slot.operator ?? "",
     reason: slot.reason,
   }));
-}
-
-function demoHold({ date, time, serviceIds }: { date: string; time: string; serviceIds: number[] }) {
-  const services = centerServices.filter((_, index) => serviceIds.includes(index + 1));
-  const hold = createAppointmentHold({
-    date,
-    time,
-    serviceNames: services.length ? services.map((service) => service.name) : [centerServices[0].name],
-    channel: "public",
-    ownerKey: "public",
-    ttlSeconds: 150,
-  });
-  return {
-    token: hold.token,
-    expiresAt: hold.expiresAt,
-    date: hold.date,
-    time: hold.time,
-    staffId: hold.staffNames[0] ? operators.indexOf(hold.staffNames[0]) + 1 || null : null,
-    staffName: hold.staffNames[0] ?? "",
-  };
-}
-
-function demoConfirmation({
-  date,
-  time,
-  serviceIds,
-  staffId,
-  locationId,
-}: {
-  date: string;
-  time: string;
-  serviceIds: number[];
-  staffId?: number | null;
-  locationId?: number | null;
-}) {
-  const selected = centerServices.filter((_, index) => serviceIds.includes(index + 1));
-  return {
-    id: Date.now(),
-    publicCode: `DEMO${String(Date.now()).slice(-6)}`,
-    status: "pending",
-    date,
-    time,
-    total: selected.reduce((sum, service) => sum + parseMoney(service.price), 0),
-    discount: 0,
-    clientId: 0,
-    staffId: staffId ?? null,
-    locationId: locationId ?? null,
-  };
 }
 
 function demoBenefits(): PublicBookingBenefit[] {
