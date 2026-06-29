@@ -1,0 +1,420 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+// Pixel-faithful port of the PHP automation page (app/pages/automation.php,
+// ?page=automation). Original Bootstrap markup preserved verbatim. Toggle
+// states are pre-filled from /api/manage/automation, which exposes a `rules`
+// array; each rule id maps to one of the on/off switches below. The PHP page
+// also renders fields the API does not expose (send-time selects, example
+// texts, SMS credit balance) — those keep their captured defaults. See risks.
+
+type AutomationRule = {
+  id: number;
+  name: string;
+  channel: string;
+  trigger: string;
+  enabled: boolean;
+  createdAt?: string;
+};
+
+const SMS_PLANS = [
+  { value: "1", domId: "smsPlan1", name: "Base", credits: "100", price: "7,00 EUR", pricePerCredit: "0,0700 EUR", note: "Per iniziare con i promemoria SMS.", recommended: false },
+  { value: "2", domId: "smsPlan2", name: "Standard", credits: "250", price: "17,50 EUR", pricePerCredit: "0,0700 EUR", note: "Per attivita con invii regolari.", recommended: true },
+  { value: "3", domId: "smsPlan3", name: "Pro", credits: "500", price: "35,00 EUR", pricePerCredit: "0,0700 EUR", note: "Per volumi mensili piu alti.", recommended: false },
+  { value: "4", domId: "smsPlan4", name: "Business", credits: "1000", price: "70,00 EUR", pricePerCredit: "0,0700 EUR", note: "Per tenant con molti appuntamenti.", recommended: false },
+] as const;
+
+function tenantSlug(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.pathname.split("/")[1] || "";
+}
+
+export function AutomationContent() {
+  const slug = tenantSlug();
+  const [rules, setRules] = useState<AutomationRule[]>([]);
+
+  useEffect(() => {
+    fetch(`/api/manage/automation?slug=${encodeURIComponent(slug)}`, {
+      headers: { "x-tenant-slug": slug },
+    })
+      .then((r) => r.json())
+      .then((j) => setRules(Array.isArray(j.rules) ? j.rules : []))
+      .catch(() => setRules([]));
+  }, [slug]);
+
+  const enabledById = useMemo(() => {
+    const map: Record<number, boolean> = {};
+    for (const rule of rules) map[rule.id] = !!rule.enabled;
+    return map;
+  }, [rules]);
+
+  // Map PHP switches to API rule ids. modified/rejected are not exposed by the
+  // API, so they fall back to the captured default (checked).
+  const reminderEnabled = enabledById[1] ?? true;
+  const smsReminderEnabled = enabledById[2] ?? true;
+  const approvedEnabled = enabledById[3] ?? true;
+  const fidelityExpiryEnabled = enabledById[4] ?? false;
+  const modifiedEnabled = true;
+  const rejectedEnabled = true;
+
+  // SMS top-up plan selection (mirrors the inline PHP script behaviour).
+  const [selectedPlan, setSelectedPlan] = useState<string>("2");
+  const summaryPlan = SMS_PLANS.find((p) => p.value === selectedPlan);
+
+  return (
+    <div className="container-fluid">
+
+      <div className="bs-page-header">
+        <div className="bs-page-heading">
+          <div className="bs-page-kicker">Impostazioni</div>
+          <h1 className="bs-page-title">Automazione</h1>
+          <div className="bs-page-subtitle">Gestisci email e SMS automatici inviati ai clienti.</div>
+        </div>
+      </div>
+
+      <div className="row g-3">
+        <div className="col-lg-7">
+          <div className="card p-4 mb-3">
+            <div className="fw-bold mb-2"><i className="bi bi-envelope me-1" />Promemoria email appuntamento</div>
+            <div className="text-muted small">Invia una email prima dell&apos;appuntamento al cliente con indirizzo email valido. Il promemoria parte solo per appuntamenti in stato <strong>Prenotato</strong>.</div>
+
+            <form method="post" className="mt-3" action={`/${encodeURIComponent(slug)}/index.php?page=automation`}>
+              <div className="row g-3">
+                <div className="col-12">
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" role="switch" id="reminderEnabled" name="reminder_enabled" value="1" defaultChecked={reminderEnabled} key={`r-${reminderEnabled}`} />
+                    <label className="form-check-label" htmlFor="reminderEnabled">Attiva promemoria email</label>
+                  </div>
+                </div>
+                <div className="col-md-6">
+                  <label className="form-label">Invio email</label>
+                  <select className="form-select" name="reminder_hours" defaultValue="24">
+                    <option value="3">3 ore prima</option>
+                    <option value="6">6 ore prima</option>
+                    <option value="12">12 ore prima</option>
+                    <option value="24">24 ore prima</option>
+                    <option value="48">48 ore prima</option>
+                  </select>
+                </div>
+                <div className="col-12">
+                  <div className="alert alert-light border mb-0">
+                    <div className="fw-semibold mb-2">Esempio</div>
+                    <div className="small text-muted">
+                      Ciao,<br /><br />
+                      ti ricordiamo il tuo appuntamento presso Sede1 il 22/06 alle 09:00 per Taglio, Colore e Piega.<br />
+                      Puoi annullare l&apos;appuntamento fino a 24 ore prima.<br />
+                      Per assistenza contattaci al 3756266694.<br /><br />
+                      Saluti,<br />
+                      elite
+                    </div>
+                  </div>
+                </div>
+
+                <div className="col-12"><hr /></div>
+
+                <div className="col-12">
+                  <div className="fw-bold mb-2"><i className="bi bi-chat-left-text me-1" />Promemoria SMS appuntamento</div>
+                  <div className="text-muted small">Invia un SMS prima dell&apos;appuntamento al cliente con telefono valido. Il promemoria parte solo per appuntamenti in stato <strong>Prenotato</strong>.</div>
+                </div>
+
+                <div className="col-12">
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" role="switch" id="smsReminderEnabled" name="sms_reminder_enabled" value="1" defaultChecked={smsReminderEnabled} key={`s-${smsReminderEnabled}`} />
+                    <label className="form-check-label" htmlFor="smsReminderEnabled">Attiva promemoria SMS</label>
+                  </div>
+                </div>
+                <div className="col-md-6">
+                  <label className="form-label">Invio SMS</label>
+                  <select className="form-select" name="sms_reminder_hours" defaultValue="24">
+                    <option value="3">3 ore prima</option>
+                    <option value="6">6 ore prima</option>
+                    <option value="12">12 ore prima</option>
+                    <option value="24">24 ore prima</option>
+                    <option value="48">48 ore prima</option>
+                  </select>
+                </div>
+
+                <div className="col-12">
+                  <div className="alert alert-warning py-2 mb-0 small">
+                    Crediti SMS insufficienti: il promemoria resterà attivo, ma gli invii verranno bloccati finché non saranno disponibili crediti.
+                  </div>
+                </div>
+
+                <div className="col-12">
+                  <div className="alert alert-light border mb-0">
+                    <div className="fw-semibold mb-2">Esempio</div>
+                    <div className="small text-muted">
+                      Ciao, ti ricordiamo l&apos;appuntamento da Sede1 il 22/06 alle 09:00. Annulla entro 24 ore. Non rispondere a questo SMS. Per assistenza: 3756266694.
+                    </div>
+                    <div className="small text-muted mt-2">Costo stimato: <strong>1 credito</strong> per invio. Se il testo supera un singolo SMS, il provider può inviarlo in più segmenti.</div>
+                  </div>
+                </div>
+
+                <div className="col-12"><hr /></div>
+
+                <div className="col-12">
+                  <div className="fw-bold mb-1"><i className="bi bi-gem me-1" />Promemoria email scadenza Fidelity</div>
+                  <div className="text-muted small">Avvisa il cliente prima della scadenza della tessera Fidelity, così può completare il rinnovo automatico in tempo. Esempio: con finestra di rinnovo a 30 giorni, l&apos;email viene inviata 30 giorni prima della scadenza.</div>
+                </div>
+
+                <div className="col-12">
+                  <div className="alert alert-warning py-2 mb-0 small">
+                    Per attivare questo promemoria, configura prima la durata della tessera e la finestra di rinnovo in <strong>Fidelity → Adesione → Impostazioni tessera</strong>.
+                  </div>
+                </div>
+
+                <div className="col-12">
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" role="switch" id="fidExpiryReminderEnabled" name="fidelity_expiry_reminder_enabled" value="1" defaultChecked={fidelityExpiryEnabled} key={`f-${fidelityExpiryEnabled}`} disabled />
+                    <label className="form-check-label" htmlFor="fidExpiryReminderEnabled">Attiva promemoria Fidelity</label>
+                  </div>
+                </div>
+
+                <div className="col-12">
+                  <div className="alert alert-light border mb-0">
+                    <div className="fw-semibold mb-2">Esempio</div>
+                    <div className="small text-muted">
+                      Ciao,<br /><br />
+                      la tua tessera Fidelity FID-123 scade il 22/07.<br />
+                      Per mantenerla attiva, effettua un acquisto o completa un appuntamento entro il 22/07.<br />
+                      Il rinnovo verrà applicato automaticamente.<br /><br />
+                      Saluti,<br />
+                      elite
+                    </div>
+                  </div>
+                </div>
+
+                <div className="col-12"><hr /></div>
+
+                <div className="col-12">
+                  <div className="fw-bold mb-1"><i className="bi bi-check2-circle me-1" />Email approvazione appuntamento</div>
+                  <div className="text-muted small">Avvisa il cliente quando il suo appuntamento viene confermato (Stato: <strong>Prenotato</strong>).</div>
+                </div>
+                <div className="col-12">
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" role="switch" id="approvedEnabled" name="approved_enabled" value="1" defaultChecked={approvedEnabled} key={`a-${approvedEnabled}`} />
+                    <label className="form-check-label" htmlFor="approvedEnabled">Attiva email approvazione</label>
+                  </div>
+                </div>
+                <div className="col-12">
+                  <div className="alert alert-light border mb-0">
+                    <div className="fw-semibold mb-2">Esempio</div>
+                    <div className="small text-muted">
+                      Ciao,<br /><br />
+                      il tuo appuntamento è stato approvato.<br />
+                      Appuntamento: 22/06 09:00<br />
+                      Servizi: Taglio, Colore e Piega<br />
+                      Operatore: Luca<br />
+                      Sede: Sede1<br />
+                      Via Tremiti 6, 00100 Roma (RM)<br />
+                      Per assistenza contattaci al 3756266694.<br /><br />
+                      Saluti,<br />
+                      elite
+                    </div>
+                  </div>
+                </div>
+
+                <div className="col-12"><hr /></div>
+
+                <div className="col-12">
+                  <div className="fw-bold mb-1"><i className="bi bi-pencil-square me-1" />Email modifica appuntamento</div>
+                  <div className="text-muted small">Avvisa il cliente quando vengono modificati i dettagli di un appuntamento già prenotato.</div>
+                </div>
+                <div className="col-12">
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" role="switch" id="modifiedEnabled" name="modified_enabled" value="1" defaultChecked={modifiedEnabled} />
+                    <label className="form-check-label" htmlFor="modifiedEnabled">Attiva email modifica</label>
+                  </div>
+                </div>
+                <div className="col-12">
+                  <div className="alert alert-light border mb-0">
+                    <div className="fw-semibold mb-2">Esempio</div>
+                    <div className="small text-muted">
+                      Ciao,<br /><br />
+                      il tuo appuntamento è stato modificato.<br />
+                      Appuntamento: 22/06 09:00<br />
+                      Servizi: Taglio, Colore e Piega<br />
+                      Operatore: Luca<br />
+                      Sede: Sede1<br />
+                      Via Tremiti 6, 00100 Roma (RM)<br />
+                      Per assistenza contattaci al 3756266694.<br /><br />
+                      Saluti,<br />
+                      elite
+                    </div>
+                  </div>
+                </div>
+
+                <div className="col-12"><hr /></div>
+
+                <div className="col-12">
+                  <div className="fw-bold mb-1"><i className="bi bi-x-circle me-1" />Email rifiuto appuntamento</div>
+                  <div className="text-muted small">Avvisa il cliente quando la sua richiesta di appuntamento non può essere confermata (Stato: <strong>Prenotato</strong>).</div>
+                </div>
+                <div className="col-12">
+                  <div className="form-check form-switch">
+                    <input className="form-check-input" type="checkbox" role="switch" id="rejectedEnabled" name="rejected_enabled" value="1" defaultChecked={rejectedEnabled} />
+                    <label className="form-check-label" htmlFor="rejectedEnabled">Attiva email rifiuto</label>
+                  </div>
+                </div>
+                <div className="col-12">
+                  <div className="alert alert-light border mb-0">
+                    <div className="fw-semibold mb-2">Esempio</div>
+                    <div className="small text-muted">
+                      Ciao,<br /><br />
+                      purtroppo non possiamo confermare l&apos;appuntamento richiesto.<br />
+                      Per assistenza contattaci al 3756266694.<br /><br />
+                      Saluti,<br />
+                      elite
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 d-flex gap-2">
+                <button className="btn btn-primary" type="submit"><i className="bi bi-check2-circle me-1" />Salva</button>
+                <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=dashboard`}>Indietro</a>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div className="col-lg-5">
+          <div className="card p-4">
+            <div className="text-muted small">Crediti SMS</div>
+            <div className="fw-semibold mb-2">Riepilogo credito</div>
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <span className="small text-muted">Saldo disponibile</span>
+              <span className="fw-bold">0 crediti</span>
+            </div>
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <span className="small text-muted">Stato promemoria SMS</span>
+              <span className="badge bg-success">Attivo</span>
+            </div>
+            <div className="d-flex justify-content-between align-items-center">
+              <span className="small text-muted">Costo stimato per invio</span>
+              <span className="fw-semibold">1 credito</span>
+            </div>
+
+            <div className="small text-muted mt-3">
+              Gli SMS vengono inviati solo se il saldo è sufficiente. In caso contrario il promemoria viene bloccato e registrato come non inviato.
+            </div>
+
+            <div className="d-flex gap-2 flex-wrap mt-3">
+              <button className="btn btn-primary btn-sm" type="button" data-bs-toggle="modal" data-bs-target="#smsCreditsTopupModal">
+                Ricarica crediti
+              </button>
+            </div>
+            <div className="small text-muted mt-2">La ricarica crediti verrà collegata al sistema di pagamento.</div>
+
+            <hr className="my-3" />
+
+            <div className="text-muted small">Testi automatici</div>
+            <div className="fw-semibold mb-2">Messaggi gestiti dal sistema</div>
+            <div className="small text-muted">
+              Email e SMS vengono generati con i dati reali di appuntamento, sede e tessera Fidelity. Il contenuto non è modificabile dall&apos;utente, così resta coerente e sotto controllo.
+            </div>
+
+            <hr className="my-3" />
+
+            <div className="text-muted small">Invio automatico</div>
+            <div className="small text-muted">
+              Le email usano la funzione PHP <code>mail()</code> del server. Gli SMS usano OpenAPI SMS v2 quando configurato in <code>config.php</code>.
+              I promemoria appuntamento e Fidelity richiedono il cron <code>/cron/reminders.php</code> ogni 10–15 minuti.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="modal fade" id="smsCreditsTopupModal" tabIndex={-1} aria-hidden="true">
+        <div className="modal-dialog modal-lg modal-dialog-scrollable">
+          <div className="modal-content">
+            <div className="modal-header">
+              <div>
+                <div className="text-muted small">Crediti SMS</div>
+                <h5 className="modal-title fw-bold m-0">Ricarica crediti</h5>
+              </div>
+              <button type="button" className="btn-close" data-bs-dismiss="modal" aria-label="Chiudi" />
+            </div>
+            <div className="modal-body">
+              <div className="d-flex justify-content-between align-items-center border rounded-3 p-3 mb-3">
+                <span className="small text-muted">Saldo attuale</span>
+                <span className="fw-bold">0 crediti</span>
+              </div>
+
+              <div className="small text-muted mb-3">
+                Scegli un pacchetto. I crediti verranno scalati automaticamente quando il sistema invia un SMS.
+              </div>
+              <div className="row g-2">
+                {SMS_PLANS.map((plan) => {
+                  const selected = plan.value === selectedPlan;
+                  return (
+                    <div className="col-md-6" key={plan.value}>
+                      <label
+                        className={`d-block border rounded-3 p-3 h-100 ${selected ? "border-primary bg-primary-subtle" : "bg-white"}`}
+                        htmlFor={plan.domId}
+                      >
+                        <div className="d-flex justify-content-between gap-2 align-items-start">
+                          <div>
+                            <input
+                              className="form-check-input me-2"
+                              type="radio"
+                              name="sms_credit_plan"
+                              id={plan.domId}
+                              value={plan.value}
+                              data-sms-plan-option
+                              data-name={plan.name}
+                              data-credits={plan.credits}
+                              data-price={plan.price}
+                              data-price-per-credit={plan.pricePerCredit}
+                              checked={selected}
+                              onChange={() => setSelectedPlan(plan.value)}
+                            />
+                            <span className="fw-semibold">{plan.name}</span>
+                          </div>
+                          {plan.recommended ? <span className="badge bg-primary">Consigliato</span> : null}
+                        </div>
+                        <div className="mt-2">
+                          <div className="fw-bold">{plan.credits} crediti</div>
+                          <div>{plan.price}</div>
+                          <div className="small text-muted">{plan.pricePerCredit} per credito</div>
+                          <div className="small text-muted mt-2">{plan.note}</div>
+                        </div>
+                      </label>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="alert alert-light border mt-3 mb-0">
+                <div className="fw-semibold mb-2">Riepilogo</div>
+                <div className="d-flex justify-content-between mb-1">
+                  <span className="small text-muted">Pacchetto</span>
+                  <span className="fw-semibold" data-sms-plan-summary="name">{summaryPlan ? summaryPlan.name : "-"}</span>
+                </div>
+                <div className="d-flex justify-content-between mb-1">
+                  <span className="small text-muted">Crediti</span>
+                  <span className="fw-semibold" data-sms-plan-summary="credits">{summaryPlan ? `${summaryPlan.credits} crediti` : "-"}</span>
+                </div>
+                <div className="d-flex justify-content-between mb-1">
+                  <span className="small text-muted">Totale</span>
+                  <span className="fw-semibold" data-sms-plan-summary="price">{summaryPlan ? summaryPlan.price : "-"}</span>
+                </div>
+                <div className="d-flex justify-content-between">
+                  <span className="small text-muted">Prezzo medio</span>
+                  <span className="fw-semibold" data-sms-plan-summary="pricePerCredit">{summaryPlan ? summaryPlan.pricePerCredit : "-"}</span>
+                </div>
+                <div className="small text-muted mt-2">Se un SMS supera un segmento, puo consumare piu crediti.</div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">Chiudi</button>
+              <button type="button" className="btn btn-primary" disabled>Pagamento non ancora disponibile</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  );
+}

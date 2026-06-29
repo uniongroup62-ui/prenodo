@@ -21,6 +21,14 @@ import { ResourcesContent } from "@/components/modules/resources-content";
 import { GiftboxContent } from "@/components/modules/giftbox-content";
 import { WalletContent } from "@/components/modules/wallet-content";
 import { InstallmentsManageContent } from "@/components/modules/installments-manage-content";
+import { AccessibilityContent } from "@/components/modules/accessibility-content";
+import { AutomationContent } from "@/components/modules/automation-content";
+import { BookingSettingsContent } from "@/components/modules/booking-content";
+import { ConsentModulesContent } from "@/components/modules/consent_modules-content";
+import { FidelityContent } from "@/components/modules/fidelity-content";
+import { PosHistoryContent } from "@/components/modules/pos_history-content";
+import { ReportsContent } from "@/components/modules/reports-content";
+import { StockMovesContent } from "@/components/modules/stock_moves-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -47,6 +55,14 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   giftbox: GiftboxContent,
   wallet: WalletContent,
   installments_manage: InstallmentsManageContent,
+  consent_modules: ConsentModulesContent,
+  accessibility: AccessibilityContent,
+  automation: AutomationContent,
+  reports: ReportsContent,
+  stock_moves: StockMovesContent,
+  pos_history: PosHistoryContent,
+  fidelity: FidelityContent,
+  booking: BookingSettingsContent,
 };
 
 export default async function TenantIndexPhpPage({
