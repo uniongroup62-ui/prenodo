@@ -157,6 +157,14 @@ Smoke/parity test per modulo vs PHP; screenshot-diff a ~0; freeze dati, migrazio
 
 **Scritture — VALIDATE su Supabase (2026-06-29):** create+delete cliente (`tenantInsert`/`RETURNING id`/`tenant_id`), checkout POS multi-tabella (`sales`+`sale_items`)+cancel, insert via `filterColumns` (prodotto con sede). Tutte con cleanup verificato (tenant 25 pristino). Le validazioni applicative (sede/cabina obbligatorie) girano correttamente prima dell'insert. Tool: `db/tools/cleanup-test-rows.mjs`.
 
+**Fase 3 — UI Path A: in corso, molto avanzata (2026-06-29):**
+- ✅ Asset originali importati; Bootstrap 5.3.3 + Bootstrap Icons + Chart.js caricati come il PHP.
+- ✅ **5 pagine auth** (login, forgot, reset, register, verify) pixel-fedeli.
+- ✅ **Shell gestionale** (`components/manage-shell.tsx`: sidebar+topbar fedeli) + **Dashboard** (KPI + grafico Chart.js + colonna laterale), DB-backed.
+- ✅ **43 pagine moduli** fedeli (`components/modules/*-content.tsx`, registrate in `FAITHFUL_MODULES` nella compat route `index.php?page=X`), prodotte via fan-out multi-agente e verificate con screenshot-diff autenticato (quasi tutte <1%; i casi 2-6% sono artefatti di warning PHP intermittenti, verificati a vista come fedeli).
+- ✅ Harness verifica: `db/tools/visual-diff.mjs` (auth pages) e `db/tools/auth-shot.mjs` (pagine autenticate) con Playwright + pixelmatch — eseguire da PowerShell.
+- ⏳ **Restano**: moduli con **tab** (Servizi, Pacchetti — adeguare il routing ai parametri tab); settings minori (package_settings, fidelity_wallet, credit_movements, fidelity_levels, fidelity_membership_settings, marketplace); schede/consensi cliente (client_sheets, client_consents, client_sheet_templates); le **3 pagine complesse** (Calendario, Appuntamenti, POS); comportamenti **`app.js`** (collapse sidebar, notifiche, prenotazione rapida); **parità funzionale** (collegare i save dei form settings alle API, completare le API parziali); **Fase 2 sicurezza**; dismissione PHP finale.
+
 **Prossimo (Fase 1 residuo → Fase 2):**
 - ⏳ Esercitare i percorsi di scrittura più complessi: **save appuntamento** (multi-tabella + hold→converted), upsert marketplace/onboarding (`ON CONFLICT`), emissione giftcard/pacchetti.
 - ⏳ Rischi residui minori: doppia unique key su `public_customer_tenant_links` (upsert account), ordinamento `string_agg` marketplace (sort_order→alfabetico).
