@@ -7,7 +7,6 @@ import { currentSaasAdminSession } from "@/lib/saas-admin-auth";
 import { dbExecute, dbQuery, quoteIdentifier, tableExists, tenantTable, usesSharedTenantTables } from "@/lib/tenant-db";
 import { logSaasTenantAudit, listSaasTenants, requireSaasTenant, tenantStatus, type SaasTenantRow } from "@/lib/saas-tenant-manager";
 import { tenantPrefix } from "@/lib/tenant-runtime";
-import { xamppRoot } from "@/lib/xampp-config";
 
 type TenantTableMode = "prefixed" | "shared" | "base";
 
@@ -1175,9 +1174,13 @@ async function smsEndpointReachability(baseUrl: string): Promise<SmsProviderDiag
 }
 
 function readConfigPhp(): string {
-  const file = path.join(/*turbopackIgnore: true*/ xamppRoot(), "config.php");
+  // Legacy SMS/provider settings used to live in the PHP config.php. The Next
+  // app no longer depends on PHP/XAMPP: read it only if an explicit path is
+  // configured, otherwise rely on environment variables (returns "").
+  const file = process.env.PRENODO_CONFIG_PHP;
+  if (!file) return "";
   try {
-    return fs.readFileSync(file, "utf8");
+    return fs.readFileSync(/*turbopackIgnore: true*/ file, "utf8");
   } catch {
     return "";
   }
@@ -1202,7 +1205,8 @@ function phpBlockRaw(block: string, key: string): string {
 }
 
 function projectRootForBackups(): string {
-  return process.env.PRENODO_BACKUP_PROJECT_ROOT || xamppRoot();
+  // Default backups to the Next project root, not the legacy XAMPP htdocs.
+  return process.env.PRENODO_BACKUP_PROJECT_ROOT || process.cwd();
 }
 
 function backupRoot(): string {
