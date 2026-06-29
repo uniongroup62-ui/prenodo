@@ -14,6 +14,90 @@ import {
   tenantTable,
   tenantUpdate,
 } from "@/lib/tenant-db";
+import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
+
+// public_customer_accounts is a GLOBAL marketplace account (unique by email, not
+// tenant-scoped). These emails therefore come from the PLATFORM, not a tenant
+// business: we use the default SES sender (no per-tenant `businesses` lookup) and
+// brand them with PRENODO_PUBLIC_BRAND (default "Prenodo"). Subjects/bodies are
+// faithful ports of the legacy global-account mailers in app/lib/Marketplace.php
+// (sendVerificationEmail / sendPasswordResetEmail / sendEmailChangeVerificationEmail).
+function publicBrandName(): string {
+  const brand = String(process.env.PRENODO_PUBLIC_BRAND ?? "").trim();
+  return brand || "Prenodo";
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// Sends an email through the default SES sender, branded as the public platform.
+// Gated on emailConfigured(): when SES is not configured this is a no-op so local
+// dev keeps working (the caller still stored the hash and returns a devCode).
+// Errors are logged and swallowed — these are best-effort side-effects on flows
+// that must not fail just because mail delivery had a transient problem; the user
+// can always re-request the code/link.
+async function sendPublicAccountEmail(to: string, subject: string, bodyHtml: string): Promise<void> {
+  if (!emailConfigured()) return;
+  const recipient = normalizeEmail(to);
+  if (!recipient) return;
+  try {
+    const brand = publicBrandName();
+    const fullSubject = `${brand} — ${subject}`;
+    const { html, text } = buildModernEmailTemplate(fullSubject, bodyHtml, { business_name: brand });
+    const res = await sendEmail({ to: recipient, subject: fullSubject, html, text });
+    if (!res.ok) {
+      console.error(`[public-customer-account] email send failed for ${recipient}: ${res.error}`);
+    }
+  } catch (error) {
+    console.error("[public-customer-account] email send error:", error);
+  }
+}
+
+// Port of Marketplace::sendVerificationEmail() — account email verification code.
+function buildVerificationEmailBody(code: string): string {
+  return (
+    '<h3 style="margin:0 0 12px 0">Verifica il tuo indirizzo email</h3>'
+    + `<p style="margin:0 0 10px 0">Inserisci questo codice per completare il tuo account cliente ${escapeHtml(publicBrandName())}:</p>`
+    + `<div style="font-size:28px;font-weight:600;letter-spacing:6px;padding:12px 16px;background:#f1f5f9;border-radius:12px;display:inline-block">${escapeHtml(code)}</div>`
+    + '<p style="margin:12px 0 0 0">Il codice scade tra 15 minuti.</p>'
+  );
+}
+
+// Port of Marketplace::sendEmailChangeVerificationEmail() — new-email confirmation code.
+function buildEmailChangeVerificationBody(code: string): string {
+  return (
+    '<h3 style="margin:0 0 12px 0">Conferma la nuova email</h3>'
+    + `<p style="margin:0 0 10px 0">Inserisci questo codice per confermare il nuovo indirizzo email del tuo account cliente ${escapeHtml(publicBrandName())}:</p>`
+    + `<div style="font-size:28px;font-weight:600;letter-spacing:6px;padding:12px 16px;background:#f1f5f9;border-radius:12px;display:inline-block">${escapeHtml(code)}</div>`
+    + '<p style="margin:12px 0 0 0">Il codice scade tra 15 minuti.</p>'
+  );
+}
+
+// Port of Marketplace::sendPasswordResetEmail() — reset link (button) email.
+function buildPasswordResetEmailBody(url: string): string {
+  return (
+    '<h3 style="margin:0 0 12px 0">Reimposta la password</h3>'
+    + `<p style="margin:0 0 14px 0">Abbiamo ricevuto una richiesta di reset password per il tuo account cliente ${escapeHtml(publicBrandName())}.</p>`
+    + `<p style="margin:0 0 14px 0"><a href="${escapeHtml(url)}" style="display:inline-block;background:#4e6da6;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:800">Reimposta password</a></p>`
+    + '<p style="margin:0;color:#64748b">Il link scade tra 30 minuti. Se non hai richiesto tu il reset, puoi ignorare questa email.</p>'
+  );
+}
+
+// Builds the public reset link the emailed button points at. The reset page at
+// /account/reset reads BOTH ?token= and ?email= (and resetPublicCustomerPassword
+// looks the account up by email), so we carry the email alongside the raw token —
+// matching the legacy Marketplace::requestGlobalPasswordReset() which appended both.
+function buildPublicResetLink(rawToken: string, email: string): string {
+  const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
+  const query = `token=${encodeURIComponent(rawToken)}&email=${encodeURIComponent(email)}`;
+  return `${base}/account/reset?${query}`;
+}
 
 export type PublicCustomer = {
   id: number;
@@ -379,6 +463,10 @@ export async function issuePublicCustomerVerificationCode(
     [codeHash(code), accountId],
   );
 
+  // Send AFTER the DB write so the code is valid even if delivery has a transient
+  // error; send is best-effort and never fails the issuance (see helper comment).
+  await sendPublicAccountEmail(String(row.email), "Codice verifica email", buildVerificationEmailBody(code));
+
   return {
     ok: true,
     requiresVerification: true,
@@ -441,6 +529,12 @@ export async function requestPublicCustomerPasswordReset(
         WHERE id=?`,
       [sha256(token), Number(rows[0].id)],
     );
+
+    // Send AFTER the DB write so the token is valid even on a transient send error;
+    // best-effort, never fails the (deliberately generic) forgot-password response.
+    const recipient = String(rows[0].email ?? email);
+    const resetLink = buildPublicResetLink(token, recipient);
+    await sendPublicAccountEmail(recipient, "Reset password", buildPasswordResetEmailBody(resetLink));
   }
 
   return {
@@ -654,6 +748,11 @@ export async function requestPublicCustomerEmailChange(
       WHERE id=?`,
     [newEmail, codeHash(code), accountId],
   );
+
+  // Send the confirmation code to the NEW pending_email, AFTER the DB write so the
+  // code stays valid on a transient send error; best-effort, never fails the change.
+  await sendPublicAccountEmail(newEmail, "Conferma nuova email", buildEmailChangeVerificationBody(code));
+
   const account = await accountById(accountId);
   if (!account) return { ok: false, error: "Account non trovato." };
   return { ok: true, account, ...(exposeLocalDebug() ? { devCode: code } : {}) };
