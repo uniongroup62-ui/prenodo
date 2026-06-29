@@ -61,7 +61,7 @@ import { FidelityMembershipSettingsContent } from "@/components/modules/fidelity
 import { PosContent } from "@/components/modules/pos-content";
 import { CalendarContent } from "@/components/modules/calendar-content";
 import { AppointmentsContent } from "@/components/modules/appointments-content";
-import { PublicBookingWizard } from "@/components/public-booking-wizard";
+import { BookingFaithful } from "@/components/public/booking-faithful";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
 
@@ -140,7 +140,7 @@ export default async function TenantIndexPhpPage({
   const query = await searchParams;
 
   if (query.page === "booking" && query.public === "1") {
-    return <PublicBookingWizard slug={tenantSlug} initialLocationId={query.location_id} initialService={query.service} />;
+    return <BookingFaithful slug={tenantSlug} />;
   }
 
   const session = await currentManageSession(tenantSlug);
