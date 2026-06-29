@@ -1,0 +1,10 @@
+.pos-cronologia-detail-panel { background: #f8f9fa; }
+.pos-cronologia-notes { white-space: pre-wrap; font-family: inherit; }
+.pos-cronologia-cancel-form { min-height: 0; }
+.pos-cronologia-cancel-body { min-height: 0; }
+.pos-cronologia-sale-number-col { width: 150px; }
+.pos-cronologia-location-col { width: 170px; }
+.pos-cronologia-date-col { width: 180px; }
+.pos-cronologia-amount-col { width: 140px; }
+.pos-cronologia-status-col { width: 120px; }
+.pos-cronologia-actions-col { width: 150px; }

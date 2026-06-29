@@ -1,0 +1,79 @@
+.promotions-empty-card{
+  min-height:640px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:8px;
+}
+.promotions-empty-state{
+  width:min(580px,100%);
+  margin:0 auto;
+  padding:48px 24px;
+  text-align:center;
+}
+.promotions-empty-icon{
+  width:96px;
+  height:88px;
+  margin:0 auto 18px;
+  display:grid;
+  place-items:center;
+  color:#9db7ef;
+  font-size:64px;
+  line-height:1;
+}
+.promotions-empty-state h2{
+  font-size:24px;
+  line-height:1.2;
+  font-weight:600;
+  margin:0 0 12px;
+}
+.promotions-empty-state p{
+  color:#475569;
+  line-height:1.55;
+  max-width:540px;
+  margin:0 auto 22px;
+}
+@media (max-width: 767.98px){
+  .promotions-empty-card{min-height:520px;}
+  .promotions-empty-state{padding:36px 16px;}
+  .promotions-empty-state h2{font-size:21px;}
+}
+.promo-hidden{
+  display:none !important;
+}
+.promo-note-xs{
+  font-size:12px;
+}
+.promo-location-valid-col{
+  width:160px;
+}
+.promo-quick-panel{
+  background:#f8f9fa;
+}
+.promo-quick-type{
+  min-width:170px;
+  max-width:220px;
+}
+.promo-quick-value{
+  width:130px;
+}
+.promo-picker-list{
+  max-height:240px;
+  overflow:auto;
+}
+.item-discount-type{
+  width:170px;
+}
+.item-discount-value{
+  width:110px;
+}
+.item-min-qty{
+  width:120px;
+}
+.item-discount-preview{
+  white-space:nowrap;
+}
+.promo-fidelity-levels{
+  max-height:180px;
+  overflow:auto;
+}

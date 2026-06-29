@@ -1,0 +1,25 @@
+.consent-system-preview {
+  white-space: pre-wrap;
+  font-family: var(--bs-font-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
+  font-size: .93rem;
+  background: #fff;
+  border: 1px solid #e6e9ef;
+  border-radius: 14px;
+  padding: .9rem 1rem;
+  line-height: 1.5;
+}
+.consent-template-editor {
+  min-height: 420px;
+  font-family: var(--bs-font-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);
+}
+.consent-module-type-badge {
+  font-size: .78rem;
+}
+.consent-template-preview-frame {
+  width: 100%;
+  min-height: 78vh;
+  border: 0;
+  display: block;
+  background: #fff;
+}
+

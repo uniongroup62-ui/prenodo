@@ -1,0 +1,54 @@
+.giftcard-empty-card{
+  min-height:640px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:8px;
+}
+.giftcard-empty-state{
+  width:min(580px,100%);
+  margin:0 auto;
+  padding:48px 24px;
+  text-align:center;
+}
+.giftcard-empty-icon{
+  width:96px;
+  height:88px;
+  margin:0 auto 18px;
+  display:grid;
+  place-items:center;
+  color:#9db7ef;
+  font-size:64px;
+  line-height:1;
+}
+.giftcard-empty-state h2{
+  font-size:24px;
+  line-height:1.2;
+  font-weight:600;
+  margin:0 0 12px;
+}
+.giftcard-empty-state p{
+  color:#475569;
+  line-height:1.55;
+  max-width:540px;
+  margin:0 auto 22px;
+}
+.giftcard-combobox-list{
+  max-height:220px;
+  overflow:auto;
+}
+.giftcard-item-qty{
+  width:110px;
+}
+.giftcard-prewrap{
+  white-space:pre-wrap;
+}
+.giftcard-recipient-results{
+  max-height:260px;
+  overflow:auto;
+}
+@media (max-width: 767.98px){
+  .giftcard-empty-card{min-height:520px;}
+  .giftcard-empty-state{padding:36px 16px;}
+  .giftcard-empty-state h2{font-size:21px;}
+}

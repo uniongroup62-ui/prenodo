@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="260" viewBox="0 0 420 260" role="img" aria-labelledby="title desc">
+  <title id="title">Agenda appuntamenti</title>
+  <desc id="desc">Illustrazione di un calendario con una nuova prenotazione</desc>
+  <defs>
+    <linearGradient id="panel" x1="88" y1="46" x2="338" y2="214" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef5ff"/>
+    </linearGradient>
+    <filter id="shadow" x="58" y="28" width="304" height="208" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#1f2937" flood-opacity=".12"/>
+    </filter>
+  </defs>
+  <rect width="420" height="260" fill="#ffffff"/>
+  <ellipse cx="210" cy="226" rx="132" ry="12" fill="#e8edf5"/>
+  <g filter="url(#shadow)">
+    <rect x="82" y="52" width="256" height="162" rx="18" fill="url(#panel)" stroke="#d9e3f2"/>
+    <rect x="82" y="52" width="256" height="42" rx="18" fill="#2563eb"/>
+    <path d="M82 76h256v18H82z" fill="#2563eb"/>
+    <circle cx="117" cy="73" r="7" fill="#bfdbfe"/>
+    <circle cx="149" cy="73" r="7" fill="#bfdbfe"/>
+    <circle cx="181" cy="73" r="7" fill="#bfdbfe"/>
+    <rect x="111" y="116" width="42" height="30" rx="8" fill="#e8f1ff" stroke="#bdd4ff"/>
+    <rect x="164" y="116" width="42" height="30" rx="8" fill="#f8fafc" stroke="#d7e3f2"/>
+    <rect x="217" y="116" width="42" height="30" rx="8" fill="#dcfce7" stroke="#86efac"/>
+    <rect x="270" y="116" width="42" height="30" rx="8" fill="#f8fafc" stroke="#d7e3f2"/>
+    <rect x="111" y="160" width="42" height="30" rx="8" fill="#f8fafc" stroke="#d7e3f2"/>
+    <rect x="164" y="160" width="42" height="30" rx="8" fill="#eff6ff" stroke="#93c5fd"/>
+    <rect x="217" y="160" width="42" height="30" rx="8" fill="#f8fafc" stroke="#d7e3f2"/>
+    <rect x="270" y="160" width="42" height="30" rx="8" fill="#f8fafc" stroke="#d7e3f2"/>
+  </g>
+  <g transform="translate(248 46)">
+    <rect x="0" y="0" width="112" height="64" rx="12" fill="#ffffff" stroke="#d7e3f2"/>
+    <circle cx="22" cy="24" r="10" fill="#86efac"/>
+    <rect x="40" y="16" width="48" height="8" rx="4" fill="#94a3b8"/>
+    <rect x="40" y="32" width="32" height="7" rx="3.5" fill="#cbd5e1"/>
+  </g>
+  <g transform="translate(62 42)">
+    <rect x="0" y="0" width="86" height="58" rx="12" fill="#ffffff" stroke="#d7e3f2"/>
+    <rect x="16" y="16" width="54" height="8" rx="4" fill="#93c5fd"/>
+    <rect x="16" y="33" width="38" height="7" rx="3.5" fill="#cbd5e1"/>
+  </g>
+  <g transform="translate(286 164)">
+    <circle cx="34" cy="34" r="32" fill="#dbeafe"/>
+    <rect x="31" y="16" width="7" height="36" rx="3.5" fill="#2563eb"/>
+    <rect x="16" y="31" width="36" height="7" rx="3.5" fill="#2563eb"/>
+  </g>
+</svg>

@@ -1,0 +1,50 @@
+.avail-wrap { overflow-x: auto; }
+.avail-grid { min-width: 900px; }
+.avail-header, .avail-row { display: flex; align-items: stretch; }
+.avail-staffcol { width: 220px; flex: 0 0 220px; padding: 8px 10px; border-right: 1px solid #e7e7e7; }
+.avail-timecol { flex: 1 1 auto; position: relative; }
+.avail-scale { position: relative; height: 34px; border-bottom: 1px solid #e7e7e7; }
+.avail-scale .tick { position: absolute; left: var(--timeline-left, 0%); top: 0; bottom: 0; width: 1px; background: #eee; }
+.avail-scale .label { position: absolute; left: var(--timeline-left, 0%); top: 6px; transform: translateX(-50%); font-size: 12px; color: #666; white-space: nowrap; }
+.avail-track { position: relative; height: 44px; border-bottom: 1px solid #f0f0f0; }
+.avail-bg { position: absolute; left: var(--timeline-left, 0%); width: var(--timeline-width, 0%); top: 0; bottom: 0; border-radius: 0; z-index: 1; pointer-events: none; }
+.avail-bg.biz-closed { background: rgba(108,117,125,0.18); }
+.avail-bg.staff-closed { background: rgba(108,117,125,0.26); }
+
+.avail-track .tick { position: absolute; left: var(--timeline-left, 0%); top: 0; bottom: 0; width: 1px; background: #f2f2f2; }
+.avail-bar { position: absolute; left: var(--timeline-left, 0%); width: var(--timeline-width, 0%); top: 7px; height: 30px; border-radius: 8px; z-index: 2; padding: 4px 8px; font-size: 12px; display: flex; align-items: center; gap: 8px; overflow: hidden; white-space: nowrap; }
+.avail-bar .btns { margin-left: auto; display: flex; gap: 6px; }
+.avail-bar .btns a { color: inherit; opacity: 0.85; text-decoration: none; }
+.avail-bar .btns a:hover { opacity: 1; }
+.avail-bar.shift { background: #d7f5d7; color: #0f5132; }
+.avail-bar.presence { background: #d7f5d7; color: #0f5132; border: 1px dashed rgba(0,0,0,0.15); }
+.avail-bar.biz { background: #111; color: #fff; opacity: 0.85; }
+.avail-bar.timeoff { background: #f8d7da; color: #842029; }
+.avail-staffname { display: flex; flex-direction: column; gap: 2px; }
+.avail-staffname .name { font-weight: 600; }
+.avail-staffname .meta { font-size: 12px; color: #6c757d; }
+.avail-focus { background: rgba(13,110,253,0.06); }
+.avail-legend span { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; font-size: 12px; color: #666; }
+.avail-legend i { width: 14px; height: 14px; display: inline-block; border-radius: 4px; }
+.avail-legend .i-shift { background: #d7f5d7; border: 1px solid rgba(0,0,0,0.08); }
+.avail-legend .i-timeoff { background: #f8d7da; border: 1px solid rgba(0,0,0,0.08); }
+.avail-legend .i-biz { background: #111; }
+
+/* Weekly view */
+.week-table td { vertical-align: top; }
+.week-events { display: flex; flex-direction: column; gap: 4px; }
+.week-chip { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 8px; font-size: 12px; overflow: hidden; }
+.week-chip .btns { margin-left: auto; display: flex; gap: 6px; }
+.week-chip .btns a { color: inherit; opacity: 0.85; text-decoration: none; }
+.week-chip.shift { background: #d7f5d7; color: #0f5132; }
+.week-chip.presence { background: #d7f5d7; color: #0f5132; border: 1px dashed rgba(0,0,0,0.15); }
+.week-chip.timeoff { background: #f8d7da; color: #842029; }
+
+.staff-availability-date-input { width: 170px; }
+.staff-availability-operator-col { min-width: 220px; }
+.staff-availability-day-col { min-width: 160px; }
+.staff-availability-color-dot { display: inline-block; width: 10px; height: 10px; border-radius: 999px; }
+.staff-availability-color-dot--legend { margin-right: 8px; vertical-align: middle; }
+.staff-availability-series-box { display: none; }
+.staff-availability-conflict-date-col { width: 120px; }
+.staff-availability-conflict-code-col { width: 140px; }

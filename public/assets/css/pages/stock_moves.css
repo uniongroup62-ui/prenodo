@@ -1,0 +1,29 @@
+.stock-moves-col-qty,
+.stock-moves-col-actions {
+  width: 120px;
+}
+
+.stock-moves-col-incoming-product {
+  width: 240px;
+}
+
+.stock-moves-col-incoming-qty {
+  width: 160px;
+}
+
+.stock-moves-col-incoming-date {
+  width: 190px;
+}
+
+.stock-moves-wrap-cell {
+  max-width: 260px;
+  white-space: normal;
+}
+
+@media print{
+  .no-print{ display:none !important; }
+  body{ background:#fff !important; }
+  .card{ border:0 !important; box-shadow:none !important; }
+  .table{ font-size: 12px; }
+  .badge{ border:1px solid #ccc !important; }
+}

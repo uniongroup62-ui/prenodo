@@ -1,0 +1,295 @@
+.sheet-tile{
+  border:1px solid rgba(15,23,42,.08);
+  border-radius:18px;
+  padding:16px;
+  background:linear-gradient(180deg,#fff 0%,#f8fbff 100%);
+  box-shadow:0 14px 30px rgba(15,23,42,.06);
+  height:100%;
+}
+.sheet-tile .value{
+  font-size:1.9rem;
+  line-height:1;
+  font-weight: 600;
+  margin-top:8px;
+}
+.sheet-tile-value-compact{
+  font-size:1.2rem;
+}
+.sheet-surface{
+  border:1px solid rgba(15,23,42,.08);
+  border-radius:20px;
+  background:#fff;
+  box-shadow:0 18px 40px rgba(15,23,42,.06);
+}
+.sheet-form-header{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  padding:12px 16px;
+  font-weight:600;
+  border-bottom:1px solid rgba(15,23,42,.08);
+  background:#fff;
+}
+.sheet-tab-item,
+.sheet-record-item{
+  display:block;
+  text-decoration:none;
+  color:inherit;
+  border:1px solid rgba(15,23,42,.08);
+  border-radius:16px;
+  padding:14px;
+  background:#fff;
+  transition:all .18s ease;
+}
+.sheet-tab-item:hover,
+.sheet-record-item:hover{
+  border-color:rgba(13,110,253,.28);
+  box-shadow:0 10px 24px rgba(13,110,253,.08);
+}
+.sheet-tab-item.is-current,
+.sheet-record-item.is-current{
+  border-color:rgba(13,110,253,.45);
+  box-shadow:0 12px 26px rgba(13,110,253,.12);
+  background:linear-gradient(180deg,#ffffff 0%,#f2f7ff 100%);
+}
+.sheet-photo-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:12px;
+}
+.sheet-photo-card{
+  border:1px solid rgba(15,23,42,.08);
+  border-radius:16px;
+  overflow:hidden;
+  background:#fff;
+}
+.sheet-photo-card img{
+  width:100%;
+  height:180px;
+  object-fit:cover;
+  display:block;
+  background:#eef2ff;
+}
+.sheet-photo-card .body{
+  padding:10px 12px;
+}
+.sheet-attachment-note-input{
+  margin-top:8px;
+  resize:vertical;
+  min-height:70px;
+}
+.sheet-sort-actions{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+  align-items:center;
+}
+.sheet-sort-actions .btn{
+  --bs-btn-padding-y:.25rem;
+  --bs-btn-padding-x:.55rem;
+}
+.sheet-item-position{
+  font-size:.78rem;
+  color:#64748b;
+  font-weight:600;
+}
+.sheet-attachment-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:12px;
+}
+.sheet-attachment-card{
+  border:1px solid rgba(15,23,42,.08);
+  border-radius:16px;
+  background:#fff;
+  padding:14px;
+  box-shadow:0 8px 20px rgba(15,23,42,.04);
+}
+.sheet-attachment-card.is-pending-remove{
+  opacity:.58;
+  border-color:rgba(220,53,69,.32);
+  background:rgba(220,53,69,.03);
+}
+.sheet-attachment-icon{
+  width:44px;
+  height:44px;
+  border-radius:14px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  background:rgba(13,110,253,.08);
+  color:#0d6efd;
+  font-size:1.25rem;
+  flex:0 0 auto;
+}
+.sheet-empty-state{
+  border:1px dashed rgba(15,23,42,.16);
+  border-radius:18px;
+  padding:24px;
+  text-align:center;
+  background:rgba(13,110,253,.03);
+}
+.sheet-empty-icon{
+  font-size:2rem;
+  color:rgba(13,110,253,.55);
+}
+.sheet-preset-select{
+  min-width:220px;
+}
+.sheet-builder-toolbar{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  align-items:center;
+  justify-content:space-between;
+}
+.sheet-field-row .form-label{
+  font-size:.85rem;
+  font-weight:600;
+}
+.sheet-dropzone{
+  border:1px dashed rgba(13,110,253,.3);
+  border-radius:16px;
+  padding:14px;
+  background:rgba(13,110,253,.03);
+  transition:border-color .18s ease, background-color .18s ease, box-shadow .18s ease;
+}
+.sheet-dropzone.is-dragover{
+  border-color:rgba(13,110,253,.7);
+  background:rgba(13,110,253,.08);
+  box-shadow:0 0 0 .2rem rgba(13,110,253,.12);
+}
+.sheet-dropzone-copy{
+  margin-bottom:10px;
+}
+.sheet-existing-delete-busy{
+  opacity:.58;
+  pointer-events:none;
+}
+.sheet-photo-card.is-pending-remove{
+  opacity:.58;
+  border-color:rgba(220,53,69,.32);
+  background:rgba(220,53,69,.03);
+}
+.sheet-photo-card .body .btn{
+  --bs-btn-padding-y:.25rem;
+  --bs-btn-padding-x:.55rem;
+}
+.sheet-upload-error-list{
+  margin:0;
+  padding-left:1rem;
+}
+.sheet-upload-progress{
+  margin-top:10px;
+}
+.sheet-upload-progress .progress{
+  height:8px;
+  border-radius:999px;
+  background:rgba(15,23,42,.08);
+}
+.sheet-gallery-thumb{
+  display:block;
+  width:100%;
+  padding:0;
+  border:0;
+  background:transparent;
+  cursor:zoom-in;
+}
+.sheet-gallery-thumb img{
+  transition:transform .18s ease;
+}
+.sheet-gallery-thumb:hover img{
+  transform:scale(1.02);
+}
+.sheet-gallery-overlay{
+  position:fixed;
+  inset:0;
+  z-index:1080;
+  background:rgba(15,23,42,.88);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px;
+}
+.sheet-gallery-dialog{
+  position:relative;
+  width:min(1100px, 100%);
+  max-height:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:16px;
+}
+.sheet-gallery-stage{
+  flex:1 1 auto;
+  min-width:0;
+  background:#0f172a;
+  border-radius:24px;
+  padding:18px 18px 14px;
+  box-shadow:0 20px 60px rgba(0,0,0,.35);
+}
+.sheet-gallery-stage img{
+  display:block;
+  width:100%;
+  max-height:72vh;
+  object-fit:contain;
+  border-radius:18px;
+  background:#020617;
+}
+.sheet-gallery-caption{
+  color:#e2e8f0;
+  margin-top:14px;
+}
+.sheet-gallery-caption-note{
+  color:#cbd5e1;
+  font-size:.92rem;
+  margin-top:6px;
+  white-space:pre-line;
+}
+.sheet-gallery-counter{
+  color:#94a3b8;
+  font-size:.88rem;
+}
+.sheet-gallery-nav,
+.sheet-gallery-close{
+  border:0;
+  border-radius:999px;
+  background:rgba(255,255,255,.12);
+  color:#fff;
+  width:46px;
+  height:46px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  backdrop-filter:blur(6px);
+}
+.sheet-gallery-nav:disabled{
+  opacity:.45;
+  cursor:not-allowed;
+}
+.sheet-gallery-close{
+  position:absolute;
+  top:-10px;
+  right:0;
+}
+.sheet-builder-alert ul{
+  margin:0;
+  padding-left:1rem;
+}
+@media (max-width: 767.98px){
+  .sheet-gallery-overlay{
+    padding:16px;
+  }
+  .sheet-gallery-dialog{
+    gap:10px;
+  }
+  .sheet-gallery-nav,
+  .sheet-gallery-close{
+    width:40px;
+    height:40px;
+  }
+  .sheet-gallery-stage img{
+    max-height:62vh;
+  }
+}

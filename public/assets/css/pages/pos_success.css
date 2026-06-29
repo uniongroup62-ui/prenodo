@@ -1,0 +1,19 @@
+.pos-success-qty-col {
+  width: 90px;
+}
+
+.pos-success-money-col {
+  width: 140px;
+}
+
+.pos-success-notes {
+  white-space: pre-wrap;
+}
+
+.pos-success-discount-item {
+  padding-left: .25rem;
+}
+
+.pos-success-discount-list {
+  padding-left: 1rem;
+}

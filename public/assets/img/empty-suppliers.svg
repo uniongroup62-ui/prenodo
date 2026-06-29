@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="320" viewBox="0 0 520 320" role="img" aria-labelledby="title desc">
+  <title id="title">Fornitori vuoti</title>
+  <desc id="desc">Illustrazione di una scheda fornitore con scatole e documento.</desc>
+  <defs>
+    <linearGradient id="card" x1="122" y1="64" x2="398" y2="246" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eff6ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#94a3b8" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <rect width="520" height="320" fill="none"/>
+  <ellipse cx="260" cy="274" rx="152" ry="18" fill="#e2e8f0" opacity=".75"/>
+  <g filter="url(#shadow)">
+    <rect x="116" y="68" width="288" height="178" rx="18" fill="url(#card)" stroke="#dbeafe" stroke-width="2"/>
+    <rect x="140" y="96" width="120" height="14" rx="7" fill="#2563eb" opacity=".9"/>
+    <rect x="140" y="128" width="168" height="10" rx="5" fill="#94a3b8"/>
+    <rect x="140" y="150" width="126" height="10" rx="5" fill="#cbd5e1"/>
+    <rect x="140" y="184" width="78" height="30" rx="9" fill="#dbeafe" stroke="#bfdbfe"/>
+    <rect x="232" y="184" width="78" height="30" rx="9" fill="#f8fafc" stroke="#d7e3f2"/>
+  </g>
+  <g transform="translate(300 132)" filter="url(#shadow)">
+    <rect x="0" y="36" width="72" height="60" rx="12" fill="#dbeafe" stroke="#93c5fd" stroke-width="2"/>
+    <path d="M0 54h72" stroke="#93c5fd" stroke-width="2"/>
+    <rect x="54" y="0" width="74" height="96" rx="12" fill="#ecfdf5" stroke="#86efac" stroke-width="2"/>
+    <path d="M54 28h74" stroke="#86efac" stroke-width="2"/>
+    <rect x="73" y="52" width="36" height="10" rx="5" fill="#22c55e"/>
+    <rect x="73" y="72" width="25" height="7" rx="3.5" fill="#86efac"/>
+  </g>
+  <g transform="translate(88 58)">
+    <rect x="0" y="0" width="84" height="58" rx="12" fill="#ffffff" stroke="#dbeafe" stroke-width="2"/>
+    <circle cx="21" cy="23" r="9" fill="#60a5fa"/>
+    <rect x="38" y="17" width="30" height="8" rx="4" fill="#94a3b8"/>
+    <rect x="16" y="38" width="52" height="7" rx="3.5" fill="#dbeafe"/>
+  </g>
+  <g transform="translate(366 72)">
+    <circle cx="31" cy="31" r="31" fill="#dcfce7"/>
+    <path d="M20 32h22M31 21v22" stroke="#22c55e" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>

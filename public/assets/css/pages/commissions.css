@@ -1,0 +1,114 @@
+.commissions-tabs {
+  gap: 22px;
+  border-bottom: 1px solid #cfd9ea;
+  margin-bottom: 16px !important;
+}
+
+.commissions-tabs .nav-item {
+  margin-bottom: -1px;
+}
+
+.commissions-tabs .nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 0 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: #526b95;
+}
+
+.commissions-tabs .nav-link i {
+  margin-right: 0 !important;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.commissions-tabs .nav-link:hover,
+.commissions-tabs .nav-link:focus {
+  color: #526b95;
+  background: transparent;
+  border-color: transparent;
+  text-decoration: none;
+}
+
+.commissions-tabs .nav-link.active {
+  color: #0d6efd;
+  background: transparent;
+  border-color: transparent transparent #2f6cff;
+}
+
+.commissions-tabs .nav-link.active:hover,
+.commissions-tabs .nav-link.active:focus {
+  color: #0d6efd;
+  border-color: transparent transparent #2f6cff;
+}
+
+.commissions-empty-card {
+  min-height: 640px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+}
+
+.commissions-empty-state {
+  width: min(590px, 100%);
+  margin: 0 auto;
+  padding: 48px 24px;
+  text-align: center;
+}
+
+.commissions-empty-icon {
+  width: 96px;
+  height: 88px;
+  margin: 0 auto 18px;
+  display: grid;
+  place-items: center;
+  color: #9db7ef;
+  font-size: 64px;
+  line-height: 1;
+}
+
+.commissions-empty-state h2 {
+  font-size: 24px;
+  line-height: 1.2;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.commissions-empty-state p {
+  color: #475569;
+  line-height: 1.55;
+  max-width: 540px;
+  margin: 0 auto 22px;
+}
+
+.commissions-settings-mode-cell {
+  min-width: 180px;
+}
+
+.commissions-settings-percent-cell {
+  min-width: 120px;
+}
+
+.commissions-settings-notes-cell {
+  min-width: 220px;
+}
+
+@media (max-width: 767.98px) {
+  .commissions-empty-card {
+    min-height: 520px;
+  }
+
+  .commissions-empty-state {
+    padding: 36px 16px;
+  }
+
+  .commissions-empty-state h2 {
+    font-size: 21px;
+  }
+}

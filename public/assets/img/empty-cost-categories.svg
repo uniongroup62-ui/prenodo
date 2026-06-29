@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="320" viewBox="0 0 520 320" role="img" aria-labelledby="title desc">
+  <title id="title">Categorie costi vuote</title>
+  <desc id="desc">Illustrazione di etichette colorate per categorie.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#94a3b8" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <rect width="520" height="320" fill="none"/>
+  <ellipse cx="260" cy="276" rx="144" ry="18" fill="#e2e8f0" opacity=".72"/>
+  <g filter="url(#shadow)">
+    <path d="M152 86h142l72 72-118 118-142-142 46-48z" fill="#ffffff" stroke="#dbeafe" stroke-width="2"/>
+    <circle cx="171" cy="107" r="12" fill="#bfdbfe"/>
+    <path d="M166 107h10" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+    <rect x="176" y="150" width="130" height="14" rx="7" transform="rotate(45 176 150)" fill="#93c5fd"/>
+    <rect x="152" y="174" width="112" height="12" rx="6" transform="rotate(45 152 174)" fill="#cbd5e1"/>
+  </g>
+  <g transform="translate(298 72)">
+    <path d="M42 0h76l38 38-72 72-76-76L42 0z" fill="#dcfce7" stroke="#bbf7d0" stroke-width="2"/>
+    <circle cx="47" cy="20" r="8" fill="#22c55e"/>
+    <path d="M78 50h52M96 68h34" stroke="#22c55e" stroke-width="8" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(101 176)">
+    <path d="M28 0h76l32 32-60 60L0 16 28 0z" fill="#fef3c7" stroke="#fde68a" stroke-width="2"/>
+    <circle cx="33" cy="17" r="8" fill="#f59e0b"/>
+    <path d="M54 45h54M70 62h28" stroke="#f59e0b" stroke-width="8" stroke-linecap="round"/>
+  </g>
+</svg>

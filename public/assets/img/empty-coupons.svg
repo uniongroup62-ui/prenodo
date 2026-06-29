@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="320" viewBox="0 0 520 320" role="img" aria-labelledby="title desc">
+  <title id="title">Coupon vuoti</title>
+  <desc id="desc">Illustrazione di un coupon sconto e simboli percentuale.</desc>
+  <defs>
+    <linearGradient id="ticket" x1="108" y1="74" x2="406" y2="239" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eff6ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#94a3b8" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <rect width="520" height="320" fill="none"/>
+  <ellipse cx="260" cy="274" rx="150" ry="18" fill="#e2e8f0" opacity=".75"/>
+  <g filter="url(#shadow)">
+    <path d="M112 104a18 18 0 0 1 18-18h260a18 18 0 0 1 18 18v31a22 22 0 0 0 0 44v31a18 18 0 0 1-18 18H130a18 18 0 0 1-18-18v-31a22 22 0 0 0 0-44v-31z" fill="url(#ticket)" stroke="#bfdbfe" stroke-width="2"/>
+    <path d="M300 94v126" stroke="#dbeafe" stroke-width="3" stroke-dasharray="7 8"/>
+    <rect x="144" y="120" width="92" height="14" rx="7" fill="#2563eb"/>
+    <rect x="144" y="150" width="122" height="10" rx="5" fill="#94a3b8"/>
+    <rect x="144" y="172" width="88" height="10" rx="5" fill="#cbd5e1"/>
+    <circle cx="350" cy="142" r="20" fill="#dcfce7"/>
+    <circle cx="350" cy="190" r="20" fill="#dbeafe"/>
+    <path d="M334 199l32-66" stroke="#2563eb" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="350" cy="142" r="6" fill="#16a34a"/>
+    <circle cx="350" cy="190" r="6" fill="#2563eb"/>
+  </g>
+  <g transform="translate(384 70)">
+    <circle cx="31" cy="31" r="31" fill="#dcfce7"/>
+    <path d="M20 32h22M31 21v22" stroke="#22c55e" stroke-width="6" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(90 62)">
+    <rect x="0" y="0" width="78" height="54" rx="12" fill="#ffffff" stroke="#dbeafe" stroke-width="2"/>
+    <rect x="16" y="16" width="46" height="8" rx="4" fill="#93c5fd"/>
+    <rect x="16" y="32" width="30" height="7" rx="3.5" fill="#cbd5e1"/>
+  </g>
+</svg>

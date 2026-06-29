@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { ManageAccountPage } from "@/components/manage-account-page";
+import { ManageLoginFaithful } from "@/components/manage-login-faithful";
 
 export const metadata: Metadata = {
-  title: "Accedi al gestionale | Prenodo",
+  title: "Accedi al gestionale - BeautySuite",
 };
 
 export default async function ManageLoginPage({
@@ -11,5 +11,5 @@ export default async function ManageLoginPage({
   searchParams: Promise<{ slug?: string }>;
 }) {
   const { slug } = await searchParams;
-  return <ManageAccountPage initialMode="login" initialSlug={slug || "centroesteticoelite"} />;
+  return <ManageLoginFaithful initialSlug={slug || "centroesteticoelite"} />;
 }

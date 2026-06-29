@@ -1,0 +1,29 @@
+.voucher-wrap{ max-width:980px; margin:0 auto; }
+.voucher-card{ position:relative; overflow:hidden; }
+.voucher-watermark{
+  position:absolute;
+  top:50%;
+  left:50%;
+  transform:translate(-50%, -50%) rotate(-18deg);
+  font-size:64px;
+  font-weight: 600;
+  letter-spacing:2px;
+  opacity:.10;
+  pointer-events:none;
+  user-select:none;
+  white-space:nowrap;
+}
+.voucher-code{ font-size:34px; letter-spacing:1px; }
+.voucher-meta .label{ color:#6c757d; font-size:12px; }
+.voucher-meta .value{ font-weight:600; }
+#barcode{ width:100%; max-width:340px; height:80px; }
+.giftcard-voucher-logo{ max-height:64px; max-width:180px; object-fit:contain; }
+.giftcard-voucher-event-image{ width:100%; max-width:560px; height:auto; border-radius:14px; border:1px solid #e5e7eb; display:block; }
+.giftcard-voucher-note{ white-space:pre-wrap; }
+
+@media print{
+  .no-print{ display:none !important; }
+  body{ background:#fff !important; }
+  .card{ border:1px solid #ddd !important; box-shadow:none !important; }
+  .voucher-wrap{ max-width:100% !important; }
+}

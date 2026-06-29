@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="320" viewBox="0 0 520 320" role="img" aria-labelledby="title desc">
+  <title id="title">Commissioni vuote</title>
+  <desc id="desc">Illustrazione di un riepilogo commissioni con grafico e monete.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#94a3b8" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <rect width="520" height="320" fill="none"/>
+  <ellipse cx="260" cy="276" rx="148" ry="18" fill="#e2e8f0" opacity=".75"/>
+  <g filter="url(#shadow)">
+    <rect x="118" y="68" width="284" height="178" rx="18" fill="#fff" stroke="#dbeafe" stroke-width="2"/>
+    <rect x="142" y="96" width="116" height="12" rx="6" fill="#93c5fd"/>
+    <rect x="142" y="122" width="86" height="10" rx="5" fill="#e2e8f0"/>
+    <rect x="142" y="144" width="128" height="10" rx="5" fill="#cbd5e1"/>
+    <rect x="142" y="166" width="96" height="10" rx="5" fill="#e2e8f0"/>
+    <rect x="142" y="198" width="58" height="18" rx="9" fill="#dbeafe"/>
+    <rect x="212" y="198" width="58" height="18" rx="9" fill="#dcfce7"/>
+  </g>
+  <g transform="translate(286 108)">
+    <rect x="0" y="0" width="84" height="92" rx="16" fill="#f8fafc" stroke="#bfdbfe" stroke-width="2"/>
+    <rect x="16" y="51" width="10" height="25" rx="5" fill="#60a5fa"/>
+    <rect x="36" y="34" width="10" height="42" rx="5" fill="#2563eb"/>
+    <rect x="56" y="20" width="10" height="56" rx="5" fill="#22c55e"/>
+  </g>
+  <g transform="translate(334 196)">
+    <circle cx="0" cy="0" r="20" fill="#fef3c7" stroke="#f59e0b" stroke-width="3"/>
+    <circle cx="34" cy="9" r="20" fill="#fde68a" stroke="#f59e0b" stroke-width="3"/>
+    <path d="M-7 0h14M27 9h14" stroke="#b45309" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(94 136)">
+    <circle cx="28" cy="28" r="28" fill="#dbeafe"/>
+    <path d="M28 12v32M18 22h20" stroke="#2563eb" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="28" cy="28" r="18" fill="none" stroke="#60a5fa" stroke-width="5"/>
+  </g>
+  <g transform="translate(366 70)">
+    <circle cx="31" cy="31" r="31" fill="#dcfce7"/>
+    <path d="M22 32l7 7 13-18" fill="none" stroke="#22c55e" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

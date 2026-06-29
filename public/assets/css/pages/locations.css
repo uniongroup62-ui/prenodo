@@ -1,0 +1,185 @@
+.location-marketplace-panel {
+  border: 1px solid #d7dee8;
+  border-radius: 14px;
+  background: #fff;
+  padding: 16px;
+}
+.location-marketplace-panel--soft {
+  background: #f8fbff;
+}
+.location-marketplace-summary {
+  border: 1px solid #d7dee8;
+  border-radius: 12px;
+  background: #f8fafc;
+  padding: 12px 14px;
+}
+.location-category-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-width: 280px;
+}
+.location-category-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid #d7dee8;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #334155;
+  padding: 3px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+.location-activity-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+}
+.location-activity-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  border: 1px solid #d7dee8;
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+}
+.location-activity-card:hover {
+  border-color: #9ec5fe;
+  background: #f8fbff;
+}
+.location-activity-card.is-selected {
+  border-color: #0d6efd;
+  background: #eef5ff;
+  box-shadow: 0 0 0 3px rgba(13,110,253,.08);
+}
+.location-activity-card__check {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.location-activity-card__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  color: #0f172a;
+  background: #f1f5f9;
+  font-size: 17px;
+}
+.location-activity-card__icon svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.location-activity-card__icon .bi {
+  display: block;
+  font-size: 20px;
+  line-height: 1;
+}
+.location-activity-card.is-selected .location-activity-card__icon {
+  color: #0d6efd;
+  background: #dbeafe;
+}
+.location-activity-card__name {
+  min-width: 0;
+  color: #111827;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.location-activity-card__badge {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  min-width: 24px;
+  min-height: 22px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: #fff;
+  background: #0d6efd;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+.location-activity-card.is-selected .location-activity-card__badge {
+  display: inline-flex;
+}
+.location-gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.location-gallery-card {
+  border: 1px solid #d7dee8;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fff;
+}
+.location-gallery-card__preview {
+  background: #f1f5f9;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+}
+.location-gallery-card__preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.location-gallery-card__body {
+  padding: 10px;
+}
+.location-gallery-card--pending {
+  border-color: #9ec5fe;
+  box-shadow: 0 0 0 3px rgba(13,110,253,.06);
+}
+.location-gallery-card__meta {
+  min-width: 0;
+}
+.location-gallery-card__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.location-gallery-pending {
+  border: 1px solid #d7e7ff;
+  border-radius: 12px;
+  background: #f8fbff;
+  padding: 12px;
+}
+.location-gallery-dropzone {
+  border: 1px dashed #a9bfdc;
+  border-radius: 12px;
+  background: #f8fbff;
+  min-height: 86px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+.location-gallery-dropzone:hover,
+.location-gallery-dropzone.is-dragover {
+  border-color: #0d6efd;
+  background: #eef5ff;
+  box-shadow: 0 0 0 3px rgba(13,110,253,.08);
+}

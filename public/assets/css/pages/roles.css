@@ -1,0 +1,19 @@
+.roles-perm-sections{display:flex;flex-direction:column;gap:16px;}
+.roles-perm-section{border:1px solid var(--border,#e5e7eb);border-radius:8px;background:#fff;padding:12px;}
+.roles-perm-section-title{font-size:.92rem;font-weight:600;margin:0 0 10px;}
+.roles-perm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;align-items:start;}
+.roles-perm-tree{display:flex;flex-direction:column;gap:6px;min-width:0;}
+.role-perm-node{min-height:36px;margin:0;background:#fff;gap:10px;}
+.role-perm-node-child{background:#f8fafc;}
+.role-perm-label{min-width:0;line-height:1.25;}
+.role-perm-label .fw-semibold{overflow-wrap:anywhere;}
+.role-perm-label .fw-semibold>.text-muted.me-1{display:none;}
+.role-perm-node-child .fw-semibold::before{content:"\21B3";color:#64748b;margin-right:.35rem;}
+.role-perm-level-1 .role-perm-label{padding-left:.8rem;}
+.role-perm-level-2 .role-perm-label{padding-left:1.6rem;}
+.role-perm-level-3 .role-perm-label{padding-left:2.4rem;}
+.role-perm-level-4 .role-perm-label{padding-left:3.2rem;}
+@media (max-width:575.98px){
+  .roles-perm-section{padding:10px;}
+  .roles-perm-grid{grid-template-columns:1fr;}
+}

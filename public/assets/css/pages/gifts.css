@@ -1,0 +1,21 @@
+.gifts-empty-card{min-height:560px;display:flex;align-items:center;justify-content:center;border-radius:8px;}
+.gifts-empty-state{width:min(620px,100%);margin:0 auto;padding:48px 24px;text-align:center;}
+.gifts-empty-icon{width:96px;height:88px;margin:0 auto 18px;display:grid;place-items:center;color:#9db7ef;font-size:64px;line-height:1;}
+.gifts-empty-state h2{font-size:24px;line-height:1.2;font-weight:600;margin:0 0 12px;}
+.gifts-empty-state p{color:#475569;line-height:1.55;max-width:560px;margin:0 auto 22px;}
+.gifts-campaigns-table-wrap{overflow:visible;}
+.gifts-campaign-actions-col{width:58px;}
+.gifts-campaign-actions .dropdown-toggle::after{display:none;}
+.gifts-campaign-actions__trigger{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;padding:0;}
+.gifts-campaign-actions .dropdown-menu{min-width:190px;}
+.gifts-location-valid-col{width:160px;}
+.gifts-rule-type-col{width:220px;}
+.gifts-rule-threshold-col{width:140px;}
+.gifts-terms-text{resize:vertical;}
+.app-combobox-list--scroll{max-height:240px;overflow:auto;}
+@media (max-width: 991.98px){
+  .gifts-empty-card{min-height:500px;}
+  .gifts-empty-state{padding:36px 16px;}
+  .gifts-empty-state h2{font-size:21px;}
+  .gifts-campaigns-table-wrap{overflow-x:auto;}
+}

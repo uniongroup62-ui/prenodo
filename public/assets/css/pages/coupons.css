@@ -1,0 +1,57 @@
+.coupons-empty-card {
+  min-height: 640px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+}
+
+.coupons-empty-state {
+  width: min(560px, 100%);
+  margin: 0 auto;
+  padding: 48px 24px;
+  text-align: center;
+}
+
+.coupons-empty-icon {
+  width: 96px;
+  height: 88px;
+  margin: 0 auto 18px;
+  display: grid;
+  place-items: center;
+  color: #9db7ef;
+  font-size: 64px;
+  line-height: 1;
+}
+
+.coupons-empty-state h2 {
+  font-size: 24px;
+  line-height: 1.2;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.coupons-empty-state p {
+  color: #475569;
+  line-height: 1.55;
+  max-width: 520px;
+  margin: 0 auto 22px;
+}
+
+.coupons-location-valid-cell {
+  width: 160px;
+}
+
+@media (max-width: 767.98px) {
+  .coupons-empty-card {
+    min-height: 520px;
+  }
+
+  .coupons-empty-state {
+    padding: 36px 16px;
+  }
+
+  .coupons-empty-state h2 {
+    font-size: 21px;
+  }
+}

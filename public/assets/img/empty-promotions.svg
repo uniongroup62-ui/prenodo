@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="320" viewBox="0 0 520 320" role="img" aria-labelledby="title desc">
+  <title id="title">Promozioni vuote</title>
+  <desc id="desc">Illustrazione di una campagna promozionale digitale.</desc>
+  <defs>
+    <linearGradient id="panel" x1="126" y1="78" x2="390" y2="255" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eff6ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#94a3b8" flood-opacity=".24"/>
+    </filter>
+  </defs>
+  <rect width="520" height="320" fill="none"/>
+  <ellipse cx="260" cy="278" rx="150" ry="18" fill="#e2e8f0" opacity=".75"/>
+  <g filter="url(#shadow)">
+    <rect x="122" y="92" width="276" height="164" rx="22" fill="url(#panel)" stroke="#bfdbfe" stroke-width="2"/>
+    <rect x="154" y="126" width="108" height="14" rx="7" fill="#2563eb"/>
+    <rect x="154" y="154" width="158" height="10" rx="5" fill="#94a3b8"/>
+    <rect x="154" y="176" width="118" height="10" rx="5" fill="#cbd5e1"/>
+    <rect x="154" y="212" width="86" height="24" rx="12" fill="#dbeafe"/>
+    <path d="M318 136l48-22v98l-48-22z" fill="#bfdbfe" stroke="#2563eb" stroke-width="6" stroke-linejoin="round"/>
+    <rect x="292" y="148" width="34" height="30" rx="8" fill="#2563eb"/>
+    <path d="M342 126c18 7 29 22 29 38s-11 31-29 38" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(354 60)" filter="url(#shadow)">
+    <circle cx="38" cy="38" r="38" fill="#dcfce7"/>
+    <path d="M23 40h30M38 25v30" stroke="#16a34a" stroke-width="8" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(82 80)">
+    <circle cx="34" cy="34" r="34" fill="#eff6ff" stroke="#bfdbfe" stroke-width="2"/>
+    <path d="M22 46l24-24M27 24h.01M41 44h.01" stroke="#2563eb" stroke-width="7" stroke-linecap="round"/>
+  </g>
+</svg>

@@ -1,0 +1,152 @@
+.consent-page-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.95fr) minmax(320px, .82fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.consent-main-stack,
+.consent-side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.consent-side-stack {
+  position: static;
+}
+
+.consent-overview-card,
+.consent-quick-card,
+.consent-records-shell {
+  border-radius: 1rem;
+}
+
+.consent-overview-card {
+  border-color: #ead1db;
+}
+
+.consent-status-line {
+  min-height: 2.6rem;
+}
+
+.consent-summary-list {
+  margin: 0;
+  padding-left: 1rem;
+  color: #6c757d;
+  font-size: .92rem;
+}
+
+.consent-record-group + .consent-record-group {
+  margin-top: 1.25rem;
+}
+
+.consent-group-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: .75rem;
+  margin-bottom: .85rem;
+}
+
+.consent-group-title {
+  font-size: .98rem;
+  font-weight: 600;
+  margin-bottom: .15rem;
+}
+
+.consent-record-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.consent-record-card {
+  border: 1px solid #e8ebf0;
+  border-radius: 1rem;
+  padding: 1rem 1.05rem;
+  background: #fff;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .02);
+}
+
+.consent-record-card.is-draft {
+  border-color: #d9e7ff;
+  background: #fcfdff;
+}
+
+.consent-record-card.is-pending {
+  border-color: #f2df9c;
+  background: #fffdf7;
+}
+
+.consent-record-card.is-signed {
+  border-color: #d7eadb;
+  background: #fcfffd;
+}
+
+.consent-divider {
+  height: 1px;
+  background: #edf1f5;
+  margin: 1rem 0;
+}
+
+.consent-record-note {
+  color: #6c757d;
+  font-size: .93rem;
+  max-width: 70ch;
+}
+
+.consent-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+}
+
+.consent-meta-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .38rem .65rem;
+  border: 1px solid #e8ebf0;
+  border-radius: 999px;
+  background: #f8f9fb;
+  color: #495057;
+  font-size: .83rem;
+}
+
+.consent-action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: .65rem;
+}
+
+.consent-upload-box {
+  padding: .95rem;
+  border: 1px dashed #d7dde7;
+  border-radius: .85rem;
+  background: #fbfcfe;
+}
+
+.consent-empty-state {
+  border: 1px dashed #d7dde7;
+  border-radius: 1rem;
+  padding: 1.35rem;
+  background: #fbfcfe;
+  text-align: center;
+  color: #6c757d;
+}
+
+.consent-count-badge {
+  font-weight: 600;
+}
+
+@media (max-width: 1199.98px) {
+  .consent-page-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .consent-side-stack {
+    position: static;
+  }
+}

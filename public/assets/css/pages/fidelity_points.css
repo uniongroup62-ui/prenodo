@@ -1,0 +1,14 @@
+.points-disabled-card{min-height:640px;display:flex;align-items:center;justify-content:center;border-radius:8px;}
+.points-disabled-state{width:min(590px,100%);margin:0 auto;padding:48px 24px;text-align:center;}
+.points-disabled-state img{width:min(260px,66vw);height:auto;display:block;margin:0 auto 24px;}
+.points-disabled-state h2{font-size:24px;line-height:1.2;font-weight:600;margin:0 0 12px;}
+.points-disabled-state p{color:#475569;line-height:1.55;max-width:540px;margin:0 auto 22px;}
+.points-appointments-scroll{max-height:246px;overflow-y:auto;scrollbar-gutter:stable;}
+.points-min-width-0{min-width:0;}
+.points-modal-scroll-body{min-height:0;}
+.points-campaign-tier-col{width:45%;}
+@media (max-width: 767.98px){
+  .points-disabled-card{min-height:520px;}
+  .points-disabled-state{padding:36px 16px;}
+  .points-disabled-state h2{font-size:21px;}
+}

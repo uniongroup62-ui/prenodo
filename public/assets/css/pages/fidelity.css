@@ -1,0 +1,13 @@
+.fidelity-appointments-scroll {
+  max-height: 246px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.fidelity-min-width-0 {
+  min-width: 0;
+}
+
+.fidelity-modal-scroll-body {
+  min-height: 0;
+}
