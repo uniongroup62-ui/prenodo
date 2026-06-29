@@ -45,6 +45,14 @@ import { RolesContent } from "@/components/modules/roles-content";
 import { GiftcardSettingsContent } from "@/components/modules/giftcard_settings-content";
 import { GiftboxSettingsContent } from "@/components/modules/giftbox_settings-content";
 import { QuoteSettingsContent } from "@/components/modules/quote_settings-content";
+import { ServicesContent } from "@/components/modules/services-content";
+import { ServiceCategoriesContent } from "@/components/modules/service_categories-content";
+import { ServiceRecommendationsContent } from "@/components/modules/service_recommendations-content";
+import { PackagesContent } from "@/components/modules/packages-content";
+import { PackageSettingsContent } from "@/components/modules/package_settings-content";
+import { MarketplaceSettingsContent } from "@/components/modules/marketplace-content";
+import { FidelityWalletContent } from "@/components/modules/fidelity_wallet-content";
+import { CreditMovementsContent } from "@/components/modules/credit_movements-content";
 import { PublicBookingWizard } from "@/components/public-booking-wizard";
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
@@ -95,6 +103,14 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   giftcard_settings: GiftcardSettingsContent,
   giftbox_settings: GiftboxSettingsContent,
   quote_settings: QuoteSettingsContent,
+  services: ServicesContent,
+  service_categories: ServiceCategoriesContent,
+  service_recommendations: ServiceRecommendationsContent,
+  packages: PackagesContent,
+  package_settings: PackageSettingsContent,
+  marketplace: MarketplaceSettingsContent,
+  fidelity_wallet: FidelityWalletContent,
+  credit_movements: CreditMovementsContent,
 };
 
 export default async function TenantIndexPhpPage({
