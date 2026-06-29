@@ -206,7 +206,15 @@ export function ManageShell({
             </div>
 
             <div className="actions ms-auto">
-              <button className="btn btn-primary btn-pill" type="button" data-qb-new="1" aria-label="Nuova prenotazione">
+              <button
+                className="btn btn-primary btn-pill"
+                type="button"
+                data-qb-new="1"
+                aria-label="Nuova prenotazione"
+                onClick={() => {
+                  window.location.href = `${pageHref(slug, "calendar")}&qbnew=1`;
+                }}
+              >
                 <i className="bi bi-plus-lg me-1" />
                 <span className="topbar-action-text">Prenotazione</span>
               </button>

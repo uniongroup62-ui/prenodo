@@ -480,6 +480,16 @@ export function CalendarContent() {
     [date, minMin, maxMin, slug, loadContext],
   );
 
+  // Auto-open the quick-book modal when arrived via the global "+ Prenotazione"
+  // shell button, which navigates here with ?qbnew=1. Deferred so the static
+  // #apptModal markup + Bootstrap are ready.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (new URLSearchParams(window.location.search).get("qbnew") !== "1") return;
+    const timer = setTimeout(() => openQuickBook(minToTime(minMin), 0), 250);
+    return () => clearTimeout(timer);
+  }, [openQuickBook, minMin]);
+
   function viewBtn(target: CalendarView, label: string) {
     const active = view === target;
     return (
