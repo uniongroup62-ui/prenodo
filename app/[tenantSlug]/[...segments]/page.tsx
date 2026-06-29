@@ -67,8 +67,10 @@ import { GiftCardVoucherFaithful } from "@/components/public/giftcard-voucher-fa
 import { currentManageSession } from "@/lib/manage-auth";
 import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
 
-// Modules already ported to the faithful Path A UI (ManageShell + content).
-// Everything else still falls back to the legacy ManagementApp.
+// Clean per-page routing for the manage app: /<slug>/<page>[/<tab>].
+// The legacy /<slug>/index.php?page=X[&tab=Y] URLs are 307-redirected here by
+// middleware.ts, so old links/bookmarks keep working. Public pages (voucher
+// viewers) are handled before the session check.
 const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   clients: ClientsContent,
   suppliers: SuppliersContent,
@@ -131,63 +133,64 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   appointments: AppointmentsContent,
 };
 
-export default async function TenantIndexPhpPage({
+export default async function TenantPage({
   params,
   searchParams,
 }: {
-  params: Promise<{ tenantSlug: string }>;
-  searchParams: Promise<{ page?: string; public?: string; location_id?: string; service?: string; tab?: string; action?: string; token?: string; embed?: string }>;
+  params: Promise<{ tenantSlug: string; segments?: string[] }>;
+  searchParams: Promise<{ public?: string; location_id?: string; service?: string; tab?: string; action?: string; token?: string; embed?: string }>;
 }) {
-  const { tenantSlug } = await params;
+  const { tenantSlug, segments } = await params;
   const query = await searchParams;
+  // Clean URLs are /<slug>/<page> with tab/action as query params (matching the
+  // legacy ?tab=/?action= semantics); segments[0] is the page.
+  const page = segments?.[0] ?? "";
+  const tab = query.tab;
 
-  if (query.page === "booking" && query.public === "1") {
+  if (page === "booking" && query.public === "1") {
     return <BookingFaithful slug={tenantSlug} />;
   }
 
   // Public GiftBox/GiftCard voucher viewers (gift email links):
-  //   index.php?page=giftbox_voucher&public=1&embed=1&token=<64hex>
-  //   index.php?page=giftcard_voucher&public=1&embed=1&token=<64hex>
-  // Token-only public access; the faithful component fetches the DB-backed API.
-  if (query.page === "giftbox_voucher" && query.public === "1") {
+  //   /<slug>/giftbox_voucher?public=1&embed=1&token=<64hex>
+  //   /<slug>/giftcard_voucher?public=1&embed=1&token=<64hex>
+  if (page === "giftbox_voucher" && query.public === "1") {
     return <GiftBoxVoucherFaithful slug={tenantSlug} token={query.token ?? ""} embed={query.embed === "1"} />;
   }
-  if (query.page === "giftcard_voucher" && query.public === "1") {
+  if (page === "giftcard_voucher" && query.public === "1") {
     return <GiftCardVoucherFaithful slug={tenantSlug} token={query.token ?? ""} embed={query.embed === "1"} />;
   }
 
   const session = await currentManageSession(tenantSlug);
   if (!session) redirect(`/manage/login?slug=${encodeURIComponent(tenantSlug)}`);
 
-  if (query.page === "onboarding") {
+  if (page === "onboarding") {
     if (session.user.role.toLowerCase() !== "admin") redirect(`/${tenantSlug}/dashboard`);
     return <ManageOnboardingApp tenantSlug={tenantSlug} />;
   }
 
   if (await shouldPromptOnboarding(tenantSlug, session.user.role.toLowerCase() === "admin")) {
-    redirect(`/${encodeURIComponent(tenantSlug)}/index.php?page=onboarding`);
+    redirect(`/${encodeURIComponent(tenantSlug)}/onboarding`);
   }
 
-  const faithfulPageKey = query.page ? faithfulKey(query.page, query.tab) : "";
+  const faithfulPageKey = page ? faithfulKey(page, tab) : "";
   const FaithfulContent = faithfulPageKey ? FAITHFUL_MODULES[faithfulPageKey] : undefined;
   if (FaithfulContent && !query.action) {
     return (
-      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={query.page}>
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <FaithfulContent />
       </ManageShell>
     );
   }
 
-  if (query.page) {
-    return <ManagementApp initialSection={legacyPageToSection(query.page, query.tab, query.action)} currentUser={session.user} tenantSlug={tenantSlug} />;
+  if (page) {
+    return <ManagementApp initialSection={legacyPageToSection(page, tab, query.action)} currentUser={session.user} tenantSlug={tenantSlug} />;
   }
 
   redirect(`/${tenantSlug}/dashboard`);
 }
 
-// Resolve the FAITHFUL_MODULES key for a legacy ?page=&tab= combination.
-// Distinguishes tab sub-pages (services/packages) without the section
-// collapses that legacyPageToSection applies for the old ManagementApp.
+// Resolve the FAITHFUL_MODULES key for a page/tab combination.
 function faithfulKey(page: string, tab?: string): string {
   if (page === "services" && tab === "categories") return "service_categories";
   if (page === "services" && tab === "recommended") return "service_recommendations";

@@ -82,8 +82,20 @@ const MENU: Group[] = [
   },
 ];
 
+// Build a clean manage URL from a menu page key. The key may embed a legacy
+// query (`costs&tab=categories`, `products&action=categories`) or hash anchor
+// (`fidelity_points#livelli-card`); the page becomes the path segment and the
+// tab/action stay as query params: /<slug>/<page>[?tab=..][#hash].
 function pageHref(slug: string, page: string): string {
-  return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
+  const hashIdx = page.indexOf("#");
+  const hash = hashIdx >= 0 ? page.slice(hashIdx) : "";
+  const noHash = hashIdx >= 0 ? page.slice(0, hashIdx) : page;
+  const ampIdx = noHash.indexOf("&");
+  const name = ampIdx >= 0 ? noHash.slice(0, ampIdx) : noHash;
+  const query = ampIdx >= 0 ? noHash.slice(ampIdx + 1) : "";
+  let url = `/${encodeURIComponent(slug)}/${name}`;
+  if (query) url += `?${query}`;
+  return url + hash;
 }
 
 export function ManageShell({
@@ -212,7 +224,7 @@ export function ManageShell({
                 data-qb-new="1"
                 aria-label="Nuova prenotazione"
                 onClick={() => {
-                  window.location.href = `${pageHref(slug, "calendar")}&qbnew=1`;
+                  window.location.href = `${pageHref(slug, "calendar")}?qbnew=1`;
                 }}
               >
                 <i className="bi bi-plus-lg me-1" />
