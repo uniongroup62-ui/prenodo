@@ -123,8 +123,9 @@ export default async function TenantIndexPhpPage({
     redirect(`/${encodeURIComponent(tenantSlug)}/index.php?page=onboarding`);
   }
 
-  const FaithfulContent = query.page ? FAITHFUL_MODULES[query.page] : undefined;
-  if (FaithfulContent && !query.action && !query.tab) {
+  const faithfulPageKey = query.page ? faithfulKey(query.page, query.tab) : "";
+  const FaithfulContent = faithfulPageKey ? FAITHFUL_MODULES[faithfulPageKey] : undefined;
+  if (FaithfulContent && !query.action) {
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={query.page}>
         <FaithfulContent />
@@ -137,6 +138,19 @@ export default async function TenantIndexPhpPage({
   }
 
   redirect(`/${tenantSlug}/dashboard`);
+}
+
+// Resolve the FAITHFUL_MODULES key for a legacy ?page=&tab= combination.
+// Distinguishes tab sub-pages (services/packages) without the section
+// collapses that legacyPageToSection applies for the old ManagementApp.
+function faithfulKey(page: string, tab?: string): string {
+  if (page === "services" && tab === "categories") return "service_categories";
+  if (page === "services" && tab === "recommended") return "service_recommendations";
+  if (page === "services") return "services";
+  if (page === "packages" && tab === "settings") return "package_settings";
+  if (page === "packages") return "packages";
+  if (page === "costs" && tab === "categories") return "cost_categories";
+  return page;
 }
 
 function legacyPageToSection(page: string, tab?: string, action?: string): string {
