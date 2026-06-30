@@ -49,6 +49,7 @@ import { GiftcardSettingsContent } from "@/components/modules/giftcard_settings-
 import { GiftboxSettingsContent } from "@/components/modules/giftbox_settings-content";
 import { QuoteSettingsContent } from "@/components/modules/quote_settings-content";
 import { ServicesContent } from "@/components/modules/services-content";
+import { ServiceFormContent } from "@/components/modules/service_form-content";
 import { ServiceCategoriesContent } from "@/components/modules/service_categories-content";
 import { ServiceRecommendationsContent } from "@/components/modules/service_recommendations-content";
 import { PackagesContent } from "@/components/modules/packages-content";
@@ -184,6 +185,17 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ClientFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful service NEW / EDIT form. The services list links to
+  // index.php?page=services&action=new|edit; route those to the faithful editor
+  // (instead of the Tailwind ManagementApp fallback).
+  if (page === "services" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <ServiceFormContent />
       </ManageShell>
     );
   }

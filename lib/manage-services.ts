@@ -192,6 +192,16 @@ export async function getManageServicesContext(slug: string, options: { query?: 
   };
 }
 
+// Single-service reader for the faithful service NEW/EDIT form prefill (route
+// action=get). Mirrors clients?action=get: returns ONE fully-mapped service row
+// (with its location/cabin/staff/resource links) so the editor can prefill all
+// fields. Reuses the same listManageServices pipeline, then narrows to the id.
+export async function getManageService(slug: string, serviceId: number): Promise<ManageServiceRow | null> {
+  if (serviceId <= 0) return null;
+  const services = await listManageServices(slug, { includeInactive: true });
+  return services.find((service) => service.id === serviceId) ?? null;
+}
+
 export async function saveManageService(slug: string, body: Record<string, string>): Promise<ManageServiceContext> {
   const input = await normalizeServiceInput(slug, body);
   const table = await tenantTable(slug, "services");

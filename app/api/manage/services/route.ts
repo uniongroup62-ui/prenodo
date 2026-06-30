@@ -5,6 +5,7 @@ import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import {
   deleteManageService,
   deleteServiceCategory,
+  getManageService,
   getManageServicesContext,
   moveServiceCategory,
   saveManageService,
@@ -28,6 +29,19 @@ export async function GET(request: Request) {
 
   try {
     const url = new URL(request.url);
+
+    // Edit-form prefill: return ONE service's editable fields for one id. Port of
+    // services.php action=edit (loads services row + its location/cabin/staff/
+    // resource links). Gated by services.manage like the save action.
+    if (url.searchParams.get("action") === "get") {
+      if (!can(session.user.perms, "services.manage")) return jsonError("Permesso Servizi richiesto.", 403);
+      const serviceId = parseInteger(url.searchParams.get("id"), 0);
+      if (serviceId <= 0) return jsonError("ID servizio mancante.");
+      const service = await getManageService(tenantSlug, serviceId);
+      if (!service) return jsonError("Servizio non trovato.", 404);
+      return Response.json({ ok: true, source: "services?action=get", sourceMode: "database", service });
+    }
+
     const locationId = await resolveManageLocationId({
       slug: tenantSlug,
       raw: url.searchParams.get("location_id"),
@@ -56,6 +70,7 @@ export async function POST(request: Request) {
     switch (action) {
       case "create":
       case "new":
+      case "save":
       case "service_save":
       case "update":
       case "edit":
