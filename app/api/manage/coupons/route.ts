@@ -51,7 +51,12 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, source: "coupons?action=create", sourceMode: "database", coupon, coupons: await listDbCoupons(tenantSlug) });
     }
 
-    if (!canAny(session.user.perms, ["coupons.manage", "pos.manage"])) return jsonError("Permesso buoni mancante.", 403);
+    // preview/redeem are also reachable from the quick-booking drawer's coupon Apply
+    // (port of api_appointments action=coupon_preview), so a booking-capable user must be
+    // able to validate a coupon even without the coupons/pos management permission.
+    if (!canAny(session.user.perms, ["coupons.manage", "pos.manage", "appointments.manage", "appointments.plan", "appointments.quick_booking"])) {
+      return jsonError("Permesso buoni mancante.", 403);
+    }
 
     if (action === "redeem") {
       const code = body.code ?? "";

@@ -549,6 +549,24 @@ async function generateUniqueAppointmentPublicCode(slug: string): Promise<string
   return null;
 }
 
+// Normalize the quick-booking manual SCONTO (port of the drawer recompute / the legacy
+// renderPriceDetails math): type is "" (none) | "percent" | "fixed"; value is the raw
+// text the staff typed. Returns the DB column pair {discount_type, discount_value}.
+// A percent is clamped to [0, 100]; a fixed amount is clamped >= 0 (the per-line cap to
+// subtotal is a display concern — the stored value is the staff's chosen figure, matching
+// the legacy which persists discount_value as entered). An empty/invalid input => 0.
+function normalizeAppointmentDiscount(
+  type: string | undefined,
+  value: string | undefined,
+): { discount_type: string | null; discount_value: number } {
+  const dtype = type === "percent" || type === "fixed" ? type : "";
+  let dval = Number.parseFloat(String(value ?? "").replace(",", "."));
+  if (!Number.isFinite(dval) || dval < 0) dval = 0;
+  if (!dtype || dval <= 0) return { discount_type: null, discount_value: 0 };
+  if (dtype === "percent" && dval > 100) dval = 100;
+  return { discount_type: dtype, discount_value: roundMoney(dval) };
+}
+
 export async function createDbAppointment({
   slug,
   clientName,
@@ -575,6 +593,8 @@ export async function createDbAppointment({
   giftRedeems = [],
   giftWarnings,
   status: statusInput = "pending",
+  discountType,
+  discountValue,
 }: {
   slug: string;
   clientName: string;
@@ -587,6 +607,8 @@ export async function createDbAppointment({
   staffNotes?: string | null;
   customerNotes?: string | null;
   status?: string;
+  discountType?: string;
+  discountValue?: string;
 } & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   const client = await resolveClientForAppointment(slug, clientName, locationId);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
@@ -631,6 +653,9 @@ export async function createDbAppointment({
   // and generate a unique 5-digit booking code like the legacy ensure_unique_public_code.
   const normalizedStatus = appointmentPhpStatus(statusInput);
   const publicCode = await generateUniqueAppointmentPublicCode(slug);
+  // Manual sconto from the quick-booking price panel (#qb_discount_type/#qb_discount_value),
+  // normalized to the discount_type/discount_value columns (was hardcoded to 0 before).
+  const discount = normalizeAppointmentDiscount(discountType, discountValue);
   const appointmentValues: Record<string, unknown> = {
     client_id: client.id,
     service_id: plan.primaryService.id,
@@ -638,7 +663,8 @@ export async function createDbAppointment({
     starts_at: start,
     ends_at: end,
     status: normalizedStatus,
-    discount_value: 0,
+    discount_type: discount.discount_type,
+    discount_value: discount.discount_value,
     location_id: locationId,
     staff_notes: staffNotes || null,
     customer_notes: customerNotes || null,
@@ -771,6 +797,8 @@ export async function updateDbAppointment({
   cabinId = null,
   staffMap = {},
   cabinMap = {},
+  discountType,
+  discountValue,
 }: {
   slug: string;
   id: number;
@@ -783,6 +811,8 @@ export async function updateDbAppointment({
   holdToken?: string | null;
   staffNotes?: string | null;
   customerNotes?: string | null;
+  discountType?: string;
+  discountValue?: string;
 } & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   // Tenant-scoped existence guard: the SELECT only returns rows for this tenant,
   // so a row from another tenant (or a missing id) yields no match.
@@ -829,6 +859,9 @@ export async function updateDbAppointment({
     excludeHoldToken: token || null,
   });
 
+  // Manual sconto from the quick-booking price panel (#qb_discount_type/#qb_discount_value),
+  // normalized to the discount_type/discount_value columns (mirrors createDbAppointment).
+  const discount = normalizeAppointmentDiscount(discountType, discountValue);
   await tenantUpdate({
     slug,
     table: "appointments",
@@ -842,6 +875,8 @@ export async function updateDbAppointment({
       location_id: locationId,
       staff_notes: staffNotes || null,
       customer_notes: customerNotes || null,
+      discount_type: discount.discount_type,
+      discount_value: discount.discount_value,
     },
   });
 
@@ -1105,6 +1140,10 @@ export type AppointmentEditPayload = {
   status: string;
   staffNotes: string;
   customerNotes: string;
+  // Persisted manual sconto (discount_type/discount_value columns) so the drawer's price
+  // panel prefills it on edit (round-trips with createDbAppointment/updateDbAppointment).
+  discountType: string;
+  discountValue: number;
 };
 
 export async function getDbAppointmentForEdit(slug: string, id: number): Promise<AppointmentEditPayload | null> {
@@ -1216,6 +1255,9 @@ export async function getDbAppointmentForEdit(slug: string, id: number): Promise
     status: phpStatus(String(row.status ?? "")),
     staffNotes: row.staff_notes === null || row.staff_notes === undefined ? "" : String(row.staff_notes),
     customerNotes: row.customer_notes === null || row.customer_notes === undefined ? "" : String(row.customer_notes),
+    // Manual sconto: "" (none) | "percent" | "fixed" + its value (0 when no discount).
+    discountType: String(row.discount_type ?? "") === "percent" || String(row.discount_type ?? "") === "fixed" ? String(row.discount_type) : "",
+    discountValue: roundMoney(Number(row.discount_value ?? 0)),
   };
 }
 

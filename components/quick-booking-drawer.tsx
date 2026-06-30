@@ -101,6 +101,9 @@ type AppointmentEditPayload = {
   status: string;
   staffNotes: string;
   customerNotes: string;
+  // Persisted manual sconto (discount_type/discount_value) to prefill the price panel.
+  discountType?: string;
+  discountValue?: number;
 };
 
 // Minimal Bootstrap offcanvas/modal surface used here (the bundle is loaded by
@@ -377,6 +380,29 @@ export function QuickBookingDrawer() {
   const [giftcardPick, setGiftcardPick] = useState<number | null>(null);
   const [giftcardAmountInput, setGiftcardAmountInput] = useState<string>("");
 
+  // ---- Manual SCONTO (#qb_discount_type / #qb_discount_value) ----
+  // The staff's manual discount, faithful to app.js renderPriceDetails: `discountType` is
+  // "" (none) | "percent" | "fixed"; `discountValue` is the raw text the staff types
+  // (parsed/clamped in the priceDetails recompute). Both controlled so editing recomputes
+  // the panel live. Reset by resetForm; prefilled on edit from the persisted columns.
+  const [discountType, setDiscountType] = useState<string>("");
+  const [discountValue, setDiscountValue] = useState<string>("");
+
+  // ---- COUPON (#qbCouponToggle / #qbCouponBox / #qb_coupon_code / #qb_coupon_discount) ----
+  // Port of app.js qbApplyCouponPreview + the coupon Apply/Remove buttons. `couponBoxOpen`
+  // reveals #qbCouponBox; `couponInput` is the text the staff types; `couponCode` +
+  // `couponDiscount` mirror the hidden inputs (#qb_coupon_code / #qb_coupon_discount) that
+  // SAVE posts; `couponMsg` is the #qbCouponMsg feedback ({text, ok}); `couponApplying`
+  // disables the buttons during the preview fetch. A monotonic req-id discards stale
+  // responses (legacy qbCouponReqId). All reset by resetForm.
+  const [couponBoxOpen, setCouponBoxOpen] = useState(false);
+  const [couponInput, setCouponInput] = useState<string>("");
+  const [couponCode, setCouponCode] = useState<string>("");
+  const [couponDiscount, setCouponDiscount] = useState<number>(0);
+  const [couponMsg, setCouponMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [couponApplying, setCouponApplying] = useState(false);
+  const couponReqRef = useRef(0);
+
   // ---- GIFTBOX redeem (#qb_giftbox_redeem) ----
   // The selected client's AVAILABLE giftbox ITEMS (issued, not expired, residual unit
   // left), and the per-service redeem selection the staff applies in the drawer. GiftBox
@@ -511,6 +537,16 @@ export function QuickBookingDrawer() {
     setStaffNotes("");
     setCustomerNotes("");
     setHoldToken("");
+    // Manual sconto + coupon belong to the booking; reset to "none" (port of qbResetForm).
+    setDiscountType("");
+    setDiscountValue("");
+    couponReqRef.current += 1; // drop any in-flight coupon preview
+    setCouponBoxOpen(false);
+    setCouponInput("");
+    setCouponCode("");
+    setCouponDiscount(0);
+    setCouponMsg(null);
+    setCouponApplying(false);
     setFormError("");
     setFindQuery("");
     setFindResults([]);
@@ -1122,6 +1158,183 @@ export function QuickBookingDrawer() {
     setGiftcardAmountInput(""); // empty -> the amount memo defaults to the full max
   }, []);
 
+  // ---- PER-SERVICE redeem badge map (port of qbGetPrepaidServiceBadgeMap) ----
+  // serviceId -> the redeem badge shown on a zero-charged line ("gift" | "Servizio" |
+  // "GiftBox" | "Pacchetto"). Priority (first wins): gift > prepaid > giftbox > package,
+  // exactly like the legacy map's `if(!map.has(key))`. A giftcard is appointment-level
+  // (monetary), not a per-line badge, so it is not here. Drives the per-line €0 + badge.
+  const redeemBadgeByService = useMemo<Record<number, string>>(() => {
+    const out: Record<number, string> = {};
+    for (const [sid] of Object.entries(effectiveGiftRedeems)) out[Number(sid)] ??= "gift";
+    for (const [sid] of Object.entries(effectivePrepaidRedeems)) out[Number(sid)] ??= "Servizio";
+    for (const [sid] of Object.entries(effectiveGiftboxRedeems)) out[Number(sid)] ??= "GiftBox";
+    for (const [sid] of Object.entries(effectivePackageRedeems)) out[Number(sid)] ??= "Pacchetto";
+    return out;
+  }, [effectiveGiftRedeems, effectivePrepaidRedeems, effectiveGiftboxRedeems, effectivePackageRedeems]);
+
+  // ===================== PRICE RECOMPUTE (port of app.js renderPriceDetails) =====================
+  // React-driven price detail: per-line list (service name + price, or struck list price +
+  // €0 + a redeem badge when the service is covered by a package/prepaid/giftbox/gift), the
+  // Subtotale, the manual Sconto (percent/€, clamped >=0 and <= subtotal), the Coupon
+  // discount, and the Totale = subtotal - sconto - coupon - fidelity - giftcard - credito
+  // (clamped >= 0). Mirrors the legacy math + which rows reveal (an amount > 0). Fidelity/
+  // Credito are not yet wired here (see the TODO on the rows below) so they contribute 0.
+  const priceDetails = useMemo(() => {
+    // Per-line: a covered service is zero-charged (price 0) but shows its list price
+    // struck through + the redeem badge; an uncovered service shows its plain price.
+    const lines = selectedServiceIds.map((id) => {
+      const svc = services.find((s) => s.id === id);
+      const listPrice = Math.max(0, Number(svc?.price ?? 0));
+      const badge = redeemBadgeByService[id] ?? "";
+      const covered = badge !== "";
+      return {
+        id,
+        name: svc?.name ?? `Servizio #${id}`,
+        price: covered ? 0 : listPrice,
+        listPrice,
+        badge,
+        covered,
+      };
+    });
+
+    // Subtotale: sum of the PAYABLE line prices (covered lines contribute 0), matching
+    // the legacy subtotal (which sums it.price, already 0 for prepaid/redeemed lines).
+    let subtotal = 0;
+    for (const line of lines) subtotal += line.price;
+    subtotal = Math.round((subtotal + Number.EPSILON) * 100) / 100;
+
+    // Manual Sconto: percent of subtotal (capped 100) or fixed €, clamped [0, subtotal].
+    const dtype = discountType === "percent" || discountType === "fixed" ? discountType : "";
+    let dval = Number.parseFloat(String(discountValue).replace(",", "."));
+    if (!Number.isFinite(dval) || dval < 0) dval = 0;
+    let discount = 0;
+    if (dtype && dval > 0) {
+      if (dtype === "percent") {
+        if (dval > 100) dval = 100;
+        discount = subtotal * (dval / 100);
+      } else {
+        discount = Math.min(dval, subtotal);
+      }
+    }
+    if (!Number.isFinite(discount) || discount < 0) discount = 0;
+    if (discount > subtotal) discount = subtotal;
+    discount = Math.round((discount + Number.EPSILON) * 100) / 100;
+
+    // Coupon discount (already validated by the preview), clamped to subtotal.
+    let coupon = Number.isFinite(couponDiscount) && couponDiscount > 0 ? couponDiscount : 0;
+    if (coupon > subtotal) coupon = subtotal;
+    coupon = Math.round((coupon + Number.EPSILON) * 100) / 100;
+    const couponApplied = couponCode.trim() !== "" && coupon > 0.000001;
+
+    // Fidelity points / GiftCard monetary / Credito: not wired here yet (see TODO on
+    // the rows). They are 0 for now so the Totale = subtotal - sconto - coupon.
+    // TODO(fidelity/giftcard-monetary/credito): drive these from the residuals-modal
+    // subsystem (qbFidelityPointsUse / qb_giftcard_redeem amount / qb_credit_use) once
+    // ported; render their rows when value > 0 and subtract them here. Do NOT fake amounts.
+    const fidelity = 0;
+    const giftcardMonetary = 0;
+    const credito = 0;
+
+    let total = subtotal - discount - coupon - fidelity - giftcardMonetary - credito;
+    if (!Number.isFinite(total) || total < 0) total = 0;
+    total = Math.round((total + Number.EPSILON) * 100) / 100;
+
+    return { lines, subtotal, discount, coupon, couponApplied, fidelity, giftcardMonetary, credito, total };
+  }, [selectedServiceIds, services, redeemBadgeByService, discountType, discountValue, couponDiscount, couponCode]);
+
+  // The panel (#qbPriceDetailsBox) reveals whenever >=1 service is selected (legacy).
+  const showPriceDetails = selectedServiceIds.length > 0;
+
+  // ---- COUPON handlers (port of qbApplyCouponPreview + Apply/Remove buttons) ----
+  // The IDs of the services the coupon applies to: only the PAYABLE (non-redeemed)
+  // services count toward the coupon (port of getSelectedPayableServiceIds), and the
+  // subtotal sent to the preview is their summed price.
+  const payableServiceIds = useMemo(
+    () => selectedServiceIds.filter((id) => !redeemBadgeByService[id]),
+    [selectedServiceIds, redeemBadgeByService],
+  );
+
+  const clearCouponState = useCallback(() => {
+    couponReqRef.current += 1; // invalidate any in-flight preview
+    setCouponCode("");
+    setCouponDiscount(0);
+  }, []);
+
+  // Toggle #qbCouponBox (port of the qbCouponToggle click handler).
+  const onCouponToggle = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setCouponBoxOpen((prev) => !prev);
+  }, []);
+
+  // Apply: validate the typed code against the DB coupons preview endpoint
+  // (/api/manage/coupons action=preview -> {ok, preview:{valid, discount, reason}}),
+  // faithful to qbApplyCouponPreview. On success set #qb_coupon_code + #qb_coupon_discount
+  // (so the recompute reveals #qbCouponRow and SAVE posts them); on failure show the reason.
+  const applyCoupon = useCallback(async () => {
+    const code = couponInput.trim().toUpperCase();
+    setCouponBoxOpen(true);
+    if (!code) {
+      clearCouponState();
+      setCouponInput("");
+      setCouponMsg({ text: "Inserisci un codice coupon.", ok: false });
+      return;
+    }
+    // One coupon per booking: refuse a different code while one is applied.
+    const currentApplied = couponCode.trim().toUpperCase();
+    if (currentApplied && currentApplied !== code) {
+      setCouponInput(currentApplied);
+      setCouponMsg({
+        text: "Puoi applicare un solo coupon per prenotazione. Rimuovi quello attuale prima di inserirne un altro.",
+        ok: false,
+      });
+      return;
+    }
+    if (!payableServiceIds.length) {
+      setCouponMsg({ text: "Seleziona almeno un servizio.", ok: false });
+      return;
+    }
+    const subtotal = priceDetails.subtotal;
+    const myReq = ++couponReqRef.current;
+    setCouponApplying(true);
+    try {
+      const res = await fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "preview", code, subtotal }),
+      });
+      const data: { ok?: boolean; error?: string; preview?: { valid?: boolean; discount?: number; reason?: string } } =
+        await res.json().catch(() => ({}));
+      if (myReq !== couponReqRef.current) return; // stale
+      const preview = data?.preview;
+      if (res.ok && data?.ok !== false && preview?.valid) {
+        const disc = Math.round((Math.max(0, Number(preview.discount ?? 0)) + Number.EPSILON) * 100) / 100;
+        setCouponCode(code);
+        setCouponDiscount(disc);
+        setCouponInput(code);
+        setCouponMsg({ text: "Coupon applicato.", ok: true });
+      } else {
+        clearCouponState();
+        setCouponInput(code);
+        setCouponMsg({ text: String(preview?.reason || data?.error || "Coupon non applicabile."), ok: false });
+      }
+    } catch {
+      if (myReq !== couponReqRef.current) return;
+      clearCouponState();
+      setCouponInput(code);
+      setCouponMsg({ text: "Errore durante la verifica del coupon.", ok: false });
+    } finally {
+      if (myReq === couponReqRef.current) setCouponApplying(false);
+    }
+  }, [couponInput, couponCode, payableServiceIds, priceDetails.subtotal, slug, clearCouponState]);
+
+  // Remove: clear the applied coupon + collapse the box (port of qbCouponRemoveBtn).
+  const removeCoupon = useCallback(() => {
+    clearCouponState();
+    setCouponInput("");
+    setCouponMsg(null);
+    setCouponBoxOpen(false);
+  }, [clearCouponState]);
+
   // ---- Client HISTORY + RESIDUALS fetch (port of qbLoadClientHistory + qbLoadClientResiduals) ----
   // Driven from the client select/clear flow (NOT an effect) so it never calls
   // setState synchronously inside an effect body — matching this file's
@@ -1355,6 +1568,11 @@ export function QuickBookingDrawer() {
           setStatus(a.status || "scheduled");
           setStaffNotes(a.staffNotes ?? "");
           setCustomerNotes(a.customerNotes ?? "");
+          // Manual sconto: prefill the price panel from the persisted discount columns.
+          // (Coupon is not persisted on the appointment yet, so it starts empty on edit.)
+          const editDiscountType = a.discountType === "percent" || a.discountType === "fixed" ? a.discountType : "";
+          setDiscountType(editDiscountType);
+          setDiscountValue(editDiscountType && Number(a.discountValue ?? 0) > 0 ? String(a.discountValue) : "");
           // An existing slot is already booked: no hold needed (the update reuses it).
           setHoldToken("");
         })
@@ -1594,6 +1812,19 @@ export function QuickBookingDrawer() {
             // Sent as a JSON STRING [{service_id, instance_id, reward_item_index}]
             // (parseRequestBody stringifies body values).
             gift_redeem: giftRedeemJson,
+            // Manual SCONTO: the staff's discount type/value shown in the price panel.
+            // discount_value is persisted on the appointment (discount_type/discount_value
+            // columns); the route threads it into create/updateDbAppointment. Sent as the
+            // raw value the recompute used (the server clamps it the same way).
+            discount_type: discountType,
+            discount_value: discountValue,
+            // COUPON: the applied code + its preview discount (only when actually applied),
+            // mirroring the hidden #qb_coupon_code / #qb_coupon_discount inputs.
+            // TODO(coupon-persist): the Next `appointments` table has no coupon_code/
+            // coupon_discount columns (unlike the legacy), so the save route does not yet
+            // persist these — they are posted for parity once the schema/route add them.
+            coupon_code: priceDetails.couponApplied ? couponCode : "",
+            coupon_discount: priceDetails.couponApplied ? String(priceDetails.coupon) : "0",
             date,
             time: startTime,
             location_id: locationId,
@@ -1642,7 +1873,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, closeOffcanvas],
+    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, discountType, discountValue, couponCode, priceDetails, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -2529,67 +2760,107 @@ export function QuickBookingDrawer() {
               />
             </div>
 
-            {/* Dettaglio prezzi (backend) — TODO: price/coupon/fidelity/discount wiring */}
-            <div className="mt-3" id="qbPriceDetailsBox" style={{ display: "none" }}>
+            {/* Dettaglio prezzi — React-driven (port of app.js renderPriceDetails). The
+                per-line list / subtotale / sconto / coupon / totale are bound to the
+                `priceDetails` recompute; the box reveals when >=1 service is selected. */}
+            <div className="mt-3" id="qbPriceDetailsBox" style={{ display: showPriceDetails ? "block" : "none" }}>
               <div className="fw-bold mb-2">Dettaglio prezzi</div>
               <div className="card p-2" style={{ borderRadius: 12 }}>
-                <div id="qbPriceDetailsList" className="small" />
+                <div id="qbPriceDetailsList" className="small">
+                  {priceDetails.lines.map((line) => (
+                    <div key={line.id} className="d-flex justify-content-between align-items-center mb-1">
+                      <div className="text-truncate" style={{ maxWidth: "70%" }}>{line.name}</div>
+                      {line.covered ? (
+                        <div className="text-end">
+                          <div className="small text-muted text-decoration-line-through">{fmtEUR(line.listPrice)}</div>
+                          <div className="fw-semibold">
+                            {fmtEUR(0)} <span className="badge bg-success ms-1">{line.badge}</span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="fw-semibold">{fmtEUR(line.price)}</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
 
                 <div className="d-flex justify-content-between align-items-center mt-2 pt-2 border-top">
                   <div className="text-muted small">Subtotale</div>
-                  <div className="text-muted small" id="qbPriceSubtotal">€ 0,00</div>
+                  <div className="text-muted small" id="qbPriceSubtotal">{fmtEUR(priceDetails.subtotal)}</div>
                 </div>
 
-                <input type="hidden" name="coupon_code" id="qb_coupon_code" value="" readOnly />
-                <input type="hidden" name="coupon_discount" id="qb_coupon_discount" value="0" readOnly />
+                <input type="hidden" name="coupon_code" id="qb_coupon_code" value={priceDetails.couponApplied ? couponCode : ""} readOnly />
+                <input type="hidden" name="coupon_discount" id="qb_coupon_discount" value={priceDetails.couponApplied ? String(priceDetails.coupon) : "0"} readOnly />
                 <div className="mt-2">
                   <div className="d-flex justify-content-between align-items-center mb-1">
                     <label className="form-label small mb-0">Coupon</label>
-                    <a href="#" className="small text-success text-decoration-underline" id="qbCouponToggle">Hai un codice coupon?</a>
+                    <a href="#" className="small text-success text-decoration-underline" id="qbCouponToggle" onClick={onCouponToggle}>Hai un codice coupon?</a>
                   </div>
-                  <div className="card border-0 bg-light p-2 d-none" id="qbCouponBox">
+                  <div className={`card border-0 bg-light p-2${couponBoxOpen ? "" : " d-none"}`} id="qbCouponBox">
                     <div className="input-group input-group-sm">
-                      <input className="form-control" type="text" id="qbCouponInput" placeholder="Inserisci codice coupon" />
-                      <button type="button" className="btn btn-outline-success" id="qbCouponApplyBtn">Applica</button>
-                      <button type="button" className="btn btn-outline-secondary" id="qbCouponRemoveBtn">Rimuovi</button>
+                      <input
+                        className="form-control"
+                        type="text"
+                        id="qbCouponInput"
+                        placeholder="Inserisci codice coupon"
+                        value={couponInput}
+                        onChange={(e) => setCouponInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            void applyCoupon();
+                          }
+                        }}
+                      />
+                      <button type="button" className="btn btn-outline-success" id="qbCouponApplyBtn" disabled={couponApplying} onClick={() => void applyCoupon()}>Applica</button>
+                      <button type="button" className="btn btn-outline-secondary" id="qbCouponRemoveBtn" disabled={couponApplying} onClick={removeCoupon}>Rimuovi</button>
                     </div>
-                    <div className="form-text" id="qbCouponMsg" />
+                    <div className={`form-text${couponMsg ? (couponMsg.ok ? " text-success" : " text-danger") : ""}`} id="qbCouponMsg">
+                      {couponMsg?.text ?? ""}
+                    </div>
                   </div>
                 </div>
 
-                <div className="d-flex justify-content-between align-items-center mt-2 pt-2 border-top d-none" id="qbCouponRow" style={{ color: "#047857" }}>
-                  <div className="small fw-semibold" id="qbCouponLabel">Coupon</div>
-                  <div className="small fw-semibold" id="qbCouponAmount">- € 0,00</div>
+                <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.couponApplied ? "" : " d-none"}`} id="qbCouponRow" style={{ color: "#047857" }}>
+                  <div className="small fw-semibold" id="qbCouponLabel">{priceDetails.couponApplied ? `Coupon (${couponCode})` : "Coupon"}</div>
+                  <div className="small fw-semibold" id="qbCouponAmount">- {fmtEUR(priceDetails.couponApplied ? priceDetails.coupon : 0)}</div>
                 </div>
 
                 <div className="mt-2">
                   <label className="form-label small mb-1">Sconto</label>
                   <div className="d-flex gap-2 align-items-center flex-wrap">
-                    <select className="form-select form-select-sm" name="discount_type" id="qb_discount_type" style={{ maxWidth: 120 }}>
+                    <select className="form-select form-select-sm" name="discount_type" id="qb_discount_type" style={{ maxWidth: 120 }} value={discountType} onChange={(e) => setDiscountType(e.target.value)}>
                       <option value="">Nessuno</option>
                       <option value="percent">%</option>
                       <option value="fixed">€</option>
                     </select>
-                    <input className="form-control form-control-sm" type="number" step="0.01" min="0" inputMode="decimal" name="discount_value" id="qb_discount_value" placeholder="0" style={{ maxWidth: 140 }} />
-                    <div className="small text-muted ms-auto" id="qbPriceDiscountAmount">- € 0,00</div>
+                    <input className="form-control form-control-sm" type="number" step="0.01" min="0" inputMode="decimal" name="discount_value" id="qb_discount_value" placeholder="0" style={{ maxWidth: 140 }} value={discountValue} onChange={(e) => setDiscountValue(e.target.value)} />
+                    <div className="small text-muted ms-auto" id="qbPriceDiscountAmount">- {fmtEUR(priceDetails.discount)}</div>
                   </div>
                 </div>
 
                 <input type="hidden" name="fidelity_points_use" id="qb_fidelity_points_use" value="0" readOnly />
                 <div className="alert alert-info p-2 mt-2 d-none" id="qbFidelityNote" style={{ borderRadius: 10 }} />
 
-                <div className="d-flex justify-content-between align-items-center mt-2 pt-2 border-top d-none" id="qbGiftcardRow" style={{ color: "#047857" }}>
+                {/* GiftCard (monetary) row — reveals when a giftcard amount > 0 is applied.
+                    TODO(giftcard-monetary): priceDetails.giftcardMonetary is 0 until the
+                    appointment-level giftcard amount (qb_giftcard_redeem) feeds the recompute
+                    via the residuals subsystem; until then the row stays hidden (faithful). */}
+                <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.giftcardMonetary > 0 ? "" : " d-none"}`} id="qbGiftcardRow" style={{ color: "#047857" }}>
                   <button type="button" className="btn btn-link btn-sm p-0 fw-semibold qb-giftcard-open" id="qbGiftcardLabel" style={{ color: "inherit", textDecoration: "none" }} title="Dettagli GiftCard">GiftCard</button>
                   <div className="d-flex align-items-center gap-2">
-                    <div className="small fw-semibold" id="qbGiftcardAmount">- € 0,00</div>
+                    <div className="small fw-semibold" id="qbGiftcardAmount">- {fmtEUR(priceDetails.giftcardMonetary)}</div>
                     <button type="button" className="btn btn-sm btn-link text-danger p-0 d-none" id="qbGiftcardRemoveBtn" title="Rimuovi GiftCard"><i className="bi bi-x-circle" /></button>
                   </div>
                 </div>
                 <input type="hidden" name="credit_use" id="qb_credit_use" value="0" readOnly />
                 <input type="hidden" name="credit_use_from_booking" id="qb_credit_use_from_booking" value="0" readOnly />
-                <div className="d-flex justify-content-between align-items-center mt-2 pt-2 border-top d-none" id="qbCreditRow" style={{ color: "#047857" }}>
+                {/* Credito row — reveals when a customer credit amount > 0 is applied.
+                    TODO(credito): priceDetails.credito is 0 until the residuals-modal
+                    credit selection (qb_credit_use) feeds the recompute; row stays hidden. */}
+                <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.credito > 0 ? "" : " d-none"}`} id="qbCreditRow" style={{ color: "#047857" }}>
                   <div className="small fw-semibold">Credito</div>
-                  <div className="small fw-semibold" id="qbCreditAmount">- € 0,00</div>
+                  <div className="small fw-semibold" id="qbCreditAmount">- {fmtEUR(priceDetails.credito)}</div>
                 </div>
 
                 <div className="card border-0 bg-light p-2 mt-2 d-none" id="qbFidelityBox">
@@ -2618,14 +2889,18 @@ export function QuickBookingDrawer() {
                   </div>
                 </div>
 
-                <div className="d-flex justify-content-between align-items-center mt-2 pt-2 border-top d-none" id="qbFidelityRow" style={{ color: "#047857" }}>
+                {/* Sconto Fidelity row — reveals when a fidelity points discount > 0 is applied.
+                    TODO(fidelity): priceDetails.fidelity is 0 until the fidelity-points
+                    subsystem (qb_fidelity_points_use + the preview API) feeds the recompute;
+                    until then the row stays hidden and the Box above is inert (faithful). */}
+                <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.fidelity > 0 ? "" : " d-none"}`} id="qbFidelityRow" style={{ color: "#047857" }}>
                   <div className="small fw-semibold" id="qbFidelityLabel">Sconto Fidelity</div>
-                  <div className="small fw-semibold" id="qbFidelityAmount">- € 0,00</div>
+                  <div className="small fw-semibold" id="qbFidelityAmount">- {fmtEUR(priceDetails.fidelity)}</div>
                 </div>
 
                 <div className="d-flex justify-content-between align-items-center mt-2 pt-2 border-top">
                   <div className="fw-semibold">Totale</div>
-                  <div className="fw-semibold" id="qbPriceTotal">€ 0,00</div>
+                  <div className="fw-semibold" id="qbPriceTotal">{fmtEUR(priceDetails.total)}</div>
                 </div>
               </div>
             </div>

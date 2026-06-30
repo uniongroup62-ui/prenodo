@@ -478,6 +478,14 @@ export async function POST(request: Request) {
       // Respected on create (normalized; default pending). updateDbAppointment
       // ignores it — status edits go through action=status.
       status: body.status ? String(body.status) : undefined,
+      // Manual SCONTO from the quick-booking price panel (#qb_discount_type /
+      // #qb_discount_value). Threaded into create/updateDbAppointment (the appointments
+      // table has discount_type/discount_value columns); each clamps it the same way the
+      // drawer's recompute does. Empty type => no discount. Mirrors how `status` is threaded.
+      // TODO(coupon-persist): coupon_code/coupon_discount are posted by the drawer but the
+      // Next appointments table has no coupon columns yet, so they are not persisted here.
+      discountType: body.discount_type ? String(body.discount_type) : undefined,
+      discountValue: body.discount_value === undefined ? undefined : String(body.discount_value),
       packageRedeems,
       packageWarnings,
       prepaidRedeems,
