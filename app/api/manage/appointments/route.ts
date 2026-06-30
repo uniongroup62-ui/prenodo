@@ -137,11 +137,19 @@ export async function GET(request: Request) {
 
   try {
     const date = url.searchParams.get("date") ?? undefined;
+    // RANGE list (calendar Week/Month views): when `from`/`to` (YYYY-MM-DD) are
+    // sent INSTEAD of a single `date`, list every appointment whose start falls in
+    // [from, to) — listDbAppointments already supports the start/end half-open
+    // clause. `date` (single day) still takes priority when present (Day view).
+    const from = url.searchParams.get("from") ?? undefined;
+    const to = url.searchParams.get("to") ?? undefined;
     return Response.json({
       ok: true,
       source: "app/pages/api_appointments.php",
       sourceMode: "database",
-      appointments: await listDbAppointments({ slug: tenantSlug, date }),
+      appointments: await listDbAppointments(
+        date ? { slug: tenantSlug, date } : { slug: tenantSlug, start: from, end: to },
+      ),
       holds: [],
     });
   } catch (error) {

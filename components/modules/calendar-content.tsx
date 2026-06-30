@@ -143,6 +143,63 @@ function longTitle(iso: string): string {
   return `${capFirst(IT_WEEKDAYS[d.getDay()] ?? "")} ${d.getDate()} ${IT_MONTHS[d.getMonth()] ?? ""} ${d.getFullYear()}`;
 }
 
+// Monday-first IT short weekday headers (Lun..Dom), matching itShortWeekdayLabel
+// in calendar.js (index 0 == Monday).
+const IT_SHORT_WEEKDAYS_MON = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"];
+
+// Monday of the week containing `iso` (FullCalendar's firstDay=1 / startOfWeek).
+function weekStart(iso: string): string {
+  const d = new Date(`${iso}T12:00:00`);
+  const dow = d.getDay(); // 0 = Sunday
+  const back = (dow + 6) % 7; // days since Monday
+  return addDays(iso, -back);
+}
+
+// The 7 ISO dates Mon..Sun for the week containing `iso`.
+function weekDates(iso: string): string[] {
+  const start = weekStart(iso);
+  return Array.from({ length: 7 }, (_, i) => addDays(start, i));
+}
+
+// First cell (Monday-aligned) of the 6x7 month grid containing `iso`, and the 42
+// ISO dates that fill it (mirrors FullCalendar's dayGridMonth fixed 6-week grid).
+function monthGridStart(iso: string): string {
+  const d = new Date(`${iso}T12:00:00`);
+  const firstOfMonth = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-01`;
+  return weekStart(firstOfMonth);
+}
+function monthGridDates(iso: string): string[] {
+  const start = monthGridStart(iso);
+  return Array.from({ length: 42 }, (_, i) => addDays(start, i));
+}
+
+// Week range header label (port of itWeekRangeLongLabel): "30 - 6 luglio 2026"
+// when same month, "30 giugno - 6 luglio 2026" across months, with the year(s).
+function weekRangeTitle(iso: string): string {
+  const dates = weekDates(iso);
+  const a = new Date(`${dates[0]}T12:00:00`);
+  const b = new Date(`${dates[6]}T12:00:00`);
+  const sameMonth = a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+  const sameYear = a.getFullYear() === b.getFullYear();
+  const ma = IT_MONTHS[a.getMonth()] ?? "";
+  const mb = IT_MONTHS[b.getMonth()] ?? "";
+  if (sameMonth) return capFirst(`${a.getDate()} - ${b.getDate()} ${mb} ${b.getFullYear()}`);
+  if (sameYear) return capFirst(`${a.getDate()} ${ma} - ${b.getDate()} ${mb} ${b.getFullYear()}`);
+  return capFirst(`${a.getDate()} ${ma} ${a.getFullYear()} - ${b.getDate()} ${mb} ${b.getFullYear()}`);
+}
+
+// Month header label (port of itLongMonthYear), capitalized: "Giugno 2026".
+function monthTitle(iso: string): string {
+  const d = new Date(`${iso}T12:00:00`);
+  return capFirst(`${IT_MONTHS[d.getMonth()] ?? ""} ${d.getFullYear()}`);
+}
+
+// Month number (0-11) of the focused date — used to dim days outside the month in
+// the 6-week grid (FullCalendar's fc-day-other).
+function monthOf(iso: string): number {
+  return new Date(`${iso}T12:00:00`).getMonth();
+}
+
 function timeToMin(time: string): number | null {
   const m = /^(\d{1,2}):(\d{2})/.exec(time || "");
   if (!m) return null;
@@ -230,6 +287,8 @@ export function CalendarContent() {
   const [notes, setNotes] = useState<CalendarNote[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [businessHours, setBusinessHours] = useState<CalendarBusinessHour[]>([]);
+  // Note count per ISO date for the visible range (Week/Month note markers).
+  const [countByDate, setCountByDate] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
 
   // Filters (drive React state; faithful to #filterStaff/#filterService/#filterStatus).
@@ -248,10 +307,32 @@ export function CalendarContent() {
   // Surfaced inside #calendarNotesAlert when a note save/delete fails.
   const [notesError, setNotesError] = useState("");
 
+  // The visible date RANGE (half-open [from, to)) for the active view, used to
+  // fetch appointments + notes across the whole grid (not just one day):
+  //   - Day  -> [date, date+1)        (single day, unchanged behavior)
+  //   - Week -> [Monday, Monday+7)    (Mon..Sun of the focused week)
+  //   - Month-> [gridStart, +42 days) (FullCalendar's fixed 6x7 month grid)
+  // listDbAppointments treats start/end as a half-open starts_at window, and the
+  // calendar context's countByDate covers the same start/end span.
+  const visibleRange = useMemo(() => {
+    if (view === "timeGridWeek") {
+      const from = weekStart(date);
+      return { from, to: addDays(from, 7) };
+    }
+    if (view === "dayGridMonth") {
+      const from = monthGridStart(date);
+      return { from, to: addDays(from, 42) };
+    }
+    return { from: date, to: addDays(date, 1) };
+  }, [view, date]);
+
   const loadContext = useCallback(
-    (forDate: string) => {
+    (forDate: string, range: { from: string; to: string }) => {
       setLoading(true);
-      const params = new URLSearchParams({ slug, date: forDate });
+      // Context (staff/services/notes/businessHours + per-date note counts) for the
+      // whole visible range. `date` keeps the day-of-week business-hours fallback
+      // working; start/end widen the notes window so Week/Month markers are complete.
+      const params = new URLSearchParams({ slug, date: forDate, start: range.from, end: range.to });
       fetch(`/api/manage/calendar?${params.toString()}`, { headers: { "x-tenant-slug": slug } })
         .then((r) => r.json())
         .then((j: CalendarContextResponse) => {
@@ -259,15 +340,22 @@ export function CalendarContent() {
           setServices(Array.isArray(j.services) ? j.services : []);
           setNotes(Array.isArray(j.notes) ? j.notes : []);
           setBusinessHours(Array.isArray(j.businessHours) ? j.businessHours : []);
+          setCountByDate(j.countByDate && typeof j.countByDate === "object" ? j.countByDate : {});
         })
         .catch(() => {
           setStaff([]);
           setServices([]);
           setNotes([]);
           setBusinessHours([]);
+          setCountByDate({});
         });
 
-      const apptParams = new URLSearchParams({ slug, action: "list", date: forDate });
+      // Appointments: a single-day `date` for the Day view (unchanged), or a
+      // from/to range for Week/Month (the route lists the half-open span once).
+      const apptParams =
+        range.to === addDays(range.from, 1)
+          ? new URLSearchParams({ slug, action: "list", date: forDate })
+          : new URLSearchParams({ slug, action: "list", from: range.from, to: range.to });
       fetch(`/api/manage/appointments?${apptParams.toString()}`, { headers: { "x-tenant-slug": slug } })
         .then((r) => r.json())
         .then((j: { appointments?: Appointment[] }) => {
@@ -280,27 +368,46 @@ export function CalendarContent() {
   );
 
   useEffect(() => {
-    loadContext(date);
-  }, [loadContext, date]);
+    loadContext(date, visibleRange);
+  }, [loadContext, date, visibleRange]);
 
   function href(page: string): string {
     return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
   }
 
-  // Visible time window from business hours for the day-of-week (fallback 09:00–19:00).
+  // Open/close window (minutes) for a single day-of-week from business hours
+  // (fallback 09:00–19:00 when no rows). Shared by the Day window and the Week
+  // window (which unions this across the 7 day-of-weeks shown).
+  const windowForDow = useCallback(
+    (dow: number): { open: number; close: number } => {
+      const todays = businessHours.filter((b) => b.dow === dow && !b.isClosed && b.openTime && b.closeTime);
+      let open = 9 * 60;
+      let close = 19 * 60;
+      if (todays.length) {
+        const opens = todays.map((b) => timeToMin(b.openTime) ?? open);
+        const closes = todays.map((b) => timeToMin(b.closeTime) ?? close);
+        open = Math.min(...opens);
+        close = Math.max(...closes);
+      }
+      return { open, close };
+    },
+    [businessHours],
+  );
+
+  // Visible time window from business hours for the focused day-of-week (Day view).
   const { minMin, maxMin } = useMemo(() => {
-    const dow = new Date(`${date}T12:00:00`).getDay();
-    const todays = businessHours.filter((b) => b.dow === dow && !b.isClosed && b.openTime && b.closeTime);
-    let open = 9 * 60;
-    let close = 19 * 60;
-    if (todays.length) {
-      const opens = todays.map((b) => timeToMin(b.openTime) ?? open);
-      const closes = todays.map((b) => timeToMin(b.closeTime) ?? close);
-      open = Math.min(...opens);
-      close = Math.max(...closes);
-    }
+    const { open, close } = windowForDow(new Date(`${date}T12:00:00`).getDay());
     return { minMin: open, maxMin: close };
-  }, [businessHours, date]);
+  }, [windowForDow, date]);
+
+  // Week time window: the UNION (min open .. max close) of the 7 days' business
+  // hours, so every day's appointments fit in the shared Week grid.
+  const { weekMinMin, weekMaxMin } = useMemo(() => {
+    const dows = weekDates(date).map((d) => new Date(`${d}T12:00:00`).getDay());
+    const opens = dows.map((d) => windowForDow(d).open);
+    const closes = dows.map((d) => windowForDow(d).close);
+    return { weekMinMin: Math.min(...opens), weekMaxMin: Math.max(...closes) };
+  }, [windowForDow, date]);
 
   const rows = useMemo(() => {
     const out: number[] = [];
@@ -308,13 +415,41 @@ export function CalendarContent() {
     return out;
   }, [minMin, maxMin]);
 
+  const weekRows = useMemo(() => {
+    const out: number[] = [];
+    for (let m = weekMinMin; m <= weekMaxMin; m += SLOT_MIN_PER_ROW) out.push(m);
+    return out;
+  }, [weekMinMin, weekMaxMin]);
+
   // Staff columns (apply the operator filter; faithful to STAFF_DAY_COLS).
   const staffCols = useMemo(() => {
     if (!filterStaff) return staff;
     return staff.filter((s) => String(s.id) === filterStaff);
   }, [staff, filterStaff]);
 
-  // Appointments visible for the current real day, after filters.
+  // Shared filter predicate (operator/service/status) WITHOUT any date constraint —
+  // applied by Week/Month so the toolbar filters affect those views too.
+  const passesFilters = useCallback(
+    (a: Appointment): boolean => {
+      if (filterStaff) {
+        const s = staff.find((st) => String(st.id) === filterStaff);
+        if (s && (a.operator || "").trim().toLowerCase() !== s.name.trim().toLowerCase()) return false;
+      }
+      if (filterStatus) {
+        if (statusKeyFromLabel(a.status).key !== filterStatus) return false;
+      }
+      if (filterService) {
+        const svc = services.find((s) => String(s.id) === filterService);
+        if (svc && a.service && a.service.trim().toLowerCase() !== svc.name.trim().toLowerCase()) return false;
+      }
+      return true;
+    },
+    [filterStaff, filterStatus, filterService, staff, services],
+  );
+
+  // Appointments visible for the current real day, after filters (Day view). The
+  // operator filter is applied per-column via staffCols in the Day grid, so it is
+  // intentionally NOT applied here (keeps the Day total/columns unchanged).
   const visibleAppts = useMemo(() => {
     return appointments.filter((a) => {
       if (a.date && a.date !== date) return false;
@@ -330,15 +465,39 @@ export function CalendarContent() {
     });
   }, [appointments, date, filterStatus, filterService, services]);
 
+  // Range-filtered appointments (Week/Month) — all filters incl. operator, no
+  // single-day constraint. Grouped by ISO date for fast per-cell/per-column lookup,
+  // each group sorted by start time.
+  const rangeApptsByDate = useMemo(() => {
+    const map: Record<string, Appointment[]> = {};
+    for (const a of appointments) {
+      if (!passesFilters(a)) continue;
+      const key = a.date || "";
+      if (!key) continue;
+      (map[key] ??= []).push(a);
+    }
+    for (const key of Object.keys(map)) {
+      map[key].sort((x, y) => (timeToMin(x.time) ?? 0) - (timeToMin(y.time) ?? 0));
+    }
+    return map;
+  }, [appointments, passesFilters]);
+
   function apptsForStaff(staffName: string): Appointment[] {
     const target = staffName.trim().toLowerCase();
     return visibleAppts.filter((a) => (a.operator || "").trim().toLowerCase() === target);
   }
 
-  const totalAppts = visibleAppts.length;
+  // Toolbar total reflects the visible range: the focused day (Day) or the whole
+  // visible week/month grid (Week/Month).
+  const totalAppts = useMemo(() => {
+    if (view === "staffTimeGridDay") return visibleAppts.length;
+    const dates = view === "timeGridWeek" ? weekDates(date) : monthGridDates(date);
+    return dates.reduce((sum, d) => sum + (rangeApptsByDate[d]?.length ?? 0), 0);
+  }, [view, visibleAppts, rangeApptsByDate, date]);
   const totalLabel = totalAppts === 1 ? "appuntamento totale" : "appuntamenti totali";
   const notesCount = notes.length;
   const gridHeight = (rows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
+  const weekGridHeight = (weekRows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
 
   function go(deltaDays: number) {
     setDate((d) => addDays(d, deltaDays));
@@ -394,13 +553,13 @@ export function CalendarContent() {
         }
         // Reconcile with the authoritative server list when provided.
         if (Array.isArray(json.appointments)) setAppointments(json.appointments);
-        else loadContext(date);
+        else loadContext(date, visibleRange);
       } catch {
         setAppointments(prev); // revert on network error
         setMoveError("Errore di rete durante lo spostamento.");
       }
     },
-    [appointments, date, loadContext, slug],
+    [appointments, date, loadContext, slug, visibleRange],
   );
 
   // POST action=resize with optimistic update + reconcile. A resize keeps the start
@@ -441,13 +600,13 @@ export function CalendarContent() {
         }
         // Reconcile with the authoritative server list when provided.
         if (Array.isArray(json.appointments)) setAppointments(json.appointments);
-        else loadContext(date);
+        else loadContext(date, visibleRange);
       } catch {
         setAppointments(prev); // revert on network error
         setMoveError("Errore di rete durante il ridimensionamento.");
       }
     },
-    [appointments, date, loadContext, slug],
+    [appointments, date, loadContext, slug, visibleRange],
   );
 
   // RESIZE drag wiring (bottom-edge handle). Mousedown on the handle records the
@@ -585,14 +744,14 @@ export function CalendarContent() {
           return false;
         }
         setNotesError("");
-        loadContext(date);
+        loadContext(date, visibleRange);
         return true;
       } catch {
         setNotesError("Errore di rete.");
         return false;
       }
     },
-    [slug, date, loadContext],
+    [slug, date, loadContext, visibleRange],
   );
 
   // Attach the notes form submit / delete / "Nuova" / card-click handlers once the
@@ -685,6 +844,267 @@ export function CalendarContent() {
       >
         {label}
       </button>
+    );
+  }
+
+  // === WEEK (timeGridWeek) ===
+  // A 7-column (Mon..Sun) x time-rows grid over the union of the week's business
+  // hours. Each appointment is positioned in its day column at its start time, with
+  // height from endTime (PX_PER_MIN), styled with the operator color + status badge
+  // like the Day view. Clicking a block opens the GLOBAL edit drawer. Uses the
+  // FullCalendar .fc-timegrid-* / .fc-col-header-cell classes so the page CSS applies.
+  // TODO: drag-move / resize / empty-slot quick-book remain Day-only for now.
+  function renderWeekView() {
+    const todayIso = isoLocal(new Date());
+    const days = weekDates(date);
+    return (
+      <div className="cal-static-grid" style={{ display: "flex", minHeight: weekGridHeight }}>
+        {/* Time axis */}
+        <div className="cal-static-axis" style={{ flex: "0 0 56px", borderRight: "1px solid var(--calendar-line, #e2e8f0)" }}>
+          <div style={{ height: 44 }} />
+          {weekRows.map((m) => (
+            <div
+              key={m}
+              className="fc-timegrid-slot-label"
+              style={{ height: ROW_HEIGHT, fontSize: 11, color: "#64748b", textAlign: "right", paddingRight: 6, boxSizing: "border-box" }}
+            >
+              {`${pad(Math.floor(m / 60))}:${pad(m % 60)}`}
+            </div>
+          ))}
+        </div>
+
+        {/* Day columns */}
+        <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0 }}>
+          {days.map((iso, i) => {
+            const d = new Date(`${iso}T12:00:00`);
+            const isToday = iso === todayIso;
+            const noteCount = countByDate[iso] ?? 0;
+            const dayAppts = rangeApptsByDate[iso] ?? [];
+            return (
+              <div
+                key={iso}
+                className={`fc-timegrid-col${isToday ? " fc-day-today" : ""}`}
+                style={{ flex: "1 1 0", minWidth: 0, borderRight: "1px solid var(--calendar-line, #e2e8f0)", position: "relative" }}
+              >
+                <div
+                  data-date={iso}
+                  className={`fc-col-header-cell${isToday ? " fc-day-today" : ""}${noteCount > 0 ? " has-calendar-notes" : ""}`}
+                  style={{ height: 44, display: "flex", alignItems: "center", justifyContent: "center", borderBottom: "1px solid var(--calendar-line, #e2e8f0)" }}
+                >
+                  <span className="fc-col-header-cell-cushion">
+                    <span className="calendar-weekday-full">
+                      <span className="calendar-weekday-short">{IT_SHORT_WEEKDAYS_MON[i]}</span>
+                      <span className="calendar-weekday-date">{`${pad(d.getDate())}/${pad(d.getMonth() + 1)}`}</span>
+                    </span>
+                    {noteCount > 0 ? (
+                      <span className="calendar-note-marker-wrap">
+                        <span className="calendar-note-marker" role="img" aria-label={`${noteCount} note`}>
+                          <i className="bi bi-stickies" aria-hidden="true" />
+                          <span>{noteCount}</span>
+                        </span>
+                      </span>
+                    ) : null}
+                  </span>
+                </div>
+
+                {/* Slot rows (background) + positioned appointment blocks */}
+                <div className="cal-col-body" style={{ position: "relative", height: weekGridHeight }}>
+                  {weekRows.map((m) => (
+                    <div
+                      key={m}
+                      className="fc-timegrid-slot"
+                      style={{ height: ROW_HEIGHT, borderTop: "1px solid var(--calendar-line, #eef2f7)", boxSizing: "border-box" }}
+                    />
+                  ))}
+
+                  {dayAppts.map((a) => {
+                    const startMin = timeToMin(a.time);
+                    if (startMin === null) return null;
+                    const top = (startMin - weekMinMin) * PX_PER_MIN;
+                    const endMinVal = timeToMin(a.endTime ?? "");
+                    const durationMin = endMinVal !== null && endMinVal > startMin ? endMinVal - startMin : DEFAULT_DURATION_MIN;
+                    const height = Math.max(durationMin * PX_PER_MIN - 2, 18);
+                    const st = statusKeyFromLabel(a.status);
+                    const op = staff.find((s) => (s.name || "").trim().toLowerCase() === (a.operator || "").trim().toLowerCase());
+                    const accent = op?.color || "#2f63d8";
+                    return (
+                      <a
+                        key={a.id}
+                        href={href(`appointments&action=view&id=${a.id}`)}
+                        className="fc-event fc-timegrid-event appt-soft-event"
+                        title={`${a.time} ${a.client} • ${a.service}`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          openGlobalEdit(a.id);
+                        }}
+                        style={{
+                          position: "absolute",
+                          top,
+                          height,
+                          left: 2,
+                          right: 2,
+                          overflow: "hidden",
+                          borderRadius: 6,
+                          padding: "3px 6px",
+                          fontSize: 12,
+                          textDecoration: "none",
+                          borderLeft: `3px solid ${accent}`,
+                          background: "#f4f8ff",
+                          color: "#14326f",
+                          boxSizing: "border-box",
+                        }}
+                      >
+                        <div className="fc-event-main">
+                          <span className={`appt-status-badge status-${st.key}`} title={`Stato: ${st.label}`}>
+                            {st.label}
+                          </span>
+                          <span className="appt-staff-dot" style={{ background: accent }} />
+                          <div className="fw-semibold" style={{ lineHeight: 1.15 }}>
+                            {a.time} {a.client}
+                          </div>
+                          <div className="small text-truncate">{a.service}</div>
+                        </div>
+                      </a>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // === MONTH (dayGridMonth) ===
+  // A 6x7 Monday-first grid; each cell shows the date number + that day's
+  // appointments as compact chips (client + time, status/operator color), with a
+  // "+N altri" overflow link. Day numbers/cells use the FullCalendar .fc-daygrid-*
+  // classes so /assets/css/pages/calendar.css applies; days with notes get the
+  // has-calendar-notes marker. Clicking a chip opens the GLOBAL edit drawer;
+  // clicking an empty day (or the overflow link) switches to that Day view.
+  function renderMonthView() {
+    const focusMonth = monthOf(date);
+    const todayIso = isoLocal(new Date());
+    const gridDates = monthGridDates(date);
+    const MAX_CHIPS = 4;
+    return (
+      <div className="fc-daygrid-body" style={{ width: "100%" }}>
+        {/* Weekday header row (Mon..Dom) */}
+        <div className="fc-col-header" style={{ display: "flex", borderBottom: "1px solid var(--calendar-line, #e2e8f0)" }}>
+          {IT_SHORT_WEEKDAYS_MON.map((wd, i) => (
+            <div key={i} className="fc-col-header-cell" style={{ flex: "1 1 0", minWidth: 0, textAlign: "center" }}>
+              <span className="fc-col-header-cell-cushion">
+                <span className="calendar-weekday-full">{wd}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* 6 week rows */}
+        {Array.from({ length: 6 }, (_, week) => (
+          <div key={week} className="fc-daygrid-row" style={{ display: "flex", minHeight: 104 }}>
+            {gridDates.slice(week * 7, week * 7 + 7).map((iso) => {
+              const dnum = new Date(`${iso}T12:00:00`).getDate();
+              const inMonth = monthOf(iso) === focusMonth;
+              const isToday = iso === todayIso;
+              const dayAppts = rangeApptsByDate[iso] ?? [];
+              const noteCount = countByDate[iso] ?? 0;
+              const shown = dayAppts.slice(0, MAX_CHIPS);
+              const overflow = dayAppts.length - shown.length;
+              return (
+                <div
+                  key={iso}
+                  data-date={iso}
+                  className={`fc-daygrid-day${inMonth ? "" : " fc-day-other"}${isToday ? " fc-day-today" : ""}${noteCount > 0 ? " has-calendar-notes" : ""}`}
+                  style={{
+                    flex: "1 1 0",
+                    minWidth: 0,
+                    borderRight: "1px solid var(--calendar-line, #e2e8f0)",
+                    borderBottom: "1px solid var(--calendar-line, #e2e8f0)",
+                    padding: 4,
+                    opacity: inMonth ? 1 : 0.45,
+                    cursor: "pointer",
+                  }}
+                  onClick={(e) => {
+                    // Empty-day click -> jump to that day's Day view (chips stop propagation).
+                    if ((e.target as HTMLElement).closest(".fc-daygrid-event")) return;
+                    setDate(iso);
+                    setView("staffTimeGridDay");
+                  }}
+                >
+                  <div className="fc-daygrid-day-top" style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 4 }}>
+                    <a className="fc-daygrid-day-number" style={{ textDecoration: "none", color: "inherit", fontSize: 12, fontWeight: 600 }}>
+                      {dnum}
+                    </a>
+                    {noteCount > 0 ? (
+                      <span className="calendar-note-marker-wrap">
+                        <span className="calendar-note-marker" role="img" aria-label={`${noteCount} note`}>
+                          <i className="bi bi-stickies" aria-hidden="true" />
+                          <span>{noteCount}</span>
+                        </span>
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="fc-daygrid-day-events" style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 2 }}>
+                    {shown.map((a) => {
+                      const st = statusKeyFromLabel(a.status);
+                      const op = staff.find((s) => (s.name || "").trim().toLowerCase() === (a.operator || "").trim().toLowerCase());
+                      const accent = op?.color || "#2f63d8";
+                      return (
+                        <a
+                          key={a.id}
+                          href={href(`appointments&action=view&id=${a.id}`)}
+                          className="fc-event fc-daygrid-event appt-soft-event"
+                          title={`${a.time} ${a.client} • ${a.service} (${st.label})`}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            openGlobalEdit(a.id);
+                          }}
+                          style={{
+                            display: "block",
+                            overflow: "hidden",
+                            whiteSpace: "nowrap",
+                            textOverflow: "ellipsis",
+                            borderRadius: 5,
+                            padding: "1px 5px",
+                            fontSize: 11,
+                            textDecoration: "none",
+                            borderLeft: `3px solid ${accent}`,
+                            background: "#f4f8ff",
+                            color: "#14326f",
+                          }}
+                        >
+                          <span className={`appt-status-badge status-${st.key}`} style={{ marginRight: 4 }} title={`Stato: ${st.label}`} />
+                          <span style={{ fontWeight: 600 }}>{a.time}</span> {a.client}
+                        </a>
+                      );
+                    })}
+                    {overflow > 0 ? (
+                      <a
+                        className="fc-daygrid-more-link"
+                        role="button"
+                        tabIndex={0}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDate(iso);
+                          setView("staffTimeGridDay");
+                        }}
+                        style={{ fontSize: 11, color: "#2f63d8", cursor: "pointer", fontWeight: 600 }}
+                      >
+                        +{overflow} altri
+                      </a>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
     );
   }
 
@@ -806,7 +1226,9 @@ export function CalendarContent() {
                       <span className="fc-icon fc-icon-chevron-right" />
                     </button>
                   </div>
-                  <h2 className="fc-toolbar-title">{longTitle(date)}</h2>
+                  <h2 className="fc-toolbar-title">
+                    {view === "timeGridWeek" ? weekRangeTitle(date) : view === "dayGridMonth" ? monthTitle(date) : longTitle(date)}
+                  </h2>
                   <button type="button" className="fc-today-button fc-button fc-button-primary" onClick={() => setDate(isoLocal(new Date()))}>
                     Oggi
                   </button>
@@ -826,13 +1248,23 @@ export function CalendarContent() {
                 </div>
               </div>
 
-              <div className="fc-view-harness" style={{ height: gridHeight + 44 }}>
-                <div className="fc-view fc-timegrid">
-                  {view === "dayGridMonth" || view === "timeGridWeek" ? (
-                    <div className="text-muted small p-4">
-                      {/* Faithful-but-static: only the Giorno (per-operatore) agenda is rendered as a real grid. */}
-                      {view === "dayGridMonth" ? "Vista Mese" : "Vista Settimana"} — usa la vista Giorno per l&apos;agenda per operatore.
-                    </div>
+              <div
+                className="fc-view-harness"
+                style={{ height: view === "dayGridMonth" ? "auto" : (view === "timeGridWeek" ? weekGridHeight : gridHeight) + 44 }}
+              >
+                <div
+                  className={
+                    view === "dayGridMonth"
+                      ? "fc-view fc-daygrid fc-dayGridMonth-view"
+                      : view === "timeGridWeek"
+                        ? "fc-view fc-timegrid fc-timeGridWeek-view"
+                        : "fc-view fc-timegrid"
+                  }
+                >
+                  {view === "dayGridMonth" ? (
+                    renderMonthView()
+                  ) : view === "timeGridWeek" ? (
+                    renderWeekView()
                   ) : (
                     <div className="cal-static-grid" style={{ display: "flex", minHeight: gridHeight }}>
                       {/* Time axis */}
