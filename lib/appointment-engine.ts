@@ -21,6 +21,10 @@ export type AppointmentWithMeta = Appointment & {
   date?: string;
   locationId?: number | null;
   holdToken?: string;
+  // End time HH:MM (from appointments.ends_at) so the calendar can render a block at
+  // its REAL persisted duration instead of a fixed default — additive, ignored by
+  // every other consumer (e.g. the list). Powers the duration-preserving resize.
+  endTime?: string;
   // Real 5-digit booking code (appointments.public_code) when present; the list
   // shows it in the "Codice prenotazione" column, falling back to #id when absent.
   publicCode?: string | null;

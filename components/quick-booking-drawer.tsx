@@ -527,6 +527,11 @@ export function QuickBookingDrawer() {
   // Listener is delegated on document so it works for buttons rendered anywhere
   // (the topbar "+ Prenotazione" button carries data-qb-new="1"). The
   // hidden.bs.offcanvas listener resets the form on close (port of app.js).
+  //
+  // OPTIONAL PREFILL (calendar empty-cell quick-book): the opener MAY carry
+  // data-qb-date (YYYY-MM-DD), data-qb-time (HH:MM) and data-qb-staff (a staff id)
+  // to pre-seed the drawer's date / start time / single operator after the reset.
+  // Absent attributes keep the resetForm defaults (today + next 5-min step).
   useEffect(() => {
     if (typeof document === "undefined") return;
 
@@ -537,6 +542,13 @@ export function QuickBookingDrawer() {
       e.preventDefault();
       loadContext();
       resetForm();
+      // Apply any cell prefill AFTER the reset so it wins over the defaults.
+      const prefDate = btn.getAttribute("data-qb-date") ?? "";
+      const prefTime = btn.getAttribute("data-qb-time") ?? "";
+      const prefStaff = btn.getAttribute("data-qb-staff") ?? "";
+      if (/^\d{4}-\d{2}-\d{2}$/.test(prefDate)) setDate(prefDate);
+      if (/^\d{1,2}:\d{2}$/.test(prefTime)) setStartTime(prefTime);
+      if (prefStaff && Number.parseInt(prefStaff, 10) > 0) setStaffId(prefStaff);
       const el = document.getElementById("quickBooking");
       const api = bootstrap()?.Offcanvas;
       if (el && api) api.getOrCreateInstance(el).show();

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 
 // Faithful port of the PHP calendar page (app/pages/calendar.php / ?page=calendar),
 // fed by the existing DB-backed /api/manage/calendar and /api/manage/appointments.
@@ -18,14 +18,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 //       on a staff column computes the target time (snapped to SNAP_MIN, like
 //       calendar.js snapDuration 00:05:00) and target operator, optimistically updates,
 //       POSTs action=move, and reconciles with the server (reverts on error).
-//     - QUICK-BOOK: clicking an empty cell prefills + opens the existing static
-//       #apptModal (date/time/operator) and wires its Save button to a minimal
-//       action=save create, then refreshes. No new chrome is added — only behavior.
-//     - RESIZE (duration change) is left INERT (see route TODO): updateDbAppointment
-//       recomputes the end from the service duration, so a custom duration cannot be
-//       persisted without a dedicated path.
-//   Modals are reproduced verbatim as static Bootstrap markup; only the #apptModal
-//   Save/quick-book behavior above is attached, the others remain controller-less.
+//     - EDIT: clicking an appointment block opens the GLOBAL quick-booking drawer
+//       (components/quick-booking-drawer.tsx) in EDIT mode — the block carries
+//       data-qb-edit={id} and a plain click (vs a drag) triggers the drawer's
+//       document-level [data-qb-edit] listener (full services/redeems/pricing).
+//     - QUICK-BOOK: clicking an empty cell opens the GLOBAL quick-booking drawer in
+//       CREATE mode (the [data-qb-new] path), prefilled with the clicked cell's
+//       date/time/operator (data-qb-date/data-qb-time/data-qb-staff). The legacy
+//       static #apptModal markup is kept but no longer used for quick-book.
+//     - RESIZE (duration change): blocks carry a bottom-edge resize handle; dragging
+//       it snaps the new end to SNAP_MIN and POSTs action=resize (a duration-preserving
+//       end write, optimistic + revert on error).
+//   Modals are reproduced verbatim as static Bootstrap markup but are now
+//   controller-less for quick-book (the global drawer handles create/edit); only the
+//   calendar-notes modal behavior is still attached.
 
 type CalendarStaff = {
   id: number;
@@ -79,6 +85,10 @@ type Appointment = {
   date: string;
   locationId?: number;
   time: string;
+  // End time HH:MM (from the API's additive endTime / appointments.ends_at). Drives
+  // the rendered block height when present, so a custom (resized) duration shows;
+  // falls back to DEFAULT_DURATION_MIN when absent. Optimistically patched on resize.
+  endTime?: string;
   client: string;
   service: string;
   operator: string;
@@ -139,20 +149,11 @@ function timeToMin(time: string): number | null {
   return Number(m[1]) * 60 + Number(m[2]);
 }
 
-// Split a datetime-local value ("YYYY-MM-DDTHH:MM") into date / HH:MM parts.
-function parseLocalDate(value: string): string {
-  const m = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}/.exec(value || "");
-  return m ? m[1] : "";
-}
-function parseLocalTime(value: string): string {
-  const m = /^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2})/.exec(value || "");
-  return m ? m[1] : "";
-}
-
-// Bootstrap modal helpers for the static #apptModal. Bootstrap's bundle is already
-// loaded by the manage shell (the page uses data-bs-* modals elsewhere); we just
-// drive show/hide programmatically for quick-book. Falls back to a no-op when the
-// API is unavailable so quick-book degrades to "nothing happens" rather than crashing.
+// Bootstrap modal helpers. Bootstrap's bundle is already loaded by the manage shell
+// (the page uses data-bs-* modals elsewhere); we just drive show programmatically for
+// the calendar-notes modal. Falls back to a no-op when the API is unavailable so the
+// modal degrades to "nothing happens" rather than crashing. (The #apptModal quick-book
+// helpers were RETIRED — quick-book now opens the global quick-booking drawer.)
 type BootstrapModalApi = {
   getOrCreateInstance: (el: Element) => { show: () => void; hide: () => void };
 };
@@ -160,16 +161,6 @@ function bootstrapModal(): BootstrapModalApi | null {
   if (typeof window === "undefined") return null;
   const bs = (window as unknown as { bootstrap?: { Modal?: BootstrapModalApi } }).bootstrap;
   return bs?.Modal ?? null;
-}
-function showApptModal(): void {
-  const el = typeof document !== "undefined" ? document.getElementById("apptModal") : null;
-  const api = bootstrapModal();
-  if (el && api) api.getOrCreateInstance(el).show();
-}
-function hideApptModal(): void {
-  const el = typeof document !== "undefined" ? document.getElementById("apptModal") : null;
-  const api = bootstrapModal();
-  if (el && api) api.getOrCreateInstance(el).hide();
 }
 function showNotesModal(): void {
   const el = typeof document !== "undefined" ? document.getElementById("calendarNotesModal") : null;
@@ -219,6 +210,16 @@ type CalendarDrag = {
   grabOffsetPx: number;
 };
 
+// In-flight RESIZE payload: which appointment's bottom edge is being dragged, the
+// block's start time (kept fixed), the column-body top (page Y) so the live end time
+// can be mapped from the cursor, and the latest snapped end (committed on mouseup).
+type CalendarResize = {
+  id: number;
+  startMin: number;
+  bodyTopPx: number;
+  endTime: string;
+};
+
 export function CalendarContent() {
   const slug = tenantSlug();
 
@@ -239,6 +240,10 @@ export function CalendarContent() {
   // Drag-move state. dragRef holds the in-flight payload (the dragged appointment id
   // and the grab offset within the block); a non-null moveError surfaces a revert.
   const dragRef = useRef<CalendarDrag | null>(null);
+  // In-flight resize (bottom-edge drag). Held in a ref (no re-render per mouse move);
+  // a non-null `resizePreview` mirrors the live snapped end so the block stretches.
+  const resizeRef = useRef<CalendarResize | null>(null);
+  const [resizePreview, setResizePreview] = useState<{ id: number; endTime: string } | null>(null);
   const [moveError, setMoveError] = useState("");
   // Surfaced inside #calendarNotesAlert when a note save/delete fails.
   const [notesError, setNotesError] = useState("");
@@ -398,99 +403,149 @@ export function CalendarContent() {
     [appointments, date, loadContext, slug],
   );
 
-  // QUICK-BOOK: prefill + open the existing static #apptModal for the clicked cell,
-  // then wire its (otherwise inert) Save button to a minimal action=save create. Uses
-  // the modal markup verbatim — only behavior is attached — and shows it via the
-  // already-loaded Bootstrap. The create posts client_name (free text taken from the
-  // modal's existing "Nuovo cliente" field, surfaced for quick-book), service_name and
-  // staff_name; the route resolves/creates the client and recomputes the end.
-  const openQuickBook = useCallback(
-    (cellTime: string, staffId: number) => {
-      if (typeof document === "undefined") return;
-      const modalEl = document.getElementById("apptModal");
-      if (!modalEl) return;
+  // POST action=resize with optimistic update + reconcile. A resize keeps the start
+  // fixed and only changes the END time (a custom duration), so the block stretches in
+  // place. The list is optimistically patched (new endTime) so the height updates
+  // immediately; on success the server list replaces local state, on error we revert.
+  // Tenant-scoped like the other calendar fetches.
+  const resizeAppointment = useCallback(
+    async (id: number, newEndTime: string) => {
+      setMoveError("");
+      const prev = appointments;
+      const target = prev.find((a) => a.id === id);
+      if (!target) return;
+      // No-op when the end did not actually change, or would be at/under the start.
+      const startMin = timeToMin(target.time);
+      const endMinVal = timeToMin(newEndTime);
+      if (startMin === null || endMinVal === null || endMinVal <= startMin) return;
+      if ((target.endTime || "") === newEndTime) return;
 
-      // Prefill the modal fields (verbatim markup; we only set values).
-      const startsAt = modalEl.querySelector<HTMLInputElement>("#starts_at");
-      const endsAt = modalEl.querySelector<HTMLInputElement>("#ends_at");
-      const staffSel = modalEl.querySelector<HTMLSelectElement>("#staff_id");
-      const idField = modalEl.querySelector<HTMLInputElement>("#appt_id");
-      const newClientBox = modalEl.querySelector<HTMLElement>("#newClientBox");
-      const newClientName = modalEl.querySelector<HTMLInputElement>('input[name="new_full_name"]');
-      const titleEl = modalEl.querySelector<HTMLElement>("#modalTitle");
+      // Optimistic patch.
+      setAppointments((list) => list.map((a) => (a.id === id ? { ...a, endTime: newEndTime } : a)));
 
-      const startLocal = `${date}T${cellTime}`;
-      const endMin = Math.min((timeToMin(cellTime) ?? minMin) + DEFAULT_DURATION_MIN, maxMin);
-      if (startsAt) startsAt.value = startLocal;
-      if (endsAt) endsAt.value = `${date}T${minToTime(endMin)}`;
-      if (staffSel) staffSel.value = staffId > 0 ? String(staffId) : "";
-      if (idField) idField.value = ""; // create (no id)
-      if (titleEl) titleEl.textContent = "Nuovo appuntamento";
-      // Surface the inline "Nuovo cliente" field so quick-book can capture a name
-      // (the route's create resolves/creates the client from client_name).
-      if (newClientBox) newClientBox.hidden = false;
-      if (newClientName) {
-        newClientName.value = "";
-        // Defer focus until the modal is shown.
-        setTimeout(() => newClientName.focus(), 150);
-      }
-
-      // Wire the Save button once (idempotent): submit a minimal create then refresh.
-      const saveBtn = modalEl.querySelector<HTMLButtonElement>("#btnSave");
-      if (saveBtn && !saveBtn.dataset.qbWired) {
-        saveBtn.dataset.qbWired = "1";
-        saveBtn.addEventListener("click", async () => {
-          const startVal = String(startsAt?.value ?? "");
-          const sd = parseLocalDate(startVal);
-          const st = parseLocalTime(startVal);
-          const clientName = String(newClientName?.value ?? "").trim();
-          // Service: use the selected option's name (text before the " • duration"),
-          // empty when "(nessuno)" so the route falls back to the first active service.
-          const serviceSel = modalEl.querySelector<HTMLSelectElement>("#service_id");
-          const serviceName = serviceSel && serviceSel.value
-            ? (serviceSel.selectedOptions[0]?.textContent ?? "").split("•")[0].trim()
-            : "";
-          // Operator: the selected staff's name, empty when "(non assegnato)".
-          const operatorName = staffSel && staffSel.value ? (staffSel.selectedOptions[0]?.textContent ?? "").trim() : "";
-          if (!sd || !st) return;
-          try {
-            const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
-              body: JSON.stringify({
-                action: "save",
-                client_name: clientName,
-                service_name: serviceName,
-                staff_name: operatorName,
-                date: sd,
-                time: st,
-              }),
-            });
-            const json: { ok?: boolean; error?: string } = await res.json().catch(() => ({}));
-            if (!res.ok || json.ok === false || json.error) {
-              setMoveError(String(json.error || "Impossibile creare l'appuntamento."));
-              return;
-            }
-            hideApptModal();
-            // Reload the day the appointment was created for (read from the live
-            // input via `sd`, never the closure `date`, so a wired-once handler stays
-            // correct after the user navigates to another day).
-            loadContext(sd);
-          } catch {
-            setMoveError("Errore di rete durante la creazione.");
-          }
+      try {
+        const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify({
+            action: "resize",
+            id,
+            end_time: newEndTime,
+          }),
         });
+        const json: { ok?: boolean; error?: string; appointments?: Appointment[] } = await res.json().catch(() => ({}));
+        if (!res.ok || json.ok === false || json.error) {
+          setAppointments(prev); // revert
+          setMoveError(String(json.error || "Impossibile ridimensionare l'appuntamento."));
+          return;
+        }
+        // Reconcile with the authoritative server list when provided.
+        if (Array.isArray(json.appointments)) setAppointments(json.appointments);
+        else loadContext(date);
+      } catch {
+        setAppointments(prev); // revert on network error
+        setMoveError("Errore di rete durante il ridimensionamento.");
       }
-
-      showApptModal();
     },
-    [date, minMin, maxMin, slug, loadContext],
+    [appointments, date, loadContext, slug],
   );
 
-  // The global "+ Prenotazione" topbar button now opens the faithful global
+  // RESIZE drag wiring (bottom-edge handle). Mousedown on the handle records the
+  // resize payload (in resizeRef) + seeds a render preview; document mousemove tracks
+  // the live snapped end (updating both the ref and the preview so the block
+  // stretches), mouseup commits via resizeAppointment. The window listeners are
+  // attached only while a resize is in flight — the effect keys off whether
+  // resizePreview is set, NOT its value, so it doesn't re-bind on every mouse move.
+  const beginResize = useCallback(
+    (e: ReactMouseEvent, appt: Appointment) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const startMin = timeToMin(appt.time);
+      // The column body (the positioned slot container) is the resize handle's
+      // nearest .cal-col-body ancestor; its page-top anchors the cursor->time map.
+      const bodyEl = (e.currentTarget as HTMLElement).closest<HTMLElement>(".cal-col-body");
+      if (startMin === null || !bodyEl) return;
+      const bodyTopPx = bodyEl.getBoundingClientRect().top;
+      // Seed the end at the current block end so the first render is stable.
+      const currentEnd = appt.endTime || minToTime(Math.min(startMin + DEFAULT_DURATION_MIN, maxMin));
+      resizeRef.current = { id: appt.id, startMin, bodyTopPx, endTime: currentEnd };
+      setResizePreview({ id: appt.id, endTime: currentEnd });
+    },
+    [maxMin],
+  );
+
+  // `resizing` is just whether a resize is active; the effect depends on this boolean
+  // so the document listeners bind once per resize gesture, not once per mouse move.
+  const resizing = resizePreview !== null;
+  useEffect(() => {
+    if (!resizing) return;
+    if (typeof window === "undefined") return;
+
+    const onMove = (ev: MouseEvent) => {
+      const r = resizeRef.current;
+      if (!r) return;
+      // Map cursor Y -> minutes from the column body top, snap, clamp to >start.
+      const rawMin = minMin + (ev.clientY - r.bodyTopPx) / PX_PER_MIN;
+      let snapped = snapMin(rawMin, SNAP_MIN);
+      snapped = Math.min(Math.max(snapped, r.startMin + SNAP_MIN), maxMin);
+      const endTime = minToTime(snapped);
+      r.endTime = endTime; // keep the ref's end in sync for the commit on mouseup
+      setResizePreview((cur) => (cur && cur.id === r.id ? { id: r.id, endTime } : cur));
+    };
+
+    const onUp = () => {
+      const r = resizeRef.current;
+      resizeRef.current = null;
+      setResizePreview(null);
+      if (r) void resizeAppointment(r.id, r.endTime);
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizing, minMin, maxMin, resizeAppointment]);
+
+  // Open the GLOBAL quick-booking drawer in EDIT mode for an appointment block. The
+  // drawer's document-level [data-qb-edit] listener catches a click on any element
+  // carrying data-qb-edit; from the block's onClick we dispatch a click on a hidden
+  // anchor we set to data-qb-edit={id}, so a plain click (not a drag) opens edit while
+  // the block's own drag handlers keep MOVE working.
+  const qbEditAnchorRef = useRef<HTMLAnchorElement | null>(null);
+  const openGlobalEdit = useCallback((id: number) => {
+    const anchor = qbEditAnchorRef.current;
+    if (!anchor) return;
+    anchor.setAttribute("data-qb-edit", String(id));
+    anchor.click();
+  }, []);
+
+  // Open the GLOBAL quick-booking drawer in CREATE mode, prefilled with the clicked
+  // empty cell's date/time/operator. The drawer's [data-qb-new] listener reads the
+  // data-qb-date/data-qb-time/data-qb-staff attributes we set on a hidden anchor, then
+  // shows the offcanvas. Replaces the legacy #apptModal quick-book entirely.
+  const qbNewAnchorRef = useRef<HTMLAnchorElement | null>(null);
+  const openGlobalQuickBook = useCallback(
+    (cellTime: string, staffId: number) => {
+      const anchor = qbNewAnchorRef.current;
+      if (!anchor) return;
+      anchor.setAttribute("data-qb-date", date);
+      anchor.setAttribute("data-qb-time", cellTime);
+      anchor.setAttribute("data-qb-staff", staffId > 0 ? String(staffId) : "");
+      anchor.click();
+    },
+    [date],
+  );
+
+  // QUICK-BOOK is now handled by the GLOBAL quick-booking drawer
+  // (components/quick-booking-drawer.tsx) via openGlobalQuickBook above — the legacy
+  // static #apptModal create flow was RETIRED so the calendar reuses the full drawer
+  // (services/redeems/pricing). The #apptModal markup is kept (verbatim) but unwired.
+
+  // The global "+ Prenotazione" topbar button opens the faithful global
   // quick-booking offcanvas IN PLACE (components/quick-booking-drawer.tsx),
-  // so there is no longer a ?qbnew=1 navigation to auto-open here. The
-  // calendar's own empty-cell quick-book (openQuickBook) is unchanged.
+  // so there is no longer a ?qbnew=1 navigation to auto-open here.
 
   // CALENDAR NOTES: open the (static) #calendarNotesModal from the header "Note"
   // button and wire its form save/delete to /api/manage/calendar (note_save /
@@ -636,6 +691,14 @@ export function CalendarContent() {
   return (
     <div className="container-fluid">
       <link rel="stylesheet" href="/assets/css/pages/calendar.css" />
+
+      {/* Hidden anchors that bridge calendar interactions to the GLOBAL quick-booking
+          drawer's document-level listeners. Clicking an appointment block sets the
+          edit anchor's data-qb-edit and clicks it (drawer opens in EDIT mode);
+          clicking an empty cell sets the new anchor's data-qb-date/time/staff and
+          clicks it (drawer opens prefilled in CREATE mode). Visually hidden. */}
+      <a ref={qbEditAnchorRef} data-qb-edit="" href="#" className="d-none" aria-hidden="true" tabIndex={-1} onClick={(e) => e.preventDefault()} />
+      <a ref={qbNewAnchorRef} data-qb-new="1" href="#" className="d-none" aria-hidden="true" tabIndex={-1} onClick={(e) => e.preventDefault()} />
 
       <div className="bs-page-header calendar-page-header">
         <div className="bs-page-heading">
@@ -837,6 +900,7 @@ export function CalendarContent() {
                                     click). The handlers compute the Y offset within this
                                     body, which starts at minMin. */}
                                 <div
+                                  className="cal-col-body"
                                   style={{ position: "relative", height: gridHeight }}
                                   onDragOver={(e) => {
                                     // Required so the browser fires onDrop on this element.
@@ -857,10 +921,12 @@ export function CalendarContent() {
                                   }}
                                   onClick={(e) => {
                                     // Quick-book only on the empty background, never on a block
-                                    // (blocks stopPropagation). Ignore right after a drag.
-                                    if (dragRef.current) return;
+                                    // (blocks stopPropagation). Ignore right after a drag/resize.
+                                    if (dragRef.current || resizeRef.current) return;
                                     const rect = e.currentTarget.getBoundingClientRect();
-                                    openQuickBook(timeFromY(e.clientY - rect.top), s.id);
+                                    // Open the GLOBAL quick-booking drawer in CREATE mode,
+                                    // prefilled with this cell's date/time/operator.
+                                    openGlobalQuickBook(timeFromY(e.clientY - rect.top), s.id);
                                   }}
                                 >
                                   {rows.map((m) => (
@@ -876,12 +942,24 @@ export function CalendarContent() {
                                     const startMin = timeToMin(a.time);
                                     if (startMin === null) return null;
                                     const top = (startMin - minMin) * PX_PER_MIN;
-                                    const height = Math.max(DEFAULT_DURATION_MIN * PX_PER_MIN - 2, 18);
+                                    // Height from the REAL end (a.endTime) — or the live resize
+                                    // preview while this block is being resized — falling back to
+                                    // DEFAULT_DURATION_MIN when no end is known. Clamped to >0.
+                                    const previewEnd = resizePreview?.id === a.id ? resizePreview.endTime : null;
+                                    const endMinVal = timeToMin(previewEnd ?? a.endTime ?? "");
+                                    const durationMin = endMinVal !== null && endMinVal > startMin ? endMinVal - startMin : DEFAULT_DURATION_MIN;
+                                    const height = Math.max(durationMin * PX_PER_MIN - 2, 18);
                                     const st = statusKeyFromLabel(a.status);
                                     return (
                                       <a
                                         key={a.id}
                                         href={href(`appointments&action=view&id=${a.id}`)}
+                                        // EDIT in the GLOBAL drawer: a plain click (not a drag)
+                                        // routes to the drawer's document-level [data-qb-edit]
+                                        // listener via the hidden edit anchor (openGlobalEdit).
+                                        // The block itself does NOT carry data-qb-edit so its own
+                                        // click can stopPropagation (to suppress the column
+                                        // quick-book) without losing the edit-open path.
                                         className="fc-event fc-timegrid-event appt-soft-event"
                                         title={`${a.time} ${a.client} • ${a.service}`}
                                         draggable
@@ -896,14 +974,18 @@ export function CalendarContent() {
                                         }}
                                         onDragEnd={() => {
                                           // Clear shortly after so the synthetic click that follows
-                                          // a drag does not trigger quick-book on the column.
+                                          // a drag does not trigger quick-book / edit on the column.
                                           setTimeout(() => { dragRef.current = null; }, 0);
                                         }}
                                         onClick={(e) => {
-                                          // Keep the block from bubbling to the column's quick-book
-                                          // click; suppress the navigation when a drag just happened.
+                                          // Always suppress navigation to the legacy view URL +
+                                          // keep the click off the column's quick-book.
+                                          e.preventDefault();
                                           e.stopPropagation();
-                                          if (dragRef.current) e.preventDefault();
+                                          // A drag/resize just ended -> do nothing (no edit open).
+                                          if (dragRef.current || resizeRef.current) return;
+                                          // Plain click -> open the GLOBAL drawer in EDIT mode.
+                                          openGlobalEdit(a.id);
                                         }}
                                         style={{
                                           position: "absolute",
@@ -932,6 +1014,25 @@ export function CalendarContent() {
                                           </div>
                                           <div className="small text-truncate">{a.service}</div>
                                         </div>
+                                        {/* RESIZE handle (bottom edge): drag to change the end
+                                            time (a custom duration). Not draggable itself; it uses
+                                            mousedown so the block's HTML5 drag doesn't fire, and
+                                            stops the click so neither edit nor quick-book triggers. */}
+                                        <span
+                                          className="cal-resize-handle"
+                                          role="presentation"
+                                          onMouseDown={(e) => beginResize(e, a)}
+                                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                                          onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                                          style={{
+                                            position: "absolute",
+                                            left: 0,
+                                            right: 0,
+                                            bottom: 0,
+                                            height: 8,
+                                            cursor: "ns-resize",
+                                          }}
+                                        />
                                       </a>
                                     );
                                   })}

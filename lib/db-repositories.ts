@@ -49,7 +49,7 @@ import type {
 } from "@/lib/tenant-store";
 import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug, type TenantTable } from "@/lib/tenant-db";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
-import { assertAppointmentSlotAvailable } from "@/lib/public-booking-db";
+import { assertAppointmentSlotAvailable, type AppointmentSlotSegment } from "@/lib/public-booking-db";
 
 export async function listDbLocations(slug: string): Promise<Location[]> {
   const table = await tenantTable(slug, "locations");
@@ -955,6 +955,121 @@ export async function getDbAppointmentMoveSnapshot(slug: string, id: number): Pr
     customerNotes: row.customer_notes === null || row.customer_notes === undefined ? null : String(row.customer_notes),
     phpStatus: phpStatus(String(row.status ?? "")),
   };
+}
+
+// RESIZE (duration change): persist a CUSTOM appointment duration by writing the
+// dragged end time DIRECTLY, WITHOUT recomputing from the service duration (unlike
+// updateDbAppointment, which always derives ends_at from the service plan). The
+// calendar's bottom-edge resize handle sends the new end HH:MM (snapped to the grid
+// step); we keep the appointment's start fixed and only move its end forward/back.
+//
+// What is written:
+//   - appointments.ends_at -> the new end (same calendar day as starts_at).
+//   - the LAST appointment_segments row's ends_at + duration_minutes -> so the
+//     persisted segment chain ends at the same custom time (single-service: that is
+//     the only segment; multi-service: only the trailing segment is stretched, the
+//     earlier sequential segments keep their service durations).
+//
+// Guards (mirroring the move action): tenant-scoped existence, pending/scheduled
+// only, end strictly after start. The operator-overlap conflict check is REUSED
+// (assertAppointmentSlotAvailable) against the appointment's own staffed segments
+// with the trailing segment extended to the new end, excluding THIS appointment.
+// Returns null when the appointment is not the tenant's / does not exist or is not
+// resizable; throws (caught by the route) on a real overlap.
+export async function resizeDbAppointmentEnd(slug: string, id: number, newEndTime: string): Promise<AppointmentWithMeta | null> {
+  // Tenant-scoped read: only returns the row when it belongs to this tenant.
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, starts_at, status, location_id",
+    where: "id = ?",
+    params: [id],
+    limit: 1,
+  });
+  const row = rows[0];
+  if (!row) return null;
+
+  // Legacy guard: only pending/scheduled appointments are editable from the calendar.
+  const status = phpStatus(String(row.status ?? ""));
+  if (status !== "pending" && status !== "scheduled") {
+    throw new Error("La prenotazione non e modificabile da calendario.");
+  }
+
+  // Resolve the start (kept fixed) and build the new end on the SAME calendar day.
+  const start = toDate(row.starts_at);
+  const startDateIso = dateIsoLocal(start);
+  const endHHMM = normalizeTime(newEndTime);
+  const startMin = start.getHours() * 60 + start.getMinutes();
+  const endMin = (() => {
+    const m = /^(\d{2}):(\d{2})$/.exec(endHHMM);
+    return m ? Number(m[1]) * 60 + Number(m[2]) : NaN;
+  })();
+  if (!Number.isFinite(endMin) || endMin <= startMin) {
+    throw new Error("La fine deve essere successiva all'inizio.");
+  }
+  const endSql = `${startDateIso} ${endHHMM}:00`;
+  const locationId = row.location_id === null || row.location_id === undefined ? null : Number(row.location_id);
+
+  // Read the appointment's segments (ordered) so we can (a) re-run the overlap
+  // check with the trailing segment stretched and (b) know which segment row to
+  // update. Best-effort: an install without the segment table degrades to checking
+  // only the appointment-level span (a single staffless range, which never blocks).
+  let segments: RowDataPacket[] = [];
+  try {
+    segments = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_segments",
+      columns: "id, staff_id, starts_at, ends_at, position",
+      where: "appointment_id = ?",
+      params: [id],
+      orderBy: "position ASC, id ASC",
+    });
+  } catch {
+    segments = [];
+  }
+
+  // Conflict check: re-use assertAppointmentSlotAvailable against this appointment's
+  // own staffed segments, with the LAST segment extended to the new end (the only
+  // one whose window grows). Earlier segments are unchanged. Excludes THIS appointment.
+  const checkSegments: AppointmentSlotSegment[] = segments.length
+    ? segments.map((seg, idx) => ({
+        staffId: seg.staff_id === null || seg.staff_id === undefined ? null : Number(seg.staff_id),
+        startsAt: sqlDateTimePrefix(seg.starts_at),
+        endsAt: idx === segments.length - 1 ? `${startDateIso} ${endHHMM}` : sqlDateTimePrefix(seg.ends_at),
+        locationId,
+      }))
+    : [{ staffId: null, startsAt: `${startDateIso} ${normalizeTime(timeLocal(start))}`, endsAt: `${startDateIso} ${endHHMM}`, locationId }];
+  await assertAppointmentSlotAvailable({
+    slug,
+    date: startDateIso,
+    segments: checkSegments,
+    excludeAppointmentId: id,
+  });
+
+  // Persist: appointment end first, then the trailing segment's end + duration. The
+  // segment update is best-effort (older installs without the table just skip it).
+  await tenantUpdate({ slug, table: "appointments", id, values: { ends_at: endSql } });
+  if (segments.length) {
+    const lastSegment = segments[segments.length - 1];
+    const lastSegmentId = Number(lastSegment.id ?? 0);
+    if (lastSegmentId > 0) {
+      // Recompute the trailing segment's own duration from its (unchanged) start to
+      // the new end, so duration_minutes stays consistent with its window.
+      const segStart = toDate(lastSegment.starts_at);
+      const segStartMin = segStart.getHours() * 60 + segStart.getMinutes();
+      const segDuration = Math.max(1, endMin - segStartMin);
+      await tenantUpdate({
+        slug,
+        table: "appointment_segments",
+        id: lastSegmentId,
+        values: { ends_at: endSql, duration_minutes: segDuration },
+      });
+    }
+  }
+
+  const updated = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
+  if (!updated[0]) return null;
+  return mapAppointment(slug, updated[0]);
 }
 
 // EDIT payload for the global quick-booking drawer (port of api_appointments.php
@@ -5053,12 +5168,17 @@ async function mapAppointment(slug: string, row: RowDataPacket): Promise<Appoint
   const primary = serviceLines[0] ?? { serviceId: 0, name: "Servizio", price: 0 };
   const staffName = await appointmentStaffName(slug, appointmentId);
   const startsAt = toDate(row.starts_at);
+  // End time HH:MM (additive) so the calendar can render a block at its real
+  // persisted duration; null/missing ends_at leaves it undefined (the grid then
+  // falls back to its default block height).
+  const endsAt = row.ends_at === null || row.ends_at === undefined ? null : toDate(row.ends_at);
 
   return {
     id: appointmentId,
     date: dateIsoLocal(startsAt),
     locationId: row.location_id === null || row.location_id === undefined ? null : Number(row.location_id),
     time: timeLocal(startsAt),
+    endTime: endsAt ? timeLocal(endsAt) : undefined,
     client: clientName,
     service: primary.name,
     operator: staffName,

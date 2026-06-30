@@ -13,6 +13,7 @@ import {
   getDbAppointmentMoveSnapshot,
   getDbAppointmentPhpStatus,
   listDbAppointments,
+  resizeDbAppointmentEnd,
   updateDbAppointment,
   updateDbAppointmentStatus,
   type AppointmentPackageRedeem,
@@ -338,15 +339,44 @@ export async function POST(request: Request) {
       });
     }
 
-    // RESIZE (duration change) is intentionally NOT wired as a write action.
-    // updateDbAppointment always recomputes ends_at from the SERVICE duration and
-    // ignores any caller-supplied end, so it cannot persist a custom duration. The
-    // legacy resize also routes through action='move' but the DB UPDATE there writes
-    // the dragged ends_at directly; reproducing that faithfully would require either
-    // rewriting updateDbAppointment (out of scope) or a dedicated duration-aware path.
-    // TODO(resize): add a duration-aware update (e.g. updateDbAppointmentSlot that
-    // writes starts_at/ends_at + segment without recomputing from service duration)
-    // and a `resize` action that calls it. Left inert for now.
+    // RESIZE (duration change, port of the calendar bottom-edge resize). Unlike
+    // `move`/`save` — which route through updateDbAppointment and recompute ends_at
+    // from the SERVICE duration — resize persists a CUSTOM duration: it writes the
+    // dragged end time DIRECTLY (appointments.ends_at + the trailing segment's
+    // ends_at), keeping the start fixed. Tenant-scoped, pending/scheduled only, and
+    // reuses the same operator-overlap conflict check (resizeDbAppointmentEnd).
+    if (action === "resize") {
+      const id = Number.parseInt(String(body.id ?? "0"), 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return Response.json({ ok: false, error: "Dati mancanti" }, { status: 400 });
+      }
+
+      // The new end: prefer an explicit HH:MM `time`/`end_time`, else split a MySQL/
+      // ISO `ends_at` ("YYYY-MM-DD HH:MM[:SS]" or with a 'T") into its HH:MM.
+      const endsAt = String(body.ends_at ?? "");
+      const endTime = String(body.end_time ?? body.time ?? parseStartsAt(endsAt).time ?? "");
+      if (!endTime) {
+        return Response.json({ ok: false, error: "Ora di fine non valida" }, { status: 400 });
+      }
+
+      const appointment = await resizeDbAppointmentEnd(tenantSlug, id, endTime);
+      if (!appointment) {
+        return Response.json({ ok: false, error: "Appuntamento non trovato." }, { status: 400 });
+      }
+
+      // No lifecycle email on resize: the end time is NOT part of the compact
+      // customer-visible snapshot (date/time/service names), so a pure duration
+      // change is never a customer-visible change — matching the move path, which
+      // only emails when date/time actually move.
+
+      return Response.json({
+        ok: true,
+        source: "app/pages/api_appointments.php?action=resize",
+        sourceMode: "database",
+        appointment,
+        appointments: await listDbAppointments({ slug: tenantSlug }),
+      });
+    }
 
     // save action. A positive integer `id` edits an EXISTING appointment
     // (updateDbAppointment); a missing/zero id creates a new one
