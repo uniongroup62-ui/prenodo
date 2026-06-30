@@ -169,6 +169,14 @@ CREATE TABLE "appointment_services" (
   -- in `appointment_package_items` (api.client_package_id/client_package_service_id).
   "client_package_id" integer,
   "client_package_service_id" integer,
+  -- Prepaid-service redeem linkage (quick-booking "Usa prepagato"): when a service
+  -- is covered by a client's prepaid-service balance the row is linked to the
+  -- consumed `client_prepaid_services` row and its `price` is zeroed (the catalog
+  -- price is preserved in list_price with a 'Prepagato' discount_badge). Mirrors the
+  -- legacy linkage the PHP keeps in `appointment_prepaid_service_items`
+  -- (api.client_prepaid_service_id). A prepaid is tied to ONE service directly
+  -- (client_prepaid_services.service_id), so there is no separate coverage row.
+  "client_prepaid_service_id" integer,
   PRIMARY KEY ("tenant_id", "appointment_id", "service_id")
 );
 

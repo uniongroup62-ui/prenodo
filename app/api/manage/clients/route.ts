@@ -48,6 +48,10 @@ export async function GET(request: Request) {
         // (port of api_clients.php action=residuals package block; see
         // quickBookClientPackages). Each carries the covered service_ids.
         packages: context.packages,
+        // Available prepaid-service balances for the drawer's per-service "Usa
+        // prepagato" control (port of api_clients.php action=residuals prepaid block;
+        // see quickBookClientPrepaids). Each is tied to ONE service (service_id).
+        prepaids: context.prepaids,
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");

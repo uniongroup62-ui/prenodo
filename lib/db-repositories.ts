@@ -395,6 +395,15 @@ export type MultiServiceAppointmentInput = {
   // Mutable collector the save pushes per-redeem skip warnings into (so the route
   // can surface them without changing AppointmentWithMeta). Optional.
   packageWarnings?: string[];
+  // Quick-booking PREPAID-SERVICE redeem (assets/js/app.js #qb_prepaid_service_redeem):
+  // per-service requests to cover a service with a client's prepaid-service balance
+  // (a prepaid is tied to ONE service directly). Re-validated + consumed server-side
+  // as part of the save (see applyAppointmentPrepaidRedeems). Optional/empty -> the
+  // non-redeem save path is unchanged. A service already covered by a package redeem
+  // is NOT also prepaid-redeemed (the prepaid apply dedupes against it).
+  prepaidRedeems?: AppointmentPrepaidRedeem[];
+  // Mutable collector the save pushes per-prepaid-redeem skip warnings into. Optional.
+  prepaidWarnings?: string[];
 };
 
 // Resolved multi-service plan: the ordered services, the per-position segment
@@ -507,6 +516,8 @@ export async function createDbAppointment({
   cabinMap = {},
   packageRedeems = [],
   packageWarnings,
+  prepaidRedeems = [],
+  prepaidWarnings,
 }: {
   slug: string;
   clientName: string;
@@ -573,15 +584,35 @@ export async function createDbAppointment({
   // PACKAGE redeem: re-validate + consume + link AFTER the appointment_services
   // rows exist (the link/zero-charge targets those rows). Skipped entries become
   // warnings; the booking itself is never failed (legacy best-effort parity).
+  // Services already covered by a package redeem MUST NOT also be prepaid-redeemed
+  // (a service is covered once). We collect the package-covered service_ids and pass
+  // them to the prepaid apply so it skips them (dedupe across the two redeem types).
+  const packageCoveredServiceIds = new Set<number>();
   if (packageRedeems.length > 0) {
-    const { warnings } = await applyAppointmentPackageRedeems({
+    const { applied, warnings } = await applyAppointmentPackageRedeems({
       slug,
       appointmentId: id,
       clientId: client.id,
       serviceIds: plan.services.map((service) => Number(service.id ?? 0)),
       redeems: packageRedeems,
     });
+    for (const entry of applied) packageCoveredServiceIds.add(Number(entry.serviceId ?? 0));
     if (packageWarnings) packageWarnings.push(...warnings);
+  }
+  // PREPAID-SERVICE redeem: re-validate + consume + link AFTER the
+  // appointment_services rows exist, and AFTER the package redeems so a service the
+  // package already covered is skipped (dedupe via packageCoveredServiceIds). Skipped
+  // entries become warnings; the booking itself is never failed (legacy parity).
+  if (prepaidRedeems.length > 0) {
+    const { warnings } = await applyAppointmentPrepaidRedeems({
+      slug,
+      appointmentId: id,
+      clientId: client.id,
+      serviceIds: plan.services.map((service) => Number(service.id ?? 0)),
+      redeems: prepaidRedeems,
+      coveredServiceIds: packageCoveredServiceIds,
+    });
+    if (prepaidWarnings) prepaidWarnings.push(...warnings);
   }
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
@@ -1786,6 +1817,165 @@ async function updateAppointmentServicePackageLink(
   ];
   const params: unknown[] = [link.clientPackageId, link.clientPackageServiceId];
   if (await columnExists(table.name, "discount_badge")) assignments.push("discount_badge = 'Pacchetto'");
+  const clauses = ["appointment_id = ?", "service_id = ?"];
+  params.push(appointmentId, serviceId);
+  if (table.mode === "shared" && (await columnExists(table.name, "tenant_id"))) {
+    clauses.push("tenant_id = ?");
+    params.push(table.tenantId ?? 0);
+  }
+  await dbExecute(
+    `UPDATE ${quoteIdentifier(table.name)} SET ${assignments.join(", ")} WHERE ${clauses.join(" AND ")}`,
+    params,
+  );
+}
+
+// One entry from the quick-booking `prepaid_service_redeem` JSON array (assets/js/
+// app.js qbReadPrepaidServiceRedeem): apply a client's prepaid-service balance to a
+// service so that service is covered (one unit is consumed, no charge). A prepaid is
+// tied to ONE service directly (client_prepaid_services.service_id), so there is no
+// separate coverage row — the prepaid's service_id must equal the redeemed service.
+export type AppointmentPrepaidRedeem = {
+  clientPrepaidServiceId: number;
+  serviceId: number;
+};
+
+// Apply the quick-booking PREPAID-SERVICE redeems for an appointment AS PART of the
+// save. For each requested redeem this RE-VALIDATES server-side (never trusting the
+// client): the prepaid exists, belongs to the appointment's client, is active + not
+// expired, has remaining_qty > 0, and its service_id == the redeemed service (which
+// must be on the appointment). On success it consumes ONE unit via consumeDbPrepaid
+// (which re-reads remaining and THROWS on insufficient balance + flips status to
+// 'completed' at 0 + writes the client_prepaid_service_usages ledger) and links the
+// matching appointment_services row (client_prepaid_service_id) while zeroing its
+// charge (price 0, list_price kept, 'Prepagato' badge). A redeem that fails
+// validation is SKIPPED (collected as a warning) and never fails the whole booking.
+//
+// `coveredServiceIds` are the services already covered by a PACKAGE redeem in this
+// same save — those are skipped so a service is covered at most once (dedupe). Like
+// the package apply, we additionally dedupe so a service is prepaid-covered by at
+// most one prepaid (first wins). Faithful to api_appointments.php +
+// ClientPrepaidServices.php (saveAppointmentSelection validation +
+// consume-on-save), adapted to the Next port's link-on-appointment_services_row.
+export async function applyAppointmentPrepaidRedeems({
+  slug,
+  appointmentId,
+  clientId,
+  serviceIds,
+  redeems,
+  coveredServiceIds,
+}: {
+  slug: string;
+  appointmentId: number;
+  clientId: number;
+  serviceIds: number[]; // service_ids actually on this appointment (the redeem is filtered to these)
+  redeems: AppointmentPrepaidRedeem[];
+  coveredServiceIds?: Set<number>; // services already covered by a package redeem (skip)
+}): Promise<{ applied: AppointmentPrepaidRedeem[]; warnings: string[] }> {
+  const applied: AppointmentPrepaidRedeem[] = [];
+  const warnings: string[] = [];
+  if (!redeems.length) return { applied, warnings };
+
+  // Only the appointment_services snapshot table can carry the linkage; if it lacks
+  // the prepaid column (older installs) we still consume + log a warning.
+  const servicesTable = await tenantTable(slug, "appointment_services").catch(() => null);
+  const hasLinkColumn = servicesTable
+    ? await columnExists(servicesTable.name, "client_prepaid_service_id")
+    : false;
+
+  // Drop redeems for services not on this appointment, those a package already
+  // covers, and dedupe so a service is covered by at most ONE prepaid (first wins).
+  const onAppointment = new Set(serviceIds.filter((id) => id > 0));
+  const seenService = new Set<number>();
+
+  for (const redeem of redeems) {
+    const clientPrepaidServiceId = Number(redeem.clientPrepaidServiceId ?? 0);
+    const serviceId = Number(redeem.serviceId ?? 0);
+    if (clientPrepaidServiceId <= 0 || serviceId <= 0) continue;
+    if (!onAppointment.has(serviceId)) continue; // service not on the appointment
+    if (coveredServiceIds?.has(serviceId)) continue; // already covered by a package
+    if (seenService.has(serviceId)) continue; // already covered by another prepaid
+    seenService.add(serviceId);
+
+    try {
+      // 1) Load the prepaid, tenant-scoped (tenantSelect scopes to the tenant).
+      const prepaidRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "client_prepaid_services",
+        columns: "id, client_id, service_id, service_name, status, expires_at, remaining_qty",
+        where: "id = ?",
+        params: [clientPrepaidServiceId],
+        limit: 1,
+      });
+      const prepaid = prepaidRows[0];
+      if (!prepaid) {
+        warnings.push("Prepagato non trovato.");
+        continue;
+      }
+
+      // 2) Ownership: the prepaid must belong to the appointment's client.
+      if (Number(prepaid.client_id ?? 0) !== clientId) {
+        warnings.push("Il prepagato selezionato non appartiene al cliente.");
+        continue;
+      }
+
+      // 3) Coverage: a prepaid covers exactly its own service_id (no coverage table).
+      if (Number(prepaid.service_id ?? 0) !== serviceId) {
+        warnings.push("Il prepagato selezionato non copre il servizio.");
+        continue;
+      }
+
+      // 4) Active + not expired + remaining > 0 (effective status, like the legacy
+      //    availability rule status='active' AND remaining_qty>0 AND not expired).
+      const remaining = Math.max(0, Number(prepaid.remaining_qty ?? 0));
+      const expiresYmd = prepaid.expires_at ? String(prepaid.expires_at).slice(0, 10) : "";
+      const effectiveStatus = clientPrepaidStatus(String(prepaid.status ?? "active"), remaining, expiresYmd);
+      if (effectiveStatus !== "active") {
+        warnings.push(`Prepagato ${String(prepaid.service_name ?? "")} non utilizzabile (${effectiveStatus}).`.trim());
+        continue;
+      }
+      if (remaining <= 0) {
+        warnings.push("Residuo prepagato esaurito.");
+        continue;
+      }
+
+      // 5) Consume ONE unit via the authoritative primitive (re-reads remaining and
+      //    THROWS on insufficient balance, so we never over-consume; flips status to
+      //    'completed' at 0 and writes the usage ledger).
+      await consumeDbPrepaid(clientPrepaidServiceId, 1, slug);
+
+      // 6) Link the appointment_services row + zero its charge (keep list_price).
+      if (hasLinkColumn && servicesTable) {
+        await updateAppointmentServicePrepaidLink(slug, servicesTable, appointmentId, serviceId, clientPrepaidServiceId);
+      } else {
+        warnings.push("Unità prepagato consumata, ma il collegamento al servizio non è disponibile su questo archivio.");
+      }
+
+      applied.push({ clientPrepaidServiceId, serviceId });
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : "Errore riscatto prepagato.");
+    }
+  }
+
+  return { applied, warnings };
+}
+
+// Set the prepaid linkage on a single appointment_services row (keyed by the
+// composite appointment_id + service_id — the table has no surrogate id) and zero
+// its charge: price 0, list_price preserved as the catalog reference, and a
+// 'Prepagato' discount_badge (faithful to the legacy zero-charge presentation).
+async function updateAppointmentServicePrepaidLink(
+  slug: string,
+  table: TenantTable,
+  appointmentId: number,
+  serviceId: number,
+  clientPrepaidServiceId: number,
+): Promise<void> {
+  const assignments: string[] = [
+    "client_prepaid_service_id = ?",
+    "price = 0",
+  ];
+  const params: unknown[] = [clientPrepaidServiceId];
+  if (await columnExists(table.name, "discount_badge")) assignments.push("discount_badge = 'Prepagato'");
   const clauses = ["appointment_id = ?", "service_id = ?"];
   params.push(appointmentId, serviceId);
   if (table.mode === "shared" && (await columnExists(table.name, "tenant_id"))) {
@@ -4071,10 +4261,23 @@ export type QuickBookClientPackage = {
   serviceItemIds: Record<number, number>;
 };
 
+// One available (redeemable) prepaid-service balance for the per-service "Usa
+// prepagato" control (port of api_clients.php action=residuals prepaid block +
+// ClientPrepaidServices::listAvailableForClient; returned by quickbook_client_context).
+// A prepaid is tied to ONE service directly (`service_id`), so coverage is a single
+// service — no separate coverage table. `remaining_qty` is the consumable balance.
+export type QuickBookClientPrepaid = {
+  id: number;
+  service_id: number;
+  name: string;
+  remaining_qty: number;
+};
+
 export type QuickBookClientContext = {
   history: QuickBookClientHistorySummary;
   residuals: QuickBookClientResidualsSummary;
   packages: QuickBookClientPackage[];
+  prepaids: QuickBookClientPrepaid[];
 };
 
 // History summary — port of api_clients.php lines ~3926-3958:
@@ -4319,12 +4522,13 @@ export async function quickBookClientContext({
   locationId?: number;
 }): Promise<QuickBookClientContext> {
   if (clientId <= 0) throw new Error("client_id mancante");
-  const [history, residuals, packages] = await Promise.all([
+  const [history, residuals, packages, prepaids] = await Promise.all([
     quickBookClientHistorySummary(slug, clientId),
     quickBookClientResidualsSummary(slug, clientId),
     quickBookClientPackages(slug, clientId),
+    quickBookClientPrepaids(slug, clientId),
   ]);
-  return { history, residuals, packages };
+  return { history, residuals, packages, prepaids };
 }
 
 // Available (redeemable) packages for a client, with the services each package
@@ -4414,6 +4618,50 @@ async function quickBookClientPackages(slug: string, clientId: number): Promise<
       expires_at: row.expires_at ? String(row.expires_at).slice(0, 10) : null,
       service_ids: serviceIds,
       serviceItemIds,
+    });
+  }
+  return out;
+}
+
+// Available (redeemable) prepaid-service balances for a client — drives the drawer's
+// per-service "Usa prepagato" control. Port of api_clients.php action=residuals
+// PREPAID block + ClientPrepaidServices::listAvailableForClient. Tenant-scoped via
+// `tenantSelect`; every read is guarded so a missing table/column degrades to an
+// empty list. "Available" mirrors the legacy WHERE exactly: status='active' AND
+// remaining_qty > 0 AND (expires_at IS NULL OR expires_at >= CURRENT_DATE),
+// client-scoped. A prepaid is tied to ONE service directly (service_id), so each
+// returned entry covers exactly that one service (no per-service coverage table).
+async function quickBookClientPrepaids(slug: string, clientId: number): Promise<QuickBookClientPrepaid[]> {
+  if (clientId <= 0) return [];
+  let prepaidRows: RowDataPacket[] = [];
+  try {
+    const prepaidTable = await tenantTable(slug, "client_prepaid_services");
+    const hasExpiry = await columnExists(prepaidTable.name, "expires_at");
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    prepaidRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_prepaid_services",
+      columns: "id, service_id, service_name, remaining_qty",
+      where: `client_id = ? AND status = 'active' AND remaining_qty > 0${expiry}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 100,
+    });
+  } catch {
+    return [];
+  }
+  if (prepaidRows.length === 0) return [];
+
+  const out: QuickBookClientPrepaid[] = [];
+  for (const row of prepaidRows) {
+    const id = Number(row.id ?? 0);
+    const serviceId = Number(row.service_id ?? 0);
+    if (id <= 0 || serviceId <= 0) continue; // a prepaid with no service can cover nothing
+    out.push({
+      id,
+      service_id: serviceId,
+      name: String(row.service_name ?? "Prepagato"),
+      remaining_qty: Math.max(0, Number(row.remaining_qty ?? 0)),
     });
   }
   return out;

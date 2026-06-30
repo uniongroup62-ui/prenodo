@@ -188,16 +188,33 @@ type QbClientPackage = {
   service_ids: number[];
   serviceItemIds?: Record<number, number>;
 };
+// One available (redeemable) prepaid-service balance for the per-service "Usa
+// prepagato" control (port of api_clients.php action=residuals prepaid block;
+// returned by quickbook_client_context). A prepaid is tied to ONE service directly
+// (`service_id`), so it covers exactly that one service; `remaining_qty` is the
+// consumable balance.
+type QbClientPrepaid = {
+  id: number;
+  service_id: number;
+  name: string;
+  remaining_qty: number;
+};
 type QbClientContextResponse = {
   ok?: boolean;
   summary?: QbHistorySummary;
   residuals?: QbResidualsSummary;
   packages?: QbClientPackage[];
+  prepaids?: QbClientPrepaid[];
 };
 
 // One entry written to #qb_package_redeem (assets/js/app.js qbReadPackageRedeem):
 // a per-service request to cover that service with the client's prepaid package.
 type QbPackageRedeem = { client_package_id: number; service_id: number; client_package_service_id: number | null };
+
+// One entry written to #qb_prepaid_service_redeem (assets/js/app.js
+// qbReadPrepaidServiceRedeem): a per-service request to cover that service with the
+// client's prepaid-service balance.
+type QbPrepaidRedeem = { client_prepaid_service_id: number; service_id: number };
 
 // History summary line, EXACT port of qbLoadClientHistory: "Appuntamenti: N •
 // Ultimo: … • Prossimo: …" (+ " • Vendite: €…" when sales_total > 0).
@@ -263,6 +280,17 @@ export function QuickBookingDrawer() {
   // cleared on client change (clearClientContext) and pruned on service change.
   const [clientPackages, setClientPackages] = useState<QbClientPackage[]>([]);
   const [packageRedeems, setPackageRedeems] = useState<Record<number, QbPackageRedeem>>({});
+
+  // ---- PREPAID-SERVICE redeem (#qb_prepaid_service_redeem) ----
+  // The selected client's AVAILABLE prepaid-service balances (each tied to ONE
+  // service, with remaining_qty left), and the per-service redeem selection the staff
+  // applies in the drawer. `prepaidRedeems` is keyed by service_id (one prepaid
+  // covers a service at most once); it is serialized to #qb_prepaid_service_redeem
+  // and sent on save. Both are cleared on client change and pruned on service change.
+  // A service already covered by a PACKAGE redeem hides its prepaid control (one
+  // service is covered once; the server also dedupes).
+  const [clientPrepaids, setClientPrepaids] = useState<QbClientPrepaid[]>([]);
+  const [prepaidRedeems, setPrepaidRedeems] = useState<Record<number, QbPrepaidRedeem>>({});
 
   // ---- Services multiselect state ----
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([]);
@@ -349,6 +377,8 @@ export function QuickBookingDrawer() {
     setContextLoading(false);
     setClientPackages([]);
     setPackageRedeems({});
+    setClientPrepaids([]);
+    setPrepaidRedeems({});
     setSelectedServiceIds([]);
     setStaffPicks({});
     setCabinPicks({});
@@ -698,6 +728,68 @@ export function QuickBookingDrawer() {
     [],
   );
 
+  // ---- PREPAID-SERVICE redeem derivation (per-service "Usa prepagato") ----
+  // For each SELECTED service that is NOT already covered by a package redeem, the
+  // client's available prepaids that COVER it (a prepaid covers exactly its own
+  // service_id, with remaining_qty left). Drives the per-service control; a service
+  // covered by a package, or with no covering prepaid, shows nothing. Recomputed
+  // from the loaded prepaids + the current selection + the effective package redeems
+  // (no effect/state — like the rest of this file). This is the UI-side half of the
+  // dedupe; the server also re-dedupes when consuming.
+  const prepaidOptionsByService = useMemo<Record<number, QbClientPrepaid[]>>(() => {
+    const out: Record<number, QbClientPrepaid[]> = {};
+    for (const serviceId of selectedServiceIds) {
+      if (effectivePackageRedeems[serviceId]) continue; // a package already covers it
+      const covering = clientPrepaids.filter(
+        (prepaid) => prepaid.remaining_qty > 0 && prepaid.service_id === serviceId,
+      );
+      if (covering.length) out[serviceId] = covering;
+    }
+    return out;
+  }, [selectedServiceIds, clientPrepaids, effectivePackageRedeems]);
+
+  // Effective per-service prepaid redeem selection: keep only entries whose service
+  // is still selected, NOT package-covered, AND whose prepaid still covers it (prunes
+  // on service/client/package change). This DERIVED map (not raw `prepaidRedeems`)
+  // drives the UI + the serialized payload, so a stale pick can never leak into save.
+  const effectivePrepaidRedeems = useMemo<Record<number, QbPrepaidRedeem>>(() => {
+    const out: Record<number, QbPrepaidRedeem> = {};
+    for (const serviceId of selectedServiceIds) {
+      const pick = prepaidRedeems[serviceId];
+      if (!pick) continue;
+      const options = prepaidOptionsByService[serviceId] ?? [];
+      if (options.some((prepaid) => prepaid.id === pick.client_prepaid_service_id)) out[serviceId] = pick;
+    }
+    return out;
+  }, [selectedServiceIds, prepaidRedeems, prepaidOptionsByService]);
+
+  // Serialize the effective redeem -> #qb_prepaid_service_redeem JSON STRING (the
+  // shape assets/js/app.js qbReadPrepaidServiceRedeem produces and the save route
+  // parses). IMPORTANT: sent as a JSON STRING (parseRequestBody stringifies body
+  // values), mirroring the package payload.
+  const prepaidRedeemJson = useMemo(() => {
+    const arr = Object.values(effectivePrepaidRedeems);
+    return arr.length ? JSON.stringify(arr) : "";
+  }, [effectivePrepaidRedeems]);
+
+  // Apply / clear a prepaid on a service. Selecting records {client_prepaid_service_id,
+  // service_id}; clearing removes the entry. Changing services never invalidates a
+  // hold (the redeem doesn't move the slot).
+  const setPrepaidForService = useCallback(
+    (serviceId: number, prepaid: QbClientPrepaid | null) => {
+      setPrepaidRedeems((prev) => {
+        const next = { ...prev };
+        if (!prepaid) {
+          delete next[serviceId];
+        } else {
+          next[serviceId] = { client_prepaid_service_id: prepaid.id, service_id: serviceId };
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
   // ---- Client HISTORY + RESIDUALS fetch (port of qbLoadClientHistory + qbLoadClientResiduals) ----
   // Driven from the client select/clear flow (NOT an effect) so it never calls
   // setState synchronously inside an effect body — matching this file's
@@ -717,6 +809,9 @@ export function QuickBookingDrawer() {
     // The packages + per-service redeem belong to the client; clear on client change.
     setClientPackages([]);
     setPackageRedeems({});
+    // The prepaids + per-service redeem also belong to the client; clear on change.
+    setClientPrepaids([]);
+    setPrepaidRedeems({});
   }, []);
 
   const loadClientContext = useCallback(
@@ -730,6 +825,9 @@ export function QuickBookingDrawer() {
       // New client -> drop any previous packages + per-service redeem selection.
       setClientPackages([]);
       setPackageRedeems({});
+      // ...and any previous prepaids + per-service redeem selection.
+      setClientPrepaids([]);
+      setPrepaidRedeems({});
 
       const params = new URLSearchParams({ slug, action: "quickbook_client_context", client_id: id });
       const locId = String(locationId || "").trim();
@@ -747,6 +845,7 @@ export function QuickBookingDrawer() {
           setHistorySummary(data.summary ?? {});
           setResidualsSummary(data.residuals ?? {});
           setClientPackages(Array.isArray(data.packages) ? data.packages : []);
+          setClientPrepaids(Array.isArray(data.prepaids) ? data.prepaids : []);
         })
         .catch(() => {
           if (myReq !== contextReqRef.current) return;
@@ -987,6 +1086,10 @@ export function QuickBookingDrawer() {
             // PACKAGE redeem: per-service requests to cover a service with the
             // client's prepaid package (re-validated + consumed server-side).
             package_redeem: packageRedeemJson,
+            // PREPAID-SERVICE redeem: per-service requests to cover a service with the
+            // client's prepaid-service balance (re-validated + consumed server-side).
+            // Sent as a JSON STRING (parseRequestBody stringifies body values).
+            prepaid_service_redeem: prepaidRedeemJson,
             date,
             time: startTime,
             location_id: locationId,
@@ -995,7 +1098,7 @@ export function QuickBookingDrawer() {
             appointment_hold_token: holdToken,
           }),
         });
-        const data: { ok?: boolean; error?: string; packageWarnings?: string[] } = await res.json().catch(() => ({}));
+        const data: { ok?: boolean; error?: string; packageWarnings?: string[]; prepaidWarnings?: string[] } = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false || data.error) {
           setFormError(String(data.error || "Errore salvataggio."));
           return;
@@ -1004,6 +1107,11 @@ export function QuickBookingDrawer() {
         // reload so the staff knows a package wasn't applied (legacy notify parity).
         if (Array.isArray(data.packageWarnings) && data.packageWarnings.length > 0) {
           if (typeof window !== "undefined") window.alert("Pacchetti:\n" + data.packageWarnings.join("\n"));
+        }
+        // Same for prepaid-service redeem skips (not covering / exhausted / already
+        // covered by a package): surface before the reload.
+        if (Array.isArray(data.prepaidWarnings) && data.prepaidWarnings.length > 0) {
+          if (typeof window !== "undefined") window.alert("Prepagati:\n" + data.prepaidWarnings.join("\n"));
         }
         closeOffcanvas();
         // Refresh the page so any calendar/list on screen shows the new booking,
@@ -1015,7 +1123,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -1060,7 +1168,7 @@ export function QuickBookingDrawer() {
             <input type="hidden" name="giftbox_redeem" id="qb_giftbox_redeem" value="" readOnly />
             <input type="hidden" name="gift_redeem" id="qb_gift_redeem" value="" readOnly />
             <input type="hidden" name="package_redeem" id="qb_package_redeem" value={packageRedeemJson} readOnly />
-            <input type="hidden" name="prepaid_service_redeem" id="qb_prepaid_service_redeem" value="" readOnly />
+            <input type="hidden" name="prepaid_service_redeem" id="qb_prepaid_service_redeem" value={prepaidRedeemJson} readOnly />
             <input type="hidden" name="giftcard_redeem" id="qb_giftcard_redeem" value="" readOnly />
 
             <div id="qbSelectedClientBox" className="card p-2 mb-2" style={{ display: client ? "block" : "none" }}>
@@ -1339,6 +1447,75 @@ export function QuickBookingDrawer() {
                       {selectedPkg ? (
                         <div className="small text-success mt-1">
                           Incluso nel pacchetto {selectedPkg.name} — nessun addebito.
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {/* PREPAID-SERVICE redeem (Prepagati) — per-service "Usa prepagato" control.
+                Faithful to the legacy intent (assets/js/app.js #qb_prepaid_service_redeem:
+                a per-service selection that writes {service_id, client_prepaid_service_id}
+                into #qb_prepaid_service_redeem). Only shown for SELECTED services the
+                client has an available prepaid for AND that a package isn't already
+                covering; a covered service reads "Coperto dal prepagato" with no charge.
+                Selecting consumes one unit on save (validated + deduped server-side). */}
+            {Object.keys(prepaidOptionsByService).length > 0 ? (
+              <div className="card p-2 mb-3" id="qbPrepaidRedeemBox">
+                <div className="fw-bold mb-1">Prepagati</div>
+                <div className="text-muted small mb-2">
+                  Applica un prepagato del cliente a un servizio: un&apos;unità verrà scalata dal prepagato e il servizio non sarà addebitato.
+                </div>
+                {selectedServiceIds.map((serviceId) => {
+                  const options = prepaidOptionsByService[serviceId];
+                  if (!options || options.length === 0) return null;
+                  const svc = services.find((s) => s.id === serviceId);
+                  const serviceName = svc?.name ?? `Servizio #${serviceId}`;
+                  const redeem = effectivePrepaidRedeems[serviceId];
+                  const selectedPrepaid = redeem ? options.find((prepaid) => prepaid.id === redeem.client_prepaid_service_id) ?? null : null;
+                  return (
+                    <div className="border-top pt-2 mt-2 qb-cp-prepaid" key={serviceId} data-service-id={serviceId}>
+                      <div className="d-flex justify-content-between align-items-center">
+                        <div className="fw-semibold">{serviceName}</div>
+                        {selectedPrepaid ? (
+                          <span className="badge badge-soft text-success">Coperto dal prepagato</span>
+                        ) : null}
+                      </div>
+                      <div className="d-flex align-items-center gap-2 mt-1">
+                        <select
+                          className="form-select form-select-sm qb-cp-prepaid-select"
+                          data-service-id={serviceId}
+                          aria-label={`Usa prepagato per ${serviceName}`}
+                          value={selectedPrepaid ? String(selectedPrepaid.id) : ""}
+                          onChange={(e) => {
+                            const id = Number.parseInt(e.target.value, 10);
+                            const prepaid = options.find((p) => p.id === id) ?? null;
+                            setPrepaidForService(serviceId, prepaid);
+                          }}
+                        >
+                          <option value="">Non usare prepagato</option>
+                          {options.map((prepaid) => (
+                            <option value={prepaid.id} key={prepaid.id}>
+                              Usa prepagato: {prepaid.name} ({prepaid.remaining_qty} residue)
+                            </option>
+                          ))}
+                        </select>
+                        {selectedPrepaid ? (
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-link text-danger p-0 qb-cp-prepaid-remove"
+                            onClick={() => setPrepaidForService(serviceId, null)}
+                            title="Rimuovi prepagato"
+                          >
+                            Rimuovi
+                          </button>
+                        ) : null}
+                      </div>
+                      {selectedPrepaid ? (
+                        <div className="small text-success mt-1">
+                          Coperto dal prepagato {selectedPrepaid.name} — nessun addebito.
                         </div>
                       ) : null}
                     </div>

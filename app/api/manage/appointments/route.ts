@@ -14,6 +14,7 @@ import {
   updateDbAppointment,
   updateDbAppointmentStatus,
   type AppointmentPackageRedeem,
+  type AppointmentPrepaidRedeem,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -308,6 +309,13 @@ export async function POST(request: Request) {
     // re-validated + consumed server-side inside createDbAppointment (never trusted).
     const packageRedeems = parsePackageRedeem(body.package_redeem);
     const packageWarnings: string[] = [];
+    // Quick-booking PREPAID-SERVICE redeem (#qb_prepaid_service_redeem JSON array):
+    // per-service requests to cover a service with the client's prepaid-service
+    // balance. Parsed here, re-validated + consumed server-side inside
+    // createDbAppointment (never trusted). A service already covered by a package
+    // redeem is skipped there (one service is covered once).
+    const prepaidRedeems = parsePrepaidRedeem(body.prepaid_service_redeem);
+    const prepaidWarnings: string[] = [];
     let serviceNames = parseServiceNamesFromBody(body);
     if (serviceIds.length > 0) {
       // `service_ids` is unambiguous (no comma-in-name issue) so it wins when sent.
@@ -337,6 +345,8 @@ export async function POST(request: Request) {
       customerNotes: emptyToNull(String(body.customer_notes ?? body.notes ?? "")),
       packageRedeems,
       packageWarnings,
+      prepaidRedeems,
+      prepaidWarnings,
     };
 
     let appointment;
@@ -369,6 +379,9 @@ export async function POST(request: Request) {
       // Per-redeem skip messages (e.g. package not covering a service / exhausted):
       // the booking still succeeds (legacy best-effort parity); the drawer may show them.
       ...(packageWarnings.length > 0 ? { packageWarnings } : {}),
+      // Per-prepaid-redeem skip messages (prepaid not covering / exhausted / already
+      // covered by a package): same best-effort parity; the drawer may show them.
+      ...(prepaidWarnings.length > 0 ? { prepaidWarnings } : {}),
     });
   } catch (error) {
     return Response.json(
@@ -527,6 +540,46 @@ function parsePackageRedeem(raw: unknown): AppointmentPackageRedeem[] {
       serviceId,
       clientPackageServiceId: Number.isFinite(rawItemId) && rawItemId > 0 ? rawItemId : null,
     });
+  }
+  return out;
+}
+
+// Parse the quick-booking `prepaid_service_redeem` payload — a JSON array (or
+// already an array) of { client_prepaid_service_id, service_id } items — into
+// AppointmentPrepaidRedeem[]. Mirrors assets/js/app.js qbReadPrepaidServiceRedeem
+// (and parseRequestBody stringifies body values, so the drawer sends this as a JSON
+// STRING, handled here): items missing a positive client_prepaid_service_id or
+// service_id are dropped, and a service is kept at most once (first wins) since one
+// service is covered by one prepaid. The real validation (ownership/active/coverage/
+// remaining) happens server-side in applyAppointmentPrepaidRedeems — this only
+// shapes the input. Also accepts the legacy `prepaid_service_id`/`id` aliases.
+function parsePrepaidRedeem(raw: unknown): AppointmentPrepaidRedeem[] {
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      source = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(source)) return [];
+  const out: AppointmentPrepaidRedeem[] = [];
+  const seenService = new Set<number>();
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    const clientPrepaidServiceId = Number.parseInt(
+      String(entry.client_prepaid_service_id ?? entry.prepaid_service_id ?? entry.id ?? ""),
+      10,
+    );
+    const serviceId = Number.parseInt(String(entry.service_id ?? ""), 10);
+    if (!Number.isFinite(clientPrepaidServiceId) || clientPrepaidServiceId <= 0) continue;
+    if (!Number.isFinite(serviceId) || serviceId <= 0) continue;
+    if (seenService.has(serviceId)) continue;
+    seenService.add(serviceId);
+    out.push({ clientPrepaidServiceId, serviceId });
   }
   return out;
 }
