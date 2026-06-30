@@ -79,6 +79,30 @@ type QbContext = {
 
 type QbClient = { id: string; full_name: string; email: string; phone: string };
 
+// EDIT-mode payload (GET /api/manage/appointments?action=get) used to PREFILL the
+// drawer for an existing appointment. Mirrors getDbAppointmentForEdit in
+// lib/db-repositories.ts: client (id+name/email/phone), location, ordered services,
+// per-service operator/cabin maps (serviceId -> id), the explicit primary cabin,
+// date/time, php-normalized status, notes and the booking code (public_code).
+type AppointmentEditPayload = {
+  id: number;
+  publicCode: string | null;
+  clientId: number;
+  clientName: string;
+  clientEmail: string;
+  clientPhone: string;
+  locationId: number | null;
+  services: Array<{ serviceId: number; name: string }>;
+  staffMap: Record<number, number>;
+  cabinMap: Record<number, number>;
+  primaryCabinId: number | null;
+  date: string;
+  time: string;
+  status: string;
+  staffNotes: string;
+  customerNotes: string;
+};
+
 // Minimal Bootstrap offcanvas/modal surface used here (the bundle is loaded by
 // manage-shell.tsx). Degrades to a no-op when bootstrap is not yet present.
 type BootstrapInstance = { show: () => void; hide: () => void };
@@ -408,6 +432,17 @@ export function QuickBookingDrawer() {
   const [customerNotes, setCustomerNotes] = useState<string>("");
   const [holdToken, setHoldToken] = useState<string>("");
 
+  // ---- EDIT MODE (#qb_appt_id + header title + #qbBookingCodeRow/#qbBookingCode) ----
+  // When a [data-qb-edit] click loads an existing appointment, `apptId` carries its
+  // id (sent as `id` on save so the route routes to updateDbAppointment) and
+  // `bookingCode` the public_code shown in the header. Both are reset on drawer close
+  // / [data-qb-new] open (resetForm), so the next create is clean. A monotonic
+  // req-id guards against a stale edit-load response (the user re-opening quickly).
+  const [apptId, setApptId] = useState<string>("");
+  const [bookingCode, setBookingCode] = useState<string>("");
+  const [editLoadError, setEditLoadError] = useState<string>("");
+  const editReqRef = useRef(0);
+
   // ---- Find-client modal state ----
   const [findQuery, setFindQuery] = useState("");
   const [findResults, setFindResults] = useState<QbClient[]>([]);
@@ -479,6 +514,12 @@ export function QuickBookingDrawer() {
     setFormError("");
     setFindQuery("");
     setFindResults([]);
+    // Back to CREATE mode: drop the edited id + booking code + any edit-load error,
+    // and invalidate any in-flight edit-load so a late response can't re-fill this.
+    editReqRef.current += 1;
+    setApptId("");
+    setBookingCode("");
+    setEditLoadError("");
     setLocationId((prev) => prev || (ctx.currentLocationId ? String(ctx.currentLocationId) : ""));
   }, [ctx.currentLocationId]);
 
@@ -1206,6 +1247,131 @@ export function QuickBookingDrawer() {
     [loadClientContext],
   );
 
+  // ---- EDIT MODE load (port of assets/js/app.js openEditAppointment/loadAppointment) ----
+  // Fetch the appointment's editable payload (GET action=get) and PREFILL the drawer:
+  // select the client (so the history/residuals/context boxes load just like picking a
+  // client), select each service in the multiselect, set the per-service operator +
+  // cabin picks from the staff/cabin maps, set the explicit primary cabin, date, time,
+  // status and notes, set #qb_appt_id (so SAVE routes to updateDbAppointment), set the
+  // header title to "Modifica prenotazione" and show the booking code. The form is reset
+  // FIRST (create defaults) so a previous edit/create never leaks. A monotonic req-id
+  // discards a stale response (the user re-opening quickly). Errors surface in the form.
+  // TODO(redeem-on-edit): the redeem selections are intentionally NOT prefilled — the
+  // save's update path does not re-apply/restore redeems (see getDbAppointmentForEdit),
+  // so the per-service redeem controls start empty; the read-only residual badges still
+  // load via the client context when the client is selected below.
+  const openEditAppointment = useCallback(
+    (id: string) => {
+      const editId = String(id || "").trim();
+      const numericId = Number.parseInt(editId, 10);
+      if (!Number.isFinite(numericId) || numericId <= 0) return;
+
+      loadContext();
+      resetForm();
+      const myReq = ++editReqRef.current;
+      setEditLoadError("");
+
+      // Open the offcanvas immediately (the legacy shows a loading state while the
+      // GET resolves); the prefill applies as soon as the payload arrives.
+      const el = document.getElementById("quickBooking");
+      const api = bootstrap()?.Offcanvas;
+      if (el && api) api.getOrCreateInstance(el).show();
+
+      const params = new URLSearchParams({ slug, action: "get", id: String(numericId) });
+      fetch(`/api/manage/appointments?${params.toString()}`, { headers: { "x-tenant-slug": slug } })
+        .then((r) => r.json())
+        .then((data: { ok?: boolean; error?: string; appointment?: AppointmentEditPayload }) => {
+          if (myReq !== editReqRef.current) return; // stale (drawer re-opened meanwhile)
+          if (!data || data.ok === false || !data.appointment) {
+            setEditLoadError(String(data?.error || "Impossibile caricare la prenotazione."));
+            return;
+          }
+          const a = data.appointment;
+
+          // EDIT MODE markers: id (-> updateDbAppointment on save) + booking code header.
+          setApptId(String(a.id));
+          setBookingCode(a.publicCode ? String(a.publicCode) : "");
+
+          // Client: reuse selectClient so the history/residuals/context boxes load
+          // exactly like picking a client from the find modal.
+          if (a.clientId && a.clientId > 0) {
+            selectClient({
+              id: String(a.clientId),
+              full_name: a.clientName ?? "",
+              email: a.clientEmail ?? "",
+              phone: a.clientPhone ?? "",
+            });
+          }
+
+          // Location FIRST (the cabin/service-location filters derive from it).
+          if (a.locationId && a.locationId > 0) setLocationId(String(a.locationId));
+
+          // Services multiselect: select each service in the payload's order.
+          setSelectedServiceIds(Array.isArray(a.services) ? a.services.map((s) => s.serviceId) : []);
+
+          // Per-service operator + cabin picks from the maps (serviceId -> id). These
+          // feed the same staffPicks/cabinPicks the multi-service picker uses; for a
+          // single service the derived single operator/cabin select reads them too via
+          // the effective maps. Stored as strings to match the picker's value type.
+          const staffPickMap: Record<number, string> = {};
+          for (const [sid, stid] of Object.entries(a.staffMap ?? {})) {
+            if (Number(stid) > 0) staffPickMap[Number(sid)] = String(stid);
+          }
+          setStaffPicks(staffPickMap);
+          const cabinPickMap: Record<number, string> = {};
+          for (const [sid, cid] of Object.entries(a.cabinMap ?? {})) {
+            if (Number(cid) > 0) cabinPickMap[Number(sid)] = String(cid);
+          }
+          setCabinPicks(cabinPickMap);
+
+          // Single-service operator/cabin: prefill the whole-appointment selects from
+          // the first service's map entry (the multi-service picker drives 2+ services).
+          const firstServiceId = a.services?.[0]?.serviceId;
+          if (firstServiceId !== undefined && a.staffMap?.[firstServiceId] && a.staffMap[firstServiceId] > 0) {
+            setStaffId(String(a.staffMap[firstServiceId]));
+          }
+          // Primary cabin (appointments.cabin_id) drives the single #qb_cabin_id select.
+          if (a.primaryCabinId && a.primaryCabinId > 0) {
+            setCabinId(String(a.primaryCabinId));
+          } else if (firstServiceId !== undefined && a.cabinMap?.[firstServiceId] && a.cabinMap[firstServiceId] > 0) {
+            setCabinId(String(a.cabinMap[firstServiceId]));
+          }
+
+          // Date / time / status / notes.
+          if (a.date) setDate(a.date);
+          if (a.time) setStartTime(a.time);
+          setStatus(a.status || "scheduled");
+          setStaffNotes(a.staffNotes ?? "");
+          setCustomerNotes(a.customerNotes ?? "");
+          // An existing slot is already booked: no hold needed (the update reuses it).
+          setHoldToken("");
+        })
+        .catch(() => {
+          if (myReq !== editReqRef.current) return;
+          setEditLoadError("Errore di rete durante il caricamento della prenotazione.");
+        });
+    },
+    [slug, loadContext, resetForm, selectClient],
+  );
+
+  // GLOBAL edit wiring: ANY [data-qb-edit] click loads + prefills THIS offcanvas in
+  // EDIT MODE (the per-row "Modifica" buttons carry data-qb-edit="<id>"). Delegated on
+  // document so it works for buttons rendered anywhere. Distinct from the [data-qb-new]
+  // listener above (which opens a clean CREATE form).
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onDocClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      const btn = target?.closest("[data-qb-edit]");
+      if (!btn) return;
+      e.preventDefault();
+      const id = btn.getAttribute("data-qb-edit") ?? "";
+      openEditAppointment(id);
+    };
+    document.addEventListener("click", onDocClick);
+    return () => document.removeEventListener("click", onDocClick);
+  }, [openEditAppointment]);
+
   const openFindClient = useCallback(() => {
     setFindQuery("");
     setFindResults([]);
@@ -1234,6 +1400,11 @@ export function QuickBookingDrawer() {
   const historyLine = historySummary ? buildHistoryLine(historySummary) : "";
   const residualBadges = residualsSummary ? buildResidualBadges(residualsSummary) : [];
   const hasResiduals = residualBadges.length > 0;
+
+  // EDIT MODE flag: a non-empty #qb_appt_id means the drawer is editing an existing
+  // appointment (loaded via [data-qb-edit]); it drives the header title, the booking
+  // code row and the submit label. Empty -> CREATE mode (the default).
+  const isEditMode = apptId.trim() !== "";
 
   // Create a new client (port of qbSubmitClientCreate). Posts to the existing
   // manage clients route (action=create); on success it becomes the selected
@@ -1377,6 +1548,10 @@ export function QuickBookingDrawer() {
           headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
           body: JSON.stringify({
             action: "save",
+            // EDIT MODE: a non-empty id routes the save to updateDbAppointment
+            // (in-place update); empty -> createDbAppointment (new booking). The
+            // route reads `id` as the edit discriminator (Number.parseInt > 0).
+            id: apptId,
             client_name: client.full_name,
             // Send ids (robust, ordered) AND names (the route prefers ids).
             service_ids: selectedServiceIds.join(","),
@@ -1455,7 +1630,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, closeOffcanvas],
+    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -1467,11 +1642,16 @@ export function QuickBookingDrawer() {
         <div className="offcanvas-header">
           <div>
             <div className="small-muted">Agenda</div>
-            <h5 className="offcanvas-title fw-bold" id="quickBookingLabel">Nuova prenotazione</h5>
-            <div id="qbBookingCodeRow" className="small text-muted mt-1" style={{ display: "none" }}>
-              Codice prenotazione: <code id="qbBookingCode" />
+            <h5 className="offcanvas-title fw-bold" id="quickBookingLabel">
+              {isEditMode ? "Modifica prenotazione" : "Nuova prenotazione"}
+            </h5>
+            <div id="qbBookingCodeRow" className="small text-muted mt-1" style={{ display: isEditMode && bookingCode ? "block" : "none" }}>
+              Codice prenotazione: <code id="qbBookingCode">{bookingCode ? `#${bookingCode}` : ""}</code>
             </div>
             <div id="qbExpiredLinkedAlert" className="alert alert-warning small py-2 px-2 mt-2 mb-0" style={{ display: "none" }} />
+            {editLoadError ? (
+              <div className="alert alert-danger small py-2 px-2 mt-2 mb-0">{editLoadError}</div>
+            ) : null}
           </div>
           <button type="button" className="btn-close" data-bs-dismiss="offcanvas" aria-label="Chiudi" />
         </div>
@@ -1496,7 +1676,7 @@ export function QuickBookingDrawer() {
             <label className="form-label">Cliente</label>
 
             <input type="hidden" name="client_id" id="qb_client_id" value={client?.id ?? ""} readOnly />
-            <input type="hidden" name="id" id="qb_appt_id" value="" readOnly />
+            <input type="hidden" name="id" id="qb_appt_id" value={apptId} readOnly />
             <input type="hidden" name="giftbox_redeem" id="qb_giftbox_redeem" value={giftboxRedeemJson} readOnly />
             <input type="hidden" name="gift_redeem" id="qb_gift_redeem" value={giftRedeemJson} readOnly />
             <input type="hidden" name="package_redeem" id="qb_package_redeem" value={packageRedeemJson} readOnly />
@@ -2441,7 +2621,7 @@ export function QuickBookingDrawer() {
             {formError ? <div className="alert alert-danger small mt-3 mb-0">{formError}</div> : null}
 
             <button className="btn btn-primary btn-pill w-100 mt-3" type="submit" id="qbSubmitBtn" disabled={submitting}>
-              <span id="qbSubmitText">{submitting ? "Salvataggio..." : "Crea prenotazione"}</span>
+              <span id="qbSubmitText">{submitting ? "Salvataggio..." : isEditMode ? "Salva modifiche" : "Crea prenotazione"}</span>
             </button>
 
             <button className="btn btn-outline-danger btn-pill w-100 mt-2" type="button" id="qbDeleteBtn" style={{ display: "none" }}>

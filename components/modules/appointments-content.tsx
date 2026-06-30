@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
 // Pixel-faithful port of the PHP appointments list page (?page=appointments),
 // fed by the existing DB-backed /api/manage/appointments?action=list.
@@ -16,12 +16,14 @@ import { Fragment, useCallback, useEffect, useMemo, useState, type FormEvent } f
 // filters (applied client-side over the fetched list). Slug is read from the
 // pathname. Action links point at the legacy /{slug}/index.php?page=... routes.
 //
-// WIRED (live): the per-row "Modifica" action now opens a minimal edit drawer
-// that prefills from the row and submits action=save WITH the appointment id (JSON
-// POST) to /api/manage/appointments, then refreshes the list. This is the native
-// edit path — the legacy quick-booking drawer (window.qbOpenEditAppointment, built
-// by a separate widget not present in Next) is intentionally not ported; the drawer
-// here reuses the legacy Bootstrap classes so it stays on-brand.
+// WIRED (live): the per-row "Modifica" action drives the GLOBAL quick-booking
+// drawer in EDIT MODE. The button carries data-qb-edit="<id>"; the global drawer
+// (quick-booking-drawer.tsx, mounted in the manage shell on every page) has a
+// delegated [data-qb-edit] handler that loads the appointment via GET action=get
+// and PREFILLS the full drawer (client, services, per-service operator/cabin,
+// date/time, status, notes). SAVE re-submits action=save WITH that id, which the
+// route routes to updateDbAppointment (faithful to the legacy
+// window.qbOpenEditAppointment). The previous minimal local edit drawer was removed.
 //
 // WIRED (live): DELETE — the per-row "Elimina" POSTs action=delete (JSON, confirm)
 // and the header "select all" + per-row checkboxes drive the selection that the
@@ -117,13 +119,6 @@ export function AppointmentsContent() {
   const [to, setTo] = useState(defaults.to);
   const [q, setQ] = useState("");
 
-  // Edit drawer state: the appointment being edited (null = closed), the
-  // editable form fields, and the submit/error UI flags.
-  const [editing, setEditing] = useState<Appointment | null>(null);
-  const [form, setForm] = useState({ client: "", service: "", operator: "", date: "", time: "", staffNotes: "", customerNotes: "" });
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState("");
-
   // Bulk-delete state: the set of selected appointment ids (drives the per-row +
   // "select all" checkboxes and the "Elimina selezionati" button), and a deleting
   // flag that disables the delete controls while a request is in flight.
@@ -152,72 +147,6 @@ export function AppointmentsContent() {
   useEffect(() => {
     load();
   }, [load]);
-
-  // Prefill the drawer from the row. The list payload exposes no notes, so the
-  // notes fields start empty (TODO: surface staff/customer notes in the list API
-  // to pre-populate them here). Submitting blank notes clears them server-side,
-  // matching the create form's behaviour.
-  const openEdit = useCallback((appt: Appointment) => {
-    setSaveError("");
-    setEditing(appt);
-    setForm({
-      client: appt.client ?? "",
-      service: appt.service ?? "",
-      operator: appt.operator ?? "",
-      date: appt.date ?? "",
-      time: appt.time ?? "",
-      staffNotes: "",
-      customerNotes: "",
-    });
-  }, []);
-
-  const closeEdit = useCallback(() => {
-    if (saving) return;
-    setEditing(null);
-    setSaveError("");
-  }, [saving]);
-
-  // Submit action=save WITH the appointment id (JSON POST) — the route branches
-  // to updateDbAppointment and fires the 'modified' email on a customer-visible
-  // change. Same fetch shape used by the other manage POST actions.
-  const submitEdit = useCallback(
-    async (event: FormEvent) => {
-      event.preventDefault();
-      if (!editing || saving) return;
-      setSaving(true);
-      setSaveError("");
-      try {
-        const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
-          body: JSON.stringify({
-            action: "save",
-            id: editing.id,
-            client_name: form.client,
-            service_name: form.service,
-            staff_name: form.operator,
-            date: form.date,
-            time: form.time,
-            location_id: editing.locationId ?? "",
-            staff_notes: form.staffNotes,
-            customer_notes: form.customerNotes,
-          }),
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok || json?.ok === false || json?.error) {
-          setSaveError(String(json?.error || "Errore durante il salvataggio dell'appuntamento."));
-          return;
-        }
-        setEditing(null);
-        load();
-      } catch {
-        setSaveError("Errore di rete durante il salvataggio.");
-      } finally {
-        setSaving(false);
-      }
-    },
-    [editing, form, load, saving, slug],
-  );
 
   // POST a delete (single id) / bulk_delete (CSV ids) to the manage route, then
   // refresh the list. The route restores the consumed redeems server-side
@@ -507,15 +436,17 @@ export function AppointmentsContent() {
                             <span className={`appointments-status-badge ${badge.className}`}>{badge.label}</span>
                           </td>
                           <td className="text-end">
-                            {/* Native edit: opens the prefilled drawer (action=save WITH id). */}
+                            {/* Edit: drives the GLOBAL quick-booking drawer in EDIT MODE.
+                                The drawer (mounted in the manage shell on every page)
+                                has a delegated [data-qb-edit] handler that loads the
+                                appointment via GET action=get and prefills the FULL
+                                drawer (client, services, per-service operator/cabin,
+                                date/time, status, notes); SAVE re-submits action=save
+                                WITH this id -> updateDbAppointment. No local handler. */}
                             <a
                               className="btn btn-sm btn-outline-secondary"
                               href="#"
                               data-qb-edit={appt.id}
-                              onClick={(e) => {
-                                e.preventDefault();
-                                openEdit(appt);
-                              }}
                             >
                               Modifica
                             </a>{" "}
@@ -560,108 +491,6 @@ export function AppointmentsContent() {
           </div>
         </div>
       </div>
-
-      {/* Native edit drawer (Bootstrap offcanvas classes, shown via inline state
-          since the bootstrap JS bundle is not loaded here). Submits action=save
-          WITH the appointment id; closing/cancel discards. */}
-      {editing && (
-        <>
-          <div className="offcanvas-backdrop fade show" onClick={closeEdit} />
-          <div
-            className="offcanvas offcanvas-end show"
-            tabIndex={-1}
-            style={{ visibility: "visible" }}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="apptEditTitle"
-          >
-            <div className="offcanvas-header">
-              <h5 className="offcanvas-title" id="apptEditTitle">
-                Modifica appuntamento <code>#{editing.id}</code>
-              </h5>
-              <button type="button" className="btn-close" aria-label="Chiudi" onClick={closeEdit} />
-            </div>
-            <div className="offcanvas-body">
-              <form onSubmit={submitEdit}>
-                <div className="mb-3">
-                  <label className="form-label">Cliente</label>
-                  <input
-                    className="form-control"
-                    type="text"
-                    value={form.client}
-                    onChange={(e) => setForm((f) => ({ ...f, client: e.target.value }))}
-                  />
-                </div>
-                <div className="mb-3">
-                  <label className="form-label">Servizio</label>
-                  <input
-                    className="form-control"
-                    type="text"
-                    value={form.service}
-                    onChange={(e) => setForm((f) => ({ ...f, service: e.target.value }))}
-                  />
-                </div>
-                <div className="mb-3">
-                  <label className="form-label">Operatore</label>
-                  <input
-                    className="form-control"
-                    type="text"
-                    value={form.operator}
-                    onChange={(e) => setForm((f) => ({ ...f, operator: e.target.value }))}
-                  />
-                </div>
-                <div className="row">
-                  <div className="col-6 mb-3">
-                    <label className="form-label">Data</label>
-                    <input
-                      className="form-control"
-                      type="date"
-                      value={form.date}
-                      onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))}
-                    />
-                  </div>
-                  <div className="col-6 mb-3">
-                    <label className="form-label">Ora</label>
-                    <input
-                      className="form-control"
-                      type="time"
-                      value={form.time}
-                      onChange={(e) => setForm((f) => ({ ...f, time: e.target.value }))}
-                    />
-                  </div>
-                </div>
-                <div className="mb-3">
-                  <label className="form-label">Note interne</label>
-                  <textarea
-                    className="form-control"
-                    rows={2}
-                    value={form.staffNotes}
-                    onChange={(e) => setForm((f) => ({ ...f, staffNotes: e.target.value }))}
-                  />
-                </div>
-                <div className="mb-3">
-                  <label className="form-label">Note cliente</label>
-                  <textarea
-                    className="form-control"
-                    rows={2}
-                    value={form.customerNotes}
-                    onChange={(e) => setForm((f) => ({ ...f, customerNotes: e.target.value }))}
-                  />
-                </div>
-                {saveError && <div className="alert alert-danger py-2">{saveError}</div>}
-                <div className="d-flex justify-content-end gap-2">
-                  <button type="button" className="btn btn-outline-secondary" onClick={closeEdit} disabled={saving}>
-                    Annulla
-                  </button>
-                  <button type="submit" className="btn btn-primary" disabled={saving}>
-                    {saving ? "Salvataggio…" : "Salva"}
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-        </>
-      )}
     </div>
   );
 }

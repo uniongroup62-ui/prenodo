@@ -926,6 +926,153 @@ export async function getDbAppointmentMoveSnapshot(slug: string, id: number): Pr
   };
 }
 
+// EDIT payload for the global quick-booking drawer (port of api_appointments.php
+// action='get', ~8594). Returns everything the drawer needs to PREFILL an existing
+// appointment in EDIT MODE: the selected client (id + name/email/phone), the
+// location, the ordered service list, the per-service operator + cabin maps (read
+// from appointment_segments, the only place the per-service staff/cabin assignment
+// is persisted), the explicit primary cabin, the date/time, the (php-normalized)
+// status and the notes — plus the booking code (public_code) for the header.
+// Tenant-scoped: returns null when the appointment is not the tenant's / missing.
+//
+// TODO(redeem-on-edit): the legacy `get` ALSO returns the applied redeems
+// (package/prepaid/giftbox/gift/giftcard) so the drawer can re-show + re-apply them.
+// This port intentionally OMITS them because updateDbAppointment does NOT re-apply
+// or restore redeems on edit (it re-inserts the appointment_services snapshot from
+// scratch without the linkage), so surfacing them would be misleading. The redeem
+// badges remain visible read-only via the client-context panel; the per-service
+// redeem controls simply start empty in edit mode.
+export type AppointmentEditPayload = {
+  id: number;
+  publicCode: string | null;
+  clientId: number;
+  clientName: string;
+  clientEmail: string;
+  clientPhone: string;
+  locationId: number | null;
+  services: Array<{ serviceId: number; name: string }>;
+  staffMap: Record<number, number>;
+  cabinMap: Record<number, number>;
+  primaryCabinId: number | null;
+  date: string;
+  time: string;
+  status: string;
+  staffNotes: string;
+  customerNotes: string;
+};
+
+export async function getDbAppointmentForEdit(slug: string, id: number): Promise<AppointmentEditPayload | null> {
+  // Tenant-scoped read of the appointments row (tenantSelect '*' so public_code /
+  // staff_notes / customer_notes / cabin_id are available when the columns exist).
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
+  const row = rows[0];
+  if (!row) return null;
+
+  // Client (id + name/email/phone) — mirrors the legacy JOIN clients c ON c.id=a.client_id.
+  const clientId = Number(row.client_id ?? 0);
+  let clientName = "";
+  let clientEmail = "";
+  let clientPhone = "";
+  if (clientId > 0) {
+    try {
+      const clientRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "clients",
+        columns: "full_name, email, phone",
+        where: "id = ?",
+        params: [clientId],
+        limit: 1,
+      });
+      if (clientRows[0]) {
+        clientName = String(clientRows[0].full_name ?? "").trim();
+        clientEmail = String(clientRows[0].email ?? "").trim();
+        clientPhone = String(clientRows[0].phone ?? "").trim();
+      }
+    } catch {
+      // tolerate a missing column; the drawer still selects the client by id+name.
+    }
+  }
+
+  // Ordered service list (one per appointment_services row; falls back to the single
+  // services-table lookup for legacy single-service rows without snapshot rows).
+  const serviceLines = await appointmentServiceLines(slug, row);
+  const services = serviceLines
+    .filter((line) => line.serviceId > 0)
+    .map((line) => ({ serviceId: line.serviceId, name: line.name }));
+
+  // Per-service operator + cabin maps from appointment_segments (the only place the
+  // per-service staff/cabin assignment is persisted; rebuilt on every save). Keyed by
+  // service_id -> staff_id / cabin_id; only positive values are emitted (0 = unassigned).
+  const staffMap: Record<number, number> = {};
+  const cabinMap: Record<number, number> = {};
+  try {
+    const segRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_segments",
+      columns: "service_id, staff_id, cabin_id",
+      where: "appointment_id = ?",
+      params: [id],
+      orderBy: "position ASC, starts_at ASC",
+    });
+    for (const seg of segRows) {
+      const serviceId = Number(seg.service_id ?? 0);
+      if (serviceId <= 0) continue;
+      const staffId = Number(seg.staff_id ?? 0);
+      if (staffId > 0 && staffMap[serviceId] === undefined) staffMap[serviceId] = staffId;
+      const cabinId = seg.cabin_id === null || seg.cabin_id === undefined ? 0 : Number(seg.cabin_id) || 0;
+      if (cabinId > 0 && cabinMap[serviceId] === undefined) cabinMap[serviceId] = cabinId;
+    }
+  } catch {
+    // older installs without appointment_segments: fall back to the single operator
+    // (appointment_staff) so at least the whole-appointment operator can prefill.
+  }
+  // Single-service / no-segment fallback: pin the whole-appointment operator to the
+  // (one) service so the single operator select prefills even without segment rows.
+  if (Object.keys(staffMap).length === 0 && services.length > 0) {
+    try {
+      const staffRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "appointment_staff",
+        columns: "staff_id",
+        where: "appointment_id = ?",
+        params: [id],
+        limit: 1,
+      });
+      const staffId = Number(staffRows[0]?.staff_id ?? 0);
+      if (staffId > 0) staffMap[services[0].serviceId] = staffId;
+    } catch {
+      // tolerate a missing table.
+    }
+  }
+
+  const startsAt = toDate(row.starts_at);
+  const primaryCabinId = row.cabin_id === null || row.cabin_id === undefined || Number(row.cabin_id) <= 0 ? null : Number(row.cabin_id);
+
+  return {
+    id: Number(row.id ?? id),
+    publicCode:
+      row.public_code === null || row.public_code === undefined || String(row.public_code).trim() === ""
+        ? null
+        : String(row.public_code).trim(),
+    clientId,
+    clientName,
+    clientEmail,
+    clientPhone,
+    locationId: row.location_id === null || row.location_id === undefined ? null : Number(row.location_id) || null,
+    services,
+    staffMap,
+    cabinMap,
+    primaryCabinId,
+    date: dateIsoLocal(startsAt),
+    time: timeLocal(startsAt),
+    // php-normalized status code (scheduled/pending/done/canceled/no_show) — the
+    // drawer's status select uses exactly these codes.
+    status: phpStatus(String(row.status ?? "")),
+    staffNotes: row.staff_notes === null || row.staff_notes === undefined ? "" : String(row.staff_notes),
+    customerNotes: row.customer_notes === null || row.customer_notes === undefined ? "" : String(row.customer_notes),
+  };
+}
+
 // True when any customer-visible field differs between the before/after
 // snapshots — i.e. the date, the time, or the set of service names changed.
 // Mirrors automation_handle_customer_visible_change's "$after !== $before" gate,

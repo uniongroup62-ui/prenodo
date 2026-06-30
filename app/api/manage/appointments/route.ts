@@ -9,6 +9,7 @@ import {
   createDbAppointment,
   deleteDbAppointment,
   getDbAppointmentCustomerVisibleSnapshot,
+  getDbAppointmentForEdit,
   getDbAppointmentMoveSnapshot,
   getDbAppointmentPhpStatus,
   listDbAppointments,
@@ -75,6 +76,30 @@ export async function GET(request: Request) {
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto prenotazione.");
+    }
+  }
+
+  // EDIT-mode load for the global quick-booking drawer (port of
+  // api_appointments.php action='get', ~8594). Returns the appointment's full
+  // EDITABLE payload (client, services, per-service operator/cabin maps, date/time,
+  // status, notes, booking code) so the drawer can PREFILL itself. Tenant-scoped +
+  // permission-gated (same view/manage/plan check as the rest of this GET). The
+  // SAVE path is unchanged: the drawer re-submits action=save WITH the id, which
+  // routes to updateDbAppointment.
+  if (action === "get") {
+    const id = Number.parseInt(String(url.searchParams.get("id") ?? "0"), 10);
+    if (!Number.isFinite(id) || id <= 0) return jsonError("ID mancante", 400);
+    try {
+      const appointment = await getDbAppointmentForEdit(tenantSlug, id);
+      if (!appointment) return jsonError("Appuntamento non trovato.", 404);
+      return Response.json({
+        ok: true,
+        source: "app/pages/api_appointments.php?action=get",
+        sourceMode: "database",
+        appointment,
+      });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore caricamento prenotazione.");
     }
   }
 
