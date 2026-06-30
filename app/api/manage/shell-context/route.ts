@@ -31,7 +31,6 @@ export async function GET(request: Request) {
 
   return Response.json({
     ok: true,
-    source: "app/lib/View.php topbar (notificationSummary + closure/support context)",
     sourceMode: locationContext.sourceMode,
     notif,
     locations: locationContext.locations.map((location) => ({ id: location.id, name: location.name })),

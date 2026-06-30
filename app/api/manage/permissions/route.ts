@@ -18,7 +18,7 @@ import { getManageLocationContext } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { jsonError, parseRequestBody } from "@/lib/api-utils";
 import { columnExists, dbExecute, quoteIdentifier, tableExists, tenantInsert, tenantSelect, tenantTable } from "@/lib/tenant-db";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -36,7 +36,6 @@ export async function GET(request: Request) {
 
   return Response.json({
     ok: true,
-    source: "app/lib/Auth.php + app/lib/RolePermissions.php",
     tenant: {
       slug: tenantSlug,
       prefix: tenantPrefix(tenantSlug),
@@ -98,7 +97,6 @@ export async function POST(request: Request) {
     const assignments = await roleAssignments(tenantSlug);
     return Response.json({
       ok: true,
-      source: "app/pages/roles.php",
       role,
       perms: assignments[role] ?? [],
       assignments,

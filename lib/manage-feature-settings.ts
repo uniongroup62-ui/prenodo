@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { tenantSelect, tenantUpdate } from "@/lib/tenant-db";
 import type { ConfigModuleState, ConfigRecord } from "@/lib/tenant-store";
 
@@ -83,7 +83,6 @@ export async function getGiftcardSettings(slug: string): Promise<ConfigModuleSta
   return {
     id: "giftcard_settings",
     title: "Impostazioni GiftCard",
-    source: "giftcard_settings.php",
     records: [
       record("giftcard_settings", 1, "Validita predefinita", `${value} ${unit}`, "Default emissione", true, created(row)),
       record("giftcard_settings", 2, "Termini GiftCard", terms, terms.trim() ? "Configurati" : "Da configurare", true, created(row)),
@@ -134,7 +133,6 @@ export async function getGiftboxSettings(slug: string): Promise<ConfigModuleStat
   return {
     id: "giftbox_settings",
     title: "Impostazioni GiftBox",
-    source: "giftbox_settings.php",
     records: [
       record("giftbox_settings", 1, "Validita predefinita", `${value} ${unit}`, "Default emissione", true, created(row)),
       record("giftbox_settings", 2, "Termini GiftBox", terms, terms.trim() ? "Configurati" : "Da configurare", true, created(row)),
@@ -182,7 +180,6 @@ export async function getPackageSettings(slug: string): Promise<ConfigModuleStat
   return {
     id: "package_settings",
     title: "Impostazioni pacchetti",
-    source: "package_settings.php",
     records: [
       record("package_settings", 1, "Validita predefinita", `${value} ${unit}`, "Default vendita", true, created(row)),
     ],
@@ -326,7 +323,6 @@ export async function getQuoteSettings(slug: string): Promise<ConfigModuleState>
   return {
     id: "quote_settings",
     title: "Impostazioni preventivi",
-    source: "quote_settings.php",
     records: [
       record("quote_settings", 1, "Intestazione", profile.quote_company_name || String(row.name ?? "Attivita"), profile.quote_email || String(row.email ?? ""), true, created(row)),
       record("quote_settings", 2, "Dati fiscali", [profile.quote_vat_number, profile.quote_tax_code, profile.quote_sdi].filter(Boolean).join(" / ") || "-", profile.quote_city, true, created(row)),
@@ -445,7 +441,6 @@ export async function getFidelityMembershipSettings(slug: string): Promise<Confi
   return {
     id: "fidelity_membership",
     title: "Adesione",
-    source: "fidelity_membership.php",
     records: [
       record("fidelity_membership", 1, "Programma fidelity", enabled ? "Fidelity abilitata" : "Fidelity disabilitata", enabled ? "Attivo" : "Disattivo", enabled, created(row)),
       record("fidelity_membership", 2, "Regole adesione", String(row.fidelity_adhesion_json ?? ""), row.fidelity_adhesion_json ? "Configurate" : "Da configurare", enabled, created(row)),

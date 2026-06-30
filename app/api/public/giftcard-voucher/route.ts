@@ -1,5 +1,5 @@
 import { dbQuery, tenantIdForSlug } from "@/lib/tenant-db";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -151,7 +151,6 @@ export async function GET(request: Request) {
 
     return Response.json({
       ok: true,
-      source: "app/pages/giftcard_voucher.php?public=1",
       voucher: {
         code: String(gc.code ?? ""),
         status: String(gc.status ?? "").trim().toLowerCase(),

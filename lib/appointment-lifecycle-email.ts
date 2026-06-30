@@ -2,7 +2,7 @@ import "server-only";
 
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 import { dbQuery, tenantIdForSlug } from "@/lib/tenant-db";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 
 // Port of automation_send_email('approved'|'modified'|'rejected', $appointmentId)
 // from app/lib/Helpers.php, wired into the Next "manage appointments" flow so a

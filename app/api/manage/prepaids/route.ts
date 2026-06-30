@@ -16,7 +16,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/pos_prepaids.php",
       sourceMode: "database",
       prepaids: await listDbPrepaids(tenantSlug),
     });

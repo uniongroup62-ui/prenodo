@@ -45,7 +45,6 @@ export async function GET(request: Request) {
       const context = await quickBookClientContext({ slug: tenantSlug, clientId, locationId });
       return Response.json({
         ok: true,
-        source: "app/pages/api_clients.php action=history + action=residuals (summary)",
         sourceMode: "database",
         summary: context.history,
         residuals: context.residuals,
@@ -87,7 +86,7 @@ export async function GET(request: Request) {
     try {
       const detail = await getManageClientDetail(tenantSlug, clientId);
       if (!detail) return jsonError("Cliente non trovato.", 404);
-      return Response.json({ ok: true, source: "clients.php action=view", sourceMode: "database", ...detail });
+      return Response.json({ ok: true, sourceMode: "database", ...detail });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore dettaglio cliente.");
     }
@@ -101,7 +100,7 @@ export async function GET(request: Request) {
     if (clientId <= 0) return jsonError("ID cliente mancante.");
     try {
       const summary = await getManageClientDeleteSummary(tenantSlug, clientId);
-      return Response.json({ ok: true, source: "clients.php action=delete_confirm", sourceMode: "database", summary });
+      return Response.json({ ok: true, sourceMode: "database", summary });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore riepilogo eliminazione.");
     }
@@ -131,7 +130,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/clients.php + app/pages/api_clients.php",
       sourceMode: "database",
       clients: await listDbClients(args),
     });

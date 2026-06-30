@@ -1,13 +1,13 @@
 import "server-only";
 
 import bcrypt from "bcryptjs";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { emptyToNull, parseInteger } from "@/lib/api-utils";
 import { dbExecute, dbQuery, quoteIdentifier, columnExists, tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
 import { sendStaffInviteEmailCode } from "@/lib/manage-accessibility";
 
 export type ManageResourceContext = {
-  source: string;
+  source?: string;
   sourceMode: "database";
   activeLocationId: number;
   locations: ResourceLocation[];
@@ -153,7 +153,6 @@ export async function resourceContext({
   ]);
 
   return {
-    source: "app/pages/resources.php, cabins.php, staff.php, staff_availability.php, hours.php",
     sourceMode: "database",
     activeLocationId,
     locations,

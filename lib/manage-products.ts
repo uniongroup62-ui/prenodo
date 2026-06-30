@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { emptyToNull, parseInteger, parseNumber } from "@/lib/api-utils";
 import {
   columnExists,
@@ -18,7 +18,6 @@ type TenantTarget = Awaited<ReturnType<typeof tenantTable>>;
 
 export type ManageProductsContext = {
   ok: true;
-  source: string;
   sourceMode: "database";
   activeLocationId: number;
   stats: {
@@ -113,7 +112,6 @@ export type StockDocumentRow = {
   }>;
 };
 
-const sourceLabel = "app/pages/products.php + app/pages/stock_moves.php + app/pages/suppliers.php";
 
 export async function getManageProductsContext(slug: string, options: { query?: string; locationId?: number; includeInactive?: boolean } = {}): Promise<ManageProductsContext> {
   const [locations, categories, suppliers] = await Promise.all([
@@ -137,7 +135,6 @@ export async function getManageProductsContext(slug: string, options: { query?: 
 
   return {
     ok: true,
-    source: sourceLabel,
     sourceMode: "database",
     activeLocationId,
     stats: {

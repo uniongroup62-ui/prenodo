@@ -17,7 +17,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/quotes.php",
       sourceMode: "database",
       quotes: await listDbQuotes(tenantSlug),
     });

@@ -66,7 +66,6 @@ export async function GET(request: Request) {
       ]);
       return Response.json({
         ok: true,
-        source: "app/lib/View.php (#quickBooking) + app/pages/api_appointments.php",
         sourceMode: "database",
         currentLocationId: locationContext.currentLocationId,
         categories: context.categories,
@@ -95,7 +94,6 @@ export async function GET(request: Request) {
       if (!appointment) return jsonError("Appuntamento non trovato.", 404);
       return Response.json({
         ok: true,
-        source: "app/pages/api_appointments.php?action=get",
         sourceMode: "database",
         appointment,
       });
@@ -120,7 +118,6 @@ export async function GET(request: Request) {
 
       return Response.json({
         ok: true,
-        source: "app/pages/api_appointments.php?action=availability",
         sourceMode: "database",
         date,
         serviceNames,
@@ -145,7 +142,6 @@ export async function GET(request: Request) {
     const to = url.searchParams.get("to") ?? undefined;
     return Response.json({
       ok: true,
-      source: "app/pages/api_appointments.php",
       sourceMode: "database",
       appointments: await listDbAppointments(
         date ? { slug: tenantSlug, date } : { slug: tenantSlug, start: from, end: to },
@@ -191,7 +187,7 @@ export async function POST(request: Request) {
         ownerKey: "manage",
       });
 
-      return Response.json({ ok: true, source: "app/pages/api_appointments.php?action=hold_availability", sourceMode: "database", ...hold });
+      return Response.json({ ok: true, sourceMode: "database", ...hold });
     }
 
     if (action === "release_hold") {
@@ -243,7 +239,6 @@ export async function POST(request: Request) {
 
       return Response.json({
         ok: true,
-        source: "app/pages/appointments.php?action=delete|bulk_delete",
         sourceMode: "database",
         deleted,
         appointments: await listDbAppointments({ slug: tenantSlug }),
@@ -340,7 +335,6 @@ export async function POST(request: Request) {
 
       return Response.json({
         ok: true,
-        source: "app/pages/api_appointments.php?action=move",
         sourceMode: "database",
         appointment,
         appointments: await listDbAppointments({ slug: tenantSlug }),
@@ -379,7 +373,6 @@ export async function POST(request: Request) {
 
       return Response.json({
         ok: true,
-        source: "app/pages/api_appointments.php?action=resize",
         sourceMode: "database",
         appointment,
         appointments: await listDbAppointments({ slug: tenantSlug }),
@@ -521,7 +514,6 @@ export async function POST(request: Request) {
 
     return Response.json({
       ok: true,
-      source: "app/pages/api_appointments.php?action=save",
       sourceMode: "database",
       appointment,
       appointments: await listDbAppointments({ slug: tenantSlug }),

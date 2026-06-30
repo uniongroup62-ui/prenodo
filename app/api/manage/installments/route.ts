@@ -1,4 +1,4 @@
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
@@ -19,7 +19,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/installments_manage.php",
       sourceMode: "database",
       plans: await listDbInstallmentPlans(tenantSlug),
     });

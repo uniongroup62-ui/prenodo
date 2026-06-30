@@ -1,7 +1,7 @@
 import { activeTenantSlugs, assertCronAuth } from "@/lib/cron";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 import { dbExecute, dbQuery, tenantIdForSlug } from "@/lib/tenant-db";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -533,7 +533,7 @@ export async function GET(request: Request) {
       total += sent;
     }
 
-    return Response.json({ ok: true, job: "giftcard-send", source: "cron/giftcard_send.php", sendEnabled: SEND_ENABLED, total, results });
+    return Response.json({ ok: true, job: "giftcard-send", sendEnabled: SEND_ENABLED, total, results });
   } catch (error) {
     return Response.json(
       { ok: false, error: error instanceof Error ? error.message : "Errore cron giftcard-send." },

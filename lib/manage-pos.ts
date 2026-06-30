@@ -1,7 +1,7 @@
 import "server-only";
 
 import { randomBytes } from "node:crypto";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import type {
   ManagedClient,
   ManagedProduct,
@@ -56,7 +56,6 @@ export type PosBusinessHeader = {
 
 export type ManagePosContext = {
   ok: true;
-  source: string;
   sourceMode: "database";
   activeLocationId: number;
   // Business identity for the printable receipt header (name / P.IVA / address / logo).
@@ -152,8 +151,6 @@ export type SellableRecharge = {
   earnPoints: boolean;
 };
 
-const sourceLabel = "app/pages/pos.php + app/pages/pos_history.php";
-
 export async function getManagePosContext(
   slug: string,
   options: { locationId?: number; includeCancelled?: boolean; query?: string } = {},
@@ -173,7 +170,6 @@ export async function getManagePosContext(
 
   return {
     ok: true,
-    source: sourceLabel,
     sourceMode: "database",
     activeLocationId,
     business,
@@ -817,7 +813,7 @@ export type PosCancelSummary = {
 
 export type PosSaleDetail = {
   ok: true;
-  source: string;
+  source?: string;
   sale: PosSale;
   operatorName: string;
   locationName: string;
@@ -840,7 +836,6 @@ export async function getManageSaleDetail(slug: string, id: number): Promise<Pos
   const cancelSummary = await buildCancelSummary(slug, id, row, sale);
   return {
     ok: true,
-    source: "app/pages/pos_sale_detail.php",
     sale,
     operatorName,
     locationName,

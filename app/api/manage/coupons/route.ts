@@ -18,7 +18,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/coupons.php",
       sourceMode: "database",
       coupons: await listDbCoupons(tenantSlug),
     });

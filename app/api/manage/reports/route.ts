@@ -23,7 +23,6 @@ export async function GET(request: Request) {
 
     return Response.json({
       ok: true,
-      source: "app/pages/reports.php",
       sourceMode: "database",
       kpis: {
         activeSales: summary.saleCount,

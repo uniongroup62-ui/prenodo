@@ -2,7 +2,7 @@ import "server-only";
 
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { allAssignablePermissions, permissionDefinitions } from "@/lib/role-permissions";
 import {
   canManageSaasAdmins,

@@ -2,7 +2,7 @@ import "server-only";
 
 import { mkdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { emptyToNull, parseInteger } from "@/lib/api-utils";
 import {
   columnExists,
@@ -97,7 +97,6 @@ export async function getBusinessSettingsContext(slug: string, publicOrigin = ""
 
   return {
     ok: true,
-    source: "app/pages/business_profile.php + app/pages/locations.php",
     tenant,
     featureFlags: {
       bookingPublicAllowed: Boolean(Number(tenant?.booking_public_allowed ?? 1)),

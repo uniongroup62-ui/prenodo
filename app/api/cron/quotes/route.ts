@@ -30,7 +30,7 @@ export async function GET(request: Request) {
       total += res.affectedRows;
     }
 
-    return Response.json({ ok: true, job: "quotes", source: "cron/quotes.php", total, results });
+    return Response.json({ ok: true, job: "quotes", total, results });
   } catch (error) {
     return Response.json({ ok: false, error: error instanceof Error ? error.message : "Errore cron quotes." }, { status: 500 });
   }

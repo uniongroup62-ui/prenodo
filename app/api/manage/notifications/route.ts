@@ -16,7 +16,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/notifications.php",
       sourceMode: "database",
       notifications: await listDbNotifications(tenantSlug),
     });

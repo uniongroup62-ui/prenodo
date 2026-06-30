@@ -12,7 +12,6 @@ export async function GET(request: Request) {
 
   return Response.json({
     ok: true,
-    source: "app/lib/Auth.php + app/lib/View.php location gate",
     sourceMode: locationContext.sourceMode,
     locations: locationContext.locations,
     currentLocationId: locationContext.currentLocationId,

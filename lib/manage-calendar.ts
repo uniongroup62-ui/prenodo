@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { listDbAppointments, listDbLocations, listDbServices } from "@/lib/db-repositories";
 import { dbExecute, dbQuery, quoteIdentifier, columnExists, tableExists, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
 

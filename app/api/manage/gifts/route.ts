@@ -19,7 +19,6 @@ export async function GET(request: Request) {
   try {
     return Response.json({
       ok: true,
-      source: "app/pages/gifts.php",
       sourceMode: "database",
       gifts: await listDbGifts(tenantSlug),
     });

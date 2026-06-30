@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { columnExists, dbExecute, dbQuery, quoteIdentifier, tenantInsert, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
 import type { ConfigModuleState, ConfigRecord } from "@/lib/tenant-store";
 
@@ -28,7 +28,6 @@ export async function getManagePosSettings(slug: string): Promise<ConfigModuleSt
   return {
     id: "pos_settings",
     title: "Impostazioni POS",
-    source: "pos_settings.php",
     records: [
       record(1, "Scadenza preordini", expiryDetail(settings.preorders_expiry_value, settings.preorders_expiry_unit), settings.preorders_expiry_enabled ? "Attiva" : "Disattiva", Boolean(settings.preorders_expiry_enabled), settings.updated_at),
       record(2, "Scadenza prepagati", expiryDetail(settings.prepaids_expiry_value, settings.prepaids_expiry_unit), settings.prepaids_expiry_enabled ? "Attiva" : "Disattiva", Boolean(settings.prepaids_expiry_enabled), settings.updated_at),

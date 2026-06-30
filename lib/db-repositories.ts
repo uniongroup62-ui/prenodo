@@ -1,7 +1,7 @@
 import "server-only";
 
 import { randomBytes } from "crypto";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import type { AppointmentStatus, Location } from "@/lib/demo-data";
 import type { AppointmentWithMeta } from "@/lib/appointment-engine";
 import type {
@@ -5333,7 +5333,7 @@ async function serviceNameById(slug: string, serviceId: number, fallback: string
 
 type ConfigDef = {
   title: string;
-  source: string;
+  source?: string;
   table: string;
   titleColumn: string;
   detailColumns?: string[];
@@ -5347,7 +5347,6 @@ type ConfigDef = {
 const configDefinitions: Record<string, ConfigDef> = {
   cost_categories: {
     title: "Categorie costi",
-    source: "costs.php?tab=categories",
     table: "cost_categories",
     titleColumn: "name",
     valueColumn: "color",
@@ -5356,7 +5355,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   product_categories: {
     title: "Categorie prodotti",
-    source: "products.php?action=categories",
     table: "product_categories",
     titleColumn: "name",
     valueColumn: "created_at",
@@ -5364,7 +5362,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   stock_moves: {
     title: "Carico / Scarico",
-    source: "stock_moves.php",
     table: "stock_moves",
     titleColumn: "cause",
     detailColumns: ["document_type", "document_number", "operator_name"],
@@ -5373,7 +5370,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   suppliers: {
     title: "Fornitori",
-    source: "suppliers.php",
     table: "suppliers",
     titleColumn: "name",
     detailColumns: ["business_name", "email", "city"],
@@ -5383,7 +5379,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   client_sheets: {
     title: "Schede cliente",
-    source: "client_sheets.php",
     table: "client_sheet_templates",
     titleColumn: "title",
     detailColumns: ["description", "slug"],
@@ -5394,7 +5389,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   client_sheet_templates: {
     title: "Template schede",
-    source: "client_sheet_templates.php",
     table: "client_sheet_presets",
     titleColumn: "name",
     detailColumns: ["category", "slug"],
@@ -5404,7 +5398,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   client_consents: {
     title: "Consensi cliente",
-    source: "client_consents.php",
     table: "consent_modules",
     titleColumn: "name",
     detailColumns: ["type", "slug"],
@@ -5414,7 +5407,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   consent_modules: {
     title: "Moduli consenso",
-    source: "consent_modules.php",
     table: "consent_modules",
     titleColumn: "name",
     detailColumns: ["type", "slug"],
@@ -5424,7 +5416,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   resources: {
     title: "Risorse",
-    source: "resources.php",
     table: "resources",
     titleColumn: "name",
     detailColumns: ["description"],
@@ -5433,7 +5424,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   service_categories: {
     title: "Categorie servizi",
-    source: "services.php?tab=categories",
     table: "service_categories",
     titleColumn: "name",
     detailColumns: ["image_url"],
@@ -5442,7 +5432,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   service_recommendations: {
     title: "Servizi consigliati",
-    source: "services.php?tab=recommended",
     table: "service_recommendations",
     titleColumn: "service_id",
     detailColumns: ["recommended_service_id"],
@@ -5451,7 +5440,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   cabins: {
     title: "Cabine",
-    source: "cabins.php",
     table: "cabins",
     titleColumn: "name",
     detailColumns: ["location_id"],
@@ -5461,7 +5449,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   staff: {
     title: "Operatori",
-    source: "staff.php",
     table: "staff",
     titleColumn: "full_name",
     detailColumns: ["email", "phone"],
@@ -5471,7 +5458,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   staff_availability: {
     title: "Disponibilita",
-    source: "staff_availability.php",
     table: "staff_availability",
     titleColumn: "kind",
     detailColumns: ["staff_id", "starts_at", "ends_at"],
@@ -5480,7 +5466,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   locations: {
     title: "Sedi",
-    source: "locations.php",
     table: "locations",
     titleColumn: "name",
     detailColumns: ["address", "email", "phone"],
@@ -5490,7 +5475,6 @@ const configDefinitions: Record<string, ConfigDef> = {
   },
   marketplace: {
     title: "Marketplace",
-    source: "marketplace.php",
     table: "marketplace_activity_categories",
     titleColumn: "name",
     detailColumns: ["slug", "icon_key"],
@@ -5631,13 +5615,13 @@ async function accessibilityConfig(slug: string): Promise<ConfigModuleState> {
   return configStateFromRows("accessibility", "Accessibilita", "accessibility.php", records);
 }
 
-function configStateFromRows(id: string, title: string, source: string, records: ConfigRecord[]): ConfigModuleState {
+function configStateFromRows(id: string, title: string, source: string | undefined, records: ConfigRecord[]): ConfigModuleState {
   return {
     id,
     title,
     source,
     records,
-    settings: { sourceMode: "database", source },
+    settings: { sourceMode: "database" },
     updatedAt: new Date().toISOString(),
   };
 }

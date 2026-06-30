@@ -67,7 +67,6 @@ export async function GET(request: Request) {
     return Response.json({
       ok: failed === 0,
       job: "saas-tenant-health",
-      source: "cron/saas_tenant_health.php",
       total: checked,
       checked,
       ok_count: okCount,

@@ -2,7 +2,7 @@ import "server-only";
 
 import fs from "node:fs";
 import path from "node:path";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { currentSaasAdminSession } from "@/lib/saas-admin-auth";
 import { dbExecute, dbQuery, quoteIdentifier, tableExists, tenantTable, usesSharedTenantTables } from "@/lib/tenant-db";
 import { logSaasTenantAudit, listSaasTenants, requireSaasTenant, tenantStatus, type SaasTenantRow } from "@/lib/saas-tenant-manager";

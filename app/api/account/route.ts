@@ -26,7 +26,6 @@ export async function GET() {
   const account = await currentPublicCustomerSession();
   return Response.json({
     ok: true,
-    source: "app/lib/Marketplace.php::globalAccountFromSession",
     ...(await accountState(account)),
   });
 }
@@ -42,7 +41,6 @@ export async function POST(request: Request) {
       if ("requiresVerification" in result) {
         return Response.json({
           ok: true,
-          source: "app/lib/Marketplace.php::globalAccountForLogin",
           requiresVerification: true,
           accountId: result.accountId,
           email: result.email,
@@ -50,7 +48,7 @@ export async function POST(request: Request) {
         });
       }
       const account = await startPublicCustomerSession(result.account.id, request) ?? result.account;
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::startGlobalCustomerSessionByAccountId", ...(await accountState(account)) });
+      return Response.json({ ok: true, ...(await accountState(account)) });
     }
 
     if (action === "register") {
@@ -67,7 +65,6 @@ export async function POST(request: Request) {
       if (!result.ok) return jsonError(result.error);
       return Response.json({
         ok: true,
-        source: "app/lib/Marketplace.php::registerGlobalCustomer",
         requiresVerification: true,
         accountId: result.accountId,
         email: result.email,
@@ -80,7 +77,7 @@ export async function POST(request: Request) {
       const result = await verifyPublicCustomerCode(accountId, body.code ?? "");
       if (!result.ok) return jsonError(result.error);
       const account = await startPublicCustomerSession(result.account.id, request) ?? result.account;
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::verifyGlobalCustomerCode", ...(await accountState(account)) });
+      return Response.json({ ok: true, ...(await accountState(account)) });
     }
 
     if (action === "resend_verification") {
@@ -88,7 +85,6 @@ export async function POST(request: Request) {
       if (!result.ok) return jsonError(result.error);
       return Response.json({
         ok: true,
-        source: "app/lib/Marketplace.php::issueGlobalVerificationCode",
         requiresVerification: result.requiresVerification,
         email: result.email,
         alreadySent: result.alreadySent,
@@ -101,7 +97,6 @@ export async function POST(request: Request) {
       if (!result.ok) return jsonError(result.error);
       return Response.json({
         ok: true,
-        source: "app/lib/Marketplace.php::requestGlobalPasswordReset",
         message: result.message,
         devToken: result.devToken,
       });
@@ -115,12 +110,12 @@ export async function POST(request: Request) {
       });
       if (!result.ok) return jsonError(result.error);
       const account = await startPublicCustomerSession(result.account.id, request) ?? result.account;
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::resetGlobalPassword", ...(await accountState(account)) });
+      return Response.json({ ok: true, ...(await accountState(account)) });
     }
 
     if (action === "logout") {
       await clearPublicCustomerSession();
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::clearGlobalCustomerSession", ...(await accountState(null)) });
+      return Response.json({ ok: true, ...(await accountState(null)) });
     }
 
     const account = await currentPublicCustomerSession();
@@ -133,7 +128,7 @@ export async function POST(request: Request) {
         phone: body.phone ?? "",
       });
       if (!result.ok) return jsonError(result.error);
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::updateGlobalCustomerProfile", ...(await accountState(result.account)) });
+      return Response.json({ ok: true, ...(await accountState(result.account)) });
     }
 
     if (action === "change_password") {
@@ -143,7 +138,7 @@ export async function POST(request: Request) {
         confirmPassword: body.confirm_password ?? body.confirmPassword ?? "",
       });
       if (!result.ok) return jsonError(result.error);
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::changeGlobalCustomerPassword", ...(await accountState(result.account)) });
+      return Response.json({ ok: true, ...(await accountState(result.account)) });
     }
 
     if (action === "request_email_change") {
@@ -152,19 +147,19 @@ export async function POST(request: Request) {
         currentPassword: body.current_password ?? body.currentPassword ?? "",
       });
       if (!result.ok) return jsonError(result.error);
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::requestGlobalCustomerEmailChange", ...(await accountState(result.account)), devCode: result.devCode });
+      return Response.json({ ok: true, ...(await accountState(result.account)), devCode: result.devCode });
     }
 
     if (action === "confirm_email_change") {
       const result = await confirmPublicCustomerEmailChange(account.id, body.code ?? "");
       if (!result.ok) return jsonError(result.error);
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::confirmGlobalCustomerEmailChange", ...(await accountState(result.account)) });
+      return Response.json({ ok: true, ...(await accountState(result.account)) });
     }
 
     if (action === "cancel_email_change") {
       const result = await cancelPublicCustomerEmailChange(account.id);
       if (!result.ok) return jsonError(result.error);
-      return Response.json({ ok: true, source: "app/lib/Marketplace.php::cancelGlobalCustomerEmailChange", ...(await accountState(result.account)) });
+      return Response.json({ ok: true, ...(await accountState(result.account)) });
     }
 
     if (action === "toggle_favorite") {
@@ -176,7 +171,6 @@ export async function POST(request: Request) {
       if (!result.ok) return jsonError(result.error);
       return Response.json({
         ok: true,
-        source: "app/lib/Marketplace.php::toggleGlobalCustomerFavorite",
         active: result.active,
         key: result.key,
         favoriteKeys: await publicCustomerFavoriteKeys(account.id),
@@ -192,7 +186,6 @@ export async function POST(request: Request) {
       if (!result.ok) return jsonError(result.error);
       return Response.json({
         ok: true,
-        source: "app/lib/Marketplace.php::removeGlobalCustomerFavorite",
         favoriteKeys: await publicCustomerFavoriteKeys(account.id),
         favorites: await publicCustomerFavorites(account.id),
       });

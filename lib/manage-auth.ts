@@ -3,7 +3,7 @@ import "server-only";
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import { cookies } from "next/headers";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { allAssignablePermissions } from "@/lib/role-permissions";
 import { normalizeTenantSlug, tenantSessionSuffix } from "@/lib/tenant-runtime";
 import { dbExecute, dbQuery, tenantSelect, tenantTable, columnExists, tableExists } from "@/lib/tenant-db";

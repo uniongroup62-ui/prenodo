@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { emptyToNull, parseInteger, parseNumber } from "@/lib/api-utils";
 import {
   columnExists,
@@ -20,7 +20,6 @@ type TenantTarget = Awaited<ReturnType<typeof tenantTable>>;
 
 export type ManageServiceContext = {
   ok: true;
-  source: string;
   sourceMode: "database";
   featureFlags: {
     bookingPublicAllowed: boolean;
@@ -138,7 +137,6 @@ type NormalizedServiceInput = {
   resourceQty: Map<number, number>;
 };
 
-const sourceLabel = "app/pages/services.php";
 
 export async function getManageServicesContext(slug: string, options: { query?: string; locationId?: number; includeInactive?: boolean } = {}): Promise<ManageServiceContext> {
   const tenant = await getTenant(slug);
@@ -170,7 +168,6 @@ export async function getManageServicesContext(slug: string, options: { query?: 
 
   return {
     ok: true,
-    source: sourceLabel,
     sourceMode: "database",
     featureFlags: {
       bookingPublicAllowed: Boolean(Number(tenant?.booking_public_allowed ?? 1)),
@@ -241,7 +238,7 @@ export async function deleteManageService(slug: string, serviceId: number): Prom
   await deleteByOwner(slug, "staff_services", "service_id", serviceId);
   await deleteByOwner(slug, "service_locations", "service_id", serviceId);
   await deleteRecommendationsForService(slug, serviceId);
-  await tenantDelete({ slug, table: "services", id: service.id });
+  await tenantDelete({ slug, table: "services", id: service.id as number });
   await syncTenantDirectoryServices(slug);
   return getManageServicesContext(slug, { includeInactive: true });
 }

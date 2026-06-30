@@ -1,6 +1,6 @@
 import { activeTenantSlugs, assertCronAuth } from "@/lib/cron";
 import { dbExecute, dbQuery, tenantIdForSlug } from "@/lib/tenant-db";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -333,7 +333,6 @@ export async function GET(request: Request) {
     return Response.json({
       ok: true,
       job: "fidelity-reconcile-lots",
-      source: "cron/fidelity_reconcile_lots.php",
       total: totFixed,
       totalChecked: totChecked,
       results,

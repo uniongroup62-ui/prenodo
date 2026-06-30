@@ -36,7 +36,6 @@ export async function GET(request: Request) {
       });
       return Response.json({
         ok: true,
-        source: "app/pages/api_calendar_notes.php?action=list",
         total: payload.notes.length,
         count_by_date: payload.countByDate,
         notes: payload.notes,
@@ -46,7 +45,6 @@ export async function GET(request: Request) {
     if (action === "get_calendar_day_staff_order") {
       return Response.json({
         ok: true,
-        source: "app/pages/api_user_prefs.php?action=get_calendar_day_staff_order",
         order: await getCalendarDayStaffOrder(tenantSlug, activeUser.id),
       });
     }
@@ -62,7 +60,6 @@ export async function GET(request: Request) {
     });
     return Response.json({
       ok: true,
-      source: "app/pages/calendar.php",
       sourceMode: "database",
       ...context,
     });
@@ -95,7 +92,7 @@ export async function POST(request: Request) {
         noteText: body.note_text ?? body.noteText ?? "",
         userId: activeUser.id,
       });
-      return Response.json({ ok: true, source: "app/pages/api_calendar_notes.php?action=save", note });
+      return Response.json({ ok: true, note });
     }
 
     if (action === "note_delete" || action === "delete") {
@@ -103,12 +100,12 @@ export async function POST(request: Request) {
         return jsonError("Permesso Appuntamenti richiesto.", 403);
       }
       await deleteCalendarNote({ slug: tenantSlug, id: parseInteger(body.id, 0) });
-      return Response.json({ ok: true, source: "app/pages/api_calendar_notes.php?action=delete" });
+      return Response.json({ ok: true });
     }
 
     if (action === "set_calendar_day_staff_order") {
       const order = await setCalendarDayStaffOrder(tenantSlug, activeUser.id, body.order ?? "[]");
-      return Response.json({ ok: true, source: "app/pages/api_user_prefs.php?action=set_calendar_day_staff_order", order });
+      return Response.json({ ok: true, order });
     }
 
     return jsonError("Azione calendario non valida.", 400);

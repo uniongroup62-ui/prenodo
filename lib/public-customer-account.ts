@@ -3,7 +3,7 @@ import "server-only";
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import { cookies } from "next/headers";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import {
   columnExists,
   dbExecute,
@@ -774,7 +774,7 @@ export async function confirmPublicCustomerEmailChange(
   const pendingEmail = normalizeEmail(row.pending_email ?? "");
   const storedHash = String(row.pending_email_verification_hash ?? "");
   if (!pendingEmail || !storedHash) return { ok: false, error: "Nessun cambio email in attesa." };
-  if (row.pending_email_verification_expires_at && !futureDate(row.pending_email_verification_expires_at)) {
+  if (row.pending_email_verification_expires_at && !futureDate(row.pending_email_verification_expires_at as string | Date | null | undefined)) {
     await cancelPublicCustomerEmailChange(accountId);
     return { ok: false, error: "Il codice e scaduto. Richiedi un nuovo codice.", account: await accountById(accountId) ?? undefined };
   }
@@ -966,8 +966,8 @@ export async function publicCustomerActivities(accountId: number): Promise<Publi
       phone: profile.phone,
       email: profile.email,
       bookingUrl: profile.bookingUrl,
-      linkedAt: dateString(row.linked_at),
-      lastSeenAt: dateString(row.last_seen_at),
+      linkedAt: dateString(row.linked_at as string | Date | null | undefined),
+      lastSeenAt: dateString(row.last_seen_at as string | Date | null | undefined),
       clientId,
       locations: locations.map((location) => ({
         locationId: location.locationId,
@@ -1122,7 +1122,7 @@ async function favoriteFromRow(row: RowDataPacket): Promise<PublicCustomerFavori
     email: location.email || profile.email,
     bookingUrl,
     profileUrl: `/attivita/${target.tenantSlug}`,
-    favoritedAt: dateString(row.created_at),
+    favoritedAt: dateString(row.created_at as string | Date | null | undefined),
     bookingEnabled: profile.bookingAllowed && location.bookingEnabled,
   };
 }

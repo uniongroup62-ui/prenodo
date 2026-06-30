@@ -21,7 +21,6 @@ export async function GET(request: Request) {
     const clients = await listDbClients({ slug: tenantSlug });
     return Response.json({
       ok: true,
-      source: "app/pages/fidelity.php + app/pages/wallet.php + app/pages/recharges.php",
       sourceMode: "database",
       clients: await Promise.all(clients.map(async (client) => ({ ...client, wallet: await dbWalletBalance(client.id, tenantSlug) }))),
       movements: await listDbWalletMovements(tenantSlug),

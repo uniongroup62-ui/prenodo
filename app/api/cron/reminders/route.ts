@@ -2,7 +2,7 @@ import { activeTenantSlugs, assertCronAuth } from "@/lib/cron";
 import { dbExecute, dbQuery, tenantIdForSlug } from "@/lib/tenant-db";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 import { sendSmsItaly, smsConfigured } from "@/lib/sms";
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -1051,7 +1051,6 @@ export async function GET(request: Request) {
     return Response.json({
       ok: true,
       job: "reminders",
-      source: "cron/reminders.php",
       emailProviderConfigured: emailReady,
       smsProviderConfigured: smsReady,
       total,

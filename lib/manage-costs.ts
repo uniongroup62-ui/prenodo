@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { emptyToNull, parseInteger } from "@/lib/api-utils";
 import { getManageLocationContext } from "@/lib/manage-locations";
 import {
@@ -21,7 +21,6 @@ export type RecurrenceUnit = "day" | "week" | "month" | "year";
 
 export type ManageCostsContext = {
   ok: true;
-  source: string;
   sourceMode: "database";
   activeLocationId: number;
   filters: {
@@ -100,7 +99,6 @@ export type CostLocationRow = {
   isActive: boolean;
 };
 
-const sourceLabel = "app/pages/costs.php";
 
 export async function getManageCostsContext(
   slug: string,
@@ -124,7 +122,6 @@ export async function getManageCostsContext(
 
   return {
     ok: true,
-    source: sourceLabel,
     sourceMode: "database",
     activeLocationId,
     filters,

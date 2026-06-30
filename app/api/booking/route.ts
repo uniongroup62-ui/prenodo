@@ -38,7 +38,6 @@ export async function GET(request: Request) {
 
       return Response.json({
         ok: true,
-        source: "app/pages/booking.php?mode=slots",
         sourceMode,
         date,
         slots,
@@ -52,7 +51,6 @@ export async function GET(request: Request) {
 
     return Response.json({
       ok: true,
-      source: "app/pages/booking.php",
       sourceMode,
       context,
     });
@@ -82,7 +80,6 @@ export async function POST(request: Request) {
 
       return Response.json({
         ok: true,
-        source: "app/pages/booking.php?mode=hold_slot",
         sourceMode: "database",
         hold,
       });
@@ -129,7 +126,6 @@ export async function POST(request: Request) {
 
     return Response.json({
       ok: true,
-      source: "app/pages/booking.php?mode=confirm",
       sourceMode: "database",
       confirmation,
       accountLinked: Boolean(linkedAccount),

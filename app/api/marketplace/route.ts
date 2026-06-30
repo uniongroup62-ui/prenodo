@@ -1,4 +1,4 @@
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { dbFirstValue } from "@/lib/db-first";
 import { centers, locations, marketplaceCategories } from "@/lib/demo-data";
 import { dbQuery } from "@/lib/tenant-db";
@@ -31,7 +31,6 @@ export async function GET() {
 
   return Response.json({
     ok: true,
-    source: "app/lib/Marketplace.php::publicProfiles",
     sourceMode,
     ...value,
   });

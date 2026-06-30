@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { columnExists, dbQuery, tenantSelect, tenantTable } from "@/lib/tenant-db";
 import { can, canAny } from "@/lib/role-permissions";
 import type { ManageUser } from "@/lib/manage-auth";

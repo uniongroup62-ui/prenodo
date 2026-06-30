@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { emptyToNull, parseInteger, parseNumber } from "@/lib/api-utils";
 import { dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug, tenantInsert, tenantSelect, tenantTable } from "@/lib/tenant-db";
 
@@ -22,7 +22,7 @@ export type OnboardingStepKey = typeof onboardingSteps[number]["key"];
 
 export type OnboardingState = {
   ok: true;
-  source: string;
+  source?: string;
   sourceMode: "database";
   tenantId: number;
   status: string;
@@ -73,7 +73,6 @@ export async function getManageOnboardingState(slug: string): Promise<Onboarding
 
   return {
     ok: true,
-    source: "app/lib/Onboarding.php",
     sourceMode: "database",
     tenantId,
     status: String(progress.status ?? "not_started"),

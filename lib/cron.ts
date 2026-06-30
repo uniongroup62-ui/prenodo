@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { RowDataPacket } from "mysql2/promise";
+import type { RowDataPacket } from "@/lib/tenant-db";
 import { dbQuery } from "@/lib/tenant-db";
 
 // Shared helpers for the Next cron routes that replace the legacy PHP

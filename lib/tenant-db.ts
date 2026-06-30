@@ -1,10 +1,17 @@
 import pg from "pg";
-import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { normalizeTenantSlug, tenantPrefix } from "@/lib/tenant-runtime";
 
 // Data layer: Supabase Postgres. Replaces the legacy MySQL/mysql2 layer.
-// The mysql2 types (RowDataPacket/ResultSetHeader) are kept only as structural
-// types so the ~20 callers compile unchanged; nothing from mysql2 runs.
+// Native structural types stand in for the old mysql2 ones so the ~20 callers
+// compile unchanged; nothing from mysql2 runs.
+//
+// A query row is a plain string-keyed bag of column values; dbExecute returns
+// the insert id / affected-row count recovered from the Postgres result.
+export type RowDataPacket = Record<string, unknown>;
+export interface ResultSetHeader {
+  insertId: number;
+  affectedRows: number;
+}
 //
 // dbQuery/dbExecute keep the legacy signatures but translate the SQL on the fly:
 //  - `?` positional placeholders  -> `$1..$n`
@@ -94,12 +101,12 @@ export async function dbExecute(sql: string, params: unknown[] = []): Promise<Re
   try {
     const res = await getPool().query(isInsert ? `${text} RETURNING id` : text, params as unknown[]);
     const insertId = Number((res.rows?.[0] as { id?: number } | undefined)?.id ?? 0) || 0;
-    return { affectedRows: res.rowCount ?? 0, insertId } as unknown as ResultSetHeader;
+    return { affectedRows: res.rowCount ?? 0, insertId };
   } catch (error) {
     // Table without an `id` column: retry without RETURNING.
     if (isInsert && error instanceof Error && /column "id"|does not exist/i.test(error.message)) {
       const res = await getPool().query(text, params as unknown[]);
-      return { affectedRows: res.rowCount ?? 0, insertId: 0 } as unknown as ResultSetHeader;
+      return { affectedRows: res.rowCount ?? 0, insertId: 0 };
     }
     throw error;
   }

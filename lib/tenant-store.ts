@@ -510,7 +510,7 @@ export type ConfigRecord = {
 export type ConfigModuleState = {
   id: string;
   title: string;
-  source: string;
+  source?: string;
   records: ConfigRecord[];
   settings: Record<string, string | number | boolean>;
   updatedAt: string;

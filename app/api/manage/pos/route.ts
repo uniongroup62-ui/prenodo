@@ -98,7 +98,6 @@ export async function POST(request: Request) {
       });
       return Response.json({
         ...payload,
-        source: "app/pages/pos.php?action=checkout",
       });
     }
 
@@ -116,7 +115,6 @@ export async function POST(request: Request) {
       });
       return Response.json({
         ...payload,
-        source: "app/pages/pos_history.php?action=cancel",
       });
     }
 
@@ -136,7 +134,6 @@ export async function POST(request: Request) {
       });
       return Response.json({
         ...payload,
-        source: "app/pages/pos_sale_detail.php?do=mark_preorder_collection",
       });
     }
 
