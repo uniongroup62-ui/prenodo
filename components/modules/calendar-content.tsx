@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent } from "react";
 
 // Faithful port of the PHP calendar page (app/pages/calendar.php / ?page=calendar),
 // fed by the existing DB-backed /api/manage/calendar and /api/manage/appointments.
@@ -14,10 +14,12 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 //   page CSS at /assets/css/pages/calendar.css applies) and render a real
 //   staff-columns x time-rows agenda from the API, positioning appointment blocks by
 //   time. Interaction parity (added on top of the unchanged rendering):
-//     - MOVE: appointment blocks are HTML5-draggable within the Giorno grid; dropping
-//       on a staff column computes the target time (snapped to SNAP_MIN, like
-//       calendar.js snapDuration 00:05:00) and target operator, optimistically updates,
-//       POSTs action=move, and reconciles with the server (reverts on error).
+//     - MOVE: appointment blocks are HTML5-draggable. In the Giorno grid, dropping on a
+//       staff column computes the target time (snapped to SNAP_MIN, like calendar.js
+//       snapDuration 00:05:00) and target OPERATOR (date unchanged); in the Settimana
+//       grid, dropping on a day column computes the target DATE (which of the 7 day
+//       columns) + time, keeping the operator. Both optimistically update, POST
+//       action=move, and reconcile with the server (revert on error).
 //     - EDIT: clicking an appointment block opens the GLOBAL quick-booking drawer
 //       (components/quick-booking-drawer.tsx) in EDIT mode — the block carries
 //       data-qb-edit={id} and a plain click (vs a drag) triggers the drawer's
@@ -26,9 +28,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 //       CREATE mode (the [data-qb-new] path), prefilled with the clicked cell's
 //       date/time/operator (data-qb-date/data-qb-time/data-qb-staff). The legacy
 //       static #apptModal markup is kept but no longer used for quick-book.
-//     - RESIZE (duration change): blocks carry a bottom-edge resize handle; dragging
-//       it snaps the new end to SNAP_MIN and POSTs action=resize (a duration-preserving
-//       end write, optimistic + revert on error).
+//     - RESIZE (duration change): blocks carry a bottom-edge resize handle (in BOTH the
+//       Giorno and Settimana grids); dragging it snaps the new end to SNAP_MIN and POSTs
+//       action=resize (a duration-preserving end write, optimistic + revert on error).
 //   Modals are reproduced verbatim as static Bootstrap markup but are now
 //   controller-less for quick-book (the global drawer handles create/edit); only the
 //   calendar-notes modal behavior is still attached.
@@ -123,6 +125,12 @@ type Appointment = {
   endTime?: string;
   client: string;
   service: string;
+  // ALL ordered service lines (one per appointment_services row) returned by the
+  // appointments list API (services: [{serviceId,name,price}]). `service` above is
+  // just the PRIMARY (first) line; the calendar blocks list EVERY service name here,
+  // faithful to the legacy multi-service block (operator bullet + a bullet per
+  // service). Absent/empty -> the blocks fall back to the single `service`.
+  services?: { serviceId: number; name: string; price?: string }[];
   operator: string;
   room?: string;
   price?: string;
@@ -441,6 +449,27 @@ function statusKeyFromLabel(label: string): { key: string; label: string } {
   return { key: "other", label: label || "—" };
 }
 
+// The ordered list of ALL service names on an appointment, faithful to the legacy
+// multi-service block (it lists each booked service as its own bulleted line, not
+// just the primary). Uses the additive `services[]` returned by the appointments
+// list API; falls back to the single primary `service` string when `services` is
+// absent/empty (single-service or older payloads). Empty names are dropped, and an
+// empty result still yields one entry (the primary) so the block always shows a line.
+function serviceNamesOf(a: Appointment): string[] {
+  const names = (a.services ?? [])
+    .map((s) => String(s?.name ?? "").trim())
+    .filter(Boolean);
+  if (names.length > 0) return names;
+  const primary = String(a.service ?? "").trim();
+  return primary ? [primary] : [];
+}
+
+// All service names joined with " • " for a block's title (hover) attribute, so the
+// native tooltip lists EVERY booked service. Falls back to "" when none.
+function serviceTitleOf(a: Appointment): string {
+  return serviceNamesOf(a).join(" • ");
+}
+
 // Pixel grid constants for the static agenda (5-min granularity like calendar.js).
 const SLOT_MIN_PER_ROW = 30;
 const ROW_HEIGHT = 48; // px per 30-min row
@@ -593,10 +622,16 @@ type CalendarDrag = {
 // In-flight RESIZE payload: which appointment's bottom edge is being dragged, the
 // block's start time (kept fixed), the column-body top (page Y) so the live end time
 // can be mapped from the cursor, and the latest snapped end (committed on mouseup).
+// winStart/winEnd are the dragged column body's visible window (minutes) so the
+// cursor->time map + clamp work for BOTH the Day (minMin/maxMin) and the Week
+// (weekMinMin/weekMaxMin) grids — captured at mousedown from the body's data-* attrs,
+// so the resize effect never has to depend on the active view.
 type CalendarResize = {
   id: number;
   startMin: number;
   bodyTopPx: number;
+  winStart: number;
+  winEnd: number;
   endTime: string;
 };
 
@@ -997,6 +1032,15 @@ export function CalendarContent() {
   const notesCount = notes.length;
   const gridHeight = (rows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
   const weekGridHeight = (weekRows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
+  // The 7 Week column dates (Mon..Sun) + today, lifted to component scope so the Week
+  // grid can render INLINE in the main return (rather than from a nested render helper).
+  // Inlining matters for the block drag/resize handlers: the React Compiler's
+  // react-hooks/refs rule allows ref-touching event handlers (onWeekBlockDragStart /
+  // beginResize, which write dragRef/resizeRef) in the component's OWN render JSX — as it
+  // already does for the identical Day-view handlers — but flags them inside a separately
+  // defined nested function. So the Week view is built inline below, like the Day view.
+  const weekTodayIso = isoLocal(new Date());
+  const weekDays = weekDates(date);
 
   // === NOW-INDICATOR position/visibility (port of FullCalendar nowIndicator +
   // updateStaffNowIndicator) ===
@@ -1301,6 +1345,62 @@ export function CalendarContent() {
     [appointments, date, loadContext, slug, visibleRange],
   );
 
+  // WEEK move (port of the FullCalendar eventDrop in timeGridWeek): dragging a Week
+  // block to another position changes the DATE (the target day column) AND the time,
+  // keeping the SAME operator (the Week grid isn't per-operator). Unlike the Day move
+  // — which keeps the date and changes the operator — this posts a new `date`+`time`
+  // with the appointment's current operator unchanged. The existing action=move route
+  // already accepts a target `date` (it builds starts_at from date+time and reuses the
+  // operator-overlap conflict check via assertAppointmentSlotAvailable), so no route/
+  // repo change is needed. Optimistic patch (new date+time) + revert on error, mirroring
+  // moveAppointment. The operator is sent as staff_name ONLY when non-empty, so an
+  // unassigned appointment keeps its (empty) assignment instead of the route clearing it.
+  const moveAppointmentToDate = useCallback(
+    async (id: number, newDate: string, newTime: string) => {
+      setMoveError("");
+      const prev = appointments;
+      const target = prev.find((a) => a.id === id);
+      if (!target) return;
+      if (target.date === newDate && target.time === newTime) {
+        return; // no-op drop on the same day/slot
+      }
+      const operator = (target.operator || "").trim();
+
+      // Optimistic patch: move the block to the new day + time (operator unchanged).
+      setAppointments((list) => list.map((a) => (a.id === id ? { ...a, date: newDate, time: newTime } : a)));
+
+      try {
+        const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify({
+            action: "move",
+            id,
+            date: newDate,
+            time: newTime,
+            // Keep the current operator. Send staff_name only when set; omitting it
+            // lets the route preserve the appointment's existing operator (an empty
+            // string would otherwise CLEAR the assignment).
+            ...(operator ? { staff_name: operator } : {}),
+          }),
+        });
+        const json: { ok?: boolean; error?: string; appointments?: Appointment[] } = await res.json().catch(() => ({}));
+        if (!res.ok || json.ok === false || json.error) {
+          setAppointments(prev); // revert
+          setMoveError(String(json.error || "Impossibile spostare l'appuntamento."));
+          return;
+        }
+        // Reconcile with the authoritative server list, else reload the visible range.
+        if (Array.isArray(json.appointments)) setAppointments(json.appointments);
+        else loadContext(date, visibleRange);
+      } catch {
+        setAppointments(prev); // revert on network error
+        setMoveError("Errore di rete durante lo spostamento.");
+      }
+    },
+    [appointments, date, loadContext, slug, visibleRange],
+  );
+
   // POST action=resize with optimistic update + reconcile. A resize keeps the start
   // fixed and only changes the END time (a custom duration), so the block stretches in
   // place. The list is optimistically patched (new endTime) so the height updates
@@ -1364,12 +1464,20 @@ export function CalendarContent() {
       const bodyEl = (e.currentTarget as HTMLElement).closest<HTMLElement>(".cal-col-body");
       if (startMin === null || !bodyEl) return;
       const bodyTopPx = bodyEl.getBoundingClientRect().top;
+      // The dragged column's visible window (minutes), read off the body's data-*
+      // attrs — Day columns carry minMin/maxMin, Week day columns weekMinMin/
+      // weekMaxMin — so the same resize math serves both views. Fall back to the Day
+      // window if the attrs are missing.
+      const winStart = Number(bodyEl.getAttribute("data-winstart"));
+      const winEnd = Number(bodyEl.getAttribute("data-winend"));
+      const wStart = Number.isFinite(winStart) ? winStart : minMin;
+      const wEnd = Number.isFinite(winEnd) ? winEnd : maxMin;
       // Seed the end at the current block end so the first render is stable.
-      const currentEnd = appt.endTime || minToTime(Math.min(startMin + DEFAULT_DURATION_MIN, maxMin));
-      resizeRef.current = { id: appt.id, startMin, bodyTopPx, endTime: currentEnd };
+      const currentEnd = appt.endTime || minToTime(Math.min(startMin + DEFAULT_DURATION_MIN, wEnd));
+      resizeRef.current = { id: appt.id, startMin, bodyTopPx, winStart: wStart, winEnd: wEnd, endTime: currentEnd };
       setResizePreview({ id: appt.id, endTime: currentEnd });
     },
-    [maxMin],
+    [minMin, maxMin],
   );
 
   // `resizing` is just whether a resize is active; the effect depends on this boolean
@@ -1382,10 +1490,11 @@ export function CalendarContent() {
     const onMove = (ev: MouseEvent) => {
       const r = resizeRef.current;
       if (!r) return;
-      // Map cursor Y -> minutes from the column body top, snap, clamp to >start.
-      const rawMin = minMin + (ev.clientY - r.bodyTopPx) / PX_PER_MIN;
+      // Map cursor Y -> minutes from the column body top, snap, clamp to >start within
+      // the dragged column's own window (Day or Week, captured at mousedown).
+      const rawMin = r.winStart + (ev.clientY - r.bodyTopPx) / PX_PER_MIN;
       let snapped = snapMin(rawMin, SNAP_MIN);
-      snapped = Math.min(Math.max(snapped, r.startMin + SNAP_MIN), maxMin);
+      snapped = Math.min(Math.max(snapped, r.startMin + SNAP_MIN), r.winEnd);
       const endTime = minToTime(snapped);
       r.endTime = endTime; // keep the ref's end in sync for the commit on mouseup
       setResizePreview((cur) => (cur && cur.id === r.id ? { id: r.id, endTime } : cur));
@@ -1404,7 +1513,52 @@ export function CalendarContent() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [resizing, minMin, maxMin, resizeAppointment]);
+  }, [resizing, resizeAppointment]);
+
+  // WEEK block drag-move drop target wiring. Component-scope callbacks attached by the
+  // inline Week view JSX to each day column's body. (The Week grid is built inline in the
+  // main return — see the weekView const — so these handlers already sit in the render
+  // scope and the dragRef writes are lint-clean; they are extracted here only to keep the
+  // JSX readable, mirroring beginResize / moveAppointment.)
+  //   - onWeekColumnDragOver: allow the drop (the browser only fires onDrop when the
+  //     dragover default is prevented), but only while a block move is in flight.
+  //   - onWeekColumnDrop(iso, e): map the dropped block TOP (cursor - grab offset) to a
+  //     snapped time in the WEEK window, and move the appointment to THIS column's date
+  //     (iso) + that time, operator unchanged (moveAppointmentToDate).
+  const onWeekColumnDragOver = useCallback((e: ReactDragEvent<HTMLElement>) => {
+    if (!dragRef.current) return;
+    e.preventDefault();
+    try { e.dataTransfer.dropEffect = "move"; } catch { /* ignore */ }
+  }, []);
+  const onWeekColumnDrop = useCallback(
+    (iso: string, e: ReactDragEvent<HTMLElement>) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      e.preventDefault();
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      // Map the block TOP (cursor minus the grab offset), snapped within the week window.
+      const topPx = e.clientY - rect.top - drag.grabOffsetPx;
+      const minutes = snappedMinFromY(topPx, weekMinMin, weekMaxMin);
+      void moveAppointmentToDate(drag.id, iso, minToTime(minutes));
+      dragRef.current = null;
+    },
+    [snappedMinFromY, weekMinMin, weekMaxMin, moveAppointmentToDate],
+  );
+  // WEEK block drag START / END — extracted callbacks (lint parity with the drop
+  // handlers above). onDragStart records the grabbed appointment id + the pointer offset
+  // from the block top, so the drop maps the block's start time. onDragEnd clears the ref
+  // shortly after so the synthetic click trailing a drag doesn't open edit on the column.
+  const onWeekBlockDragStart = useCallback((id: number, e: ReactDragEvent<HTMLElement>) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    dragRef.current = { id, grabOffsetPx: e.clientY - rect.top };
+    try {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", String(id));
+    } catch { /* ignore */ }
+  }, []);
+  const onWeekBlockDragEnd = useCallback(() => {
+    setTimeout(() => { dragRef.current = null; }, 0);
+  }, []);
 
   // NOW-INDICATOR tick (port of installStaffNowIndicatorFix): keep nowMinutes in sync
   // with the wall clock via a 30s interval, mirroring FullCalendar's minute-based
@@ -1509,6 +1663,25 @@ export function CalendarContent() {
       window.removeEventListener("mouseup", onUp);
     };
   }, [dragSelecting, dragWinStart, dragWinEnd, snappedMinFromY, openGlobalQuickBook]);
+
+  // WEEK empty-cell quick-book click — extracted callback (the drag / resize /
+  // just-committed ref guards), like the Day body's inline onClick. Ignores the click
+  // right after a block drag / resize or a committed drag-select range; otherwise opens
+  // the global quick-book drawer prefilled with this column's date + the clicked time.
+  // (Placed after openGlobalQuickBook so it can call it.)
+  const onWeekColumnClick = useCallback(
+    (iso: string, e: ReactMouseEvent) => {
+      if (dragRef.current || resizeRef.current) return;
+      if (dragSelectJustCommittedRef.current) {
+        dragSelectJustCommittedRef.current = false;
+        return;
+      }
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const rawMin = snappedMinFromY(e.clientY - rect.top, weekMinMin, weekMaxMin);
+      openGlobalQuickBook(minToTime(rawMin), 0, undefined, iso);
+    },
+    [snappedMinFromY, weekMinMin, weekMaxMin, openGlobalQuickBook],
+  );
 
   // QUICK-BOOK is now handled by the GLOBAL quick-booking drawer
   // (components/quick-booking-drawer.tsx) via openGlobalQuickBook above — the legacy
@@ -1832,13 +2005,23 @@ export function CalendarContent() {
   // A 7-column (Mon..Sun) x time-rows grid over the union of the week's business
   // hours. Each appointment is positioned in its day column at its start time, with
   // height from endTime (PX_PER_MIN), styled with the operator color + status badge
-  // like the Day view. Clicking a block opens the GLOBAL edit drawer. Uses the
-  // FullCalendar .fc-timegrid-* / .fc-col-header-cell classes so the page CSS applies.
-  // TODO: drag-move / resize / empty-slot quick-book remain Day-only for now.
-  function renderWeekView() {
-    const todayIso = isoLocal(new Date());
-    const days = weekDates(date);
-    return (
+  // like the Day view, listing the operator + EVERY booked service as bulleted lines.
+  // Clicking a block opens the GLOBAL edit drawer. Uses the FullCalendar
+  // .fc-timegrid-* / .fc-col-header-cell classes so the page CSS applies.
+  // INTERACTION (same set as the Day view, just per-DAY columns instead of per-operator):
+  //   - MOVE: blocks are HTML5-draggable; dropping on a day column moves the appointment
+  //     to THAT day + the snapped drop time, operator unchanged (onWeekColumn*/onWeekBlock*
+  //     -> moveAppointmentToDate, which posts a new date+time via action=move — the route
+  //     already accepts a target date and reuses the conflict check, no route/repo change).
+  //   - RESIZE: the bottom-edge cal-resize-handle changes the end time (beginResize reads
+  //     the day column's window from its data-* attrs, so the same flow serves Week).
+  //   - QUICK-BOOK / drag-select / hover: unchanged (the empty-cell click books that DAY).
+  // Built as a component-scope const (not a nested function) so its ref-touching block
+  // drag/resize handlers sit in the component's OWN render scope — lint-clean, like the
+  // inline Day view. Uses the lifted weekTodayIso / weekDays. Guarded by the view so the
+  // heavy per-day JSX is only built when the Week view is active (parity with the lazy
+  // renderMonthView()/Day branch), and null otherwise.
+  const weekView = view !== "timeGridWeek" ? null : (
       <div className="cal-static-grid" style={{ display: "flex", minHeight: weekGridHeight }}>
         {/* Time axis */}
         <div className="cal-static-axis" style={{ flex: "0 0 56px", borderRight: "1px solid var(--calendar-line, #e2e8f0)", position: "relative" }}>
@@ -1916,9 +2099,9 @@ export function CalendarContent() {
               }}
             />
           ) : null}
-          {days.map((iso, i) => {
+          {weekDays.map((iso, i) => {
             const d = new Date(`${iso}T12:00:00`);
-            const isToday = iso === todayIso;
+            const isToday = iso === weekTodayIso;
             const noteCount = countByDate[iso] ?? 0;
             const dayAppts = rangeApptsByDate[iso] ?? [];
             return (
@@ -1964,17 +2147,15 @@ export function CalendarContent() {
                   data-staffid={0}
                   data-celldate={iso}
                   style={{ position: "relative", height: weekGridHeight }}
-                  onClick={(e) => {
-                    // Plain-click quick-book on the empty background (blocks
-                    // stopPropagation). Skip right after a committed drag-select range.
-                    if (dragSelectJustCommittedRef.current) {
-                      dragSelectJustCommittedRef.current = false;
-                      return;
-                    }
-                    const rect = e.currentTarget.getBoundingClientRect();
-                    const rawMin = snappedMinFromY(e.clientY - rect.top, weekMinMin, weekMaxMin);
-                    openGlobalQuickBook(minToTime(rawMin), 0, undefined, iso);
-                  }}
+                  // Block drag-move DROP target: a Week block dropped here moves to THIS
+                  // column's day + the snapped drop time (operator unchanged). onDragOver
+                  // must allow the drop for the browser to fire onDrop. Component-scope
+                  // handlers (read dragRef outside the nested render helper).
+                  onDragOver={onWeekColumnDragOver}
+                  onDrop={(e) => onWeekColumnDrop(iso, e)}
+                  // Plain-click quick-book on the empty background (blocks stopPropagation);
+                  // guarded against the click trailing a drag / resize / drag-select.
+                  onClick={(e) => onWeekColumnClick(iso, e)}
                 >
                   {/* Store-background shading per DAY column (unavailable / lunch break /
                       closed), computed from THIS column's date over the shared week
@@ -1996,7 +2177,11 @@ export function CalendarContent() {
                     const startMin = timeToMin(a.time);
                     if (startMin === null) return null;
                     const top = (startMin - weekMinMin) * PX_PER_MIN;
-                    const endMinVal = timeToMin(a.endTime ?? "");
+                    // Block height from the REAL end (a.endTime) — or the live resize
+                    // preview while THIS block is being resized — falling back to the
+                    // default duration when no end is known, mirroring the Day view.
+                    const previewEnd = resizePreview?.id === a.id ? resizePreview.endTime : null;
+                    const endMinVal = timeToMin(previewEnd ?? a.endTime ?? "");
                     const durationMin = endMinVal !== null && endMinVal > startMin ? endMinVal - startMin : DEFAULT_DURATION_MIN;
                     const height = Math.max(durationMin * PX_PER_MIN - 2, 18);
                     const st = statusKeyFromLabel(a.status);
@@ -2007,12 +2192,20 @@ export function CalendarContent() {
                         key={a.id}
                         href={href(`appointments&action=view&id=${a.id}`)}
                         className="fc-event fc-timegrid-event appt-soft-event"
-                        title={`${a.time} ${a.client} • ${a.service}`}
+                        title={`${a.time} ${a.client} • ${serviceTitleOf(a)}${a.operator ? ` (${a.operator})` : ""}`}
+                        // DRAG-MOVE: a Week block is HTML5-draggable to another day column /
+                        // time (changes the DATE, operator unchanged). Component-scope drag
+                        // handlers keep the dragRef writes out of this render helper.
+                        draggable
                         // A press on a block must not start the column drag-select.
                         onMouseDown={(e) => e.stopPropagation()}
+                        onDragStart={(e) => onWeekBlockDragStart(a.id, e)}
+                        onDragEnd={onWeekBlockDragEnd}
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
+                          // A drag/resize just ended -> swallow the trailing click (no edit).
+                          if (dragRef.current || resizeRef.current) return;
                           openGlobalEdit(a.id);
                         }}
                         style={{
@@ -2040,11 +2233,39 @@ export function CalendarContent() {
                             {st.label}
                           </span>
                           <span className="appt-staff-dot" style={{ background: accent }} />
-                          <div className="fw-semibold" style={{ lineHeight: 1.15 }}>
+                          <div className="fw-semibold appt-client" style={{ lineHeight: 1.15 }}>
                             {a.time} {a.client}
                           </div>
-                          <div className="small text-truncate">{a.service}</div>
+                          {/* OPERATOR bullet then ALL booked services, one bulleted line
+                              each — faithful to the legacy Week block (showStaff=true in
+                              timeGridWeek: it shows the operator + each service). */}
+                          {a.operator ? (
+                            <div className="small text-truncate appt-staff">{`· ${a.operator}`}</div>
+                          ) : null}
+                          {serviceNamesOf(a).map((name, i) => (
+                            <div key={i} className="small text-truncate appt-service">
+                              {`· ${name}`}
+                            </div>
+                          ))}
                         </div>
+                        {/* RESIZE handle (bottom edge): drag to change the end time (custom
+                            duration), identical to the Day view, positioned in this day
+                            column. beginResize reads the body's window from its data-* attrs. */}
+                        <span
+                          className="cal-resize-handle"
+                          role="presentation"
+                          onMouseDown={(e) => beginResize(e, a)}
+                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                          onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                          style={{
+                            position: "absolute",
+                            left: 0,
+                            right: 0,
+                            bottom: 0,
+                            height: 8,
+                            cursor: "ns-resize",
+                          }}
+                        />
                       </a>
                     );
                   })}
@@ -2054,16 +2275,23 @@ export function CalendarContent() {
           })}
         </div>
       </div>
-    );
-  }
+  );
 
   // === MONTH (dayGridMonth) ===
   // A 6x7 Monday-first grid; each cell shows the date number + that day's
-  // appointments as compact chips (client + time, status/operator color), with a
-  // "+N altri" overflow link. Day numbers/cells use the FullCalendar .fc-daygrid-*
-  // classes so /assets/css/pages/calendar.css applies; days with notes get the
-  // has-calendar-notes marker. Clicking a chip opens the GLOBAL edit drawer;
+  // appointments as compact chips (client + time + first service, status/operator
+  // color), with a "+N altri" overflow link. Day numbers/cells use the FullCalendar
+  // .fc-daygrid-* classes so /assets/css/pages/calendar.css applies; days with notes
+  // get the has-calendar-notes marker. Clicking a chip opens the GLOBAL edit drawer;
   // clicking an empty day (or the overflow link) switches to that Day view.
+  // TODO(month-chip-drag): drag a chip onto another day cell to change the DATE only
+  // (the appointment keeps its existing time; reuse moveAppointmentToDate(id, targetIso,
+  // a.time)). Deferred: the Month grid is a date-only overview (no time axis to map a
+  // drop Y to), and the day cell's onClick already jumps to that Day view for precise
+  // re-scheduling, so a chip date-move is lower value than the Day/Week drag. When
+  // added: make chips draggable writing dragRef, add onDragOver/onDrop to each
+  // .fc-daygrid-day cell (component-scope handlers so the dragRef reads stay out of
+  // this render helper), and suppress the cell's jump-to-day onClick after a drop.
   function renderMonthView() {
     const focusMonth = monthOf(date);
     const todayIso = isoLocal(new Date());
@@ -2132,12 +2360,18 @@ export function CalendarContent() {
                       const st = statusKeyFromLabel(a.status);
                       const op = staff.find((s) => (s.name || "").trim().toLowerCase() === (a.operator || "").trim().toLowerCase());
                       const accent = op?.color || "#2f63d8";
+                      // Compact multi-service hint (Month is an overview, the chip stays a
+                      // single ellipsised line): the FIRST service name plus "+N" when the
+                      // appointment has more than one. The native title lists EVERY service
+                      // (+ operator). Faithful to the legacy density (one line per chip).
+                      const svcNames = serviceNamesOf(a);
+                      const svcHint = svcNames.length === 0 ? "" : svcNames.length === 1 ? svcNames[0] : `${svcNames[0]} +${svcNames.length - 1}`;
                       return (
                         <a
                           key={a.id}
                           href={href(`appointments&action=view&id=${a.id}`)}
                           className="fc-event fc-daygrid-event appt-soft-event"
-                          title={`${a.time} ${a.client} • ${a.service} (${st.label})`}
+                          title={`${a.time} ${a.client} • ${serviceTitleOf(a)}${a.operator ? ` (${a.operator})` : ""} (${st.label})`}
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
@@ -2159,6 +2393,7 @@ export function CalendarContent() {
                         >
                           <span className={`appt-status-badge status-${st.key}`} style={{ marginRight: 4 }} title={`Stato: ${st.label}`} />
                           <span style={{ fontWeight: 600 }}>{a.time}</span> {a.client}
+                          {svcHint ? <span className="appt-service" style={{ marginLeft: 4 }}>{`· ${svcHint}`}</span> : null}
                         </a>
                       );
                     })}
@@ -2492,7 +2727,7 @@ export function CalendarContent() {
                   {view === "dayGridMonth" ? (
                     renderMonthView()
                   ) : view === "timeGridWeek" ? (
-                    renderWeekView()
+                    weekView
                   ) : (
                     <div className="cal-static-grid" style={{ display: "flex", minHeight: gridHeight }}>
                       {/* Time axis */}
@@ -2706,7 +2941,7 @@ export function CalendarContent() {
                                         // click can stopPropagation (to suppress the column
                                         // quick-book) without losing the edit-open path.
                                         className="fc-event fc-timegrid-event appt-soft-event"
-                                        title={`${a.time} ${a.client} • ${a.service}`}
+                                        title={`${a.time} ${a.client} • ${serviceTitleOf(a)}`}
                                         draggable
                                         // Keep a press on the block from starting a column
                                         // drag-select; the HTML5 move-drag (onDragStart) and the
@@ -2762,10 +2997,19 @@ export function CalendarContent() {
                                             {st.label}
                                           </span>
                                           <span className="appt-staff-dot" style={{ background: s.color }} />
-                                          <div className="fw-semibold" style={{ lineHeight: 1.15 }}>
+                                          <div className="fw-semibold appt-client" style={{ lineHeight: 1.15 }}>
                                             {a.time} {a.client}
                                           </div>
-                                          <div className="small text-truncate">{a.service}</div>
+                                          {/* ALL booked services, one bulleted line each (faithful to
+                                              the legacy multi-service block), not just the primary. The
+                                              operator is NOT bulleted here: the Day view already has a
+                                              per-operator column header (legacy showStaff=false in
+                                              staffTimeGridDay). Falls back to the single service. */}
+                                          {serviceNamesOf(a).map((name, i) => (
+                                            <div key={i} className="small text-truncate appt-service">
+                                              {`· ${name}`}
+                                            </div>
+                                          ))}
                                         </div>
                                         {/* RESIZE handle (bottom edge): drag to change the end
                                             time (a custom duration). Not draggable itself; it uses
