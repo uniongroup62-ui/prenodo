@@ -437,6 +437,9 @@ export async function POST(request: Request) {
       holdToken,
       staffNotes: emptyToNull(String(body.staff_notes ?? "")),
       customerNotes: emptyToNull(String(body.customer_notes ?? body.notes ?? "")),
+      // Respected on create (normalized; default pending). updateDbAppointment
+      // ignores it — status edits go through action=status.
+      status: body.status ? String(body.status) : undefined,
       packageRedeems,
       packageWarnings,
       prepaidRedeems,

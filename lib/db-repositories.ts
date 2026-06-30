@@ -526,6 +526,29 @@ async function planAppointmentServices({
   };
 }
 
+// Generate a unique 5-digit booking code (port of the legacy ensure_unique_public_code).
+async function generateUniqueAppointmentPublicCode(slug: string): Promise<string | null> {
+  try {
+    const table = await tenantTable(slug, "appointments");
+    if (!(await columnExists(table.name, "public_code"))) return null;
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const code = String(Math.floor(10000 + Math.random() * 90000));
+      const rows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "appointments",
+        columns: "id",
+        where: "public_code = ?",
+        params: [code],
+        limit: 1,
+      });
+      if (rows.length === 0) return code;
+    }
+  } catch {
+    // best-effort: a missing public_code column just means no booking code
+  }
+  return null;
+}
+
 export async function createDbAppointment({
   slug,
   clientName,
@@ -551,6 +574,7 @@ export async function createDbAppointment({
   giftboxWarnings,
   giftRedeems = [],
   giftWarnings,
+  status: statusInput = "pending",
 }: {
   slug: string;
   clientName: string;
@@ -562,6 +586,7 @@ export async function createDbAppointment({
   holdToken?: string | null;
   staffNotes?: string | null;
   customerNotes?: string | null;
+  status?: string;
 } & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   const client = await resolveClientForAppointment(slug, clientName, locationId);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
@@ -602,18 +627,24 @@ export async function createDbAppointment({
     excludeHoldToken: token || null,
   });
   const appointments = await tenantTable(slug, "appointments");
-  const id = await tenantInsert(appointments, {
+  // Respect the requested status (normalized to the legacy code), default pending,
+  // and generate a unique 5-digit booking code like the legacy ensure_unique_public_code.
+  const normalizedStatus = appointmentPhpStatus(statusInput);
+  const publicCode = await generateUniqueAppointmentPublicCode(slug);
+  const appointmentValues: Record<string, unknown> = {
     client_id: client.id,
     service_id: plan.primaryService.id,
     cabin_id: plan.primaryCabinId,
     starts_at: start,
     ends_at: end,
-    status: "pending",
+    status: normalizedStatus,
     discount_value: 0,
     location_id: locationId,
     staff_notes: staffNotes || null,
     customer_notes: customerNotes || null,
-  });
+  };
+  if (publicCode) appointmentValues.public_code = publicCode;
+  const id = await tenantInsert(appointments, appointmentValues);
 
   // One appointment_services snapshot row per selected service (ordered).
   for (const service of plan.services) await insertAppointmentService(slug, id, service);
