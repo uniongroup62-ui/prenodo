@@ -39,6 +39,7 @@ import {
 } from "@/lib/public-booking-db";
 import { listQuickBookingCabins } from "@/lib/db-repositories";
 import { getManageLocationContext } from "@/lib/manage-locations";
+import { planCreate, planPreview } from "@/lib/manage-planner";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -202,6 +203,40 @@ export async function POST(request: Request) {
       const token = String(body.appointment_hold_token ?? body.token ?? "");
       const hold = await renewPublicBookingHold({ slug: tenantSlug, token, ownerKey: "manage" });
       return Response.json({ ok: true, sourceMode: "database", ...hold });
+    }
+
+    // PIANIFICA (calendar Block 3) — recurring/planned appointments. Port of
+    // app/pages/appointments_plan.php (?page=appointments_plan). plan_preview builds
+    // the recurrence date set + per-date slot search and returns the OK/Saltato
+    // table; plan_create re-runs the same search (never trusting the client),
+    // creates the new client if needed, and createDbAppointment for each OK date.
+    // Both gated on appointments.plan / appointments.manage (the legacy page's
+    // permission), stricter than the POST umbrella which also admits quick_booking.
+    if (action === "plan_preview" || action === "plan_create") {
+      if (!canAny(session.user.perms, ["appointments.plan", "appointments.manage"])) {
+        return jsonError("Permesso pianificazione appuntamenti mancante.", 403);
+      }
+      const planLocationId = await resolveManageLocationId({
+        slug: tenantSlug,
+        raw: body.location_id === undefined ? null : String(body.location_id),
+        fallbackCurrent: true,
+      }) || null;
+      try {
+        if (action === "plan_preview") {
+          const preview = await planPreview(tenantSlug, body, planLocationId);
+          return Response.json({ sourceMode: "database", ...preview });
+        }
+        const result = await planCreate(tenantSlug, body, planLocationId);
+        return Response.json({
+          sourceMode: "database",
+          ...result,
+          appointments: await listDbAppointments({ slug: tenantSlug }),
+        });
+      } catch (error) {
+        // Validation / no-slot throws -> 200 { ok:false, error } so the planner UI
+        // surfaces the message inline (matching the status/cancel_done paths).
+        return Response.json({ ok: false, error: error instanceof Error ? error.message : "Errore pianificazione." });
+      }
     }
 
     // DELETE — per-row "Elimina" (app/pages/appointments.php ~79-130) + bulk_delete

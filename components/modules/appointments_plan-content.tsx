@@ -47,6 +47,42 @@ type SelectedClient = {
   phone: string;
 };
 
+// Preview / create response shapes (mirrors lib/manage-planner.ts).
+type PreviewRow = {
+  date: string;
+  time: string | null;
+  start: string | null;
+  end: string | null;
+  operator: string | null;
+  ok: boolean;
+  reason: string | null;
+};
+
+type PreviewData = {
+  dates: PreviewRow[];
+  totalDuration: number;
+  totalPrice: number;
+  services: Array<{ id: number; name: string; durationMin: number; price: number }>;
+  countOk: number;
+  countSkip: number;
+};
+
+type CreateData = {
+  created: number;
+  skipped: number;
+  details: Array<{ date: string; ok: boolean; appointmentId?: number; reason?: string }>;
+};
+
+function fmtDateIt(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return iso;
+  return `${m[3]}/${m[2]}/${m[1]}`;
+}
+
+function fmtMoney(value: number): string {
+  return (Number(value) || 0).toFixed(2).replace(".", ",");
+}
+
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
@@ -95,6 +131,18 @@ export function AppointmentsPlanContent() {
 
   // Form state.
   const [startDate, setStartDate] = useState(todayIso());
+  const [repeat, setRepeat] = useState("1");
+  const [recurrence, setRecurrence] = useState("weekly");
+  const [weekdays, setWeekdays] = useState<number[]>([]);
+  const [timeFrom, setTimeFrom] = useState("09:00");
+  const [timeTo, setTimeTo] = useState("18:00");
+
+  // Preview / create state.
+  const [preview, setPreview] = useState<PreviewData | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [createResult, setCreateResult] = useState<CreateData | null>(null);
 
   // Client section state.
   const [clientId, setClientId] = useState("");
@@ -219,6 +267,110 @@ export function AppointmentsPlanContent() {
     setSelectedClient(null);
   }
 
+  function toggleWeekday(value: number) {
+    setWeekdays((prev) => (prev.includes(value) ? prev.filter((x) => x !== value) : [...prev, value]));
+  }
+
+  // Build the shared planner request body. parseRequestBody flattens every value to
+  // a string, so service_ids / weekdays go as comma-joined strings and the per-service
+  // staff_map / cabin_map go as PRE-STRINGIFIED JSON (a plain object would become
+  // "[object Object]"). The server's parsePlannerForm tolerates all of these shapes.
+  const buildBody = useCallback(() => {
+    const staffMap: Record<number, number> = {};
+    for (const [sid, stid] of Object.entries(staffPerService)) {
+      if (Number(stid) > 0) staffMap[Number(sid)] = Number(stid);
+    }
+    return {
+      client_id: clientId || "0",
+      new_full_name: newFullName,
+      new_phone: newPhone,
+      new_email: newEmail,
+      service_ids: selectedServiceIds.join(","),
+      repeat,
+      staff_id: "0",
+      staff_map: JSON.stringify(staffMap),
+      recurrence,
+      weekdays: weekdays.join(","),
+      start_date: startDate,
+      time_from: timeFrom,
+      time_to: timeTo,
+    };
+  }, [
+    clientId,
+    newFullName,
+    newPhone,
+    newEmail,
+    selectedServiceIds,
+    repeat,
+    staffPerService,
+    recurrence,
+    weekdays,
+    startDate,
+    timeFrom,
+    timeTo,
+  ]);
+
+  async function submitPreview(e: React.FormEvent) {
+    e.preventDefault();
+    setPlanError(null);
+    setCreateResult(null);
+    setPreviewing(true);
+    try {
+      const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "plan_preview", ...buildBody() }),
+      });
+      const j = await res.json();
+      if (!j.ok) {
+        setPreview(null);
+        setPlanError(String(j.error ?? "Errore anteprima."));
+        return;
+      }
+      setPreview({
+        dates: Array.isArray(j.dates) ? j.dates : [],
+        totalDuration: Number(j.totalDuration ?? 0),
+        totalPrice: Number(j.totalPrice ?? 0),
+        services: Array.isArray(j.services) ? j.services : [],
+        countOk: Number(j.countOk ?? 0),
+        countSkip: Number(j.countSkip ?? 0),
+      });
+    } catch {
+      setPreview(null);
+      setPlanError("Errore di rete durante l'anteprima.");
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
+  async function submitCreate() {
+    setPlanError(null);
+    setCreating(true);
+    try {
+      const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "plan_create", ...buildBody() }),
+      });
+      const j = await res.json();
+      if (!j.ok) {
+        setPlanError(String(j.error ?? "Errore creazione."));
+        return;
+      }
+      setCreateResult({
+        created: Number(j.created ?? 0),
+        skipped: Number(j.skipped ?? 0),
+        details: Array.isArray(j.details) ? j.details : [],
+      });
+      // Clear the preview so the OK rows can't be created twice from the same panel.
+      setPreview(null);
+    } catch {
+      setPlanError("Errore di rete durante la creazione.");
+    } finally {
+      setCreating(false);
+    }
+  }
+
   return (
     <div className="container-fluid">
       <div className="bs-page-header">
@@ -245,7 +397,7 @@ export function AppointmentsPlanContent() {
         <div className="col-lg-5">
           <div className="card p-4">
             <div className="h5 mb-3">Impostazioni</div>
-            <form method="post" className="row g-3" onSubmit={(e) => e.preventDefault()}>
+            <form method="post" className="row g-3" onSubmit={submitPreview}>
               <input type="hidden" name="_step" value="preview" />
 
               <div className="col-12">
@@ -423,7 +575,15 @@ export function AppointmentsPlanContent() {
 
               <div className="col-6">
                 <label className="form-label">Ripeti per</label>
-                <input type="number" min={1} max={200} className="form-control" name="repeat" defaultValue={1} />
+                <input
+                  type="number"
+                  min={1}
+                  max={200}
+                  className="form-control"
+                  name="repeat"
+                  value={repeat}
+                  onChange={(e) => setRepeat(e.target.value)}
+                />
                 <div className="form-text">Numero di cicli da pianificare (settimane/mesi). Se selezioni più giorni, in ogni ciclo verranno creati tutti i giorni selezionati.</div>
               </div>
 
@@ -465,7 +625,15 @@ export function AppointmentsPlanContent() {
                 <div className="d-flex flex-wrap gap-3">
                   {WEEKDAYS.map((d) => (
                     <div className="form-check" key={d.value}>
-                      <input className="form-check-input" type="checkbox" id={`dow${d.value}`} name="weekdays[]" value={d.value} />
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        id={`dow${d.value}`}
+                        name="weekdays[]"
+                        value={d.value}
+                        checked={weekdays.includes(d.value)}
+                        onChange={() => toggleWeekday(d.value)}
+                      />
                       <label className="form-check-label" htmlFor={`dow${d.value}`}>{d.label}</label>
                     </div>
                   ))}
@@ -477,7 +645,7 @@ export function AppointmentsPlanContent() {
               <div className="col-12">
                 <label className="form-label">Ricorrenza</label>
                 <div className="d-flex flex-wrap gap-3">
-                  {RECURRENCES.map((r, i) => (
+                  {RECURRENCES.map((r) => (
                     <div className="form-check" key={r.id}>
                       <input
                         className="form-check-input"
@@ -485,7 +653,8 @@ export function AppointmentsPlanContent() {
                         name="recurrence"
                         id={r.id}
                         value={r.value}
-                        defaultChecked={i === 0}
+                        checked={recurrence === r.value}
+                        onChange={() => setRecurrence(r.value)}
                       />
                       <label className="form-check-label" htmlFor={r.id}>{r.label}</label>
                     </div>
@@ -508,16 +677,35 @@ export function AppointmentsPlanContent() {
 
               <div className="col-3">
                 <label className="form-label">Dalle ore</label>
-                <input type="time" className="form-control" id="plannerTimeFrom" name="time_from" defaultValue="09:00" required />
+                <input
+                  type="time"
+                  className="form-control"
+                  id="plannerTimeFrom"
+                  name="time_from"
+                  value={timeFrom}
+                  onChange={(e) => setTimeFrom(e.target.value)}
+                  required
+                />
               </div>
 
               <div className="col-3">
                 <label className="form-label">Alle ore</label>
-                <input type="time" className="form-control" id="plannerTimeTo" name="time_to" defaultValue="09:00" required />
+                <input
+                  type="time"
+                  className="form-control"
+                  id="plannerTimeTo"
+                  name="time_to"
+                  value={timeTo}
+                  onChange={(e) => setTimeTo(e.target.value)}
+                  required
+                />
               </div>
 
               <div className="col-12">
-                <button className="btn btn-primary w-100"><i className="bi bi-magic me-1" />Anteprima</button>
+                <button className="btn btn-primary w-100" type="submit" disabled={previewing}>
+                  <i className="bi bi-magic me-1" />
+                  {previewing ? "Calcolo…" : "Anteprima"}
+                </button>
                 <div className="form-text">Se “Dalle ore” e “Alle ore” coincidono, l’orario è fisso. Altrimenti viene scelto il primo slot libero nella finestra.</div>
               </div>
             </form>
@@ -529,7 +717,87 @@ export function AppointmentsPlanContent() {
             <div className="h5 mb-1">Anteprima</div>
             <div className="text-muted mb-3">Controllo disponibilità e riepilogo prima della creazione.</div>
 
-            <div className="alert alert-light border">Compila il form e clicca <strong>Anteprima</strong>.</div>
+            {planError ? <div className="alert alert-danger">{planError}</div> : null}
+
+            {createResult ? (
+              <div className="alert alert-success">
+                Pianificazione completata: creati <strong>{createResult.created}</strong> appuntamenti
+                {createResult.skipped > 0 ? <> (saltati {createResult.skipped})</> : null}.
+              </div>
+            ) : null}
+
+            {!preview && !createResult && !planError ? (
+              <div className="alert alert-light border">Compila il form e clicca <strong>Anteprima</strong>.</div>
+            ) : null}
+
+            {preview ? (
+              <>
+                <div className="d-flex flex-wrap gap-2 mb-3">
+                  <span className="badge text-bg-primary">Durata totale: {preview.totalDuration} min</span>
+                  <span className="badge text-bg-secondary">Prezzo totale: € {fmtMoney(preview.totalPrice)}</span>
+                </div>
+
+                <div className="small text-muted mb-2">Servizi selezionati:</div>
+                <ul className="small">
+                  {preview.services.map((s) => (
+                    <li key={s.id}>
+                      {s.name} ({s.durationMin} min, € {fmtMoney(s.price)})
+                    </li>
+                  ))}
+                </ul>
+
+                <div className="table-responsive">
+                  <table className="table align-middle">
+                    <thead>
+                      <tr>
+                        <th>Data</th>
+                        <th>Ora</th>
+                        <th>Operatore</th>
+                        <th>Esito</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {preview.dates.map((r) => (
+                        <tr key={r.date}>
+                          <td>{fmtDateIt(r.date)}</td>
+                          <td>
+                            {r.ok ? (
+                              <span className="badge text-bg-light border">{r.start}–{r.end}</span>
+                            ) : (
+                              <span className="text-muted">—</span>
+                            )}
+                          </td>
+                          <td>{r.operator ?? "—"}</td>
+                          <td>
+                            {r.ok ? (
+                              <span className="badge text-bg-success">OK</span>
+                            ) : (
+                              <>
+                                <span className="badge text-bg-warning">Saltato</span>
+                                <div className="small text-muted">{r.reason}</div>
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="mt-3">
+                  <button
+                    type="button"
+                    className="btn btn-success"
+                    onClick={submitCreate}
+                    disabled={creating || preview.countOk < 1}
+                  >
+                    <i className="bi bi-check2-circle me-1" />
+                    {creating ? "Creazione…" : "Crea appuntamenti"}
+                  </button>
+                  <div className="form-text">Verranno creati solo quelli con esito <strong>OK</strong>.</div>
+                </div>
+              </>
+            ) : null}
           </div>
         </div>
       </div>
