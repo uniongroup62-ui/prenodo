@@ -31,6 +31,10 @@ export type ManageCalendarContext = {
   end: string;
   staff: ManageCalendarStaff[];
   staffOrder: number[];
+  // The staff id linked to the logged-in operator (matched by email, then name).
+  // 0 when the user is not linked to a staff row. Faithful to calendar.php's
+  // $currentStaffId — drives the "your column is always first" pin in the Day view.
+  currentStaffId: number;
   locations: Awaited<ReturnType<typeof listDbLocations>>;
   services: Awaited<ReturnType<typeof listDbServices>>;
   appointments: Awaited<ReturnType<typeof listDbAppointments>>;
@@ -75,6 +79,10 @@ type TenantTableLike = {
 export async function calendarContext(input: {
   slug: string;
   userId?: number;
+  // Logged-in user's email/name, used to resolve currentStaffId (the operator's
+  // own staff column). Optional so callers without a session still work.
+  userEmail?: string;
+  userName?: string;
   date?: string;
   start?: string;
   end?: string;
@@ -102,6 +110,7 @@ export async function calendarContext(input: {
     end,
     staff: orderStaff(staff, staffOrder),
     staffOrder,
+    currentStaffId: resolveCurrentStaffId(staff, input.userEmail, input.userName),
     locations,
     services,
     appointments,
@@ -458,6 +467,32 @@ function mapCalendarNote(row: RowDataPacket): ManageCalendarNote {
     createdAtLabel: dateLabel(row.created_at),
     updatedAtLabel: dateLabel(row.updated_at),
   };
+}
+
+// Resolve the staff id linked to the logged-in user. Faithful to calendar.php:
+// preferred match is staff.email == user.email; fallback is staff.name == user.name
+// (both compared case-insensitively, trimmed). Returns 0 when no staff row matches.
+function resolveCurrentStaffId(
+  staff: ManageCalendarStaff[],
+  userEmail?: string,
+  userName?: string,
+): number {
+  const email = String(userEmail ?? "").trim().toLowerCase();
+  const name = String(userName ?? "").trim().toLowerCase();
+
+  if (email) {
+    for (const member of staff) {
+      const memberEmail = String(member.email ?? "").trim().toLowerCase();
+      if (member.id > 0 && memberEmail && memberEmail === email) return member.id;
+    }
+  }
+  if (name) {
+    for (const member of staff) {
+      const memberName = String(member.name ?? "").trim().toLowerCase();
+      if (member.id > 0 && memberName && memberName === name) return member.id;
+    }
+  }
+  return 0;
 }
 
 function orderStaff(staff: ManageCalendarStaff[], order: number[]): ManageCalendarStaff[] {

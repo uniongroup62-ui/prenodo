@@ -73,6 +73,10 @@ type CalendarContextResponse = {
   ok?: boolean;
   date?: string;
   staff?: CalendarStaff[];
+  // The logged-in operator's linked staff id (0 = none). Pinned first in the Day view.
+  currentStaffId?: number;
+  // Saved per-user column order for the OTHER operators (the pinned one is excluded).
+  staffOrder?: number[];
   locations?: CalendarLocation[];
   services?: CalendarService[];
   notes?: CalendarNote[];
@@ -318,6 +322,80 @@ function showNotesModal(): void {
   const api = bootstrapModal();
   if (el && api) api.getOrCreateInstance(el).show();
 }
+function showStaffOrderModal(): void {
+  const el = typeof document !== "undefined" ? document.getElementById("staffOrderModal") : null;
+  const api = bootstrapModal();
+  if (el && api) api.getOrCreateInstance(el).show();
+}
+function hideStaffOrderModal(): void {
+  const el = typeof document !== "undefined" ? document.getElementById("staffOrderModal") : null;
+  const api = bootstrapModal();
+  if (el && api) api.getOrCreateInstance(el).hide();
+}
+
+// Sanitize a saved staff-column order list (port of calendar.js normalizeStaffOrder):
+// positive integers only, de-duplicated, capped at 200 ids.
+function normalizeStaffOrder(arr: unknown): number[] {
+  if (!Array.isArray(arr)) return [];
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const v of arr) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    const id = Math.floor(n);
+    if (id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= 200) break;
+  }
+  return out;
+}
+
+// Reorder the Day-view staff columns: the pinned (logged-in) operator first, then the
+// OTHER operators in the saved order, then any remaining operators in natural order.
+// Faithful port of calendar.js applyStaffDayColumnsOrdering. The incoming `cols` is the
+// operator-FILTERED list, so the filter composes with the ordering.
+function applyStaffDayColumnsOrdering<T extends { id: number }>(
+  cols: T[],
+  pinnedStaffId: number,
+  otherOrderIds: number[],
+): T[] {
+  const pinnedId = Number(pinnedStaffId || 0) || 0;
+  let pinned: T | null = null;
+  const others: T[] = [];
+  for (const s of cols) {
+    const sid = Number(s?.id || 0) || 0;
+    if (pinnedId > 0 && sid === pinnedId && pinned === null) pinned = s;
+    else others.push(s);
+  }
+
+  const wanted = normalizeStaffOrder(otherOrderIds);
+  const byId = new Map<number, T>();
+  for (const s of others) {
+    const sid = Number(s?.id || 0) || 0;
+    if (sid > 0) byId.set(sid, s);
+  }
+
+  const orderedOthers: T[] = [];
+  for (const id of wanted) {
+    if (pinnedId > 0 && id === pinnedId) continue;
+    const s = byId.get(id);
+    if (!s) continue;
+    orderedOthers.push(s);
+    byId.delete(id);
+  }
+  // Append the operators not in the saved order, keeping their current order.
+  for (const s of others) {
+    const sid = Number(s?.id || 0) || 0;
+    if (sid > 0 && byId.has(sid)) {
+      orderedOthers.push(s);
+      byId.delete(sid);
+    }
+  }
+
+  const result = pinned ? [pinned, ...orderedOthers] : orderedOthers;
+  return result.length ? result : cols; // safety
+}
 
 // Map the Italian status label returned by /api/manage/appointments back to the
 // legacy calendar badge key (see calendar.js status map).
@@ -381,6 +459,11 @@ export function CalendarContent() {
   const [notes, setNotes] = useState<CalendarNote[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [businessHours, setBusinessHours] = useState<CalendarBusinessHour[]>([]);
+  // Staff-column ordering (Day view). currentStaffId is the logged-in operator's
+  // own column (always pinned first); savedStaffOrder is the persisted order of the
+  // OTHER operators (port of CURRENT_STAFF_ID + SAVED_DAY_STAFF_ORDER).
+  const [currentStaffId, setCurrentStaffId] = useState<number>(0);
+  const [savedStaffOrder, setSavedStaffOrder] = useState<number[]>([]);
   // Note count per ISO date for the visible range (Week/Month note markers).
   const [countByDate, setCountByDate] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
@@ -400,6 +483,16 @@ export function CalendarContent() {
   const [moveError, setMoveError] = useState("");
   // Surfaced inside #calendarNotesAlert when a note save/delete fails.
   const [notesError, setNotesError] = useState("");
+
+  // === Staff-column ordering modal (#staffOrderModal) state ===
+  // staffOrderRows is the working order of the OTHER operators (excludes the pinned
+  // one) being edited in the modal; it seeds from the live staffCols when opened and
+  // is mutated by drag-drop / up-down before Save. staffOrderError mirrors #staffOrderErr.
+  const [staffOrderRows, setStaffOrderRows] = useState<CalendarStaff[]>([]);
+  const [staffOrderError, setStaffOrderError] = useState("");
+  const [staffOrderSaving, setStaffOrderSaving] = useState(false);
+  // Index of the row being dragged (HTML5 DnD), or null.
+  const staffOrderDragIndexRef = useRef<number | null>(null);
 
   // === "Data" date-picker popover (port of the calendar.js mini date-picker) ===
   // Whether the popover is open, and the browse "cursor" (ISO) — the month/year being
@@ -446,6 +539,8 @@ export function CalendarContent() {
           setNotes(Array.isArray(j.notes) ? j.notes : []);
           setBusinessHours(Array.isArray(j.businessHours) ? j.businessHours : []);
           setCountByDate(j.countByDate && typeof j.countByDate === "object" ? j.countByDate : {});
+          setCurrentStaffId(Number(j.currentStaffId ?? 0) || 0);
+          setSavedStaffOrder(normalizeStaffOrder(j.staffOrder));
         })
         .catch(() => {
           setStaff([]);
@@ -453,6 +548,8 @@ export function CalendarContent() {
           setNotes([]);
           setBusinessHours([]);
           setCountByDate({});
+          setCurrentStaffId(0);
+          setSavedStaffOrder([]);
         });
 
       // Appointments: a single-day `date` for the Day view (unchanged), or a
@@ -526,11 +623,13 @@ export function CalendarContent() {
     return out;
   }, [weekMinMin, weekMaxMin]);
 
-  // Staff columns (apply the operator filter; faithful to STAFF_DAY_COLS).
+  // Staff columns (apply the operator filter, then the saved Day-view ordering;
+  // faithful to STAFF_DAY_COLS). The filter composes with the order: the pinned
+  // (logged-in) operator is first, then the saved order of the others, then the rest.
   const staffCols = useMemo(() => {
-    if (!filterStaff) return staff;
-    return staff.filter((s) => String(s.id) === filterStaff);
-  }, [staff, filterStaff]);
+    const filtered = filterStaff ? staff.filter((s) => String(s.id) === filterStaff) : staff;
+    return applyStaffDayColumnsOrdering(filtered, currentStaffId, savedStaffOrder);
+  }, [staff, filterStaff, currentStaffId, savedStaffOrder]);
 
   // Shared filter predicate (operator/service/status) WITHOUT any date constraint —
   // applied by Week/Month so the toolbar filters affect those views too.
@@ -937,6 +1036,81 @@ export function CalendarContent() {
     setNotesError("");
     showNotesModal();
   }, [resetNotesForm]);
+
+  // === Staff-column ordering modal ===
+  // The pinned (logged-in) operator, resolved from the live staff list (its own
+  // column is always rendered first and is NOT part of the reorderable list).
+  const pinnedStaff = useMemo(
+    () => (currentStaffId > 0 ? staff.find((s) => s.id === currentStaffId) ?? null : null),
+    [staff, currentStaffId],
+  );
+
+  // The OTHER operators (everything except the pinned one), in the CURRENT applied
+  // order (i.e. the live Day-view column order minus the pinned column). Port of
+  // getOtherStaffCols — this is what the modal lists for reordering.
+  const otherStaffCols = useMemo(
+    () => staffCols.filter((s) => !(currentStaffId > 0 && s.id === currentStaffId)),
+    [staffCols, currentStaffId],
+  );
+
+  const openStaffOrderModal = useCallback(() => {
+    setStaffOrderError("");
+    // Seed the editable rows from the current applied order of the other operators.
+    setStaffOrderRows(otherStaffCols.slice());
+    showStaffOrderModal();
+  }, [otherStaffCols]);
+
+  // Move a row up/down within the modal list (port of the chevron buttons).
+  const moveStaffOrderRow = useCallback((index: number, delta: number) => {
+    setStaffOrderRows((prev) => {
+      const next = prev.slice();
+      const target = index + delta;
+      if (target < 0 || target >= next.length) return prev;
+      const [row] = next.splice(index, 1);
+      next.splice(target, 0, row);
+      return next;
+    });
+  }, []);
+
+  // Reorder via drag-drop: move the dragged row to the drop row's position
+  // (port of ensureStaffOrderDnD's insertBefore behavior).
+  const dropStaffOrderRow = useCallback((dropIndex: number) => {
+    const from = staffOrderDragIndexRef.current;
+    staffOrderDragIndexRef.current = null;
+    if (from === null || from === dropIndex) return;
+    setStaffOrderRows((prev) => {
+      const next = prev.slice();
+      const [row] = next.splice(from, 1);
+      next.splice(dropIndex > from ? dropIndex - 1 : dropIndex, 0, row);
+      return next;
+    });
+  }, []);
+
+  const saveStaffOrder = useCallback(async () => {
+    setStaffOrderError("");
+    setStaffOrderSaving(true);
+    try {
+      const ids = staffOrderRows.map((s) => Number(s.id) || 0).filter((n) => n > 0);
+      const res = await fetch(`/api/manage/calendar?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ slug, action: "set_calendar_day_staff_order", order: JSON.stringify(ids) }),
+      });
+      const json: { ok?: boolean; error?: string; order?: number[] } = await res.json().catch(() => ({}));
+      if (!res.ok || json.ok === false || json.error) {
+        throw new Error(String(json.error || "Impossibile salvare l'ordinamento"));
+      }
+      // Apply immediately (staffCols re-derives from savedStaffOrder) and reload so
+      // the persisted order survives subsequent refetches.
+      setSavedStaffOrder(normalizeStaffOrder(Array.isArray(json.order) ? json.order : ids));
+      hideStaffOrderModal();
+      loadContext(date, visibleRange);
+    } catch (err) {
+      setStaffOrderError(err instanceof Error ? err.message : "Errore");
+    } finally {
+      setStaffOrderSaving(false);
+    }
+  }, [staffOrderRows, slug, date, visibleRange, loadContext]);
 
   // === Date-picker open/close (port of toggle/open/closeCalendarDatePicker) ===
   // The Data button toggles the popover; opening seeds the browse cursor from the
@@ -1577,7 +1751,14 @@ export function CalendarContent() {
                     {viewBtn("timeGridWeek", "Settimana")}
                     {viewBtn("dayGridMonth", "Mese")}
                   </div>
-                  <button type="button" className="fc-orderStaffCols-button fc-button fc-button-primary" onClick={() => {}}>
+                  {/* Ordina: only in the Day view with more than one staff column,
+                      faithful to toggleStaffOrderButton. Opens #staffOrderModal. */}
+                  <button
+                    type="button"
+                    className="fc-orderStaffCols-button fc-button fc-button-primary"
+                    onClick={openStaffOrderModal}
+                    style={{ display: view === "staffTimeGridDay" && staffCols.length > 1 ? "" : "none" }}
+                  >
                     Ordina
                   </button>
                 </div>
@@ -2024,25 +2205,103 @@ export function CalendarContent() {
                 La <strong>prima colonna</strong> è sempre la tua. Puoi ordinare le colonne degli altri operatori (trascina oppure usa
                 le frecce).
               </div>
-              <div id="staffOrderPinnedInfo" className="alert alert-light border d-flex align-items-center gap-2 py-2 px-3" hidden>
+              <div
+                id="staffOrderPinnedInfo"
+                className="alert alert-light border d-flex align-items-center gap-2 py-2 px-3"
+                hidden={!(pinnedStaff && pinnedStaff.name.trim())}
+              >
                 <i className="bi bi-person-circle" />
                 <div className="small">
-                  La tua colonna: <strong id="staffOrderPinnedName" />
+                  La tua colonna: <strong id="staffOrderPinnedName">{pinnedStaff?.name ?? ""}</strong>
                 </div>
               </div>
-              <div className="list-group" id="staffOrderList" />
-              <div id="staffOrderEmpty" className="text-muted small mt-2" hidden>
+              <div className="list-group" id="staffOrderList">
+                {staffOrderRows.map((s, index) => {
+                  const name = s.name.trim();
+                  if (!s.id || !name) return null;
+                  return (
+                    <div
+                      key={s.id}
+                      className="list-group-item d-flex align-items-center gap-2 staff-order-item"
+                      data-sid={s.id}
+                      draggable
+                      onDragStart={(e) => {
+                        staffOrderDragIndexRef.current = index;
+                        e.currentTarget.classList.add("dragging");
+                        try {
+                          e.dataTransfer.effectAllowed = "move";
+                          e.dataTransfer.setData("text/plain", String(s.id));
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                      onDragEnd={(e) => {
+                        e.currentTarget.classList.remove("dragging");
+                        staffOrderDragIndexRef.current = null;
+                      }}
+                      onDragOver={(e) => {
+                        if (staffOrderDragIndexRef.current === null) return;
+                        e.preventDefault();
+                        try {
+                          e.dataTransfer.dropEffect = "move";
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        dropStaffOrderRow(index);
+                      }}
+                    >
+                      <span className="text-muted" style={{ cursor: "grab" }}>
+                        <i className="bi bi-grip-vertical" />
+                      </span>
+                      <span className="op-color-dot" style={{ background: s.color }} title="Operatore" />
+                      <div className="flex-grow-1">{name}</div>
+                      <div className="btn-group btn-group-sm">
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary"
+                          title="Sposta su"
+                          disabled={index === 0}
+                          onClick={() => moveStaffOrderRow(index, -1)}
+                        >
+                          <i className="bi bi-chevron-up" />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary"
+                          title="Sposta giù"
+                          disabled={index === staffOrderRows.length - 1}
+                          onClick={() => moveStaffOrderRow(index, 1)}
+                        >
+                          <i className="bi bi-chevron-down" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div id="staffOrderEmpty" className="text-muted small mt-2" hidden={staffOrderRows.length > 0}>
                 Nessun altro operatore da ordinare.
               </div>
-              <div id="staffOrderErr" className="text-danger small mt-2" hidden />
+              <div id="staffOrderErr" className="text-danger small mt-2" hidden={!staffOrderError}>
+                {staffOrderError}
+              </div>
             </div>
             <div className="modal-footer">
               <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">
                 Annulla
               </button>
-              <button type="button" className="btn btn-primary" id="staffOrderSave">
+              <button
+                type="button"
+                className="btn btn-primary"
+                id="staffOrderSave"
+                disabled={staffOrderSaving || staffOrderRows.length === 0}
+                onClick={saveStaffOrder}
+              >
                 <i className="bi bi-check2-circle me-1" />
-                Salva
+                {staffOrderSaving ? "Salvataggio…" : "Salva"}
               </button>
             </div>
           </div>

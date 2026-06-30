@@ -51,7 +51,15 @@ export async function GET(request: Request) {
       });
     }
 
-    const context = await calendarContext({ slug: tenantSlug, userId: activeUser.id, date, start, end });
+    const context = await calendarContext({
+      slug: tenantSlug,
+      userId: activeUser.id,
+      userEmail: activeUser.email,
+      userName: activeUser.name,
+      date,
+      start,
+      end,
+    });
     return Response.json({
       ok: true,
       source: "app/pages/calendar.php",
