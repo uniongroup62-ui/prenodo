@@ -56,6 +56,11 @@ export async function GET(request: Request) {
         // (port of api_clients.php action=residuals giftcard block; see
         // quickBookClientGiftcards). Each carries a spendable monetary balance.
         giftcards: context.giftcards,
+        // Available giftbox ITEMS for the drawer's per-service "Usa GiftBox" control
+        // (see quickBookClientGiftboxes). GiftBox is per-service + ITEM-based; each
+        // entry covers exactly its service_id and pins the redeem via
+        // instance_id + giftbox_item_id.
+        giftboxes: context.giftboxes,
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");

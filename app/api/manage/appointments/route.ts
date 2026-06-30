@@ -16,6 +16,7 @@ import {
   type AppointmentPackageRedeem,
   type AppointmentPrepaidRedeem,
   type AppointmentGiftcardRedeem,
+  type AppointmentGiftboxRedeem,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -323,6 +324,13 @@ export async function POST(request: Request) {
     // giftcard decremented server-side inside createDbAppointment (never trusted).
     const giftcardRedeems = parseGiftcardRedeem(body.giftcard_redeem);
     const giftcardWarnings: string[] = [];
+    // Quick-booking GIFTBOX redeem (#qb_giftbox_redeem JSON array): per-service requests
+    // to cover a service with ONE ITEM from the client's giftbox (a per-service item is
+    // consumed, the service is zero-charged). Parsed here, re-validated + the redemption
+    // recorded server-side inside createDbAppointment (never trusted). A service already
+    // covered by a package OR prepaid redeem is skipped there (one service is covered once).
+    const giftboxRedeems = parseGiftboxRedeem(body.giftbox_redeem);
+    const giftboxWarnings: string[] = [];
     let serviceNames = parseServiceNamesFromBody(body);
     if (serviceIds.length > 0) {
       // `service_ids` is unambiguous (no comma-in-name issue) so it wins when sent.
@@ -356,6 +364,8 @@ export async function POST(request: Request) {
       prepaidWarnings,
       giftcardRedeems,
       giftcardWarnings,
+      giftboxRedeems,
+      giftboxWarnings,
     };
 
     let appointment;
@@ -394,6 +404,9 @@ export async function POST(request: Request) {
       // GiftCard-redeem skip messages (not the client's / expired / no balance /
       // nothing payable / clamped to 0): same best-effort parity; drawer may show them.
       ...(giftcardWarnings.length > 0 ? { giftcardWarnings } : {}),
+      // GiftBox-redeem skip messages (not the client's / expired / item not covering /
+      // exhausted / already covered by a package/prepaid): same best-effort parity.
+      ...(giftboxWarnings.length > 0 ? { giftboxWarnings } : {}),
     });
   } catch (error) {
     return Response.json(
@@ -631,6 +644,45 @@ function parseGiftcardRedeem(raw: unknown): AppointmentGiftcardRedeem[] {
       String(entry.amount ?? entry.used_amount ?? entry.used ?? "").replace(",", "."),
     );
     out.push({ giftcardId, amount: Number.isFinite(amount) && amount > 0 ? amount : 0 });
+  }
+  return out;
+}
+
+// Parse the quick-booking `giftbox_redeem` payload — a JSON array (or already an array)
+// of { instance_id, giftbox_item_id, service_id } items — into AppointmentGiftboxRedeem[].
+// Mirrors assets/js/app.js #qb_giftbox_redeem (and parseRequestBody stringifies body
+// values, so the drawer sends this as a JSON STRING, handled here). GiftBox is per-service
+// + ITEM-based: one giftbox item covers one service. Items missing a positive instance_id,
+// giftbox_item_id or service_id are dropped, and a service is kept at most once (first
+// wins) since one service is covered by one item. The real validation (ownership/issued/
+// not expired/coverage/residual) happens server-side in applyAppointmentGiftboxRedeems —
+// this only shapes the input.
+function parseGiftboxRedeem(raw: unknown): AppointmentGiftboxRedeem[] {
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      source = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(source)) return [];
+  const out: AppointmentGiftboxRedeem[] = [];
+  const seenService = new Set<number>();
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    const instanceId = Number.parseInt(String(entry.instance_id ?? ""), 10);
+    const giftboxItemId = Number.parseInt(String(entry.giftbox_item_id ?? ""), 10);
+    const serviceId = Number.parseInt(String(entry.service_id ?? ""), 10);
+    if (!Number.isFinite(instanceId) || instanceId <= 0) continue;
+    if (!Number.isFinite(giftboxItemId) || giftboxItemId <= 0) continue;
+    if (!Number.isFinite(serviceId) || serviceId <= 0) continue;
+    if (seenService.has(serviceId)) continue;
+    seenService.add(serviceId);
+    out.push({ instanceId, giftboxItemId, serviceId });
   }
   return out;
 }

@@ -209,6 +209,16 @@ type QbClientGiftcard = {
   code: string;
   balance: number;
 };
+// One available (redeemable) GiftBox ITEM for the per-service "Usa GiftBox" control
+// (returned by quickbook_client_context). GiftBox is per-service + ITEM-based (like a
+// package): each entry covers exactly its `service_id`, consuming one unit of that item.
+// `instance_id` + `giftbox_item_id` pin the redeem; `name` is the item/service label.
+type QbClientGiftbox = {
+  instance_id: number;
+  giftbox_item_id: number;
+  service_id: number;
+  name: string;
+};
 type QbClientContextResponse = {
   ok?: boolean;
   summary?: QbHistorySummary;
@@ -216,6 +226,7 @@ type QbClientContextResponse = {
   packages?: QbClientPackage[];
   prepaids?: QbClientPrepaid[];
   giftcards?: QbClientGiftcard[];
+  giftboxes?: QbClientGiftbox[];
 };
 
 // One entry written to #qb_package_redeem (assets/js/app.js qbReadPackageRedeem):
@@ -231,6 +242,11 @@ type QbPrepaidRedeem = { client_prepaid_service_id: number; service_id: number }
 // APPOINTMENT-LEVEL request to apply a giftcard BALANCE (a monetary amount) toward the
 // whole appointment (NOT per-service). One giftcard, one amount.
 type QbGiftcardRedeem = { giftcard_id: number; amount: number };
+
+// One entry written to #qb_giftbox_redeem (assets/js/app.js): a per-service request to
+// cover that service with ONE ITEM from the client's giftbox (instance_id +
+// giftbox_item_id pin the item; the service is zero-charged on save).
+type QbGiftboxRedeem = { instance_id: number; giftbox_item_id: number; service_id: number };
 
 // History summary line, EXACT port of qbLoadClientHistory: "Appuntamenti: N •
 // Ultimo: … • Prossimo: …" (+ " • Vendite: €…" when sales_total > 0).
@@ -319,6 +335,18 @@ export function QuickBookingDrawer() {
   const [clientGiftcards, setClientGiftcards] = useState<QbClientGiftcard[]>([]);
   const [giftcardPick, setGiftcardPick] = useState<number | null>(null);
   const [giftcardAmountInput, setGiftcardAmountInput] = useState<string>("");
+
+  // ---- GIFTBOX redeem (#qb_giftbox_redeem) ----
+  // The selected client's AVAILABLE giftbox ITEMS (issued, not expired, residual unit
+  // left), and the per-service redeem selection the staff applies in the drawer. GiftBox
+  // is per-service + ITEM-based (like a package): one item covers one service.
+  // `giftboxRedeems` is keyed by service_id (one item covers a service at most once); it
+  // is serialized to #qb_giftbox_redeem (a JSON STRING) and sent on save. Both are cleared
+  // on client change and pruned on service change. A service already covered by a PACKAGE
+  // or PREPAID redeem hides its giftbox control (one service is covered once; the server
+  // also dedupes).
+  const [clientGiftboxes, setClientGiftboxes] = useState<QbClientGiftbox[]>([]);
+  const [giftboxRedeems, setGiftboxRedeems] = useState<Record<number, QbGiftboxRedeem>>({});
 
   // ---- Services multiselect state ----
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([]);
@@ -818,22 +846,87 @@ export function QuickBookingDrawer() {
     [],
   );
 
+  // ---- GIFTBOX redeem derivation (per-service "Usa GiftBox") ----
+  // For each SELECTED service that is NOT already covered by a package OR prepaid redeem,
+  // the client's available giftbox ITEMS that COVER it (an item covers exactly its own
+  // service_id, with a residual unit left). Drives the per-service control; a service
+  // covered by a package/prepaid, or with no covering item, shows nothing. Recomputed
+  // from the loaded giftboxes + the current selection + the effective package/prepaid
+  // redeems (no effect/state — like the rest of this file). This is the UI-side half of
+  // the dedupe; the server also re-dedupes (against package + prepaid) when recording.
+  const giftboxOptionsByService = useMemo<Record<number, QbClientGiftbox[]>>(() => {
+    const out: Record<number, QbClientGiftbox[]> = {};
+    for (const serviceId of selectedServiceIds) {
+      if (effectivePackageRedeems[serviceId]) continue; // a package already covers it
+      if (effectivePrepaidRedeems[serviceId]) continue; // a prepaid already covers it
+      const covering = clientGiftboxes.filter((gb) => gb.service_id === serviceId);
+      if (covering.length) out[serviceId] = covering;
+    }
+    return out;
+  }, [selectedServiceIds, clientGiftboxes, effectivePackageRedeems, effectivePrepaidRedeems]);
+
+  // Effective per-service giftbox redeem selection: keep only entries whose service is
+  // still selected, NOT package/prepaid-covered, AND whose giftbox item still covers it
+  // (prunes on service/client/package/prepaid change). This DERIVED map (not raw
+  // `giftboxRedeems`) drives the UI + the serialized payload, so a stale pick can never
+  // leak into the save.
+  const effectiveGiftboxRedeems = useMemo<Record<number, QbGiftboxRedeem>>(() => {
+    const out: Record<number, QbGiftboxRedeem> = {};
+    for (const serviceId of selectedServiceIds) {
+      const pick = giftboxRedeems[serviceId];
+      if (!pick) continue;
+      const options = giftboxOptionsByService[serviceId] ?? [];
+      if (options.some((gb) => gb.instance_id === pick.instance_id && gb.giftbox_item_id === pick.giftbox_item_id)) {
+        out[serviceId] = pick;
+      }
+    }
+    return out;
+  }, [selectedServiceIds, giftboxRedeems, giftboxOptionsByService]);
+
+  // Serialize the effective redeem -> #qb_giftbox_redeem JSON STRING array of
+  // {service_id, instance_id, giftbox_item_id} (the shape assets/js/app.js produces and
+  // the save route parses). IMPORTANT: sent as a JSON STRING (parseRequestBody stringifies
+  // body values), mirroring the package/prepaid payload.
+  const giftboxRedeemJson = useMemo(() => {
+    const arr = Object.values(effectiveGiftboxRedeems);
+    return arr.length ? JSON.stringify(arr) : "";
+  }, [effectiveGiftboxRedeems]);
+
+  // Apply / clear a giftbox item on a service. Selecting records {service_id, instance_id,
+  // giftbox_item_id}; clearing removes the entry. Changing services never invalidates a
+  // hold (the redeem doesn't move the slot).
+  const setGiftboxForService = useCallback(
+    (serviceId: number, giftbox: QbClientGiftbox | null) => {
+      setGiftboxRedeems((prev) => {
+        const next = { ...prev };
+        if (!giftbox) {
+          delete next[serviceId];
+        } else {
+          next[serviceId] = { service_id: serviceId, instance_id: giftbox.instance_id, giftbox_item_id: giftbox.giftbox_item_id };
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
   // ---- GIFTCARD redeem derivation (appointment-level "GiftCard") ----
   // The appointment's PAYABLE TOTAL: sum of the SELECTED services' prices MINUS any
-  // service zero-charged by an applied package OR prepaid redeem (those services are
-  // not addebitati, so they don't count toward the giftcard cap). This MIRRORS the
-  // server's payable total (SUM of appointment_services.price after package/prepaid
+  // service zero-charged by an applied package, prepaid OR giftbox redeem (those services
+  // are not addebitati, so they don't count toward the giftcard cap). This MIRRORS the
+  // server's payable total (SUM of appointment_services.price after package/prepaid/giftbox
   // zeroing), so the default + clamp the staff sees match what the server applies.
   const appointmentPayableTotal = useMemo(() => {
     let total = 0;
     for (const serviceId of selectedServiceIds) {
       if (effectivePackageRedeems[serviceId]) continue; // zero-charged by a package
       if (effectivePrepaidRedeems[serviceId]) continue; // zero-charged by a prepaid
+      if (effectiveGiftboxRedeems[serviceId]) continue; // zero-charged by a giftbox
       const svc = services.find((s) => s.id === serviceId);
       total += Math.max(0, Number(svc?.price ?? 0));
     }
     return Math.round((total + Number.EPSILON) * 100) / 100;
-  }, [selectedServiceIds, services, effectivePackageRedeems, effectivePrepaidRedeems]);
+  }, [selectedServiceIds, services, effectivePackageRedeems, effectivePrepaidRedeems, effectiveGiftboxRedeems]);
 
   // The effective giftcard pick: keep the chosen giftcard only while it is still in
   // the client's available list (prunes on client change / balance exhaustion). This
@@ -909,6 +1002,9 @@ export function QuickBookingDrawer() {
     setClientGiftcards([]);
     setGiftcardPick(null);
     setGiftcardAmountInput("");
+    // The giftboxes + per-service redeem also belong to the client; clear on change.
+    setClientGiftboxes([]);
+    setGiftboxRedeems({});
   }, []);
 
   const loadClientContext = useCallback(
@@ -929,6 +1025,9 @@ export function QuickBookingDrawer() {
       setClientGiftcards([]);
       setGiftcardPick(null);
       setGiftcardAmountInput("");
+      // ...and any previous giftboxes + per-service redeem selection.
+      setClientGiftboxes([]);
+      setGiftboxRedeems({});
 
       const params = new URLSearchParams({ slug, action: "quickbook_client_context", client_id: id });
       const locId = String(locationId || "").trim();
@@ -948,6 +1047,7 @@ export function QuickBookingDrawer() {
           setClientPackages(Array.isArray(data.packages) ? data.packages : []);
           setClientPrepaids(Array.isArray(data.prepaids) ? data.prepaids : []);
           setClientGiftcards(Array.isArray(data.giftcards) ? data.giftcards : []);
+          setClientGiftboxes(Array.isArray(data.giftboxes) ? data.giftboxes : []);
         })
         .catch(() => {
           if (myReq !== contextReqRef.current) return;
@@ -1197,6 +1297,11 @@ export function QuickBookingDrawer() {
             // + clamped + decremented server-side). Sent as a JSON STRING [{giftcard_id,
             // amount}] (parseRequestBody stringifies body values).
             giftcard_redeem: giftcardRedeemJson,
+            // GIFTBOX redeem: per-service requests to cover a service with ONE ITEM from
+            // the client's giftbox (re-validated + the redemption recorded server-side).
+            // Sent as a JSON STRING [{service_id, instance_id, giftbox_item_id}]
+            // (parseRequestBody stringifies body values).
+            giftbox_redeem: giftboxRedeemJson,
             date,
             time: startTime,
             location_id: locationId,
@@ -1205,7 +1310,7 @@ export function QuickBookingDrawer() {
             appointment_hold_token: holdToken,
           }),
         });
-        const data: { ok?: boolean; error?: string; packageWarnings?: string[]; prepaidWarnings?: string[]; giftcardWarnings?: string[] } = await res.json().catch(() => ({}));
+        const data: { ok?: boolean; error?: string; packageWarnings?: string[]; prepaidWarnings?: string[]; giftcardWarnings?: string[]; giftboxWarnings?: string[] } = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false || data.error) {
           setFormError(String(data.error || "Errore salvataggio."));
           return;
@@ -1225,6 +1330,11 @@ export function QuickBookingDrawer() {
         if (Array.isArray(data.giftcardWarnings) && data.giftcardWarnings.length > 0) {
           if (typeof window !== "undefined") window.alert("GiftCard:\n" + data.giftcardWarnings.join("\n"));
         }
+        // Same for giftbox redeem skips (not the client's / expired / item not covering /
+        // exhausted / already covered by a package or prepaid): surface before the reload.
+        if (Array.isArray(data.giftboxWarnings) && data.giftboxWarnings.length > 0) {
+          if (typeof window !== "undefined") window.alert("GiftBox:\n" + data.giftboxWarnings.join("\n"));
+        }
         closeOffcanvas();
         // Refresh the page so any calendar/list on screen shows the new booking,
         // matching the legacy reload-on-save behavior.
@@ -1235,7 +1345,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -1277,7 +1387,7 @@ export function QuickBookingDrawer() {
 
             <input type="hidden" name="client_id" id="qb_client_id" value={client?.id ?? ""} readOnly />
             <input type="hidden" name="id" id="qb_appt_id" value="" readOnly />
-            <input type="hidden" name="giftbox_redeem" id="qb_giftbox_redeem" value="" readOnly />
+            <input type="hidden" name="giftbox_redeem" id="qb_giftbox_redeem" value={giftboxRedeemJson} readOnly />
             <input type="hidden" name="gift_redeem" id="qb_gift_redeem" value="" readOnly />
             <input type="hidden" name="package_redeem" id="qb_package_redeem" value={packageRedeemJson} readOnly />
             <input type="hidden" name="prepaid_service_redeem" id="qb_prepaid_service_redeem" value={prepaidRedeemJson} readOnly />
@@ -1628,6 +1738,80 @@ export function QuickBookingDrawer() {
                       {selectedPrepaid ? (
                         <div className="small text-success mt-1">
                           Coperto dal prepagato {selectedPrepaid.name} — nessun addebito.
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {/* GIFTBOX redeem (GiftBox) — per-service "Usa GiftBox" control. Faithful to
+                the legacy intent (assets/js/app.js #qb_giftbox_redeem: a per-service
+                selection that writes {service_id, instance_id, giftbox_item_id} into
+                #qb_giftbox_redeem). GiftBox is per-service + ITEM-based (like a package):
+                one item covers one service. Only shown for SELECTED services the client
+                has an available giftbox item for AND that a package/prepaid isn't already
+                covering; a covered service reads "Coperto dalla GiftBox" with no charge.
+                Selecting consumes one item on save (validated + deduped server-side). */}
+            {Object.keys(giftboxOptionsByService).length > 0 ? (
+              <div className="card p-2 mb-3" id="qbGiftboxRedeemBox">
+                <div className="fw-bold mb-1">GiftBox</div>
+                <div className="text-muted small mb-2">
+                  Applica una GiftBox del cliente a un servizio: un elemento verrà scalato dalla GiftBox e il servizio non sarà addebitato.
+                </div>
+                {selectedServiceIds.map((serviceId) => {
+                  const options = giftboxOptionsByService[serviceId];
+                  if (!options || options.length === 0) return null;
+                  const svc = services.find((s) => s.id === serviceId);
+                  const serviceName = svc?.name ?? `Servizio #${serviceId}`;
+                  const redeem = effectiveGiftboxRedeems[serviceId];
+                  const selectedGiftbox = redeem
+                    ? options.find((gb) => gb.instance_id === redeem.instance_id && gb.giftbox_item_id === redeem.giftbox_item_id) ?? null
+                    : null;
+                  return (
+                    <div className="border-top pt-2 mt-2 qb-cp-giftbox" key={serviceId} data-service-id={serviceId}>
+                      <div className="d-flex justify-content-between align-items-center">
+                        <div className="fw-semibold">{serviceName}</div>
+                        {selectedGiftbox ? (
+                          <span className="badge badge-soft text-success">Coperto dalla GiftBox</span>
+                        ) : null}
+                      </div>
+                      <div className="d-flex align-items-center gap-2 mt-1">
+                        <select
+                          className="form-select form-select-sm qb-cp-giftbox-select"
+                          data-service-id={serviceId}
+                          aria-label={`Usa GiftBox per ${serviceName}`}
+                          value={selectedGiftbox ? `${selectedGiftbox.instance_id}:${selectedGiftbox.giftbox_item_id}` : ""}
+                          onChange={(e) => {
+                            const [instStr, itemStr] = String(e.target.value).split(":");
+                            const inst = Number.parseInt(instStr, 10);
+                            const item = Number.parseInt(itemStr, 10);
+                            const giftbox = options.find((gb) => gb.instance_id === inst && gb.giftbox_item_id === item) ?? null;
+                            setGiftboxForService(serviceId, giftbox);
+                          }}
+                        >
+                          <option value="">Non usare GiftBox</option>
+                          {options.map((gb) => (
+                            <option value={`${gb.instance_id}:${gb.giftbox_item_id}`} key={`${gb.instance_id}:${gb.giftbox_item_id}`}>
+                              Usa GiftBox: {gb.name}
+                            </option>
+                          ))}
+                        </select>
+                        {selectedGiftbox ? (
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-link text-danger p-0 qb-cp-giftbox-remove"
+                            onClick={() => setGiftboxForService(serviceId, null)}
+                            title="Rimuovi GiftBox"
+                          >
+                            Rimuovi
+                          </button>
+                        ) : null}
+                      </div>
+                      {selectedGiftbox ? (
+                        <div className="small text-success mt-1">
+                          Coperto dalla GiftBox {selectedGiftbox.name} — nessun addebito.
                         </div>
                       ) : null}
                     </div>

@@ -412,6 +412,15 @@ export type MultiServiceAppointmentInput = {
   giftcardRedeems?: AppointmentGiftcardRedeem[];
   // Mutable collector the save pushes giftcard-redeem skip warnings into. Optional.
   giftcardWarnings?: string[];
+  // Quick-booking GIFTBOX redeem (assets/js/app.js #qb_giftbox_redeem): per-service
+  // requests to cover a service with ONE ITEM from a client's giftbox (a per-service
+  // item is consumed, the service is zero-charged). Re-validated + the redemption
+  // recorded server-side as part of the save (see applyAppointmentGiftboxRedeems).
+  // Optional/empty -> the non-redeem save path is unchanged. A service already covered
+  // by a package OR prepaid redeem is NOT also giftbox-redeemed (the apply dedupes).
+  giftboxRedeems?: AppointmentGiftboxRedeem[];
+  // Mutable collector the save pushes per-giftbox-redeem skip warnings into. Optional.
+  giftboxWarnings?: string[];
 };
 
 // Resolved multi-service plan: the ordered services, the per-position segment
@@ -528,6 +537,8 @@ export async function createDbAppointment({
   prepaidWarnings,
   giftcardRedeems = [],
   giftcardWarnings,
+  giftboxRedeems = [],
+  giftboxWarnings,
 }: {
   slug: string;
   clientName: string;
@@ -613,8 +624,12 @@ export async function createDbAppointment({
   // appointment_services rows exist, and AFTER the package redeems so a service the
   // package already covered is skipped (dedupe via packageCoveredServiceIds). Skipped
   // entries become warnings; the booking itself is never failed (legacy parity).
+  // A service covered by a package OR prepaid must not also be giftbox-redeemed. We
+  // collect the prepaid-covered service_ids alongside the package ones into a single
+  // `redeemCoveredServiceIds` set passed to the giftbox apply (dedupe across all three).
+  const redeemCoveredServiceIds = new Set<number>(packageCoveredServiceIds);
   if (prepaidRedeems.length > 0) {
-    const { warnings } = await applyAppointmentPrepaidRedeems({
+    const { applied, warnings } = await applyAppointmentPrepaidRedeems({
       slug,
       appointmentId: id,
       clientId: client.id,
@@ -622,7 +637,24 @@ export async function createDbAppointment({
       redeems: prepaidRedeems,
       coveredServiceIds: packageCoveredServiceIds,
     });
+    for (const entry of applied) redeemCoveredServiceIds.add(Number(entry.serviceId ?? 0));
     if (prepaidWarnings) prepaidWarnings.push(...warnings);
+  }
+  // GIFTBOX redeem: re-validate + RECORD (giftbox_redemptions + _items, qty 1) + link
+  // AFTER the appointment_services rows exist, and AFTER package + prepaid so a service
+  // already covered is skipped (dedupe via redeemCoveredServiceIds). GiftBox is
+  // per-service + ITEM-based (one item covers one service); a covered service is
+  // zero-charged. Skipped entries become warnings; the booking is never failed.
+  if (giftboxRedeems.length > 0) {
+    const { warnings } = await applyAppointmentGiftboxRedeems({
+      slug,
+      appointmentId: id,
+      clientId: client.id,
+      serviceIds: plan.services.map((service) => Number(service.id ?? 0)),
+      redeems: giftboxRedeems,
+      coveredServiceIds: redeemCoveredServiceIds,
+    });
+    if (giftboxWarnings) giftboxWarnings.push(...warnings);
   }
   // GIFTCARD redeem: re-validate + decrement + link AFTER the appointment_services
   // rows (and any package/prepaid zeroing) exist, because the payable total is
@@ -2013,6 +2045,267 @@ async function updateAppointmentServicePrepaidLink(
   );
 }
 
+// One entry from the quick-booking `giftbox_redeem` JSON array (assets/js/app.js
+// #qb_giftbox_redeem): cover a service with ONE ITEM from a client's giftbox. GiftBox
+// is per-service + ITEM-based (like a package): a single giftbox item (identified by
+// instance_id + giftbox_item_id, the giftbox_instance_items.giftbox_item_id value)
+// covers one service, consuming one unit of that item. `serviceId` must be on the
+// appointment. The redemption is recorded in giftbox_redemptions + giftbox_redemption_items.
+export type AppointmentGiftboxRedeem = {
+  instanceId: number;
+  giftboxItemId: number; // = giftbox_instance_items.giftbox_item_id (NOT the row's surrogate id)
+  serviceId: number;
+};
+
+// Apply the quick-booking GIFTBOX redeems for an appointment AS PART of the save. For
+// each requested redeem this RE-VALIDATES server-side (never trusting the client): the
+// giftbox instance exists, belongs to the appointment's client (recipient_client_id,
+// else client_id), is 'issued' + not expired; the item exists ON that instance for the
+// redeemed service (giftbox_instance_items WHERE instance_id + giftbox_item_id +
+// service_id), and the item's residual (qty - already-redeemed via giftBoxItemRedeemedUnits)
+// is > 0. On success it RECORDS the redemption — a giftbox_redemptions row (instance_id,
+// redeemed_at, source_type='appointment', source_id=appointmentId) + a
+// giftbox_redemption_items row (redemption_id, giftbox_item_id, qty 1), exactly the
+// tables the legacy GiftBox::redeemInstanceItems writes — so giftBoxItemRedeemedUnits
+// immediately reflects the consumption and the unit can never be double-redeemed. It
+// then links the matching appointment_services row (giftbox_instance_id + giftbox_item_id)
+// and zeroes its charge (price 0, list_price kept, 'GiftBox' badge). When the item is the
+// instance's LAST residual unit the instance is flipped to status='redeemed' (parity with
+// redeemInstanceItems). A redeem that fails validation is SKIPPED (collected as a warning)
+// and never fails the whole booking (legacy best-effort parity).
+//
+// `coveredServiceIds` are the services already covered by a PACKAGE or PREPAID redeem in
+// this same save — those are skipped so a service is covered at most once (dedupe). Like
+// the package/prepaid apply we additionally dedupe so a service is giftbox-covered by at
+// most one item (first wins). Faithful to api_appointments.php +
+// GiftBox::redeemInstanceItems, adapted to the Next port's consume-on-save + link.
+export async function applyAppointmentGiftboxRedeems({
+  slug,
+  appointmentId,
+  clientId,
+  serviceIds,
+  redeems,
+  coveredServiceIds,
+}: {
+  slug: string;
+  appointmentId: number;
+  clientId: number;
+  serviceIds: number[]; // service_ids actually on this appointment (the redeem is filtered to these)
+  redeems: AppointmentGiftboxRedeem[];
+  coveredServiceIds?: Set<number>; // services already covered by a package/prepaid redeem (skip)
+}): Promise<{ applied: AppointmentGiftboxRedeem[]; warnings: string[] }> {
+  const applied: AppointmentGiftboxRedeem[] = [];
+  const warnings: string[] = [];
+  if (!redeems.length) return { applied, warnings };
+
+  // The redemption recording tables must exist; without them we cannot consume a unit
+  // safely (the residual maths reads them), so we skip with a warning (best-effort).
+  const hasRedemptionTables =
+    (await tableExists((await tenantTable(slug, "giftbox_redemptions").catch(() => ({ name: "" } as TenantTable))).name)) &&
+    (await tableExists((await tenantTable(slug, "giftbox_redemption_items").catch(() => ({ name: "" } as TenantTable))).name));
+
+  // Only the appointment_services snapshot table can carry the linkage; if it lacks the
+  // giftbox columns (older installs) we still record + consume + log a warning.
+  const servicesTable = await tenantTable(slug, "appointment_services").catch(() => null);
+  const hasLinkColumns = servicesTable
+    ? (await columnExists(servicesTable.name, "giftbox_instance_id")) &&
+      (await columnExists(servicesTable.name, "giftbox_item_id"))
+    : false;
+
+  // Drop redeems for services not on this appointment, those a package/prepaid already
+  // covers, and dedupe so a service is covered by at most ONE giftbox item (first wins).
+  const onAppointment = new Set(serviceIds.filter((id) => id > 0));
+  const seenService = new Set<number>();
+
+  for (const redeem of redeems) {
+    const instanceId = Number(redeem.instanceId ?? 0);
+    const giftboxItemId = Number(redeem.giftboxItemId ?? 0);
+    const serviceId = Number(redeem.serviceId ?? 0);
+    if (instanceId <= 0 || giftboxItemId <= 0 || serviceId <= 0) continue;
+    if (!onAppointment.has(serviceId)) continue; // service not on the appointment
+    if (coveredServiceIds?.has(serviceId)) continue; // already covered by a package/prepaid
+    if (seenService.has(serviceId)) continue; // already covered by another giftbox item
+    seenService.add(serviceId);
+
+    if (!hasRedemptionTables) {
+      warnings.push("GiftBox: schema riscatti non disponibile su questo archivio.");
+      continue;
+    }
+
+    try {
+      // 1) Load the giftbox instance, tenant-scoped (tenantSelect scopes to the tenant).
+      const instanceRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instances",
+        columns: "id, client_id, recipient_client_id, status, issued_at, expires_at",
+        where: "id = ?",
+        params: [instanceId],
+        limit: 1,
+      });
+      const instance = instanceRows[0];
+      if (!instance) {
+        warnings.push("GiftBox non trovata.");
+        continue;
+      }
+
+      // 2) Ownership: the instance must belong to the appointment's client. The target
+      //    is recipient_client_id when set, else client_id (same rule the residuals block
+      //    + GiftBox::instanceBelongsToClient use).
+      const recipientId = Number(instance.recipient_client_id ?? 0);
+      const ownerId = Number(instance.client_id ?? 0);
+      const belongs = recipientId > 0 ? recipientId === clientId : ownerId === clientId;
+      if (!belongs) {
+        warnings.push("La GiftBox selezionata non appartiene al cliente.");
+        continue;
+      }
+
+      // 3) Status 'issued' + not yet valid? + not expired (parity with redeemInstanceItems).
+      const status = String(instance.status ?? "").toLowerCase();
+      if (status !== "issued" && status !== "active") {
+        warnings.push("GiftBox non riscattabile.");
+        continue;
+      }
+      const issuedYmd = instance.issued_at ? String(instance.issued_at).slice(0, 10) : "";
+      if (issuedYmd && issuedYmd > todayIso()) {
+        warnings.push("GiftBox non ancora valida.");
+        continue;
+      }
+      const expiresYmd = instance.expires_at ? String(instance.expires_at).slice(0, 10) : "";
+      if (expiresYmd && expiresYmd < todayIso()) {
+        warnings.push("GiftBox scaduta.");
+        continue;
+      }
+
+      // 4) Coverage: the item must exist ON this instance for the redeemed service, keyed
+      //    by the giftbox_instance_items.giftbox_item_id column (the threaded identifier,
+      //    NOT the row's surrogate id — faithful to qb_giftbox_item_remaining).
+      const itemRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instance_items",
+        columns: "giftbox_item_id, service_id, qty",
+        where: "instance_id = ? AND giftbox_item_id = ?",
+        params: [instanceId, giftboxItemId],
+        limit: 1,
+      });
+      const item = itemRows[0];
+      if (!item) {
+        warnings.push("Elemento GiftBox non valido.");
+        continue;
+      }
+      if (Number(item.service_id ?? 0) !== serviceId) {
+        warnings.push("La GiftBox selezionata non copre il servizio.");
+        continue;
+      }
+
+      // 5) Residual: item qty - already-redeemed (per item) must be > 0. Reading the
+      //    redemption tables means a unit recorded earlier in THIS save (an earlier
+      //    redeem of the same item) is already counted, so we never over-redeem.
+      const totalQty = Math.max(0, Number(item.qty ?? 0));
+      const redeemedQty = await giftBoxItemRedeemedUnits(slug, instanceId, giftboxItemId);
+      if (totalQty - redeemedQty <= 0) {
+        warnings.push("Unità GiftBox esaurite per l'elemento selezionato.");
+        continue;
+      }
+
+      // 6) RECORD the redemption: a header row + a single redemption-item row (qty 1).
+      //    This is the consume — it makes giftBoxItemRedeemedUnits reflect the unit.
+      const redemptionId = await tenantInsert(await tenantTable(slug, "giftbox_redemptions"), {
+        instance_id: instanceId,
+        redeemed_at: new Date(),
+        source_type: "appointment",
+        source_id: appointmentId,
+      });
+      if (redemptionId <= 0) {
+        warnings.push("GiftBox: impossibile registrare il riscatto.");
+        continue;
+      }
+      await tenantInsert(await tenantTable(slug, "giftbox_redemption_items"), {
+        redemption_id: redemptionId,
+        giftbox_item_id: giftboxItemId,
+        qty: 1,
+      });
+
+      // 7) If this item was the instance's LAST residual unit across ALL its items,
+      //    flip the instance to 'redeemed' (parity with redeemInstanceItems' allDone).
+      try {
+        const allItems = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "giftbox_instance_items",
+          columns: "giftbox_item_id, qty",
+          where: "instance_id = ?",
+          params: [instanceId],
+        });
+        let anyRemaining = false;
+        for (const it of allItems) {
+          const itId = Number(it.giftbox_item_id ?? 0);
+          if (itId <= 0) continue;
+          const used = await giftBoxItemRedeemedUnits(slug, instanceId, itId);
+          if (Math.max(0, Number(it.qty ?? 0)) - used > 0) {
+            anyRemaining = true;
+            break;
+          }
+        }
+        if (!anyRemaining) {
+          await tenantUpdate({
+            slug,
+            table: "giftbox_instances",
+            id: instanceId,
+            values: { status: "redeemed", redeemed_at: new Date(), redeemed_source_type: "appointment", redeemed_source_id: appointmentId },
+          });
+        }
+      } catch {
+        // best-effort: a status-flip failure must not fail the booking (unit is recorded).
+      }
+
+      // 8) Link the appointment_services row + zero its charge (keep list_price).
+      if (hasLinkColumns && servicesTable) {
+        await updateAppointmentServiceGiftboxLink(slug, servicesTable, appointmentId, serviceId, {
+          instanceId,
+          giftboxItemId,
+        });
+      } else {
+        warnings.push("Unità GiftBox consumata, ma il collegamento al servizio non è disponibile su questo archivio.");
+      }
+
+      applied.push({ instanceId, giftboxItemId, serviceId });
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : "Errore riscatto GiftBox.");
+    }
+  }
+
+  return { applied, warnings };
+}
+
+// Set the giftbox linkage on a single appointment_services row (keyed by the composite
+// appointment_id + service_id — the table has no surrogate id) and zero its charge:
+// price 0, list_price preserved as the catalog reference, and a 'GiftBox' discount_badge
+// (faithful to the legacy zero-charge presentation, mirroring the package/prepaid links).
+async function updateAppointmentServiceGiftboxLink(
+  slug: string,
+  table: TenantTable,
+  appointmentId: number,
+  serviceId: number,
+  link: { instanceId: number; giftboxItemId: number },
+): Promise<void> {
+  const assignments: string[] = [
+    "giftbox_instance_id = ?",
+    "giftbox_item_id = ?",
+    "price = 0",
+  ];
+  const params: unknown[] = [link.instanceId, link.giftboxItemId];
+  if (await columnExists(table.name, "discount_badge")) assignments.push("discount_badge = 'GiftBox'");
+  const clauses = ["appointment_id = ?", "service_id = ?"];
+  params.push(appointmentId, serviceId);
+  if (table.mode === "shared" && (await columnExists(table.name, "tenant_id"))) {
+    clauses.push("tenant_id = ?");
+    params.push(table.tenantId ?? 0);
+  }
+  await dbExecute(
+    `UPDATE ${quoteIdentifier(table.name)} SET ${assignments.join(", ")} WHERE ${clauses.join(" AND ")}`,
+    params,
+  );
+}
+
 // One entry from the quick-booking `giftcard_redeem` JSON array (assets/js/app.js
 // #qb_giftcard_redeem): apply a client's GiftCard BALANCE (a monetary amount) toward
 // the WHOLE appointment. Unlike package/prepaid (per-service units), this is
@@ -3072,6 +3365,46 @@ async function giftBoxRedeemedUnits(slug: string, instanceId: number): Promise<n
     const appointmentUnits = rows.reduce((sum, row) => sum + Math.max(1, Number(row.qty ?? 1)), 0);
     const manual = await tenantSelect<RowDataPacket>({ slug, table: "giftbox_redemptions", columns: "id", where: "instance_id = ?", params: [instanceId] });
     return appointmentUnits + manual.length;
+  } catch {
+    return 0;
+  }
+}
+
+// Units already REDEEMED for a SINGLE giftbox item (instance_id + the item's
+// giftbox_instance_items.giftbox_item_id value, NOT the row surrogate id). This is the
+// authoritative per-item redeemed count used to compute residual availability, exactly
+// like the legacy qb_giftbox_item_remaining: it sums giftbox_redemption_items.qty for
+// redemptions of that instance whose redemption-item targets that giftbox_item_id.
+//   SUM(ri.qty) FROM giftbox_redemptions r JOIN giftbox_redemption_items ri
+//     ON ri.redemption_id = r.id WHERE r.instance_id = ? AND ri.giftbox_item_id = ?
+// Recording one redeem (a giftbox_redemptions row + a giftbox_redemption_items row with
+// qty 1 for that giftbox_item_id) therefore makes this reflect the consumption — so we
+// never double-redeem a unit. Tolerates the redemption tables being absent (-> 0).
+async function giftBoxItemRedeemedUnits(slug: string, instanceId: number, giftboxItemId: number): Promise<number> {
+  if (instanceId <= 0 || giftboxItemId <= 0) return 0;
+  try {
+    const headerTable = await tenantTable(slug, "giftbox_redemptions");
+    const itemTable = await tenantTable(slug, "giftbox_redemption_items");
+    const clauses: string[] = ["r.instance_id = ?", "ri.giftbox_item_id = ?"];
+    const params: unknown[] = [instanceId, giftboxItemId];
+    // tenantSelect can only scope a single table; this is a JOIN, so scope BOTH
+    // shared-mode tables to the tenant explicitly (mirrors tenantSelect's guard).
+    if (headerTable.mode === "shared" && (await columnExists(headerTable.name, "tenant_id"))) {
+      clauses.push("r.tenant_id = ?");
+      params.push(headerTable.tenantId ?? 0);
+    }
+    if (itemTable.mode === "shared" && (await columnExists(itemTable.name, "tenant_id"))) {
+      clauses.push("ri.tenant_id = ?");
+      params.push(itemTable.tenantId ?? 0);
+    }
+    const rows = await dbQuery<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(ri.qty), 0) AS c
+         FROM ${quoteIdentifier(itemTable.name)} ri
+         JOIN ${quoteIdentifier(headerTable.name)} r ON r.id = ri.redemption_id
+        WHERE ${clauses.join(" AND ")}`,
+      params,
+    );
+    return Math.max(0, Number(rows[0]?.c ?? 0) || 0);
   } catch {
     return 0;
   }
@@ -4468,12 +4801,26 @@ export type QuickBookClientGiftcard = {
   balance: number;
 };
 
+// One available (redeemable) GiftBox ITEM for the per-service "Usa GiftBox" control
+// (returned by quickbook_client_context). GiftBox is per-service + ITEM-based (like a
+// package): each entry is a single item from an issued, non-expired instance that still
+// has a residual unit and covers exactly `service_id`. `instance_id` + `giftbox_item_id`
+// (the giftbox_instance_items.giftbox_item_id value) pin the redeem; `name` is the item /
+// service label for the option. The drawer offers it on the service it covers.
+export type QuickBookClientGiftbox = {
+  instance_id: number;
+  giftbox_item_id: number;
+  service_id: number;
+  name: string;
+};
+
 export type QuickBookClientContext = {
   history: QuickBookClientHistorySummary;
   residuals: QuickBookClientResidualsSummary;
   packages: QuickBookClientPackage[];
   prepaids: QuickBookClientPrepaid[];
   giftcards: QuickBookClientGiftcard[];
+  giftboxes: QuickBookClientGiftbox[];
 };
 
 // History summary — port of api_clients.php lines ~3926-3958:
@@ -4718,14 +5065,15 @@ export async function quickBookClientContext({
   locationId?: number;
 }): Promise<QuickBookClientContext> {
   if (clientId <= 0) throw new Error("client_id mancante");
-  const [history, residuals, packages, prepaids, giftcards] = await Promise.all([
+  const [history, residuals, packages, prepaids, giftcards, giftboxes] = await Promise.all([
     quickBookClientHistorySummary(slug, clientId),
     quickBookClientResidualsSummary(slug, clientId),
     quickBookClientPackages(slug, clientId),
     quickBookClientPrepaids(slug, clientId),
     quickBookClientGiftcards(slug, clientId),
+    quickBookClientGiftboxes(slug, clientId),
   ]);
-  return { history, residuals, packages, prepaids, giftcards };
+  return { history, residuals, packages, prepaids, giftcards, giftboxes };
 }
 
 // Available (redeemable) packages for a client, with the services each package
@@ -4908,6 +5256,76 @@ async function quickBookClientGiftcards(slug: string, clientId: number): Promise
       code: String(row.code ?? ""),
       balance,
     });
+  }
+  return out;
+}
+
+// Available (redeemable) GiftBox ITEMS for a client — drives the drawer's per-service
+// "Usa GiftBox" control. GiftBox is per-service + ITEM-based (like a package): a single
+// giftbox item covers ONE service, consuming one unit. This adapts the residuals giftbox
+// block (quickBookClientResidualsSummary), but exposes one entry PER ITEM (with its
+// service_id) so the drawer can offer a giftbox on the service it covers. Tenant-scoped
+// via tenantSelect; every read is guarded so a missing table/column degrades to an empty
+// list. "Available" mirrors the legacy rule exactly: the instance is status='issued' and
+// not expired and belongs to the client (recipient_client_id when set, else client_id),
+// and the item's residual (giftbox_instance_items.qty MINUS giftBoxItemRedeemedUnits for
+// that item) is > 0. Only SERVICE items (item_type='service' with a positive service_id)
+// are offerable. Mirrors qb_giftbox_item_remaining + the residuals giftbox computation.
+async function quickBookClientGiftboxes(slug: string, clientId: number): Promise<QuickBookClientGiftbox[]> {
+  if (clientId <= 0) return [];
+  let instances: RowDataPacket[] = [];
+  try {
+    if (!(await tableExists((await tenantTable(slug, "giftbox_instances")).name))) return [];
+    const instanceTable = await tenantTable(slug, "giftbox_instances");
+    const hasRecipient = await columnExists(instanceTable.name, "recipient_client_id");
+    const hasExpiry = await columnExists(instanceTable.name, "expires_at");
+    const target = hasRecipient
+      ? "(recipient_client_id = ? OR (recipient_client_id IS NULL AND client_id = ?))"
+      : "client_id = ?";
+    const params = hasRecipient ? [clientId, clientId] : [clientId];
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= NOW())" : "";
+    instances = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftbox_instances",
+      columns: "id",
+      where: `${target} AND status = 'issued'${expiry}`,
+      params,
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 100,
+    });
+  } catch {
+    return [];
+  }
+  if (instances.length === 0) return [];
+
+  const out: QuickBookClientGiftbox[] = [];
+  for (const inst of instances) {
+    const instanceId = Number(inst.id ?? 0);
+    if (instanceId <= 0) continue;
+    try {
+      const items = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instance_items",
+        columns: "giftbox_item_id, item_type, service_id, qty, custom_label",
+        where: "instance_id = ?",
+        params: [instanceId],
+        orderBy: "sort_order ASC, giftbox_item_id ASC",
+      });
+      for (const item of items) {
+        const itemType = String(item.item_type ?? "service");
+        if (itemType !== "service") continue; // only service items can cover a service
+        const giftboxItemId = Number(item.giftbox_item_id ?? 0);
+        const serviceId = Number(item.service_id ?? 0);
+        if (giftboxItemId <= 0 || serviceId <= 0) continue;
+        const totalQty = Math.max(0, Number(item.qty ?? 0));
+        const redeemed = await giftBoxItemRedeemedUnits(slug, instanceId, giftboxItemId);
+        if (totalQty - redeemed <= 0) continue; // exhausted -> not offerable
+        const label = String(item.custom_label ?? "") || (await serviceNameById(slug, serviceId, "Servizio"));
+        out.push({ instance_id: instanceId, giftbox_item_id: giftboxItemId, service_id: serviceId, name: label });
+      }
+    } catch {
+      // tolerate giftbox item/redemption tables being absent for this instance
+    }
   }
   return out;
 }

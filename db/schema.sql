@@ -177,6 +177,17 @@ CREATE TABLE "appointment_services" (
   -- (api.client_prepaid_service_id). A prepaid is tied to ONE service directly
   -- (client_prepaid_services.service_id), so there is no separate coverage row.
   "client_prepaid_service_id" integer,
+  -- GiftBox redeem linkage (quick-booking "Usa GiftBox"): when a service is covered
+  -- by ONE item from a client's giftbox the row is linked to the consumed giftbox
+  -- instance + the specific giftbox_instance_items.giftbox_item_id that was redeemed,
+  -- and its `price` is zeroed (the catalog price is preserved in list_price with a
+  -- 'GiftBox' discount_badge). The redemption itself is recorded in
+  -- giftbox_redemptions + giftbox_redemption_items (qty 1); these columns are only the
+  -- back-link on the appointment_services snapshot (parity with the package/prepaid
+  -- linkage above). GiftBox is per-service + ITEM-based (like a package), so each
+  -- covered service consumes exactly one giftbox item.
+  "giftbox_instance_id" integer,
+  "giftbox_item_id" integer,
   PRIMARY KEY ("tenant_id", "appointment_id", "service_id")
 );
 
