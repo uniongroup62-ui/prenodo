@@ -606,6 +606,17 @@ async function hoursLabel(slug: string, locationId: number | null, date: string)
 // (b) the booking's own active hold (excludeHoldToken). Without these exclusions a
 // save would conflict with itself / its own [Disponibilità] hold. The public slot
 // finder calls this with no exclusions, so its behavior is unchanged.
+//
+// M3 (segment-level staff conflicts): mirrors the legacy `staff_has_conflict_in_range`
+// (api_appointments.php:4213), which judges overlap per-SEGMENT (appointment_segments
+// windows) rather than against an appointment's single rolled-up span. We therefore
+// emit ONE busy range PER segment (its own staff_id + starts_at + ends_at), so a
+// multi-service appointment whose operator is busy in only one segment no longer
+// blocks the whole rolled-up window. Appointments that have NO segments fall back to
+// the appointment span with its aggregated appointment_staff ids (the legacy
+// "legacy-appointments-missing-a-segment" handling). The no-staff-range-blocks-everyone
+// rule is preserved by candidateFree (a range with an empty staffIds list blocks any
+// operator).
 async function busyRangesForDate(
   slug: string,
   date: string,
@@ -619,17 +630,29 @@ async function busyRangesForDate(
     : "starts_at::date = ? AND status NOT IN ('canceled','cancelled')";
   const appointmentParams = excludeAppointmentId ? [date, excludeAppointmentId] : [date];
 
+  const segmentWhere = excludeAppointmentId
+    ? "starts_at::date = ? AND appointment_id <> ?"
+    : "starts_at::date = ?";
+  const segmentParams = excludeAppointmentId ? [date, excludeAppointmentId] : [date];
+
   const holdWhere = excludeHoldToken
     ? "starts_at::date = ? AND status = 'active' AND expires_at > NOW() AND token <> ?"
     : "starts_at::date = ? AND status = 'active' AND expires_at > NOW()";
   const holdParams = excludeHoldToken ? [date, excludeHoldToken] : [date];
 
-  const [appointmentRows, holdRows] = await Promise.all([
+  const [appointmentRows, segmentRows, holdRows] = await Promise.all([
     tenantSelect<RowDataPacket>({
       slug,
       table: "appointments",
       where: appointmentWhere,
       params: appointmentParams,
+      orderBy: "starts_at ASC",
+    }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_segments",
+      where: segmentWhere,
+      params: segmentParams,
       orderBy: "starts_at ASC",
     }).catch(() => [] as RowDataPacket[]),
     tenantSelect<RowDataPacket>({
@@ -641,7 +664,31 @@ async function busyRangesForDate(
     }).catch(() => [] as RowDataPacket[]),
   ]);
 
-  const appointments = await Promise.all(appointmentRows.map(async (row) => ({
+  // Per-segment ranges (M3). Each segment contributes a busy range for ITS OWN
+  // staff only. Segments WITHOUT a real operator (staff_id 0/null — the "Senza
+  // Operatore" case) do NOT constrain any specific operator and are dropped: the
+  // legacy `staff_has_conflict_in_range` segment query matches `sg.staff_id = ?`
+  // (the requested staff) and treats SSO as never-busy (is_sso_staff short-circuit),
+  // so an unassigned segment must NOT block everyone. The conservative
+  // "no-staff-range-blocks-everyone" rule applies only to legacy whole-appointment
+  // ranges (the fallback below) and holds, mirroring the legacy clause 3.
+  const segmentRanges: BusyRange[] = segmentRows
+    .filter((row) => nullableNumber(row.staff_id))
+    .map((row) => ({
+      start: timeToMinutes(timeFromSql(row.starts_at)),
+      end: timeToMinutes(timeFromSql(row.ends_at)),
+      locationId: null,
+      staffIds: [Number(row.staff_id)],
+    }));
+  // Appointment ids that already have at least one segment row for the date — those
+  // appointments are represented by their segments, so we skip their rolled-up span.
+  const appointmentsWithSegments = new Set<number>(
+    segmentRows.map((row) => Number(row.appointment_id ?? 0)).filter((id) => id > 0),
+  );
+
+  // Appointment-span fallback ONLY for appointments missing segments (legacy bookings).
+  const fallbackAppointments = appointmentRows.filter((row) => !appointmentsWithSegments.has(Number(row.id ?? 0)));
+  const appointments = await Promise.all(fallbackAppointments.map(async (row) => ({
     start: timeToMinutes(timeFromSql(row.starts_at)),
     end: timeToMinutes(timeFromSql(row.ends_at)),
     locationId: nullableNumber(row.location_id),
@@ -655,7 +702,233 @@ async function busyRangesForDate(
     staffIds: parseNumberArray(row.staff_ids_json),
   }));
 
-  return [...appointments, ...holds].filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start);
+  return [...segmentRanges, ...appointments, ...holds].filter(
+    (range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start,
+  );
+}
+
+// H2 (cabin double-booking): mirrors the legacy `occupied_cabin_ids_for_range`
+// (api_appointments.php:2770). Gathers the date's busy CABIN ranges so a save/move
+// can refuse booking a cabin already taken in the same window. Sources, like the
+// legacy: (1) appointment_segments.cabin_id (per-segment occupancy), (2) the
+// appointments.cabin_id span for appointments WITHOUT segments (legacy fallback),
+// and (3) active holds' reserved cabins (cabin_ids_json). Same exclusions as
+// busyRangesForDate (the edited appointment + the booking's own hold). Best-effort:
+// a failed/missing query yields no ranges (never blocks).
+type CabinBusyRange = { start: number; end: number; locationId: number | null; cabinId: number };
+
+async function busyCabinRangesForDate(
+  slug: string,
+  date: string,
+  options: { excludeAppointmentId?: number | null; excludeHoldToken?: string | null } = {},
+): Promise<CabinBusyRange[]> {
+  const excludeAppointmentId = options.excludeAppointmentId && options.excludeAppointmentId > 0 ? options.excludeAppointmentId : null;
+  const excludeHoldToken = (options.excludeHoldToken ?? "").trim();
+
+  const appointmentWhere = excludeAppointmentId
+    ? "starts_at::date = ? AND status NOT IN ('canceled','cancelled') AND id <> ?"
+    : "starts_at::date = ? AND status NOT IN ('canceled','cancelled')";
+  const appointmentParams = excludeAppointmentId ? [date, excludeAppointmentId] : [date];
+
+  const segmentWhere = excludeAppointmentId
+    ? "starts_at::date = ? AND appointment_id <> ?"
+    : "starts_at::date = ?";
+  const segmentParams = excludeAppointmentId ? [date, excludeAppointmentId] : [date];
+
+  const holdWhere = excludeHoldToken
+    ? "starts_at::date = ? AND status = 'active' AND expires_at > NOW() AND token <> ?"
+    : "starts_at::date = ? AND status = 'active' AND expires_at > NOW()";
+  const holdParams = excludeHoldToken ? [date, excludeHoldToken] : [date];
+
+  const [appointmentRows, segmentRows, holdRows] = await Promise.all([
+    tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointments",
+      where: appointmentWhere,
+      params: appointmentParams,
+      orderBy: "starts_at ASC",
+    }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_segments",
+      where: segmentWhere,
+      params: segmentParams,
+      orderBy: "starts_at ASC",
+    }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_holds",
+      where: holdWhere,
+      params: holdParams,
+      orderBy: "starts_at ASC",
+    }).catch(() => [] as RowDataPacket[]),
+  ]);
+
+  const out: CabinBusyRange[] = [];
+
+  // (1) Per-segment cabins.
+  for (const row of segmentRows) {
+    const cabinId = nullableNumber(row.cabin_id);
+    if (!cabinId) continue;
+    out.push({
+      start: timeToMinutes(timeFromSql(row.starts_at)),
+      end: timeToMinutes(timeFromSql(row.ends_at)),
+      locationId: null,
+      cabinId,
+    });
+  }
+
+  // (2) Appointment-level cabin for appointments WITHOUT segments (legacy fallback).
+  const appointmentsWithSegments = new Set<number>(
+    segmentRows.map((row) => Number(row.appointment_id ?? 0)).filter((id) => id > 0),
+  );
+  for (const row of appointmentRows) {
+    if (appointmentsWithSegments.has(Number(row.id ?? 0))) continue;
+    const cabinId = nullableNumber(row.cabin_id);
+    if (!cabinId) continue;
+    out.push({
+      start: timeToMinutes(timeFromSql(row.starts_at)),
+      end: timeToMinutes(timeFromSql(row.ends_at)),
+      locationId: nullableNumber(row.location_id),
+      cabinId,
+    });
+  }
+
+  // (3) Active holds' reserved cabins.
+  for (const row of holdRows) {
+    const cabinIds = parseNumberArray(row.cabin_ids_json);
+    if (!cabinIds.length) continue;
+    const start = timeToMinutes(timeFromSql(row.starts_at));
+    const end = timeToMinutes(timeFromSql(row.ends_at));
+    const locationId = nullableNumber(row.location_id);
+    for (const cabinId of cabinIds) out.push({ start, end, locationId, cabinId });
+  }
+
+  return out.filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start);
+}
+
+// H3 time-off (HARD block): mirrors the legacy `staff_timeoff_reason_for_range`
+// (api_appointments.php:3479). Returns the time-off reason (ferie/malattia/assenza)
+// when the staff has any staff_timeoff window overlapping [start,end] on this date,
+// else null. Always enforced (cannot be overridden). Best-effort: a failed query
+// returns null (never blocks). Compared in minutes-of-day within the single date,
+// matching the rest of this guard.
+async function staffTimeoffReasonForRange(
+  slug: string,
+  staffId: number,
+  date: string,
+  start: number,
+  end: number,
+): Promise<string | null> {
+  if (staffId <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "staff_timeoff",
+    columns: "starts_at, ends_at, reason",
+    where: "staff_id = ? AND starts_at::date <= ? AND ends_at::date >= ?",
+    params: [staffId, date, date],
+    orderBy: "starts_at ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  for (const row of rows) {
+    const offStart = timeToMinutes(timeFromSql(row.starts_at));
+    const offEnd = timeToMinutes(timeFromSql(row.ends_at));
+    // A timeoff window may span the whole day (or multiple days). For a multi-day
+    // window whose start/end fall outside this date, treat it as covering the day.
+    const offStartDay = dateFromSql(row.starts_at);
+    const offEndDay = dateFromSql(row.ends_at);
+    const effStart = offStartDay < date ? 0 : offStart;
+    const effEnd = offEndDay > date ? 24 * 60 : offEnd;
+    if (!Number.isFinite(effStart) || !Number.isFinite(effEnd)) continue;
+    if (overlaps(start, end, effStart, effEnd)) {
+      const reason = String(row.reason ?? "").trim();
+      return reason !== "" ? reason : "Non disponibile";
+    }
+  }
+  return null;
+}
+
+// H3 shift (SOFT block): mirrors the legacy `staff_schedule_reason_for_range`
+// (lib/Helpers.php:6935) reached via staff_timeoff_reason_for_range when
+// includeSchedule is true. If the staff uses the availability feature (has any
+// staff_availability row), a day with NO availability interval means NOT available,
+// and a segment outside all the day's intervals is "Fuori turno". Returns the
+// "Fuori turno" string or null. Best-effort: a failed query returns null. Only
+// consulted when includeSchedule is true (the legacy override path: bookings that
+// fit inside business hours enforce the shift; out-of-hours override bookings skip
+// it — appt_include_staff_schedule_for_range, api_appointments.php:3598).
+async function staffScheduleReasonForRange(
+  slug: string,
+  staffId: number,
+  date: string,
+  start: number,
+  end: number,
+  locationId: number | null,
+): Promise<string | null> {
+  if (staffId <= 0) return null;
+  // Does this operator use the availability feature at all (this location or global)?
+  const anyRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "staff_availability",
+    columns: "id",
+    where: locationId
+      ? "staff_id = ? AND (location_id = ? OR location_id IS NULL)"
+      : "staff_id = ?",
+    params: locationId ? [staffId, locationId] : [staffId],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  if (!anyRows.length) return null; // legacy: no availability configured → unconstrained.
+
+  // Availability intervals for THIS date (minutes-of-day). presenza overrides turno.
+  const dayRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "staff_availability",
+    columns: "kind, starts_at, ends_at, location_id",
+    where: locationId
+      ? "staff_id = ? AND (location_id = ? OR location_id IS NULL) AND starts_at::date <= ? AND ends_at::date >= ?"
+      : "staff_id = ? AND starts_at::date <= ? AND ends_at::date >= ?",
+    params: locationId ? [staffId, locationId, date, date] : [staffId, date, date],
+    orderBy: "starts_at ASC",
+  }).catch(() => [] as RowDataPacket[]);
+
+  // Prefer location-specific rows when a location is in play (legacy specific filter).
+  let rows = dayRows;
+  if (locationId) {
+    const specific = dayRows.filter((row) => Number(row.location_id ?? 0) === locationId);
+    if (specific.length) rows = specific;
+  }
+
+  const presence = rows.filter((row) => String(row.kind ?? "").trim().toLowerCase() === "presenza");
+  const used = presence.length ? presence : rows;
+
+  const intervals: Array<[number, number]> = [];
+  for (const row of used) {
+    const rowStartDay = dateFromSql(row.starts_at);
+    const rowEndDay = dateFromSql(row.ends_at);
+    const s = rowStartDay < date ? 0 : timeToMinutes(timeFromSql(row.starts_at));
+    const e = rowEndDay > date ? 24 * 60 : timeToMinutes(timeFromSql(row.ends_at));
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) continue;
+    intervals.push([s, e]);
+  }
+
+  // Legacy: no interval that day → operator NOT available → "Fuori turno".
+  if (!intervals.length) return "Fuori turno";
+
+  // Union must fully cover [start, end] (intervals_cover_range). Merge then test.
+  intervals.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of intervals) {
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  let cursor = start;
+  for (const [s, e] of merged) {
+    if (s > cursor) break;
+    if (e >= end) return null; // fully covered
+    if (e > cursor) cursor = e;
+  }
+  if (cursor >= end) return null;
+  return "Fuori turno";
 }
 
 async function appointmentStaffIds(slug: string, appointmentId: number): Promise<number[]> {
@@ -696,18 +969,31 @@ export type AppointmentSlotSegment = {
   startsAt: string;
   endsAt: string;
   locationId?: number | null;
+  // H2: the cabin this segment occupies (appointments.cabin_id primary / per-segment
+  // cabin). Optional so legacy callers compile; a positive value enables the cabin
+  // double-booking check for the segment.
+  cabinId?: number | null;
 };
 
-// Double-booking guard for the manage save (quick-booking drawer + any save).
-// Faithful to the legacy, which enforces operator availability before booking.
-// Gathers the date's busy ranges EXCLUDING the appointment being edited
-// (excludeAppointmentId) and the booking's own active hold (excludeHoldToken), then
-// for EACH segment with a positive staffId checks the staff-overlap rule
-// (candidateFree, same-location) against those ranges. Segments with no operator are
-// skipped (an unassigned operator can't be double-booked — matching the slot
-// finder, which treats no-staff ranges specially). Throws a clear Italian error on
-// the first detected overlap. Best-effort: a failed busy-range query (missing table)
-// never blocks the booking — only a REAL detected overlap throws.
+// Resource-availability guard for the manage save (quick-booking drawer + any save /
+// move / resize). Faithful to the legacy guards run on every save/move:
+//
+//  * STAFF OVERLAP (M3): per-segment, via candidateFree against the date's busy
+//    ranges (now per-segment too) — `staff_has_conflict_in_range` (api_appointments.php:4213).
+//  * CABIN (H2, HARD): refuse a segment whose cabin overlaps a busy cabin range —
+//    `occupied_cabin_ids_for_range` / `resolve_cabin_id_for_range` (:2770 / :3117).
+//  * TIME-OFF (H3, HARD): refuse a staffed segment overlapping any staff_timeoff
+//    window — `staff_timeoff_reason_for_range` (:3479). Cannot be overridden.
+//  * SHIFT (H3, SOFT): refuse a staffed segment outside the staff's staff_availability
+//    intervals — `staff_schedule_reason_for_range` (Helpers.php:6935), but ONLY when
+//    the segment fits inside business hours (`appt_include_staff_schedule_for_range`,
+//    :3598); out-of-business-hours override bookings skip the shift check (and the
+//    manage save passes this same include flag, so we mirror it rather than inventing
+//    a stricter rule).
+//
+// Excludes the appointment being edited (excludeAppointmentId) and the booking's own
+// active hold (excludeHoldToken). Best-effort throughout: a failed/missing-table query
+// never blocks a booking — only a REAL detected conflict throws.
 export async function assertAppointmentSlotAvailable({
   slug,
   date,
@@ -721,24 +1007,88 @@ export async function assertAppointmentSlotAvailable({
   excludeAppointmentId?: number | null;
   excludeHoldToken?: string | null;
 }): Promise<void> {
-  // Only segments with a real assigned operator can conflict.
-  const staffedSegments = segments.filter((seg) => typeof seg.staffId === "number" && (seg.staffId ?? 0) > 0);
-  if (staffedSegments.length === 0) return;
+  const normSegments = segments
+    .map((seg) => {
+      const start = timeToMinutes(timeFromSql(seg.startsAt));
+      const end = timeToMinutes(timeFromSql(seg.endsAt));
+      const staffId = typeof seg.staffId === "number" && (seg.staffId ?? 0) > 0 ? (seg.staffId as number) : 0;
+      const cabinId = nullableNumber(seg.cabinId === undefined ? null : seg.cabinId) ?? 0;
+      const locationId = seg.locationId === undefined ? null : nullableNumber(seg.locationId);
+      return { start, end, staffId, cabinId, locationId };
+    })
+    .filter((seg) => Number.isFinite(seg.start) && Number.isFinite(seg.end) && seg.end > seg.start);
+  if (normSegments.length === 0) return;
 
-  const busyRanges = await busyRangesForDate(slug, date, { excludeAppointmentId, excludeHoldToken });
-  // No ranges to compare against (or the query failed silently): nothing to block.
-  if (busyRanges.length === 0) return;
+  const staffedSegments = normSegments.filter((seg) => seg.staffId > 0);
+  const cabinSegments = normSegments.filter((seg) => seg.cabinId > 0);
 
+  // Gather only the resource ranges we actually need (best-effort, each guarded).
+  const [busyRanges, cabinRanges] = await Promise.all([
+    staffedSegments.length
+      ? busyRangesForDate(slug, date, { excludeAppointmentId, excludeHoldToken }).catch(() => [] as BusyRange[])
+      : Promise.resolve([] as BusyRange[]),
+    cabinSegments.length
+      ? busyCabinRangesForDate(slug, date, { excludeAppointmentId, excludeHoldToken }).catch(() => [] as CabinBusyRange[])
+      : Promise.resolve([] as CabinBusyRange[]),
+  ]);
+
+  // --- STAFF OVERLAP (M3) ---
   for (const seg of staffedSegments) {
-    const staffId = seg.staffId as number;
-    const start = timeToMinutes(timeFromSql(seg.startsAt));
-    const end = timeToMinutes(timeFromSql(seg.endsAt));
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-    const locationId = seg.locationId === undefined ? null : nullableNumber(seg.locationId);
-    const conflict = firstConflictingRange(staffId, start, end, locationId, busyRanges);
+    if (!busyRanges.length) break;
+    const conflict = firstConflictingRange(seg.staffId, seg.start, seg.end, seg.locationId, busyRanges);
     if (conflict) {
       throw new Error(
         `Operatore già occupato dalle ${minutesToTime(conflict.start)} alle ${minutesToTime(conflict.end)}. Scegli un altro orario o operatore.`,
+      );
+    }
+  }
+
+  // --- CABIN (H2, HARD) ---
+  for (const seg of cabinSegments) {
+    if (!cabinRanges.length) break;
+    const busy = cabinRanges.find(
+      (range) => range.cabinId === seg.cabinId && sameLocation(seg.locationId, range.locationId) && overlaps(seg.start, seg.end, range.start, range.end),
+    );
+    if (busy) {
+      throw new Error(
+        `Cabina già occupata dalle ${minutesToTime(busy.start)} alle ${minutesToTime(busy.end)}. Scegli un'altra cabina o orario.`,
+      );
+    }
+  }
+
+  if (staffedSegments.length === 0) return;
+
+  // --- TIME-OFF (H3, HARD) + SHIFT (H3, SOFT) ---
+  // includeSchedule mirrors appt_include_staff_schedule_for_range: the shift is only
+  // enforced for segments that fit inside the day's business hours. Compute once per
+  // location used by the staffed segments.
+  const businessByLocation = new Map<number, Array<[number, number]>>();
+  async function intervalsFor(locationId: number | null): Promise<Array<[number, number]>> {
+    const key = locationId ?? 0;
+    const cached = businessByLocation.get(key);
+    if (cached) return cached;
+    const intervals = await businessIntervals(slug, locationId, date).catch(() => [] as Array<[number, number]>);
+    businessByLocation.set(key, intervals);
+    return intervals;
+  }
+
+  for (const seg of staffedSegments) {
+    // HARD time-off (always enforced).
+    const timeoffReason = await staffTimeoffReasonForRange(slug, seg.staffId, date, seg.start, seg.end);
+    if (timeoffReason) {
+      throw new Error(
+        `Prenotazione non creata: l'operatore risulta non disponibile (${timeoffReason}) nel giorno/orario selezionato.`,
+      );
+    }
+
+    // SOFT shift: only when the segment fits inside the day's business hours.
+    const intervals = await intervalsFor(seg.locationId);
+    const includeSchedule = intervals.some(([s, e]) => seg.start >= s && seg.end <= e);
+    if (!includeSchedule) continue;
+    const shiftReason = await staffScheduleReasonForRange(slug, seg.staffId, date, seg.start, seg.end, seg.locationId);
+    if (shiftReason) {
+      throw new Error(
+        `Prenotazione non creata: l'operatore risulta non disponibile (${shiftReason}) nel giorno/orario selezionato.`,
       );
     }
   }

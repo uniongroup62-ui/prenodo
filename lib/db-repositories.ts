@@ -1400,7 +1400,7 @@ export async function createDbAppointment({
   await assertAppointmentSlotAvailable({
     slug,
     date,
-    segments: plan.segments.map((seg) => ({ staffId: seg.staffId, startsAt: seg.startsAt, endsAt: seg.endsAt, locationId })),
+    segments: plan.segments.map((seg) => ({ staffId: seg.staffId, startsAt: seg.startsAt, endsAt: seg.endsAt, locationId, cabinId: seg.cabinId })),
     excludeHoldToken: token || null,
   });
   const appointments = await tenantTable(slug, "appointments");
@@ -1609,7 +1609,7 @@ export async function updateDbAppointment({
   await assertAppointmentSlotAvailable({
     slug,
     date,
-    segments: plan.segments.map((seg) => ({ staffId: seg.staffId, startsAt: seg.startsAt, endsAt: seg.endsAt, locationId })),
+    segments: plan.segments.map((seg) => ({ staffId: seg.staffId, startsAt: seg.startsAt, endsAt: seg.endsAt, locationId, cabinId: seg.cabinId })),
     excludeAppointmentId: id,
     excludeHoldToken: token || null,
   });
@@ -1771,7 +1771,7 @@ export async function resizeDbAppointmentEnd(slug: string, id: number, newEndTim
   const rows = await tenantSelect<RowDataPacket>({
     slug,
     table: "appointments",
-    columns: "id, starts_at, status, location_id",
+    columns: "id, starts_at, status, location_id, cabin_id",
     where: "id = ?",
     params: [id],
     limit: 1,
@@ -1799,6 +1799,10 @@ export async function resizeDbAppointmentEnd(slug: string, id: number, newEndTim
   }
   const endSql = `${startDateIso} ${endHHMM}:00`;
   const locationId = row.location_id === null || row.location_id === undefined ? null : Number(row.location_id);
+  // Appointment-level cabin (single-service bookings keep the cabin on appointments,
+  // not necessarily on the segment row) — used as the trailing segment's cabin
+  // fallback so the resize cabin check still applies.
+  const appointmentCabinId = row.cabin_id === null || row.cabin_id === undefined ? 0 : Number(row.cabin_id) || 0;
 
   // Read the appointment's segments (ordered) so we can (a) re-run the overlap
   // check with the trailing segment stretched and (b) know which segment row to
@@ -1809,7 +1813,7 @@ export async function resizeDbAppointmentEnd(slug: string, id: number, newEndTim
     segments = await tenantSelect<RowDataPacket>({
       slug,
       table: "appointment_segments",
-      columns: "id, staff_id, starts_at, ends_at, position",
+      columns: "id, staff_id, cabin_id, starts_at, ends_at, position",
       where: "appointment_id = ?",
       params: [id],
       orderBy: "position ASC, id ASC",
@@ -1822,13 +1826,19 @@ export async function resizeDbAppointmentEnd(slug: string, id: number, newEndTim
   // own staffed segments, with the LAST segment extended to the new end (the only
   // one whose window grows). Earlier segments are unchanged. Excludes THIS appointment.
   const checkSegments: AppointmentSlotSegment[] = segments.length
-    ? segments.map((seg, idx) => ({
-        staffId: seg.staff_id === null || seg.staff_id === undefined ? null : Number(seg.staff_id),
-        startsAt: sqlDateTimePrefix(seg.starts_at),
-        endsAt: idx === segments.length - 1 ? `${startDateIso} ${endHHMM}` : sqlDateTimePrefix(seg.ends_at),
-        locationId,
-      }))
-    : [{ staffId: null, startsAt: `${startDateIso} ${normalizeTime(timeLocal(start))}`, endsAt: `${startDateIso} ${endHHMM}`, locationId }];
+    ? segments.map((seg, idx) => {
+        const segCabin = seg.cabin_id === null || seg.cabin_id === undefined ? 0 : Number(seg.cabin_id) || 0;
+        return {
+          staffId: seg.staff_id === null || seg.staff_id === undefined ? null : Number(seg.staff_id),
+          // Only the trailing (extended) segment can newly collide with a cabin; for
+          // it, fall back to the appointment-level cabin when the segment has none.
+          cabinId: segCabin > 0 ? segCabin : (idx === segments.length - 1 ? appointmentCabinId : 0) || null,
+          startsAt: sqlDateTimePrefix(seg.starts_at),
+          endsAt: idx === segments.length - 1 ? `${startDateIso} ${endHHMM}` : sqlDateTimePrefix(seg.ends_at),
+          locationId,
+        };
+      })
+    : [{ staffId: null, cabinId: appointmentCabinId || null, startsAt: `${startDateIso} ${normalizeTime(timeLocal(start))}`, endsAt: `${startDateIso} ${endHHMM}`, locationId }];
   await assertAppointmentSlotAvailable({
     slug,
     date: startDateIso,
