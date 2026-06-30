@@ -14,6 +14,9 @@ frontend:
         - npm ci
     build:
       commands:
+        # The project's type-check/build needs more heap than Node's default
+        # (a default-heap build OOMs); raise it so the Amplify build doesn't fail.
+        - export NODE_OPTIONS=--max-old-space-size=4096
         - npm run build
   artifacts:
     baseDirectory: .next
