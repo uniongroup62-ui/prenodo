@@ -7,6 +7,7 @@ import {
   deleteProduct,
   deleteProductCategory,
   deleteSupplier,
+  getManageProduct,
   getManageProductsContext,
   saveProduct,
   saveProductCategory,
@@ -28,6 +29,18 @@ export async function GET(request: Request) {
 
   try {
     const url = new URL(request.url);
+
+    // Edit-form prefill: return ONE product's editable fields for one id. Port of
+    // products.php action=edit. Gated by products.manage like the save action.
+    if (url.searchParams.get("action") === "get") {
+      if (!can(session.user.perms, "products.manage")) return jsonError("Permesso Magazzino richiesto.", 403);
+      const productId = parseInteger(url.searchParams.get("id"), 0);
+      if (productId <= 0) return jsonError("ID prodotto mancante.");
+      const product = await getManageProduct(tenantSlug, productId);
+      if (!product) return jsonError("Prodotto non trovato.", 404);
+      return Response.json({ ok: true, source: "products?action=get", sourceMode: "database", product });
+    }
+
     const locationId = await resolveManageLocationId({
       slug: tenantSlug,
       raw: url.searchParams.get("location_id"),
@@ -56,6 +69,7 @@ export async function POST(request: Request) {
     switch (action) {
       case "create":
       case "new":
+      case "save":
       case "update":
       case "edit":
       case "product_save":

@@ -18,6 +18,7 @@ import { GiftcardContent } from "@/components/modules/giftcard-content";
 import { GiftsContent } from "@/components/modules/gifts-content";
 import { HoursContent } from "@/components/modules/hours-content";
 import { ProductsContent } from "@/components/modules/products-content";
+import { ProductFormContent } from "@/components/modules/product_form-content";
 import { StaffContent } from "@/components/modules/staff-content";
 import { ResourcesContent } from "@/components/modules/resources-content";
 import { GiftboxContent } from "@/components/modules/giftbox-content";
@@ -196,6 +197,17 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ServiceFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful product NEW / EDIT form. The products list links to
+  // index.php?page=products&action=new|edit; route those to the faithful editor
+  // (instead of the Tailwind ManagementApp fallback).
+  if (page === "products" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <ProductFormContent />
       </ManageShell>
     );
   }

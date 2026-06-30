@@ -153,6 +153,17 @@ export async function getManageProductsContext(slug: string, options: { query?: 
   };
 }
 
+// Edit-form prefill: return ONE product's editable fields for one id. Port of
+// products.php action=edit (loads the products row + its enabled locations). The
+// list pipeline (listProducts) already exposes every editable field as a
+// ProductRow, so we reuse it and narrow by id. locationId 0 keeps min_stock /
+// reorder_qty at the product-level values (faithful to the form defaults).
+export async function getManageProduct(slug: string, productId: number): Promise<ProductRow | null> {
+  if (productId <= 0) return null;
+  const products = await listProducts(slug, { query: "", locationId: 0, includeInactive: true });
+  return products.find((product) => product.id === productId) ?? null;
+}
+
 export async function saveProduct(slug: string, body: Record<string, string>): Promise<ManageProductsContext> {
   const table = await tenantTable(slug, "products");
   const id = parseInteger(body.id ?? body.product_id, 0);
