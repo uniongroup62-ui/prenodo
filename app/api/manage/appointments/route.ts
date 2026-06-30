@@ -15,6 +15,7 @@ import {
   updateDbAppointmentStatus,
   type AppointmentPackageRedeem,
   type AppointmentPrepaidRedeem,
+  type AppointmentGiftcardRedeem,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -316,6 +317,12 @@ export async function POST(request: Request) {
     // redeem is skipped there (one service is covered once).
     const prepaidRedeems = parsePrepaidRedeem(body.prepaid_service_redeem);
     const prepaidWarnings: string[] = [];
+    // Quick-booking GIFTCARD redeem (#qb_giftcard_redeem JSON array): an
+    // APPOINTMENT-LEVEL request to apply the client's giftcard BALANCE (a monetary
+    // amount) toward the appointment. Parsed here, re-validated + clamped + the
+    // giftcard decremented server-side inside createDbAppointment (never trusted).
+    const giftcardRedeems = parseGiftcardRedeem(body.giftcard_redeem);
+    const giftcardWarnings: string[] = [];
     let serviceNames = parseServiceNamesFromBody(body);
     if (serviceIds.length > 0) {
       // `service_ids` is unambiguous (no comma-in-name issue) so it wins when sent.
@@ -347,6 +354,8 @@ export async function POST(request: Request) {
       packageWarnings,
       prepaidRedeems,
       prepaidWarnings,
+      giftcardRedeems,
+      giftcardWarnings,
     };
 
     let appointment;
@@ -382,6 +391,9 @@ export async function POST(request: Request) {
       // Per-prepaid-redeem skip messages (prepaid not covering / exhausted / already
       // covered by a package): same best-effort parity; the drawer may show them.
       ...(prepaidWarnings.length > 0 ? { prepaidWarnings } : {}),
+      // GiftCard-redeem skip messages (not the client's / expired / no balance /
+      // nothing payable / clamped to 0): same best-effort parity; drawer may show them.
+      ...(giftcardWarnings.length > 0 ? { giftcardWarnings } : {}),
     });
   } catch (error) {
     return Response.json(
@@ -580,6 +592,45 @@ function parsePrepaidRedeem(raw: unknown): AppointmentPrepaidRedeem[] {
     if (seenService.has(serviceId)) continue;
     seenService.add(serviceId);
     out.push({ clientPrepaidServiceId, serviceId });
+  }
+  return out;
+}
+
+// Parse the quick-booking `giftcard_redeem` payload — a JSON array (or already an
+// array) of { giftcard_id, amount } items — into AppointmentGiftcardRedeem[]. Mirrors
+// assets/js/app.js #qb_giftcard_redeem (and parseRequestBody stringifies body values,
+// so the drawer sends this as a JSON STRING, handled here). GiftCard is
+// APPOINTMENT-LEVEL + MONETARY: one giftcard, one amount (NOT per-service). Items
+// missing a positive giftcard_id are dropped; the amount is coerced to a non-negative
+// number (the real clamp to min(balance, payableTotal) happens server-side in
+// applyAppointmentGiftcardRedeem — this only shapes the input). Also accepts the
+// legacy `id` alias for the giftcard id and `used_amount`/`used` aliases for the
+// amount (qbOpenGiftcardInfo passes usedAmount).
+function parseGiftcardRedeem(raw: unknown): AppointmentGiftcardRedeem[] {
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      source = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(source)) return [];
+  const out: AppointmentGiftcardRedeem[] = [];
+  const seen = new Set<number>();
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    const giftcardId = Number.parseInt(String(entry.giftcard_id ?? entry.id ?? ""), 10);
+    if (!Number.isFinite(giftcardId) || giftcardId <= 0) continue;
+    if (seen.has(giftcardId)) continue; // dedupe a giftcard (one per appointment anyway)
+    seen.add(giftcardId);
+    const amount = Number.parseFloat(
+      String(entry.amount ?? entry.used_amount ?? entry.used ?? "").replace(",", "."),
+    );
+    out.push({ giftcardId, amount: Number.isFinite(amount) && amount > 0 ? amount : 0 });
   }
   return out;
 }

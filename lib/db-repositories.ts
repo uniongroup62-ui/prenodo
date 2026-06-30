@@ -404,6 +404,14 @@ export type MultiServiceAppointmentInput = {
   prepaidRedeems?: AppointmentPrepaidRedeem[];
   // Mutable collector the save pushes per-prepaid-redeem skip warnings into. Optional.
   prepaidWarnings?: string[];
+  // Quick-booking GIFTCARD redeem (assets/js/app.js #qb_giftcard_redeem): an
+  // APPOINTMENT-LEVEL request to apply a client's giftcard BALANCE (a monetary amount)
+  // toward the whole appointment (NOT per-service). Re-validated + the giftcard
+  // decremented server-side as part of the save (see applyAppointmentGiftcardRedeem).
+  // Only ONE giftcard per appointment (first valid). Optional/empty -> unchanged.
+  giftcardRedeems?: AppointmentGiftcardRedeem[];
+  // Mutable collector the save pushes giftcard-redeem skip warnings into. Optional.
+  giftcardWarnings?: string[];
 };
 
 // Resolved multi-service plan: the ordered services, the per-position segment
@@ -518,6 +526,8 @@ export async function createDbAppointment({
   packageWarnings,
   prepaidRedeems = [],
   prepaidWarnings,
+  giftcardRedeems = [],
+  giftcardWarnings,
 }: {
   slug: string;
   clientName: string;
@@ -613,6 +623,21 @@ export async function createDbAppointment({
       coveredServiceIds: packageCoveredServiceIds,
     });
     if (prepaidWarnings) prepaidWarnings.push(...warnings);
+  }
+  // GIFTCARD redeem: re-validate + decrement + link AFTER the appointment_services
+  // rows (and any package/prepaid zeroing) exist, because the payable total is
+  // computed server-side from those rows (so a service zero-charged by a package/
+  // prepaid never counts toward the giftcard cap). Appointment-level + monetary:
+  // ONE giftcard per appointment (first valid), capped at min(balance, payableTotal).
+  // Invalid -> warning, never fails the booking (legacy best-effort parity).
+  if (giftcardRedeems.length > 0) {
+    const { warnings } = await applyAppointmentGiftcardRedeem({
+      slug,
+      appointmentId: id,
+      clientId: client.id,
+      redeems: giftcardRedeems,
+    });
+    if (giftcardWarnings) giftcardWarnings.push(...warnings);
   }
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
@@ -1986,6 +2011,165 @@ async function updateAppointmentServicePrepaidLink(
     `UPDATE ${quoteIdentifier(table.name)} SET ${assignments.join(", ")} WHERE ${clauses.join(" AND ")}`,
     params,
   );
+}
+
+// One entry from the quick-booking `giftcard_redeem` JSON array (assets/js/app.js
+// #qb_giftcard_redeem): apply a client's GiftCard BALANCE (a monetary amount) toward
+// the WHOLE appointment. Unlike package/prepaid (per-service units), this is
+// APPOINTMENT-LEVEL + MONETARY: one giftcard, one amount. `amount` is the requested
+// amount to apply; it is re-clamped server-side to min(amount, balance, payableTotal).
+export type AppointmentGiftcardRedeem = {
+  giftcardId: number;
+  amount: number;
+};
+
+// Apply the quick-booking GIFTCARD redeem for an appointment AS PART of the save.
+// GiftCard is APPOINTMENT-LEVEL + MONETARY (not per-service like package/prepaid):
+// ONE giftcard per appointment, an AMOUNT applied toward the appointment's payable
+// total. For the FIRST requested redeem that passes validation this RE-VALIDATES
+// server-side (never trusting the client): the giftcard exists, belongs to the
+// appointment's client (recipient_client_id, else client_id), is active + not expired
+// + has balance > 0. It then computes the appointment's PAYABLE TOTAL server-side as
+// SUM(appointment_services.price) over the rows just inserted (a service zero-charged
+// by a package/prepaid redeem already has price 0, so it never inflates the cap),
+// CLAMPS the requested amount to min(requestedAmount, balance, payableTotal), and —
+// when the clamped amount is > 0 — decrements the giftcard via redeemDbGiftCard
+// (which re-reads the balance and THROWS on over-redeem, flips status to 'redeemed'
+// at 0, and writes a giftcard_transactions movement) and links the appointment
+// (appointments.giftcard_id + giftcard_used = clamped amount, columnExists-guarded).
+// A redeem that fails validation / clamps to 0 is SKIPPED (collected as a warning)
+// and never fails the whole booking (legacy best-effort parity).
+//
+// Faithful to api_appointments.php qb_apply_giftcard_redeem_to_appointment (+
+// qb_giftcard_appointment_schema_available), adapted to the Next port's
+// consume-on-save + columnExists-guarded appointment link.
+export async function applyAppointmentGiftcardRedeem({
+  slug,
+  appointmentId,
+  clientId,
+  redeems,
+}: {
+  slug: string;
+  appointmentId: number;
+  clientId: number;
+  redeems: AppointmentGiftcardRedeem[];
+}): Promise<{ applied: AppointmentGiftcardRedeem | null; warnings: string[] }> {
+  const warnings: string[] = [];
+  if (!redeems.length) return { applied: null, warnings };
+
+  // Only the appointments table can carry the linkage; if it lacks the giftcard
+  // columns (older installs) we still decrement the balance + log a warning. This
+  // mirrors qb_giftcard_appointment_schema_available.
+  const appointmentsTable = await tenantTable(slug, "appointments").catch(() => null);
+  const hasLinkColumns = appointmentsTable
+    ? (await columnExists(appointmentsTable.name, "giftcard_id")) &&
+      (await columnExists(appointmentsTable.name, "giftcard_used"))
+    : false;
+
+  // The appointment's PAYABLE TOTAL: SUM(appointment_services.price) AFTER any
+  // package/prepaid zeroing (those rows already have price 0). Computed once, used as
+  // the upper cap so we never redeem more than the appointment can absorb. If the
+  // snapshot table is absent we fall back to 0 (nothing payable -> nothing to apply).
+  let payableTotal = 0;
+  try {
+    const serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      columns: "price",
+      where: "appointment_id = ?",
+      params: [appointmentId],
+    });
+    payableTotal = roundMoney(
+      serviceRows.reduce((sum, row) => sum + Math.max(0, parseMoney(row.price, 0)), 0),
+    );
+  } catch {
+    payableTotal = 0;
+  }
+
+  // ONE giftcard per appointment: take the FIRST entry that validates + clamps > 0.
+  for (const redeem of redeems) {
+    const giftcardId = Number(redeem.giftcardId ?? 0);
+    const requestedAmount = roundMoney(Math.max(0, Number(redeem.amount ?? 0)));
+    if (giftcardId <= 0) continue;
+
+    try {
+      // 1) Load the giftcard, tenant-scoped (tenantSelect scopes to the tenant).
+      const giftcardTable = await tenantTable(slug, "giftcards");
+      const hasRecipient = await columnExists(giftcardTable.name, "recipient_client_id");
+      const giftcardRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftcards",
+        columns: hasRecipient
+          ? "id, client_id, recipient_client_id, code, status, expires_at, balance"
+          : "id, client_id, code, status, expires_at, balance",
+        where: "id = ?",
+        params: [giftcardId],
+        limit: 1,
+      });
+      const giftcard = giftcardRows[0];
+      if (!giftcard) {
+        warnings.push("GiftCard non trovata.");
+        continue;
+      }
+
+      // 2) Ownership: the giftcard must belong to the appointment's client. The
+      //    recipient_client_id (when present) is the target client; older installs
+      //    fall back to client_id (mirrors the residuals availability rule).
+      const ownerId = hasRecipient
+        ? Number(giftcard.recipient_client_id ?? 0)
+        : Number(giftcard.client_id ?? 0);
+      if (ownerId !== clientId) {
+        warnings.push("La GiftCard selezionata non appartiene al cliente.");
+        continue;
+      }
+
+      // 3) Active + not expired + balance > 0 (effective status, like giftCardStatus).
+      const balance = roundMoney(Math.max(0, parseMoney(giftcard.balance, 0)));
+      const expiresYmd = giftcard.expires_at ? String(giftcard.expires_at).slice(0, 10) : "";
+      const effectiveStatus = giftCardStatus(String(giftcard.status ?? "active"), expiresYmd);
+      if (effectiveStatus !== "active") {
+        warnings.push(`GiftCard ${String(giftcard.code ?? "")} non utilizzabile (${effectiveStatus}).`.trim());
+        continue;
+      }
+      if (balance <= 0) {
+        warnings.push("Saldo GiftCard esaurito.");
+        continue;
+      }
+
+      // 4) Clamp the requested amount to [0, min(balance, payableTotal)]. We never
+      //    redeem more than the giftcard balance NOR more than the appointment's
+      //    payable total (financial correctness). A 0 clamp -> nothing to apply.
+      const clamped = roundMoney(Math.min(requestedAmount, balance, payableTotal));
+      if (clamped <= 0) {
+        if (payableTotal <= 0) warnings.push("Nessun importo da coprire con la GiftCard.");
+        else warnings.push("Importo GiftCard non valido.");
+        continue;
+      }
+
+      // 5) Decrement the giftcard via the authoritative primitive (re-reads the
+      //    balance and THROWS on over-redeem, so we never over-decrement; flips status
+      //    to 'redeemed' at 0 and writes the giftcard_transactions movement).
+      await redeemDbGiftCard(giftcardId, clamped, slug);
+
+      // 6) Link the appointment: giftcard_id + giftcard_used = clamped amount.
+      if (hasLinkColumns && appointmentsTable) {
+        await tenantUpdate({
+          slug,
+          table: "appointments",
+          id: appointmentId,
+          values: { giftcard_id: giftcardId, giftcard_used: clamped },
+        });
+      } else {
+        warnings.push("Saldo GiftCard scalato, ma il collegamento all'appuntamento non è disponibile su questo archivio.");
+      }
+
+      return { applied: { giftcardId, amount: clamped }, warnings };
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : "Errore riscatto GiftCard.");
+    }
+  }
+
+  return { applied: null, warnings };
 }
 
 export async function listDbPrepaids(slug: string): Promise<ClientPrepaid[]> {
@@ -4273,11 +4457,23 @@ export type QuickBookClientPrepaid = {
   remaining_qty: number;
 };
 
+// One available (redeemable) GiftCard for the APPOINTMENT-LEVEL "GiftCard" control
+// (port of api_clients.php action=residuals giftcard block; returned by
+// quickbook_client_context). A GiftCard is MONETARY (a spendable `balance`, not a
+// per-service unit) and applies to the WHOLE appointment — one giftcard per
+// appointment, an amount. `balance` is the consumable monetary balance.
+export type QuickBookClientGiftcard = {
+  id: number;
+  code: string;
+  balance: number;
+};
+
 export type QuickBookClientContext = {
   history: QuickBookClientHistorySummary;
   residuals: QuickBookClientResidualsSummary;
   packages: QuickBookClientPackage[];
   prepaids: QuickBookClientPrepaid[];
+  giftcards: QuickBookClientGiftcard[];
 };
 
 // History summary — port of api_clients.php lines ~3926-3958:
@@ -4522,13 +4718,14 @@ export async function quickBookClientContext({
   locationId?: number;
 }): Promise<QuickBookClientContext> {
   if (clientId <= 0) throw new Error("client_id mancante");
-  const [history, residuals, packages, prepaids] = await Promise.all([
+  const [history, residuals, packages, prepaids, giftcards] = await Promise.all([
     quickBookClientHistorySummary(slug, clientId),
     quickBookClientResidualsSummary(slug, clientId),
     quickBookClientPackages(slug, clientId),
     quickBookClientPrepaids(slug, clientId),
+    quickBookClientGiftcards(slug, clientId),
   ]);
-  return { history, residuals, packages, prepaids };
+  return { history, residuals, packages, prepaids, giftcards };
 }
 
 // Available (redeemable) packages for a client, with the services each package
@@ -4662,6 +4859,54 @@ async function quickBookClientPrepaids(slug: string, clientId: number): Promise<
       service_id: serviceId,
       name: String(row.service_name ?? "Prepagato"),
       remaining_qty: Math.max(0, Number(row.remaining_qty ?? 0)),
+    });
+  }
+  return out;
+}
+
+// Available (redeemable) GiftCards for a client — drives the drawer's APPOINTMENT-LEVEL
+// "GiftCard" control. Port of api_clients.php action=residuals GIFTCARD block (the same
+// availability rule the residuals summary counts at quickBookClientResidualsSummary).
+// Tenant-scoped via `tenantSelect`; every read is guarded so a missing table/column
+// degrades to an empty list. "Available" mirrors the legacy WHERE exactly:
+//   (recipient_client_id | client_id) = ? AND status='active' AND balance > 0
+//   AND (expires_at IS NULL OR expires_at >= CURRENT_DATE),
+// client-scoped. A GiftCard is MONETARY (a spendable `balance`) and applies to the
+// WHOLE appointment (one per appointment, an amount) — NOT per-service like package/
+// prepaid. The recipient_client_id column (when present) is the target client; older
+// installs fall back to client_id (the same column the residuals block chooses).
+async function quickBookClientGiftcards(slug: string, clientId: number): Promise<QuickBookClientGiftcard[]> {
+  if (clientId <= 0) return [];
+  let giftcardRows: RowDataPacket[] = [];
+  try {
+    const giftcardTable = await tenantTable(slug, "giftcards");
+    const hasRecipient = await columnExists(giftcardTable.name, "recipient_client_id");
+    const hasExpiry = await columnExists(giftcardTable.name, "expires_at");
+    const target = hasRecipient ? "recipient_client_id = ?" : "client_id = ?";
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    giftcardRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftcards",
+      columns: "id, code, balance",
+      where: `${target} AND status = 'active' AND balance > 0${expiry}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 50,
+    });
+  } catch {
+    return [];
+  }
+  if (giftcardRows.length === 0) return [];
+
+  const out: QuickBookClientGiftcard[] = [];
+  for (const row of giftcardRows) {
+    const id = Number(row.id ?? 0);
+    const balance = roundMoney(Math.max(0, Number(row.balance ?? 0)));
+    if (id <= 0 || balance <= 0) continue; // a giftcard with no balance covers nothing
+    out.push({
+      id,
+      code: String(row.code ?? ""),
+      balance,
     });
   }
   return out;

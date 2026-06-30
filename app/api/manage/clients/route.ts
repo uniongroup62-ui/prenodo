@@ -52,6 +52,10 @@ export async function GET(request: Request) {
         // prepagato" control (port of api_clients.php action=residuals prepaid block;
         // see quickBookClientPrepaids). Each is tied to ONE service (service_id).
         prepaids: context.prepaids,
+        // Available giftcards for the drawer's APPOINTMENT-LEVEL "GiftCard" control
+        // (port of api_clients.php action=residuals giftcard block; see
+        // quickBookClientGiftcards). Each carries a spendable monetary balance.
+        giftcards: context.giftcards,
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");

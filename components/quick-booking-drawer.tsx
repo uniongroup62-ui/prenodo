@@ -199,12 +199,23 @@ type QbClientPrepaid = {
   name: string;
   remaining_qty: number;
 };
+// One available (redeemable) GiftCard for the APPOINTMENT-LEVEL "GiftCard" control
+// (port of api_clients.php action=residuals giftcard block; returned by
+// quickbook_client_context). A GiftCard is MONETARY (a spendable `balance`, not a
+// per-service unit) and applies to the WHOLE appointment — one per appointment, an
+// amount. `balance` is the consumable monetary balance.
+type QbClientGiftcard = {
+  id: number;
+  code: string;
+  balance: number;
+};
 type QbClientContextResponse = {
   ok?: boolean;
   summary?: QbHistorySummary;
   residuals?: QbResidualsSummary;
   packages?: QbClientPackage[];
   prepaids?: QbClientPrepaid[];
+  giftcards?: QbClientGiftcard[];
 };
 
 // One entry written to #qb_package_redeem (assets/js/app.js qbReadPackageRedeem):
@@ -215,6 +226,11 @@ type QbPackageRedeem = { client_package_id: number; service_id: number; client_p
 // qbReadPrepaidServiceRedeem): a per-service request to cover that service with the
 // client's prepaid-service balance.
 type QbPrepaidRedeem = { client_prepaid_service_id: number; service_id: number };
+
+// The single entry written to #qb_giftcard_redeem (assets/js/app.js): an
+// APPOINTMENT-LEVEL request to apply a giftcard BALANCE (a monetary amount) toward the
+// whole appointment (NOT per-service). One giftcard, one amount.
+type QbGiftcardRedeem = { giftcard_id: number; amount: number };
 
 // History summary line, EXACT port of qbLoadClientHistory: "Appuntamenti: N •
 // Ultimo: … • Prossimo: …" (+ " • Vendite: €…" when sales_total > 0).
@@ -291,6 +307,18 @@ export function QuickBookingDrawer() {
   // service is covered once; the server also dedupes).
   const [clientPrepaids, setClientPrepaids] = useState<QbClientPrepaid[]>([]);
   const [prepaidRedeems, setPrepaidRedeems] = useState<Record<number, QbPrepaidRedeem>>({});
+
+  // ---- GIFTCARD redeem (#qb_giftcard_redeem) ----
+  // The selected client's AVAILABLE giftcards (active, not expired, balance > 0), and
+  // the APPOINTMENT-LEVEL redeem the staff applies in the drawer. Unlike package/
+  // prepaid (per-service), a giftcard is MONETARY and covers the WHOLE appointment:
+  // ONE giftcard + an AMOUNT. `giftcardPick` is the chosen giftcard id (or null), and
+  // `giftcardAmountInput` is the raw amount text the staff may lower (clamped on
+  // serialize). Both are cleared on client change and pruned when the pick is no longer
+  // available. The amount DEFAULTS to min(balance, payable total) on selection.
+  const [clientGiftcards, setClientGiftcards] = useState<QbClientGiftcard[]>([]);
+  const [giftcardPick, setGiftcardPick] = useState<number | null>(null);
+  const [giftcardAmountInput, setGiftcardAmountInput] = useState<string>("");
 
   // ---- Services multiselect state ----
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([]);
@@ -790,6 +818,71 @@ export function QuickBookingDrawer() {
     [],
   );
 
+  // ---- GIFTCARD redeem derivation (appointment-level "GiftCard") ----
+  // The appointment's PAYABLE TOTAL: sum of the SELECTED services' prices MINUS any
+  // service zero-charged by an applied package OR prepaid redeem (those services are
+  // not addebitati, so they don't count toward the giftcard cap). This MIRRORS the
+  // server's payable total (SUM of appointment_services.price after package/prepaid
+  // zeroing), so the default + clamp the staff sees match what the server applies.
+  const appointmentPayableTotal = useMemo(() => {
+    let total = 0;
+    for (const serviceId of selectedServiceIds) {
+      if (effectivePackageRedeems[serviceId]) continue; // zero-charged by a package
+      if (effectivePrepaidRedeems[serviceId]) continue; // zero-charged by a prepaid
+      const svc = services.find((s) => s.id === serviceId);
+      total += Math.max(0, Number(svc?.price ?? 0));
+    }
+    return Math.round((total + Number.EPSILON) * 100) / 100;
+  }, [selectedServiceIds, services, effectivePackageRedeems, effectivePrepaidRedeems]);
+
+  // The effective giftcard pick: keep the chosen giftcard only while it is still in
+  // the client's available list (prunes on client change / balance exhaustion). This
+  // DERIVED value (not raw `giftcardPick`) drives the UI + serialized payload, so a
+  // stale pick can never leak into the save.
+  const effectiveGiftcard = useMemo<QbClientGiftcard | null>(() => {
+    if (giftcardPick === null) return null;
+    return clientGiftcards.find((gc) => gc.id === giftcardPick) ?? null;
+  }, [giftcardPick, clientGiftcards]);
+
+  // The maximum applicable amount = min(giftcard balance, appointment payable total).
+  // The amount picker is clamped to [0, max]; the default (on selection) is `max`.
+  const giftcardMaxAmount = useMemo(() => {
+    if (!effectiveGiftcard) return 0;
+    return Math.round((Math.min(effectiveGiftcard.balance, appointmentPayableTotal) + Number.EPSILON) * 100) / 100;
+  }, [effectiveGiftcard, appointmentPayableTotal]);
+
+  // The effective AMOUNT to apply: parse the staff's input, clamp to [0, max]. An
+  // empty/invalid input falls back to the full `max` (the sensible default), matching
+  // "default the amount to min(balance, payable total)".
+  const giftcardAmount = useMemo(() => {
+    if (!effectiveGiftcard || giftcardMaxAmount <= 0) return 0;
+    const raw = giftcardAmountInput.trim();
+    if (raw === "") return giftcardMaxAmount;
+    const parsed = Number.parseFloat(raw.replace(",", "."));
+    if (!Number.isFinite(parsed) || parsed < 0) return 0;
+    const clamped = Math.min(parsed, giftcardMaxAmount);
+    return Math.round((Math.max(0, clamped) + Number.EPSILON) * 100) / 100;
+  }, [effectiveGiftcard, giftcardMaxAmount, giftcardAmountInput]);
+
+  // Serialize the effective giftcard redeem -> #qb_giftcard_redeem JSON STRING array
+  // [{giftcard_id, amount}] (one giftcard per appointment). IMPORTANT: sent as a JSON
+  // STRING (parseRequestBody stringifies body values), mirroring package/prepaid. Empty
+  // when nothing is applicable (no pick / amount clamps to 0), so the save is unchanged.
+  const giftcardRedeemJson = useMemo(() => {
+    if (!effectiveGiftcard || giftcardAmount <= 0) return "";
+    const entry: QbGiftcardRedeem = { giftcard_id: effectiveGiftcard.id, amount: giftcardAmount };
+    return JSON.stringify([entry]);
+  }, [effectiveGiftcard, giftcardAmount]);
+
+  // Apply / clear the appointment giftcard. Selecting resets the amount to the default
+  // (the full applicable max, recomputed from the chosen card + payable total);
+  // clearing drops the pick + amount. Changing the giftcard never invalidates a hold
+  // (the redeem doesn't move the slot).
+  const setGiftcardForAppointment = useCallback((giftcard: QbClientGiftcard | null) => {
+    setGiftcardPick(giftcard ? giftcard.id : null);
+    setGiftcardAmountInput(""); // empty -> the amount memo defaults to the full max
+  }, []);
+
   // ---- Client HISTORY + RESIDUALS fetch (port of qbLoadClientHistory + qbLoadClientResiduals) ----
   // Driven from the client select/clear flow (NOT an effect) so it never calls
   // setState synchronously inside an effect body — matching this file's
@@ -812,6 +905,10 @@ export function QuickBookingDrawer() {
     // The prepaids + per-service redeem also belong to the client; clear on change.
     setClientPrepaids([]);
     setPrepaidRedeems({});
+    // The giftcards + appointment-level redeem also belong to the client; clear too.
+    setClientGiftcards([]);
+    setGiftcardPick(null);
+    setGiftcardAmountInput("");
   }, []);
 
   const loadClientContext = useCallback(
@@ -828,6 +925,10 @@ export function QuickBookingDrawer() {
       // ...and any previous prepaids + per-service redeem selection.
       setClientPrepaids([]);
       setPrepaidRedeems({});
+      // ...and any previous giftcards + appointment-level redeem selection.
+      setClientGiftcards([]);
+      setGiftcardPick(null);
+      setGiftcardAmountInput("");
 
       const params = new URLSearchParams({ slug, action: "quickbook_client_context", client_id: id });
       const locId = String(locationId || "").trim();
@@ -846,6 +947,7 @@ export function QuickBookingDrawer() {
           setResidualsSummary(data.residuals ?? {});
           setClientPackages(Array.isArray(data.packages) ? data.packages : []);
           setClientPrepaids(Array.isArray(data.prepaids) ? data.prepaids : []);
+          setClientGiftcards(Array.isArray(data.giftcards) ? data.giftcards : []);
         })
         .catch(() => {
           if (myReq !== contextReqRef.current) return;
@@ -1090,6 +1192,11 @@ export function QuickBookingDrawer() {
             // client's prepaid-service balance (re-validated + consumed server-side).
             // Sent as a JSON STRING (parseRequestBody stringifies body values).
             prepaid_service_redeem: prepaidRedeemJson,
+            // GIFTCARD redeem: an APPOINTMENT-LEVEL request to apply the client's
+            // giftcard balance (a monetary amount) toward the appointment (re-validated
+            // + clamped + decremented server-side). Sent as a JSON STRING [{giftcard_id,
+            // amount}] (parseRequestBody stringifies body values).
+            giftcard_redeem: giftcardRedeemJson,
             date,
             time: startTime,
             location_id: locationId,
@@ -1098,7 +1205,7 @@ export function QuickBookingDrawer() {
             appointment_hold_token: holdToken,
           }),
         });
-        const data: { ok?: boolean; error?: string; packageWarnings?: string[]; prepaidWarnings?: string[] } = await res.json().catch(() => ({}));
+        const data: { ok?: boolean; error?: string; packageWarnings?: string[]; prepaidWarnings?: string[]; giftcardWarnings?: string[] } = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false || data.error) {
           setFormError(String(data.error || "Errore salvataggio."));
           return;
@@ -1113,6 +1220,11 @@ export function QuickBookingDrawer() {
         if (Array.isArray(data.prepaidWarnings) && data.prepaidWarnings.length > 0) {
           if (typeof window !== "undefined") window.alert("Prepagati:\n" + data.prepaidWarnings.join("\n"));
         }
+        // Same for giftcard redeem skips (not the client's / expired / no balance /
+        // nothing payable): surface before the reload.
+        if (Array.isArray(data.giftcardWarnings) && data.giftcardWarnings.length > 0) {
+          if (typeof window !== "undefined") window.alert("GiftCard:\n" + data.giftcardWarnings.join("\n"));
+        }
         closeOffcanvas();
         // Refresh the page so any calendar/list on screen shows the new booking,
         // matching the legacy reload-on-save behavior.
@@ -1123,7 +1235,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -1169,7 +1281,7 @@ export function QuickBookingDrawer() {
             <input type="hidden" name="gift_redeem" id="qb_gift_redeem" value="" readOnly />
             <input type="hidden" name="package_redeem" id="qb_package_redeem" value={packageRedeemJson} readOnly />
             <input type="hidden" name="prepaid_service_redeem" id="qb_prepaid_service_redeem" value={prepaidRedeemJson} readOnly />
-            <input type="hidden" name="giftcard_redeem" id="qb_giftcard_redeem" value="" readOnly />
+            <input type="hidden" name="giftcard_redeem" id="qb_giftcard_redeem" value={giftcardRedeemJson} readOnly />
 
             <div id="qbSelectedClientBox" className="card p-2 mb-2" style={{ display: client ? "block" : "none" }}>
               <div className="d-flex justify-content-between align-items-start">
@@ -1521,6 +1633,83 @@ export function QuickBookingDrawer() {
                     </div>
                   );
                 })}
+              </div>
+            ) : null}
+
+            {/* GIFTCARD redeem (GiftCard) — APPOINTMENT-LEVEL "Usa GiftCard" control.
+                Faithful to the legacy intent (assets/js/app.js #qb_giftcard_redeem:
+                ONE giftcard + an AMOUNT written as [{giftcard_id, amount}]). Unlike
+                Pacchetti/Prepagati this is NOT per-service: a giftcard is MONETARY and
+                applies to the WHOLE appointment. Only shown when the client has an
+                available giftcard. The amount DEFAULTS to min(balance, payable total)
+                and can be lowered; it is clamped to [0, max] and re-clamped + the
+                giftcard decremented server-side on save. */}
+            {clientGiftcards.length > 0 ? (
+              <div className="card p-2 mb-3" id="qbGiftcardRedeemBox">
+                <div className="fw-bold mb-1">GiftCard</div>
+                <div className="text-muted small mb-2">
+                  Applica il saldo di una GiftCard del cliente all&apos;appuntamento: l&apos;importo verrà scalato dalla GiftCard e dedotto dal totale.
+                </div>
+                <div className="d-flex align-items-center gap-2">
+                  <select
+                    className="form-select form-select-sm qb-giftcard-select"
+                    aria-label="Usa GiftCard per l'appuntamento"
+                    value={effectiveGiftcard ? String(effectiveGiftcard.id) : ""}
+                    onChange={(e) => {
+                      const id = Number.parseInt(e.target.value, 10);
+                      const gc = clientGiftcards.find((g) => g.id === id) ?? null;
+                      setGiftcardForAppointment(gc);
+                    }}
+                  >
+                    <option value="">Non usare GiftCard</option>
+                    {clientGiftcards.map((gc) => (
+                      <option value={gc.id} key={gc.id}>
+                        Usa GiftCard: {gc.code || `#${gc.id}`} (saldo {fmtEUR(gc.balance)})
+                      </option>
+                    ))}
+                  </select>
+                  {effectiveGiftcard ? (
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-link text-danger p-0 qb-giftcard-remove"
+                      onClick={() => setGiftcardForAppointment(null)}
+                      title="Rimuovi GiftCard"
+                    >
+                      Rimuovi
+                    </button>
+                  ) : null}
+                </div>
+                {effectiveGiftcard ? (
+                  <div className="mt-2">
+                    {giftcardMaxAmount > 0 ? (
+                      <>
+                        <label className="form-label small mb-1" htmlFor="qbGiftcardAmountInput2">Importo da applicare</label>
+                        <div className="input-group input-group-sm" style={{ maxWidth: 220 }}>
+                          <span className="input-group-text">€</span>
+                          <input
+                            id="qbGiftcardAmountInput2"
+                            className="form-control qb-giftcard-amount"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            max={giftcardMaxAmount}
+                            inputMode="decimal"
+                            placeholder={giftcardMaxAmount.toFixed(2)}
+                            value={giftcardAmountInput}
+                            onChange={(e) => setGiftcardAmountInput(e.target.value)}
+                          />
+                        </div>
+                        <div className="small text-success mt-1">
+                          Applicato: {fmtEUR(giftcardAmount)} — massimo {fmtEUR(giftcardMaxAmount)} (saldo {fmtEUR(effectiveGiftcard.balance)}).
+                        </div>
+                      </>
+                    ) : (
+                      <div className="small text-muted mt-1">
+                        Nessun importo da coprire con la GiftCard (totale dell&apos;appuntamento già azzerato).
+                      </div>
+                    )}
+                  </div>
+                ) : null}
               </div>
             ) : null}
 
