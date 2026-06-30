@@ -460,6 +460,12 @@ export function QuickBookingDrawer() {
   const [locationId, setLocationId] = useState<string>("");
   const [cabinId, setCabinId] = useState<string>("");
   const [status, setStatus] = useState<string>("scheduled");
+  // The appointment's status AS LOADDED in edit mode (php code). The status <select>
+  // mutates `status` freely; on save we compare against this to detect a status
+  // TRANSITION and route it: a normal transition -> action=status, but a DONE
+  // appointment moved to canceled/no_show -> the dedicated action=cancel_done flow
+  // (action=status BLOCKS done->canceled/no_show). Empty -> a CREATE (no transition).
+  const [originalStatus, setOriginalStatus] = useState<string>("");
   const [staffId, setStaffId] = useState<string>("");
   const [staffNotes, setStaffNotes] = useState<string>("");
   const [customerNotes, setCustomerNotes] = useState<string>("");
@@ -541,6 +547,7 @@ export function QuickBookingDrawer() {
     setPrefillEndTime(""); // drop any drag-select end override (services drive the end)
     setCabinId("");
     setStatus("scheduled");
+    setOriginalStatus(""); // no transition baseline on a fresh CREATE
     setStaffId("");
     setStaffNotes("");
     setCustomerNotes("");
@@ -1587,6 +1594,8 @@ export function QuickBookingDrawer() {
           if (a.date) setDate(a.date);
           if (a.time) setStartTime(a.time);
           setStatus(a.status || "scheduled");
+          // Baseline for the save-time transition detection (php code as loaded).
+          setOriginalStatus(a.status || "scheduled");
           setStaffNotes(a.staffNotes ?? "");
           setCustomerNotes(a.customerNotes ?? "");
           // Manual sconto: prefill the price panel from the persisted discount columns.
@@ -1884,6 +1893,52 @@ export function QuickBookingDrawer() {
         if (Array.isArray(data.giftWarnings) && data.giftWarnings.length > 0) {
           if (typeof window !== "undefined") window.alert("Omaggi:\n" + data.giftWarnings.join("\n"));
         }
+
+        // STATUS TRANSITION (edit mode only). action=save persists every other field
+        // but NOT the status (updateDbAppointment ignores it — status edits go through
+        // a dedicated action). So when editing an existing appointment whose status the
+        // user changed, fire the transition AFTER the save succeeds:
+        //   - DONE -> canceled/no_show : the dedicated CANCEL-DONE flow. action=status
+        //     BLOCKS this ("usa il popup dedicato di annullamento") because settling a
+        //     done booking consumed redeems + awarded fidelity points; cancel_done
+        //     restores all of that, then flips the status. Gated behind a confirm()
+        //     since it stornos points + restores credit/redeem.
+        //   - any other transition : the normal action=status path (unchanged).
+        // A failed transition surfaces inline (we DON'T reload) so the staff can retry.
+        const newStatus = status.trim();
+        if (apptId && originalStatus && newStatus && newStatus !== originalStatus) {
+          const isCancelDone =
+            originalStatus === "done" && (newStatus === "canceled" || newStatus === "no_show");
+          if (isCancelDone) {
+            if (
+              typeof window !== "undefined" &&
+              !window.confirm(
+                "Annullare una prenotazione eseguita storna i punti fidelity e ripristina credito/redeem associati. Continuare?",
+              )
+            ) {
+              // Staff declined the storno: keep the appointment done. The save already
+              // persisted the other fields; just stop here (no reload) so the drawer
+              // stays open and the status select can be reverted.
+              setFormError("Annullamento non confermato: lo stato resta 'Eseguito'.");
+              return;
+            }
+          }
+          const transitionRes = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+            body: JSON.stringify(
+              isCancelDone
+                ? { action: "cancel_done", id: apptId, status: newStatus }
+                : { action: "status", id: apptId, status: newStatus },
+            ),
+          });
+          const transitionData: { ok?: boolean; error?: string } = await transitionRes.json().catch(() => ({}));
+          if (!transitionRes.ok || transitionData.ok === false || transitionData.error) {
+            setFormError(String(transitionData.error || "Errore cambio stato."));
+            return;
+          }
+        }
+
         closeOffcanvas();
         // Refresh the page so any calendar/list on screen shows the new booking,
         // matching the legacy reload-on-save behavior.
@@ -1894,7 +1949,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, discountType, discountValue, couponCode, priceDetails, closeOffcanvas],
+    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, discountType, discountValue, couponCode, priceDetails, status, originalStatus, closeOffcanvas],
   );
 
   // ---- Delete (#qbDeleteBtn, edit mode only -> action=delete) ----

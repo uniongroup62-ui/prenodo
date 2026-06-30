@@ -2150,6 +2150,145 @@ export async function restoreAppointmentRedeems(slug: string, appointmentId: num
   }
 }
 
+// CANCEL a DONE appointment (the dedicated cancel-done flow). Tenant-scoped port of
+// app/lib/AppointmentLifecycle.php appt_lifecycle_cancel_done_apply (~867): once an
+// appointment is EXECUTED ('done') the plain action=status transition refuses
+// done->canceled/no_show ("usa il popup dedicato di annullamento"), because settling a
+// done booking consumed redeems AND awarded fidelity points — a bare status flip would
+// leak both. This flow RESTORES everything the done settlement consumed/awarded, then
+// flips the status. Best-effort PER PIECE (a single restore failing must not abort the
+// others or the status flip), but the status change itself always happens.
+//
+// Restore order (mirrors the legacy apply + the POS-void reverse model):
+//   1) VALIDATE the appointment is 'done' (idempotency: a non-done row can't be
+//      cancel-done'd again — re-running would otherwise double-restore).
+//   2) restoreAppointmentRedeems — package/prepaid/giftbox/gift sessions + the
+//      appointment-level GIFTCARD refund (reused, same as delete/cancel-on-status).
+//   3) FIDELITY reverse (the POS-void pattern, manage-pos.ts ~1896-1924):
+//        - reverse the EARNED points: a points_redeem of -fidelity_points_earned
+//          (source_type='appointment') + zero appointments.fidelity_points_earned.
+//        - refund the USED/redeemed points: a points_earn of +fidelity_points_used
+//          (source_type='appointment') + zero appointments.fidelity_points_used.
+//          (fidelity_points_used is currently always 0 — the drawer fidelity row is
+//          inert/Block 4 — so this branch is dormant but ported faithfully.)
+//   4) CREDIT restore: if credit_used>0, re-credit the wallet (+credit_used) + zero
+//      appointments.credit_used. (Also dormant: the drawer credit row is inert/Block 4.)
+//   5) Set appointments.status = the php target (canceled|no_show) and return the
+//      refreshed mapped appointment so the caller can refresh the calendar.
+//
+// Each zero-the-column step doubles as the idempotency guard for that piece (a re-run
+// sees 0 and skips), but the status validation in step 1 is the real gate: after a
+// successful cancel-done the row is no longer 'done', so a second call is rejected.
+export async function cancelDoneAppointment(
+  slug: string,
+  appointmentId: number,
+  targetStatus: AppointmentStatus | string,
+  createdBy?: number,
+): Promise<AppointmentWithMeta> {
+  const id = Number.parseInt(String(appointmentId), 10);
+  if (!Number.isFinite(id) || id <= 0) throw new Error("Appuntamento non trovato.");
+
+  // The target must normalize to canceled or no_show — this flow only ANNULS a done
+  // booking, it never moves it to another live state.
+  const target = phpStatus(targetStatus);
+  if (target !== "canceled" && target !== "no_show") {
+    throw new Error("Stato di annullamento non valido.");
+  }
+
+  // Load the appointment fidelity/credit fields (tenant-scoped). No row -> not found.
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, client_id, status, fidelity_points_earned, fidelity_points_used, credit_used",
+    where: "id = ?",
+    params: [id],
+    limit: 1,
+  });
+  const appointment = rows[0];
+  if (!appointment) throw new Error("Appuntamento non trovato.");
+
+  // IDEMPOTENCY / GUARD: only a DONE appointment is cancellable via this dedicated flow.
+  // A pending/scheduled cancel goes through action=status (restoreAppointmentRedeems on
+  // the transition); an already canceled/no_show row is terminal. Rejecting a non-done
+  // row here also prevents a second cancel-done from double-restoring.
+  if (phpStatus(String(appointment.status ?? "")) !== "done") {
+    throw new Error("Solo una prenotazione eseguita può essere annullata da questo flusso.");
+  }
+
+  const clientId = Math.max(0, Number(appointment.client_id ?? 0) || 0);
+  const pointsEarned = Math.max(0, Math.round(Number(appointment.fidelity_points_earned ?? 0) || 0));
+  const pointsUsed = Math.max(0, Math.round(Number(appointment.fidelity_points_used ?? 0) || 0));
+  const creditUsed = roundMoney(Math.max(0, parseMoney(appointment.credit_used, 0)));
+  const by = createdBy && createdBy > 0 ? createdBy : undefined;
+
+  // 2) Restore package/prepaid/giftbox/gift sessions + the appointment-level giftcard.
+  await restoreAppointmentRedeems(slug, id).catch(() => undefined);
+
+  // 3) FIDELITY reverse (mirrors the POS-void reverse). Wrapped so a fidelity error
+  //    never blocks the credit restore or the status flip below.
+  try {
+    // REVERSE the EARNED points: a negative points_redeem removes the loyalty points
+    // awarded when the appointment was completed, so a canceled booking leaves none.
+    if (pointsEarned > 0 && clientId > 0) {
+      await addDbWalletMovement(
+        {
+          clientId,
+          type: "points_redeem",
+          points: -pointsEarned,
+          source_type: "appointment",
+          source_id: id,
+          createdBy: by,
+          note: `Storno punti guadagnati prenotazione #${id}`,
+        },
+        slug,
+      ).catch(() => undefined);
+    }
+    // Zero the stamp regardless (idempotency guard: a re-run can't double-reverse).
+    if (pointsEarned > 0) {
+      await tenantUpdate({ slug, table: "appointments", id, values: { fidelity_points_earned: 0 } }).catch(() => 0);
+    }
+    // REFUND the USED/redeemed points: a positive points_earn re-credits clients.points
+    // (the inverse of the points_redeem reserved at booking). Dormant (always 0 today).
+    if (pointsUsed > 0 && clientId > 0) {
+      await addDbWalletMovement(
+        {
+          clientId,
+          type: "points_earn",
+          points: pointsUsed,
+          source_type: "appointment",
+          source_id: id,
+          createdBy: by,
+          note: `Storno punti usati prenotazione #${id}`,
+        },
+        slug,
+      ).catch(() => undefined);
+    }
+    if (pointsUsed > 0) {
+      await tenantUpdate({ slug, table: "appointments", id, values: { fidelity_points_used: 0 } }).catch(() => 0);
+    }
+  } catch {
+    // best-effort: fidelity reverse must never block the status flip.
+  }
+
+  // 4) CREDIT restore: re-credit the client wallet by the credit this appointment spent,
+  //    then zero appointments.credit_used so a re-run can't double-credit. Dormant today
+  //    (credit_used is always 0 — the drawer credit row is inert/Block 4) but ported.
+  if (creditUsed > 0 && clientId > 0) {
+    await addDbWalletMovement(
+      { clientId, type: "recharge", amount: creditUsed, note: `Storno credito prenotazione #${id}` },
+      slug,
+    ).catch(() => undefined);
+    await tenantUpdate({ slug, table: "appointments", id, values: { credit_used: 0 } }).catch(() => 0);
+  }
+
+  // 5) Flip the status to the php target (canceled|no_show). The ROW is KEPT (legacy
+  //    keeps canceled appointments). This is the one step that must always run.
+  await tenantUpdate({ slug, table: "appointments", id, values: { status: target } });
+  const updated = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
+  if (!updated[0]) throw new Error("Appuntamento non trovato.");
+  return mapAppointment(slug, updated[0]);
+}
+
 // DELETE an appointment (single-row "Elimina" + bulk_delete). Tenant-scoped port of
 // app/pages/appointments.php (single delete ~79-130 + bulk_delete ~292-520) and the
 // api_appointments.php delete rollback (~9665). This app CONSUMES redeems at SAVE

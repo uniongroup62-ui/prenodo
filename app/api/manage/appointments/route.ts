@@ -5,6 +5,7 @@ import { emptyToNull, jsonError, parseRequestBody } from "@/lib/api-utils";
 import {
   appointmentCustomerVisibleChanged,
   appointmentPhpStatus,
+  cancelDoneAppointment,
   createDbAppointment,
   deleteDbAppointment,
   getDbAppointmentCustomerVisibleSnapshot,
@@ -320,6 +321,48 @@ export async function POST(request: Request) {
         if (kind) await sendAppointmentLifecycleEmail({ slug: tenantSlug, appointmentId: id, kind });
       }
       return Response.json({ ok: true, sourceMode: "database", appointment, appointments: await listDbAppointments({ slug: tenantSlug }) });
+    }
+
+    // CANCEL-DONE — the dedicated annullamento flow for an EXECUTED ('done')
+    // appointment (port of api_appointments.php action='cancel_done_apply' ->
+    // app/lib/AppointmentLifecycle.php appt_lifecycle_cancel_done_apply, ~867). The
+    // plain action=status path BLOCKS done->canceled/no_show ("usa il popup dedicato
+    // di annullamento") because settling a done booking consumed redeems AND awarded
+    // fidelity points; this action runs cancelDoneAppointment, which RESTORES all of
+    // that (package/prepaid/giftbox/gift/giftcard + fidelity earn/redeem + credit) and
+    // then flips the status. Gated on appointments.manage (a storno is a management
+    // action, like delete/bulk_delete — stricter than the POST umbrella check above).
+    // On the validation throw (e.g. the row is not 'done') we mirror the status path:
+    // return { ok:false, error } with a 200 so the UI shows the message inline.
+    if (action === "cancel_done") {
+      if (!can(session.user.perms, "appointments.manage")) {
+        return jsonError("Permesso annullamento appuntamenti mancante.", 403);
+      }
+      const id = Number.parseInt(String(body.id ?? url.searchParams.get("id") ?? "0"), 10);
+      if (!Number.isFinite(id) || id <= 0) {
+        return Response.json({ ok: false, error: "ID mancante" }, { status: 400 });
+      }
+      // Target status: default 'canceled'; 'no_show' is the only other accepted target
+      // (cancelDoneAppointment re-validates this and rejects anything else).
+      const rawTarget = String(body.status ?? body.target_status ?? "canceled").trim();
+      const targetStatus = appointmentPhpStatus(rawTarget) === "no_show" ? "no_show" : "canceled";
+      try {
+        const appointment = await cancelDoneAppointment(tenantSlug, id, targetStatus, session.user.id);
+        // Lifecycle email: a done->canceled crossing maps to the same 'rejected'/cancel
+        // kind the status path fires; gated + error-swallowed inside the helper.
+        const kind = lifecycleKindForStatusChange("done", targetStatus);
+        if (kind) await sendAppointmentLifecycleEmail({ slug: tenantSlug, appointmentId: id, kind });
+        return Response.json({
+          ok: true,
+          sourceMode: "database",
+          appointment,
+          appointments: await listDbAppointments({ slug: tenantSlug }),
+        });
+      } catch (error) {
+        // Validation errors (not done / not found / bad target) -> 200 { ok:false }
+        // so the UI surfaces the message inline, matching the action=status path.
+        return Response.json({ ok: false, error: error instanceof Error ? error.message : "Errore annullamento." });
+      }
     }
 
     // Calendar drag/move (port of api_appointments.php action='move'). A move only
