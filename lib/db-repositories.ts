@@ -4376,6 +4376,92 @@ export async function redeemDbCoupon(code: string, subtotal: number, slug: strin
   return { coupon: preview.coupon, discount: preview.discount };
 }
 
+// Editable coupon record for the NEW / EDIT form. Extends the list CouponRule
+// with the description + apply_scope columns that the coupons.php editor posts
+// but the dashboard list does not surface.
+export type ManageCouponRecord = CouponRule & {
+  description: string;
+  applyScope: string;
+};
+
+// Edit-form prefill: return ONE coupon's editable fields for one id. Port of
+// coupons.php action=edit (loads the coupons row). Reuses mapCoupon (the list
+// pipeline) and reads the extra description/apply_scope columns directly.
+export async function getManageCoupon(slug: string, id: number): Promise<ManageCouponRecord | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "coupons", where: "id = ? AND deleted_at IS NULL", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const base = await mapCoupon(slug, rows[0]);
+  return {
+    ...base,
+    description: String(rows[0].description ?? ""),
+    applyScope: String(rows[0].apply_scope ?? "all"),
+  };
+}
+
+// Create / update a coupon rule, faithful to coupons.php POST(action=new|edit).
+// On create the code is required + validated and must be unique; on edit the
+// code is immutable (the legacy form renders it readonly), so only the editable
+// fields (description, type, value, min_subtotal, usage_limit, apply_scope,
+// valid_from, valid_to) are written. The scope-restricted catalogs
+// (service/product id lists) and per-location toggles from the legacy form are
+// not part of the current coupon data pipeline — see the form TODO.
+export async function saveManageCoupon(slug: string, body: Record<string, string>, id: number): Promise<ManageCouponRecord> {
+  let type = String(body.discount_type ?? "percent").trim().toLowerCase();
+  if (type === "amount") type = "fixed";
+  if (type !== "percent" && type !== "fixed") type = "percent";
+
+  let value = roundMoney(Math.max(0, Number(String(body.discount_value ?? "0").replace(",", ".")) || 0));
+  if (type === "percent" && value > 100) value = 100;
+  if (value <= 0) throw new Error("Inserisci un valore valido.");
+
+  const minSubtotal = roundMoney(Math.max(0, Number(String(body.min_subtotal ?? "0").replace(",", ".")) || 0));
+  const usageLimit = Math.max(0, Math.round(Number(body.usage_limit ?? 0) || 0));
+  const scope = normalizeCouponScope(String(body.apply_scope ?? "all_services_products"));
+  const description = String(body.description ?? "").trim();
+  const from = normalizeClientDate(body.valid_from);
+  const to = normalizeClientDate(body.valid_to);
+  if ((String(body.valid_from ?? "").trim() !== "" && !from) || (String(body.valid_to ?? "").trim() !== "" && !to)) {
+    throw new Error("Formato data non valido.");
+  }
+  if (from && to && from > to) throw new Error('La data "Valido al" deve essere successiva o uguale a "Valido dal".');
+
+  const values: Record<string, unknown> = {
+    description: description !== "" ? description : null,
+    discount_type: type,
+    discount_value: value,
+    min_subtotal: minSubtotal,
+    usage_limit: usageLimit,
+    apply_scope: scope === "all" && id <= 0 ? "all_services_products" : scope,
+    valid_from: from,
+    valid_to: to,
+  };
+
+  let couponId = id;
+  if (couponId > 0) {
+    const existing = await tenantSelect<RowDataPacket>({ slug, table: "coupons", where: "id = ? AND deleted_at IS NULL", params: [couponId], limit: 1 });
+    if (!existing[0]) throw new Error("Coupon non trovato.");
+    await tenantUpdate({ slug, table: "coupons", id: couponId, values });
+  } else {
+    const code = normalizeCouponCode(String(body.code ?? ""));
+    if (!code) throw new Error("Inserisci un codice.");
+    if (!/^[A-Z0-9][A-Z0-9_-]{0,39}$/.test(code)) throw new Error("Codice non valido. Usa solo lettere, numeri, - e _. (Max 40)");
+    const dup = await tenantSelect<RowDataPacket>({ slug, table: "coupons", columns: "id", where: "code = ? AND deleted_at IS NULL", params: [code], limit: 1 });
+    if (dup[0]) throw new Error("Esiste gia un coupon con questo codice.");
+    couponId = await tenantInsert(await tenantTable(slug, "coupons"), { ...values, code, is_active: 1 });
+  }
+
+  const saved = await getManageCoupon(slug, couponId);
+  if (!saved) throw new Error("Coupon non salvato.");
+  return saved;
+}
+
+function normalizeCouponScope(value: string): string {
+  const scope = value.trim().toLowerCase();
+  const allowed = ["all", "service_categories", "services", "product_categories", "products", "all_services_products"];
+  return allowed.includes(scope) ? scope : "all_services_products";
+}
+
 export async function listDbPromotions(slug: string): Promise<PromotionRule[]> {
   const rows = await tenantSelect<RowDataPacket>({
     slug,
@@ -4398,6 +4484,125 @@ export async function previewDbPromotion(id: number, subtotal: number, slug: str
   const promotion = mapPromotion(rows[0]);
   if (!promotion.active || !activeWindow(promotion.startsAt, promotion.endsAt)) return { valid: false, discount: 0, reason: "Promozione non attiva.", promotion };
   return { valid: true, discount: discountValue(promotion.discountType, promotion.discountValue, subtotal), reason: "Promozione valida.", promotion };
+}
+
+// Editable promotion record for the NEW / EDIT form. Extends the list
+// PromotionRule with the extra columns the promotions.php editor posts
+// (description, target windows, apply modes, conditions) that the dashboard list
+// does not surface.
+export type ManagePromotionRecord = PromotionRule & {
+  description: string;
+  applyServicesMode: "none" | "all" | "selected";
+  applyProductsMode: "none" | "all" | "selected";
+  newWithinDays: string;
+  inactiveDays: string;
+  birthdayWindowDays: string;
+  perCustomerLimit: string;
+  promoConditionsEnabled: boolean;
+  promoConditions: string;
+};
+
+// Edit-form prefill: return ONE promotion's editable fields for one id. Port of
+// promotions.php action=edit (Promotions::get). Reuses mapPromotion (the list
+// pipeline) and reads the extra editable columns directly from the row.
+export async function getManagePromotion(slug: string, id: number): Promise<ManagePromotionRecord | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const row = rows[0];
+  return {
+    ...mapPromotion(row),
+    description: String(row.description ?? ""),
+    applyServicesMode: normalizePromoMode(String(row.apply_services_mode ?? "all"), "all"),
+    applyProductsMode: normalizePromoMode(String(row.apply_products_mode ?? "none"), "none"),
+    newWithinDays: row.new_within_days == null ? "" : String(row.new_within_days),
+    inactiveDays: row.inactive_days == null ? "" : String(row.inactive_days),
+    birthdayWindowDays: row.birthday_window_days == null ? "" : String(row.birthday_window_days),
+    perCustomerLimit: row.per_customer_limit == null ? "" : String(row.per_customer_limit),
+    promoConditionsEnabled: Number(row.promo_conditions_enabled ?? 0) === 1,
+    promoConditions: String(row.promo_conditions ?? ""),
+  };
+}
+
+// Create / update the core promotion record, faithful to promotions.php POST
+// (action=new|edit). Validation mirrors the legacy required fields: title is
+// required, dates must be valid YYYY-MM-DD with start <= end, target_type is
+// constrained to the legacy enum, and a positive value is required when a
+// services/products scope is "all".
+//
+// The legacy editor also persists per-service/per-product discount rows,
+// promotion_locations, time windows, blackout dates, fidelity-level targeting
+// and client exclusions via Promotions::saveAdvanced. Those sub-tables are not
+// part of the current promotions data pipeline (listDbPromotions / mapPromotion)
+// — see the form TODO. This save writes only the main promotions row.
+export async function saveManagePromotion(slug: string, body: Record<string, string>, id: number): Promise<ManagePromotionRecord> {
+  const title = String(body.title ?? "").trim();
+  if (title === "") throw new Error("Inserisci il nome della promozione.");
+
+  const startsAt = String(body.starts_at ?? "").trim();
+  const endsAt = String(body.ends_at ?? "").trim();
+  if (startsAt !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(startsAt)) throw new Error("La data di inizio non e valida.");
+  if (endsAt !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(endsAt)) throw new Error("La data di fine non e valida.");
+  if (startsAt !== "" && endsAt !== "" && startsAt > endsAt) throw new Error("La data di fine deve essere uguale o successiva alla data di inizio.");
+
+  let discountType = String(body.discount_type ?? "percent").trim().toLowerCase();
+  if (discountType !== "percent" && discountType !== "fixed") discountType = "percent";
+  const discountValue = roundMoney(Math.max(0, Number(String(body.discount_value ?? "0").replace(",", ".")) || 0));
+
+  const svcMode = normalizePromoMode(String(body.apply_services_mode ?? "all"), "all");
+  const prdMode = normalizePromoMode(String(body.apply_products_mode ?? "none"), "none");
+  if (svcMode === "none" && prdMode === "none") throw new Error("Seleziona almeno servizi o prodotti da includere nella promozione.");
+  if (svcMode === "all") {
+    if (discountValue <= 0) throw new Error("Inserisci uno sconto maggiore di 0 per tutti i servizi.");
+    if (discountType === "percent" && discountValue > 100) throw new Error("Lo sconto percentuale servizi non puo superare 100%.");
+  }
+
+  let target = String(body.target_type ?? "all").trim().toLowerCase();
+  if (!["all", "new", "inactive", "birthday", "fidelity"].includes(target)) target = "all";
+
+  const values: Record<string, unknown> = {
+    title,
+    description: String(body.description ?? "").trim() || null,
+    starts_at: startsAt !== "" ? startsAt : null,
+    ends_at: endsAt !== "" ? endsAt : null,
+    is_active: ["1", "true", "yes", "on"].includes(String(body.is_active ?? "").toLowerCase()) ? 1 : 0,
+    discount_type: discountType,
+    discount_value: discountValue,
+    apply_services_mode: svcMode,
+    apply_products_mode: prdMode,
+    target_type: target,
+    new_within_days: nullableInt(body.new_within_days),
+    inactive_days: nullableInt(body.inactive_days),
+    birthday_window_days: nullableInt(body.birthday_window_days),
+    per_customer_limit: nullableInt(body.per_customer_limit),
+    promo_conditions_enabled: ["1", "true", "yes", "on"].includes(String(body.promo_conditions_enabled ?? "").toLowerCase()) ? 1 : 0,
+    promo_conditions: String(body.promo_conditions ?? "").trim() || null,
+  };
+
+  let promotionId = id;
+  if (promotionId > 0) {
+    const existing = await tenantSelect<RowDataPacket>({ slug, table: "promotions", columns: "id", where: "id = ?", params: [promotionId], limit: 1 });
+    if (!existing[0]) throw new Error("Promozione non trovata.");
+    await tenantUpdate({ slug, table: "promotions", id: promotionId, values });
+  } else {
+    promotionId = await tenantInsert(await tenantTable(slug, "promotions"), values);
+  }
+
+  const saved = await getManagePromotion(slug, promotionId);
+  if (!saved) throw new Error("Promozione non salvata.");
+  return saved;
+}
+
+function normalizePromoMode(value: string, fallback: "all" | "none"): "none" | "all" | "selected" {
+  const mode = value.trim().toLowerCase();
+  return mode === "none" || mode === "all" || mode === "selected" ? mode : fallback;
+}
+
+function nullableInt(value: unknown): number | null {
+  const s = String(value ?? "").trim();
+  if (s === "") return null;
+  const n = Number.parseInt(s, 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
 export async function listDbGiftBoxes(slug: string): Promise<GiftBoxInstance[]> {

@@ -8,12 +8,15 @@ import { ClientDetailContent } from "@/components/modules/client_detail-content"
 import { CommissionsContent } from "@/components/modules/commissions-content";
 import { CostsContent } from "@/components/modules/costs-content";
 import { CouponsContent } from "@/components/modules/coupons-content";
+import { CouponFormContent } from "@/components/modules/coupon_form-content";
 import { LocationsContent } from "@/components/modules/locations-content";
 import { LocationFormContent } from "@/components/modules/location_form-content";
 import { PromotionsContent } from "@/components/modules/promotions-content";
+import { PromotionFormContent } from "@/components/modules/promotion_form-content";
 import { QuotesContent } from "@/components/modules/quotes-content";
 import { RechargesContent } from "@/components/modules/recharges-content";
 import { SuppliersContent } from "@/components/modules/suppliers-content";
+import { SupplierFormContent } from "@/components/modules/supplier_form-content";
 import { CabinsContent } from "@/components/modules/cabins-content";
 import { GiftcardContent } from "@/components/modules/giftcard-content";
 import { GiftsContent } from "@/components/modules/gifts-content";
@@ -232,6 +235,39 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <StaffFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful coupon NEW / EDIT form. The coupons list links to
+  // index.php?page=coupons&action=new|edit; route those to the faithful editor
+  // (instead of the Tailwind ManagementApp fallback).
+  if (page === "coupons" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <CouponFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful promotion NEW / EDIT form. The promotions list links to
+  // index.php?page=promotions&action=new|edit; route those to the faithful
+  // editor (instead of the Tailwind ManagementApp fallback).
+  if (page === "promotions" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <PromotionFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful supplier (fornitore) NEW / EDIT form. The suppliers list links to
+  // index.php?page=suppliers&action=new|edit; route those to the faithful editor
+  // (instead of the Tailwind ManagementApp fallback).
+  if (page === "suppliers" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <SupplierFormContent />
       </ManageShell>
     );
   }

@@ -89,6 +89,35 @@ export type SupplierRow = {
   costLocationIds: number[];
 };
 
+// Full editable supplier record for the NEW / EDIT form. The list SupplierRow
+// only surfaces a subset; the editor (suppliers.php) reads/writes every column.
+export type ManageSupplierRecord = {
+  id: number;
+  name: string;
+  businessName: string;
+  address1: string;
+  address2: string;
+  cap: string;
+  city: string;
+  province: string;
+  country: string;
+  countryIso: string;
+  vatNumber: string;
+  taxCode: string;
+  sdiCode: string;
+  phone: string;
+  fax: string;
+  mobile: string;
+  email: string;
+  pec: string;
+  website: string;
+  isActive: boolean;
+  isActiveCosts: boolean;
+  warehouseLocationIds: number[];
+  costLocationIds: number[];
+  createdAt: string;
+};
+
 export type StockDocumentRow = {
   id: number;
   moveDate: string;
@@ -162,6 +191,44 @@ export async function getManageProduct(slug: string, productId: number): Promise
   if (productId <= 0) return null;
   const products = await listProducts(slug, { query: "", locationId: 0, includeInactive: true });
   return products.find((product) => product.id === productId) ?? null;
+}
+
+// Edit-form prefill: return ONE supplier's editable fields for one id. Port of
+// suppliers.php action=edit (loads the suppliers row + its supplier_locations
+// warehouse/costs flags). Reads the full row (the list SupplierRow drops most
+// header/fiscal/contact columns) and reuses supplierLocationMaps.
+export async function getManageSupplier(slug: string, id: number): Promise<ManageSupplierRecord | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "suppliers", where: "id=?", params: [id], limit: 1 }).catch(() => []);
+  const row = rows[0];
+  if (!row) return null;
+  const maps = (await supplierLocationMaps(slug, [id])).get(id) ?? { warehouse: [], costs: [] };
+  return {
+    id,
+    name: String(row.name ?? ""),
+    businessName: String(row.business_name ?? ""),
+    address1: String(row.address1 ?? ""),
+    address2: String(row.address2 ?? ""),
+    cap: String(row.cap ?? ""),
+    city: String(row.city ?? ""),
+    province: String(row.province ?? ""),
+    country: String(row.country ?? ""),
+    countryIso: String(row.country_iso ?? ""),
+    vatNumber: String(row.vat_number ?? ""),
+    taxCode: String(row.tax_code ?? ""),
+    sdiCode: String(row.sdi_code ?? ""),
+    phone: String(row.phone ?? ""),
+    fax: String(row.fax ?? ""),
+    mobile: String(row.mobile ?? ""),
+    email: String(row.email ?? ""),
+    pec: String(row.pec ?? ""),
+    website: String(row.website ?? ""),
+    isActive: Number(row.is_active ?? 1) === 1,
+    isActiveCosts: Number(row.is_active_costs ?? 1) === 1,
+    warehouseLocationIds: maps.warehouse,
+    costLocationIds: maps.costs,
+    createdAt: row.created_at ? String(row.created_at) : "",
+  };
 }
 
 export async function saveProduct(slug: string, body: Record<string, string>): Promise<ManageProductsContext> {

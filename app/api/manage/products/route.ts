@@ -9,6 +9,7 @@ import {
   deleteSupplier,
   getManageProduct,
   getManageProductsContext,
+  getManageSupplier,
   saveProduct,
   saveProductCategory,
   saveStockMovement,
@@ -29,6 +30,17 @@ export async function GET(request: Request) {
 
   try {
     const url = new URL(request.url);
+
+    // Edit-form prefill: return ONE supplier's editable fields for one id. Port
+    // of suppliers.php action=edit. Gated by suppliers.manage like supplier_save.
+    if (url.searchParams.get("action") === "get" && url.searchParams.get("type") === "supplier") {
+      if (!can(session.user.perms, "suppliers.manage")) return jsonError("Permesso Fornitori richiesto.", 403);
+      const supplierId = parseInteger(url.searchParams.get("id"), 0);
+      if (supplierId <= 0) return jsonError("ID fornitore mancante.");
+      const supplier = await getManageSupplier(tenantSlug, supplierId);
+      if (!supplier) return jsonError("Fornitore non trovato.", 404);
+      return Response.json({ ok: true, source: "products?action=get&type=supplier", sourceMode: "database", supplier });
+    }
 
     // Edit-form prefill: return ONE product's editable fields for one id. Port of
     // products.php action=edit. Gated by products.manage like the save action.

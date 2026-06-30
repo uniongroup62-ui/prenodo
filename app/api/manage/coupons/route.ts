@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { createDbCoupon, listDbCoupons, previewDbCoupon, redeemDbCoupon } from "@/lib/db-repositories";
+import { createDbCoupon, getManageCoupon, listDbCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -16,6 +16,19 @@ export async function GET(request: Request) {
   if (!canAny(session.user.perms, ["coupons.manage", "pos.manage"])) return jsonError("Permesso buoni mancante.", 403);
 
   try {
+    const url = new URL(request.url);
+
+    // Edit-form prefill: return ONE coupon's editable fields for one id. Port of
+    // coupons.php action=edit. Gated by coupons.manage like the save action.
+    if (url.searchParams.get("action") === "get") {
+      if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
+      const couponId = parseInteger(url.searchParams.get("id"), 0);
+      if (couponId <= 0) return jsonError("ID coupon mancante.");
+      const coupon = await getManageCoupon(tenantSlug, couponId);
+      if (!coupon) return jsonError("Coupon non trovato.", 404);
+      return Response.json({ ok: true, source: "coupons?action=get", sourceMode: "database", coupon });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -48,6 +61,14 @@ export async function POST(request: Request) {
       };
       const coupon = await createDbCoupon(input, tenantSlug);
       return Response.json({ ok: true, source: "coupons?action=create", sourceMode: "database", coupon, coupons: await listDbCoupons(tenantSlug) });
+    }
+
+    // Faithful coupon editor save (port of coupons.php POST action=new|edit). id=0
+    // creates, id>0 updates; the code is immutable on edit.
+    if (action === "save" || action === "new" || action === "edit" || action === "update") {
+      if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
+      const coupon = await saveManageCoupon(tenantSlug, body, parseInteger(body.id, 0));
+      return Response.json({ ok: true, source: "coupons?action=save", sourceMode: "database", coupon, coupons: await listDbCoupons(tenantSlug) });
     }
 
     // preview/redeem are also reachable from the quick-booking drawer's coupon Apply

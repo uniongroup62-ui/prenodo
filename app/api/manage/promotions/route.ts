@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { listDbPromotions, previewDbPromotion, toggleDbPromotion } from "@/lib/db-repositories";
+import { getManagePromotion, listDbPromotions, previewDbPromotion, saveManagePromotion, toggleDbPromotion } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -14,6 +14,19 @@ export async function GET(request: Request) {
   if (!canAny(session.user.perms, ["promotions.manage", "pos.manage"])) return jsonError("Permesso promozioni mancante.", 403);
 
   try {
+    const url = new URL(request.url);
+
+    // Edit-form prefill: return ONE promotion's editable fields for one id. Port
+    // of promotions.php action=edit. Gated by promotions.manage like the save.
+    if (url.searchParams.get("action") === "get") {
+      if (!can(session.user.perms, "promotions.manage")) return jsonError("Permesso promozioni mancante.", 403);
+      const promotionId = parseInteger(url.searchParams.get("id"), 0);
+      if (promotionId <= 0) return jsonError("ID promozione mancante.");
+      const promotion = await getManagePromotion(tenantSlug, promotionId);
+      if (!promotion) return jsonError("Promozione non trovata.", 404);
+      return Response.json({ ok: true, source: "promotions?action=get", sourceMode: "database", promotion });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -39,6 +52,14 @@ export async function POST(request: Request) {
       const active = ["1", "true", "yes", "on"].includes((body.active ?? "").toLowerCase());
       const promotion = await toggleDbPromotion(id, active, tenantSlug);
       return Response.json({ ok: true, source: "promotions?action=toggle", sourceMode: "database", promotion, promotions: await listDbPromotions(tenantSlug) });
+    }
+
+    // Faithful promotion editor save (port of promotions.php POST action=new|edit).
+    // id=0 creates, id>0 updates the core promotion record.
+    if (action === "save" || action === "new" || action === "edit" || action === "update") {
+      if (!can(session.user.perms, "promotions.manage")) return jsonError("Permesso promozioni mancante.", 403);
+      const promotion = await saveManagePromotion(tenantSlug, body, id);
+      return Response.json({ ok: true, source: "promotions?action=save", sourceMode: "database", promotion, promotions: await listDbPromotions(tenantSlug) });
     }
 
     if (!canAny(session.user.perms, ["promotions.manage", "pos.manage"])) return jsonError("Permesso promozioni mancante.", 403);
