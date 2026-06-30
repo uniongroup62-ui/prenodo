@@ -2077,6 +2077,79 @@ export async function getDbAppointmentPhpStatus(slug: string, id: number): Promi
   return phpStatus(String(rows[0].status ?? ""));
 }
 
+// Restore EVERY redeem an appointment consumed at save time (PACKAGE + PREPAID +
+// GIFTBOX + GIFT sessions per appointment_services row, plus the appointment-level
+// GIFTCARD refund). Extracted from deleteDbAppointment so it can be reused by the
+// status path: this app consumes redeems at CREATE time, so an appointment that is
+// CANCELED (or marked no_show) — not just deleted — must give those redeems back or
+// they leak. Tenant-scoped, idempotent/best-effort (each helper re-reads the live
+// row and only re-activates when this redemption had closed it, and the per-pool
+// updates are guarded), so a double call would re-add sessions; the caller must
+// therefore only invoke it on the FIRST transition into a canceled/no_show state.
+// It does NOT delete any rows — the appointment + its child snapshot rows survive
+// (legacy keeps canceled appointments); only deleteDbAppointment removes them after.
+export async function restoreAppointmentRedeems(slug: string, appointmentId: number): Promise<void> {
+  const id = Number(appointmentId);
+  if (!Number.isFinite(id) || id <= 0) return;
+
+  // Appointment-level giftcard linkage (refund amount + which card).
+  const existing = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, giftcard_id, giftcard_used",
+    where: "id = ?",
+    params: [id],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  if (!existing[0]) return;
+
+  // Read the appointment_services linkage snapshot, the same columns the apply
+  // helpers set. Best-effort: a missing table -> no per-service restores.
+  let serviceRows: RowDataPacket[] = [];
+  try {
+    serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      where: "appointment_id = ?",
+      params: [id],
+    });
+  } catch {
+    serviceRows = [];
+  }
+
+  // Restore PACKAGE + PREPAID + GIFTBOX + GIFT redeems per appointment_services row.
+  for (const row of serviceRows) {
+    // PACKAGE: give the session back (package pool + the per-service pool when linked).
+    const clientPackageId = Number(row.client_package_id ?? 0);
+    if (clientPackageId > 0) {
+      await restoreClientPackageSession(slug, clientPackageId, Number(row.client_package_service_id ?? 0) || null);
+    }
+    // PREPAID: give the unit back.
+    const clientPrepaidServiceId = Number(row.client_prepaid_service_id ?? 0);
+    if (clientPrepaidServiceId > 0) {
+      await restoreClientPrepaidUnit(slug, clientPrepaidServiceId);
+    }
+    // GIFTBOX: remove this appointment's redemption rows + reactivate the instance.
+    const giftboxInstanceId = Number(row.giftbox_instance_id ?? 0);
+    if (giftboxInstanceId > 0) {
+      await restoreGiftboxRedemption(slug, giftboxInstanceId, id);
+    }
+    // GIFT: reactivate the instance (the appointment_gift_items rows stay on a cancel;
+    // restoreGiftInstance only re-activates a 'riscattato' instance, so re-running is safe).
+    const giftInstanceId = Number(row.gift_instance_id ?? 0);
+    if (giftInstanceId > 0) {
+      await restoreGiftInstance(slug, giftInstanceId);
+    }
+  }
+
+  // Restore the appointment-level GIFTCARD redeem (refund the used amount).
+  const giftcardId = Number(existing[0].giftcard_id ?? 0);
+  const giftcardUsed = roundMoney(Math.max(0, parseMoney(existing[0].giftcard_used, 0)));
+  if (giftcardId > 0 && giftcardUsed > 0) {
+    await restoreGiftcardBalance(slug, giftcardId, giftcardUsed);
+  }
+}
+
 // DELETE an appointment (single-row "Elimina" + bulk_delete). Tenant-scoped port of
 // app/pages/appointments.php (single delete ~79-130 + bulk_delete ~292-520) and the
 // api_appointments.php delete rollback (~9665). This app CONSUMES redeems at SAVE
@@ -2119,50 +2192,11 @@ export async function deleteDbAppointment(slug: string, id: number): Promise<boo
   }).catch(() => [] as RowDataPacket[]);
   if (!existing[0]) return false;
 
-  // 2) Read the appointment_services linkage snapshot BEFORE deleting anything, so we
-  //    know which redeems to restore. Best-effort: a missing table -> no restores.
-  let serviceRows: RowDataPacket[] = [];
-  try {
-    serviceRows = await tenantSelect<RowDataPacket>({
-      slug,
-      table: "appointment_services",
-      where: "appointment_id = ?",
-      params: [appointmentId],
-    });
-  } catch {
-    serviceRows = [];
-  }
-
-  // 2a) Restore PACKAGE + PREPAID + GIFTBOX + GIFT redeems per appointment_services row.
-  for (const row of serviceRows) {
-    // PACKAGE: give the session back (package pool + the per-service pool when linked).
-    const clientPackageId = Number(row.client_package_id ?? 0);
-    if (clientPackageId > 0) {
-      await restoreClientPackageSession(slug, clientPackageId, Number(row.client_package_service_id ?? 0) || null);
-    }
-    // PREPAID: give the unit back.
-    const clientPrepaidServiceId = Number(row.client_prepaid_service_id ?? 0);
-    if (clientPrepaidServiceId > 0) {
-      await restoreClientPrepaidUnit(slug, clientPrepaidServiceId);
-    }
-    // GIFTBOX: remove this appointment's redemption rows + reactivate the instance.
-    const giftboxInstanceId = Number(row.giftbox_instance_id ?? 0);
-    if (giftboxInstanceId > 0) {
-      await restoreGiftboxRedemption(slug, giftboxInstanceId, appointmentId);
-    }
-    // GIFT: the appointment_gift_items rows are deleted below; reactivate the instance.
-    const giftInstanceId = Number(row.gift_instance_id ?? 0);
-    if (giftInstanceId > 0) {
-      await restoreGiftInstance(slug, giftInstanceId);
-    }
-  }
-
-  // 2b) Restore the appointment-level GIFTCARD redeem (refund the used amount).
-  const giftcardId = Number(existing[0].giftcard_id ?? 0);
-  const giftcardUsed = roundMoney(Math.max(0, parseMoney(existing[0].giftcard_used, 0)));
-  if (giftcardId > 0 && giftcardUsed > 0) {
-    await restoreGiftcardBalance(slug, giftcardId, giftcardUsed);
-  }
+  // 2) Restore every redeem this appointment consumed (package/prepaid/giftbox/gift
+  //    sessions + the appointment-level giftcard refund) BEFORE deleting any child
+  //    rows, so the linkage snapshot the restore reads is still intact. Extracted
+  //    into restoreAppointmentRedeems so the cancel-on-status path can reuse it.
+  await restoreAppointmentRedeems(slug, appointmentId);
 
   // 3) Delete the child snapshot rows + redeem links (best-effort per table). The
   //    appointment_gift_items rows are the gift redeem links; deleting them (paired

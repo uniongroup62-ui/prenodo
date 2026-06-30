@@ -1,5 +1,4 @@
 import {
-  normalizeAppointmentStatus,
   todayIso,
 } from "@/lib/appointment-engine";
 import { emptyToNull, jsonError, parseRequestBody } from "@/lib/api-utils";
@@ -14,6 +13,7 @@ import {
   getDbAppointmentPhpStatus,
   listDbAppointments,
   resizeDbAppointmentEnd,
+  restoreAppointmentRedeems,
   updateDbAppointment,
   updateDbAppointmentStatus,
   type AppointmentPackageRedeem,
@@ -247,18 +247,64 @@ export async function POST(request: Request) {
 
     if (action === "status") {
       const id = Number.parseInt(String(body.id ?? "0"), 10);
-      const status = normalizeAppointmentStatus(body.status);
+      // The status select (drawer + calendar) sends the PHP CODE
+      // (pending|scheduled|done|canceled|no_show). We must NOT route it through
+      // normalizeAppointmentStatus: that maps to the 3-value UI type and DEFAULTS
+      // every unknown key (scheduled/canceled/no_show) to "In attesa" -> pending,
+      // so those three statuses would never be settable. Instead derive the target
+      // PHP status directly via appointmentPhpStatus (the phpStatus path the DB
+      // write uses), and validate the raw input first so empty/garbage is rejected
+      // with a clear error rather than silently defaulting to scheduled.
+      const rawStatus = String(body.status ?? "").trim();
+      if (!isRecognizedStatusInput(rawStatus)) {
+        return Response.json({ ok: false, error: "Stato prenotazione non valido." }, { status: 400 });
+      }
       // Capture the prior PHP status BEFORE the write so we can map the
       // transition (pending->scheduled = 'approved', pending->canceled =
       // 'rejected') to the lifecycle email, matching the legacy PHP callers.
       const oldPhpStatus = await getDbAppointmentPhpStatus(tenantSlug, id);
-      const appointment = await updateDbAppointmentStatus(tenantSlug, id, status);
+      // The real target PHP status (all five codes settable now that we bypass the
+      // 3-state normalizeAppointmentStatus). Used by the guards, the email mapping,
+      // and the redeem restore below.
+      const newPhpStatus = appointmentPhpStatus(rawStatus);
+      // Transition guards — port of api_appointments.php:10225-10233. Once an
+      // appointment is canceled/no_show it is no longer editable; a 'done'
+      // appointment cannot be reverted to other states from this screen (a
+      // done -> canceled/no_show has to go through the dedicated cancel-done flow).
+      // These run BEFORE the DB write (and before any redeem restore).
+      if (oldPhpStatus === "canceled" || oldPhpStatus === "no_show") {
+        return Response.json({ ok: false, error: "La prenotazione annullata non è più modificabile." });
+      }
+      if (oldPhpStatus === "done" && newPhpStatus !== "done") {
+        return Response.json({
+          ok: false,
+          error:
+            newPhpStatus === "canceled" || newPhpStatus === "no_show"
+              ? "Per annullare una prenotazione eseguita usa il popup dedicato di annullamento."
+              : "Una prenotazione eseguita non può essere riportata ad altri stati da questa schermata.",
+        });
+      }
+      // RESTORE-ON-CANCEL (H5 redeem part): this app consumes redeems at CREATE time,
+      // so a pending/scheduled appointment already holds them. Transitioning it to
+      // canceled/no_show must give them back or they leak. Restore BEFORE the write
+      // (the linkage snapshot is read directly, write order is irrelevant) only when
+      // the OLD status was a non-canceled/non-done state — done->canceled/no_show is
+      // already blocked by the guard above, and old canceled/no_show is too, so this
+      // can never double-restore (a re-cancel never reaches here).
+      const transitioningToCancel = newPhpStatus === "canceled" || newPhpStatus === "no_show";
+      if (transitioningToCancel && (oldPhpStatus === "pending" || oldPhpStatus === "scheduled")) {
+        await restoreAppointmentRedeems(tenantSlug, id);
+      }
+      // Pass the raw code through: updateDbAppointmentStatus applies phpStatus(), so
+      // all five statuses persist correctly (the bug was upstream, not here). The
+      // appointment ROW is kept on cancel (legacy keeps canceled appointments).
+      const appointment = await updateDbAppointmentStatus(tenantSlug, id, rawStatus);
       // Port of automation_send_email('approved'|'rejected', id): fire AFTER the
       // DB write, gated on emailConfigured() + the kind's toggle (all handled
       // inside the helper). Errors are swallowed there so a delivery problem
       // never fails the status API; the response shape is unchanged.
       if (oldPhpStatus) {
-        const kind = lifecycleKindForStatusChange(oldPhpStatus, appointmentPhpStatus(status));
+        const kind = lifecycleKindForStatusChange(oldPhpStatus, newPhpStatus);
         if (kind) await sendAppointmentLifecycleEmail({ slug: tenantSlug, appointmentId: id, kind });
       }
       return Response.json({ ok: true, sourceMode: "database", appointment, appointments: await listDbAppointments({ slug: tenantSlug }) });
@@ -552,6 +598,30 @@ function parseStartsAt(value: string): { date: string; time: string } {
   const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(value.trim());
   if (!m) return { date: "", time: "" };
   return { date: m[1], time: m[2] };
+}
+
+// Whether `body.status` is a RECOGNIZED appointment status for action=status —
+// one of the five PHP codes (pending|scheduled|done|canceled|no_show) or their
+// Italian labels (the labels the status <select> shows + the legacy spellings
+// phpStatus accepts). phpStatus() itself can't validate: it DEFAULTS every
+// unknown key to 'scheduled', so we gate empty/garbage here before deriving the
+// target, rather than silently coercing an invalid value to scheduled.
+const RECOGNIZED_STATUS_INPUTS = new Set<string>([
+  // pending
+  "pending", "waiting", "in attesa",
+  // scheduled
+  "scheduled", "prenotato", "confermato", "confirmed",
+  // done (note: the "Eseguito" select LABEL submits the code "done", so the
+  // label spelling itself need not be accepted; only phpStatus-mapped values are).
+  "done", "completed", "completato",
+  // canceled
+  "canceled", "cancelled", "annullato",
+  // no_show
+  "no_show", "no show",
+]);
+
+function isRecognizedStatusInput(raw: string): boolean {
+  return RECOGNIZED_STATUS_INPUTS.has(raw.trim().toLowerCase());
 }
 
 function parseServiceNames(params: URLSearchParams): string[] {
