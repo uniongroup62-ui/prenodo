@@ -5,16 +5,36 @@ import { useEffect, useState } from "react";
 // Faithful port of the PHP giftbox page (app/pages/giftbox.php).
 type Row = Record<string, unknown>;
 
+// Giftbox TEMPLATE row (giftbox.php tab=boxes). The box catalog the POS issues
+// instances from. Surfaced as the "Template GiftBox" grid when ?tab=boxes.
+type Template = { id: number; name: string; active: boolean; pointsCost: number; itemsCount: number };
+
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
 }
 
+function currentTab(): string {
+  if (typeof window === "undefined") return "";
+  return new URLSearchParams(window.location.search).get("tab") ?? "";
+}
+
 export function GiftboxContent() {
   const slug = tenantSlug();
+  const [tab] = useState<string>(currentTab);
   const [items, setItems] = useState<Row[]>([]);
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [loadingTemplates, setLoadingTemplates] = useState(true);
 
   useEffect(() => {
+    if (tab === "boxes") {
+      fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}&action=templates`, { headers: { "x-tenant-slug": slug } })
+        .then((r) => r.json())
+        .then((j) => setTemplates(Array.isArray(j.templates) ? j.templates : []))
+        .catch(() => setTemplates([]))
+        .finally(() => setLoadingTemplates(false));
+      return;
+    }
     fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}`, { headers: { "x-tenant-slug": slug } })
       .then((r) => r.json())
       .then((j) => {
@@ -22,9 +42,86 @@ export function GiftboxContent() {
         setItems(Array.isArray(list) ? list : []);
       })
       .catch(() => {});
-  }, [slug]);
+  }, [slug, tab]);
 
   const settingsHref = `/${encodeURIComponent(slug)}/index.php?page=giftbox_settings`;
+  const boxesHref = `/${encodeURIComponent(slug)}/index.php?page=giftbox&tab=boxes`;
+
+  // Template grid (giftbox.php tab=boxes): the box catalog + the editor entry
+  // points (Nuova GiftBox / Modifica), wired to the faithful template editor.
+  if (tab === "boxes") {
+    return (
+      <div className="container-fluid">
+        <link rel="stylesheet" href="/assets/css/pages/giftbox.css" />
+
+        <div className="bs-page-header">
+          <div className="bs-page-heading">
+            <div className="bs-page-kicker">Programma fedelta</div>
+            <h1 className="bs-page-title">Fidelity / GiftBox</h1>
+            <div className="bs-page-subtitle">Template GiftBox (contenuti + regole base).</div>
+          </div>
+          <div className="bs-page-actions">
+            <div className="d-flex gap-2">
+              <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=giftbox`}>
+                <i className="bi bi-arrow-left me-1" />
+                GiftBox emesse
+              </a>
+              <a className="btn btn-primary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=giftbox&action=new`}>
+                <i className="bi bi-plus-circle me-1" />
+                Nuova GiftBox
+              </a>
+            </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="table-responsive">
+            <table className="table mb-0 align-middle">
+              <thead>
+                <tr>
+                  <th>Nome</th>
+                  <th>Contenuti</th>
+                  <th>Costo punti</th>
+                  <th>Stato</th>
+                  <th className="text-end">Azioni</th>
+                </tr>
+              </thead>
+              <tbody>
+                {templates.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="text-muted small p-3">
+                      {loadingTemplates ? "Caricamento…" : "Nessun template GiftBox."}
+                    </td>
+                  </tr>
+                ) : (
+                  templates.map((t) => (
+                    <tr key={t.id}>
+                      <td className="fw-semibold">{t.name || "—"}</td>
+                      <td className="text-muted small">{t.itemsCount} elementi</td>
+                      <td className="text-muted small">{t.pointsCost > 0 ? `${t.pointsCost} punti` : "—"}</td>
+                      <td>
+                        <span className={`badge ${t.active ? "text-bg-success" : "text-bg-secondary"}`}>
+                          {t.active ? "Abilitata" : "Disabilitata"}
+                        </span>
+                      </td>
+                      <td className="text-end">
+                        <a
+                          className="btn btn-sm btn-outline-primary"
+                          href={`/${encodeURIComponent(slug)}/index.php?page=giftbox&action=edit&id=${t.id}`}
+                        >
+                          Modifica
+                        </a>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="container-fluid">
@@ -41,6 +138,10 @@ export function GiftboxContent() {
             <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=fidelity`}>
               <i className="bi bi-arrow-left me-1" />
               Fidelity
+            </a>
+            <a className="btn btn-outline-secondary btn-pill" href={boxesHref}>
+              <i className="bi bi-box-seam me-1" />
+              Template GiftBox
             </a>
             <a className="btn btn-outline-secondary btn-pill" href={settingsHref}>
               <i className="bi bi-gear me-1" />

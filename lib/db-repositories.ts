@@ -5439,6 +5439,515 @@ async function ensureDbGiftTemplate(slug: string, input: { title?: string; rewar
   });
 }
 
+// ---------------------------------------------------------------------------
+// Gift CAMPAIGN editor (gifts.php action=new|edit) — the "Nuova/Modifica
+// campagna" form, distinct from the issued gift INSTANCES list. It writes the
+// `gifts` template row (+ a single unlock rule via gift_rule_sets/gift_rules and
+// the enabled sedi via gift_locations) so the POS/booking gift engine can issue
+// instances from it. Reward items are stored in gifts.reward_items_json, exactly
+// like the legacy Gifts::saveGift.
+// ---------------------------------------------------------------------------
+
+export type GiftFormCatalogItem = { id: number; name: string };
+
+// Shared catalog used by the gift + giftbox template editors: active services,
+// active products (label = name + sku), and locations. Mirrors the SELECTs the
+// legacy gifts.php/giftbox.php run to populate their item dropdowns.
+export async function giftFormCatalog(slug: string): Promise<{
+  services: GiftFormCatalogItem[];
+  products: GiftFormCatalogItem[];
+  locations: GiftFormCatalogItem[];
+}> {
+  const serviceRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "services",
+    columns: "id, name",
+    where: "is_active = 1",
+    orderBy: "COALESCE(category_id, 999999) ASC, COALESCE(sort_order, 0) ASC, name ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  const productRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "products",
+    columns: "id, name, sku",
+    where: "is_active = 1",
+    orderBy: "name ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  const locationRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "locations",
+    columns: "id, name",
+    orderBy: "sort_order ASC, name ASC, id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+
+  return {
+    services: serviceRows.map((row) => ({ id: Number(row.id ?? 0), name: String(row.name ?? "") })),
+    products: productRows.map((row) => {
+      const name = String(row.name ?? "");
+      const sku = String(row.sku ?? "").trim();
+      return { id: Number(row.id ?? 0), name: sku ? `${name} (${sku})` : name };
+    }),
+    locations: locationRows.map((row) => ({ id: Number(row.id ?? 0), name: String(row.name ?? "") })),
+  };
+}
+
+export type GiftCampaignRewardItem = {
+  type: "service" | "product" | "custom";
+  serviceId: number;
+  productId: number;
+  customLabel: string;
+  customDetails: string;
+  qty: number;
+};
+
+export type GiftRuleRecord = {
+  ruleType: string;
+  targetServiceId: number;
+  targetProductId: number;
+  threshold: string;
+};
+
+export type ManageGiftRecord = {
+  id: number;
+  name: string;
+  description: string;
+  fidelityOnly: boolean;
+  active: boolean;
+  termsEnabled: boolean;
+  termsText: string;
+  validFrom: string;
+  validTo: string;
+  expiresAfterDays: string;
+  locationIds: number[];
+  rewardItems: GiftCampaignRewardItem[];
+  rule: GiftRuleRecord;
+};
+
+function normalizeGiftRewardType(value: unknown): GiftCampaignRewardItem["type"] {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "service" || v === "product" || v === "custom" ? v : "service";
+}
+
+function normalizeGiftRuleType(value: unknown): string {
+  const v = String(value ?? "").trim().toLowerCase();
+  const allowed = ["service_qty", "product_qty", "appointments_count", "total_spend", "first_visit"];
+  return allowed.includes(v) ? v : "appointments_count";
+}
+
+// Edit-form prefill: ONE gift campaign's editable fields. Port of gifts.php
+// action=edit, reading the gifts row, its reward_items_json, its enabled sedi
+// (gift_locations) and its single unlock rule (gift_rule_sets -> gift_rules).
+export async function getManageGift(slug: string, id: number): Promise<ManageGiftRecord | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "gifts",
+    where: "id = ? AND deleted_at IS NULL",
+    params: [id],
+    limit: 1,
+  });
+  const g = rows[0];
+  if (!g) return null;
+
+  // reward_items_json -> list (fallback to the legacy single reward_* columns).
+  let rewardItems: GiftCampaignRewardItem[] = [];
+  try {
+    const parsed = JSON.parse(String(g.reward_items_json ?? "[]"));
+    if (Array.isArray(parsed)) {
+      rewardItems = parsed.map((it: Record<string, unknown>) => ({
+        type: normalizeGiftRewardType(it.type),
+        serviceId: Number(it.service_id ?? 0) || 0,
+        productId: Number(it.product_id ?? 0) || 0,
+        customLabel: String(it.custom_label ?? ""),
+        customDetails: String(it.custom_details ?? ""),
+        qty: Math.max(1, Number(it.qty ?? 1) || 1),
+      }));
+    }
+  } catch {
+    rewardItems = [];
+  }
+  if (rewardItems.length === 0) {
+    rewardItems = [{
+      type: normalizeGiftRewardType(g.reward_type),
+      serviceId: Number(g.reward_service_id ?? 0) || 0,
+      productId: Number(g.reward_product_id ?? 0) || 0,
+      customLabel: String(g.reward_custom_label ?? ""),
+      customDetails: String(g.reward_custom_details ?? ""),
+      qty: 1,
+    }];
+  }
+
+  const locationRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "gift_locations",
+    columns: "location_id",
+    where: "gift_id = ?",
+    params: [id],
+  }).catch(() => [] as RowDataPacket[]);
+  const locationIds = locationRows.map((row) => Number(row.location_id ?? 0)).filter((n) => n > 0);
+
+  // Single unlock rule via the first rule set.
+  let rule: GiftRuleRecord = { ruleType: "appointments_count", targetServiceId: 0, targetProductId: 0, threshold: "1" };
+  const ruleSets = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "gift_rule_sets",
+    columns: "id",
+    where: "gift_id = ?",
+    params: [id],
+    orderBy: "sort_order ASC, id ASC",
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  if (ruleSets[0]) {
+    const ruleRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "gift_rules",
+      where: "rule_set_id = ?",
+      params: [Number(ruleSets[0].id ?? 0)],
+      orderBy: "sort_order ASC, id ASC",
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    if (ruleRows[0]) {
+      rule = {
+        ruleType: normalizeGiftRuleType(ruleRows[0].rule_type),
+        targetServiceId: Number(ruleRows[0].target_service_id ?? 0) || 0,
+        targetProductId: Number(ruleRows[0].target_product_id ?? 0) || 0,
+        threshold: String(ruleRows[0].threshold ?? "1"),
+      };
+    }
+  }
+
+  return {
+    id,
+    name: String(g.name ?? ""),
+    description: String(g.description ?? ""),
+    fidelityOnly: String(g.eligibility ?? "all_clients") === "fidelity_only",
+    active: Number(g.active ?? 0) === 1,
+    termsEnabled: Number(g.terms_enabled ?? 0) === 1,
+    termsText: String(g.terms_text ?? ""),
+    validFrom: g.valid_from ? toIso(g.valid_from).slice(0, 10) : "",
+    validTo: g.valid_to ? toIso(g.valid_to).slice(0, 10) : "",
+    expiresAfterDays: g.expires_after_days != null ? String(g.expires_after_days) : "",
+    locationIds,
+    rewardItems,
+    rule,
+  };
+}
+
+// Create / update a gift campaign, faithful to gifts.php POST(action=new|edit) /
+// Gifts::saveGift. Writes the gifts row, replaces the gift_locations rows, and
+// rebuilds the single unlock rule (gift_rule_sets + gift_rules). Reward items are
+// posted as a JSON string (reward_items_json) because parseRequestBody flattens
+// arrays. The advanced Fidelity targeting (eligible_levels_points) and the
+// excluded-clients list are NOT written here — see the form TODO.
+export async function saveManageGift(slug: string, body: Record<string, string>, id: number): Promise<ManageGiftRecord> {
+  const name = String(body.name ?? "").trim();
+  if (name === "") throw new Error("Nome campagna obbligatorio.");
+
+  const fidelityOnly = String(body.fidelity_only ?? "") === "1";
+  const active = String(body.active ?? "") === "1";
+  const termsEnabled = String(body.terms_enabled ?? "") === "1";
+  const termsText = String(body.terms_text ?? "");
+
+  const from = normalizeClientDate(body.valid_from);
+  const to = normalizeClientDate(body.valid_to);
+  if (!from) throw new Error('Inserisci una data "Valido dal" valida.');
+  if (!to) throw new Error('Inserisci una data "Valido al" valida.');
+  if (from > to) throw new Error('La data "Valido al" deve essere successiva a "Valido dal".');
+
+  const expiresAfterRaw = String(body.expires_after_days ?? "").trim();
+  const expiresAfterDays = expiresAfterRaw === "" ? null : Math.max(0, parseInt(expiresAfterRaw, 10) || 0);
+
+  // reward_items_json -> persisted JSON (mirror of Gifts::saveGift items).
+  let rewardItems: Array<Record<string, unknown>> = [];
+  try {
+    const parsed = JSON.parse(String(body.reward_items_json ?? "[]"));
+    if (Array.isArray(parsed)) {
+      rewardItems = parsed
+        .map((it: Record<string, unknown>) => {
+          const type = normalizeGiftRewardType(it.type);
+          return {
+            type,
+            service_id: type === "service" ? Number(it.service_id ?? 0) || 0 : 0,
+            product_id: type === "product" ? Number(it.product_id ?? 0) || 0 : 0,
+            custom_label: type === "custom" ? String(it.custom_label ?? "") : "",
+            custom_details: type === "custom" ? String(it.custom_details ?? "") : "",
+            qty: Math.max(1, Number(it.qty ?? 1) || 1),
+          };
+        })
+        .filter((it) => it.type === "custom" ? String(it.custom_label).trim() !== "" : (it.service_id > 0 || it.product_id > 0));
+    }
+  } catch {
+    rewardItems = [];
+  }
+  if (rewardItems.length === 0) throw new Error("Aggiungi almeno un elemento da regalare.");
+  const firstReward = rewardItems[0];
+
+  const locationIds = String(body.location_ids ?? "")
+    .split(",")
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const values: Record<string, unknown> = {
+    name,
+    description: String(body.description ?? "").trim() || null,
+    eligibility: fidelityOnly ? "fidelity_only" : "all_clients",
+    reward_type: String(firstReward.type ?? "custom"),
+    reward_service_id: Number(firstReward.service_id ?? 0) || null,
+    reward_product_id: Number(firstReward.product_id ?? 0) || null,
+    reward_custom_label: String(firstReward.custom_label ?? "") || null,
+    reward_custom_details: String(firstReward.custom_details ?? "") || null,
+    reward_items_json: JSON.stringify(rewardItems),
+    active: active ? 1 : 0,
+    valid_from: from,
+    valid_to: to,
+    expires_after_days: expiresAfterDays,
+    terms_enabled: termsEnabled ? 1 : 0,
+    terms_text: termsText,
+  };
+
+  let giftId = id;
+  if (giftId > 0) {
+    const existing = await tenantSelect<RowDataPacket>({ slug, table: "gifts", columns: "id", where: "id = ? AND deleted_at IS NULL", params: [giftId], limit: 1 });
+    if (!existing[0]) throw new Error("Campagna non trovata.");
+    await tenantUpdate({ slug, table: "gifts", id: giftId, values });
+  } else {
+    giftId = await tenantInsert(await tenantTable(slug, "gifts"), values);
+  }
+
+  // Replace enabled sedi (gift_locations): remove existing rows for this gift,
+  // then re-insert the selection.
+  const locTable = await tenantTable(slug, "gift_locations");
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(locTable.name)} WHERE gift_id = ?${locTable.mode === "shared" && (await columnExists(locTable.name, "tenant_id")) ? " AND tenant_id = ?" : ""}`,
+    locTable.mode === "shared" && (await columnExists(locTable.name, "tenant_id")) ? [giftId, locTable.tenantId ?? 0] : [giftId],
+  ).catch(() => undefined);
+  for (const locationId of locationIds) {
+    await tenantInsert(locTable, { gift_id: giftId, location_id: locationId }).catch(() => 0);
+  }
+
+  // Rebuild the single unlock rule (gift_rule_sets + gift_rules).
+  const ruleType = normalizeGiftRuleType(body.rule_type);
+  const ruleThresholdRaw = String(body.rule_threshold ?? "1").replace(",", ".");
+  const ruleThreshold = Math.max(0, Number.parseFloat(ruleThresholdRaw) || 0);
+  const ruleServiceId = Number.parseInt(String(body.rule_service_id ?? "0"), 10) || 0;
+  const ruleProductId = Number.parseInt(String(body.rule_product_id ?? "0"), 10) || 0;
+
+  const setTable = await tenantTable(slug, "gift_rule_sets");
+  const ruleTable = await tenantTable(slug, "gift_rules");
+  const existingSets = await tenantSelect<RowDataPacket>({ slug, table: "gift_rule_sets", columns: "id", where: "gift_id = ?", params: [giftId] }).catch(() => [] as RowDataPacket[]);
+  for (const set of existingSets) {
+    const setId = Number(set.id ?? 0);
+    await dbExecute(
+      `DELETE FROM ${quoteIdentifier(ruleTable.name)} WHERE rule_set_id = ?${ruleTable.mode === "shared" && (await columnExists(ruleTable.name, "tenant_id")) ? " AND tenant_id = ?" : ""}`,
+      ruleTable.mode === "shared" && (await columnExists(ruleTable.name, "tenant_id")) ? [setId, ruleTable.tenantId ?? 0] : [setId],
+    ).catch(() => undefined);
+  }
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(setTable.name)} WHERE gift_id = ?${setTable.mode === "shared" && (await columnExists(setTable.name, "tenant_id")) ? " AND tenant_id = ?" : ""}`,
+    setTable.mode === "shared" && (await columnExists(setTable.name, "tenant_id")) ? [giftId, setTable.tenantId ?? 0] : [giftId],
+  ).catch(() => undefined);
+  const ruleSetId = await tenantInsert(setTable, { gift_id: giftId, set_operator: "and", sort_order: 0 });
+  await tenantInsert(ruleTable, {
+    rule_set_id: ruleSetId,
+    rule_type: ruleType,
+    comparator: ">=",
+    threshold: ruleThreshold,
+    target_service_id: ruleType === "service_qty" ? (ruleServiceId || null) : null,
+    target_product_id: ruleType === "product_qty" ? (ruleProductId || null) : null,
+    window_type: "all_time",
+    sort_order: 0,
+  }).catch(() => 0);
+
+  const saved = await getManageGift(slug, giftId);
+  if (!saved) throw new Error("Campagna non salvata.");
+  return saved;
+}
+
+// ---------------------------------------------------------------------------
+// GiftBox TEMPLATE editor (giftbox.php tab=boxes action=new|edit) — the box
+// catalog the POS giftbox-sale issues instances from. A template is a `giftboxes`
+// row plus its `giftbox_items` (services / products / custom voices with qty).
+// Distinct from giftbox_instances (the issued GiftBoxes shown in the list).
+// ---------------------------------------------------------------------------
+
+export type GiftBoxTemplateItem = {
+  itemType: "service" | "product" | "custom";
+  serviceId: number;
+  productId: number;
+  qty: number;
+  customLabel: string;
+  customDetails: string;
+};
+
+export type GiftBoxTemplateRecord = {
+  id: number;
+  name: string;
+  description: string;
+  fidelityOnly: boolean;
+  pointsCost: string;
+  active: boolean;
+  sortOrder: string;
+  validFrom: string;
+  validTo: string;
+  items: GiftBoxTemplateItem[];
+};
+
+function normalizeGiftBoxItemType(value: unknown): GiftBoxTemplateItem["itemType"] {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "service" || v === "product" || v === "custom" ? v : "custom";
+}
+
+// Lightweight list of giftbox TEMPLATES (for the template grid). Port of
+// GiftBox::listGiftBoxes(false): non-deleted boxes ordered by sort_order.
+export async function listManageGiftBoxTemplates(slug: string): Promise<Array<{ id: number; name: string; active: boolean; pointsCost: number; itemsCount: number }>> {
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "giftboxes",
+    where: "deleted_at IS NULL",
+    orderBy: "sort_order ASC, id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  return Promise.all(rows.map(async (row) => {
+    const id = Number(row.id ?? 0);
+    const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "giftbox_items", columns: "id", where: "giftbox_id = ?", params: [id] }).catch(() => [] as RowDataPacket[]);
+    return {
+      id,
+      name: String(row.name ?? ""),
+      active: Number(row.active ?? 0) === 1,
+      pointsCost: roundMoney(Number(row.points_cost ?? 0)),
+      itemsCount: itemRows.length,
+    };
+  }));
+}
+
+// Edit-form prefill: ONE giftbox template + its items. Port of GiftBox::getGiftBox.
+export async function getManageGiftBoxTemplate(slug: string, id: number): Promise<GiftBoxTemplateRecord | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftboxes", where: "id = ? AND deleted_at IS NULL", params: [id], limit: 1 });
+  const gb = rows[0];
+  if (!gb) return null;
+
+  const itemRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "giftbox_items",
+    where: "giftbox_id = ?",
+    params: [id],
+    orderBy: "sort_order ASC, id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+
+  const items: GiftBoxTemplateItem[] = itemRows.map((row) => ({
+    itemType: normalizeGiftBoxItemType(row.item_type),
+    serviceId: Number(row.service_id ?? 0) || 0,
+    productId: Number(row.product_id ?? 0) || 0,
+    qty: Math.max(1, Number(row.qty ?? 1) || 1),
+    customLabel: String(row.custom_label ?? ""),
+    customDetails: String(row.custom_details ?? ""),
+  }));
+
+  return {
+    id,
+    name: String(gb.name ?? ""),
+    description: String(gb.description ?? ""),
+    fidelityOnly: String(gb.eligibility ?? "fidelity_only") === "fidelity_only",
+    pointsCost: gb.points_cost != null ? String(roundMoney(Number(gb.points_cost ?? 0))) : "0",
+    active: Number(gb.active ?? 0) === 1,
+    sortOrder: gb.sort_order != null ? String(gb.sort_order) : "0",
+    validFrom: gb.valid_from ? toIso(gb.valid_from).slice(0, 10) : "",
+    validTo: gb.valid_to ? toIso(gb.valid_to).slice(0, 10) : "",
+    items,
+  };
+}
+
+// Create / update a giftbox template, faithful to giftbox.php POST(action=new|
+// edit) / GiftBox::saveGiftBox: writes the giftboxes row and rebuilds its
+// giftbox_items. Items are posted as a JSON string (items_json) because
+// parseRequestBody flattens arrays. The advanced Fidelity targeting
+// (eligible_levels_points) is NOT written here — see the form TODO.
+export async function saveManageGiftBoxTemplate(slug: string, body: Record<string, string>, id: number): Promise<GiftBoxTemplateRecord> {
+  const name = String(body.name ?? "").trim();
+  if (name === "") throw new Error("Nome GiftBox obbligatorio.");
+
+  const fidelityOnly = String(body.fidelity_only ?? "") === "1";
+  const active = String(body.active ?? "") === "1";
+  const pointsCost = roundMoney(Math.max(0, Number(String(body.points_cost ?? "0").replace(",", ".")) || 0));
+  const sortOrder = Number.parseInt(String(body.sort_order ?? "0"), 10) || 0;
+  const from = normalizeClientDate(body.valid_from);
+  const to = normalizeClientDate(body.valid_to);
+  if (String(body.valid_from ?? "").trim() !== "" && !from) throw new Error('Formato "Validità dal" non valido.');
+  if (String(body.valid_to ?? "").trim() !== "" && !to) throw new Error('Formato "Validità al" non valido.');
+  if (from && to && from > to) throw new Error('La data "Validità al" deve essere successiva a "Validità dal".');
+
+  let items: Array<Record<string, unknown>> = [];
+  try {
+    const parsed = JSON.parse(String(body.items_json ?? "[]"));
+    if (Array.isArray(parsed)) {
+      items = parsed
+        .map((it: Record<string, unknown>) => {
+          const itemType = normalizeGiftBoxItemType(it.item_type);
+          return {
+            item_type: itemType,
+            service_id: itemType === "service" ? Number(it.service_id ?? 0) || 0 : 0,
+            product_id: itemType === "product" ? Number(it.product_id ?? 0) || 0 : 0,
+            qty: Math.max(1, Number(it.qty ?? 1) || 1),
+            custom_label: String(it.custom_label ?? ""),
+            custom_details: String(it.custom_details ?? ""),
+          };
+        })
+        .filter((it) =>
+          it.item_type === "service" ? it.service_id > 0 :
+          it.item_type === "product" ? it.product_id > 0 :
+          String(it.custom_label).trim() !== "",
+        );
+    }
+  } catch {
+    items = [];
+  }
+  if (items.length === 0) throw new Error("Aggiungi almeno un contenuto alla GiftBox.");
+
+  const values: Record<string, unknown> = {
+    name,
+    description: String(body.description ?? "").trim() || null,
+    eligibility: fidelityOnly ? "fidelity_only" : "all_clients",
+    points_cost: pointsCost,
+    active: active ? 1 : 0,
+    sort_order: sortOrder,
+    valid_from: from,
+    valid_to: to,
+  };
+
+  let giftboxId = id;
+  if (giftboxId > 0) {
+    const existing = await tenantSelect<RowDataPacket>({ slug, table: "giftboxes", columns: "id", where: "id = ? AND deleted_at IS NULL", params: [giftboxId], limit: 1 });
+    if (!existing[0]) throw new Error("GiftBox non trovata.");
+    await tenantUpdate({ slug, table: "giftboxes", id: giftboxId, values });
+  } else {
+    giftboxId = await tenantInsert(await tenantTable(slug, "giftboxes"), values);
+  }
+
+  // Rebuild giftbox_items.
+  const itemTable = await tenantTable(slug, "giftbox_items");
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(itemTable.name)} WHERE giftbox_id = ?${itemTable.mode === "shared" && (await columnExists(itemTable.name, "tenant_id")) ? " AND tenant_id = ?" : ""}`,
+    itemTable.mode === "shared" && (await columnExists(itemTable.name, "tenant_id")) ? [giftboxId, itemTable.tenantId ?? 0] : [giftboxId],
+  ).catch(() => undefined);
+  let sort = 0;
+  for (const item of items) {
+    await tenantInsert(itemTable, {
+      giftbox_id: giftboxId,
+      item_type: String(item.item_type),
+      service_id: Number(item.service_id ?? 0) || null,
+      product_id: Number(item.product_id ?? 0) || null,
+      qty: Number(item.qty ?? 1),
+      custom_label: String(item.custom_label ?? "") || null,
+      custom_details: String(item.custom_details ?? "") || null,
+      sort_order: sort,
+    }).catch(() => 0);
+    sort += 1;
+  }
+
+  const saved = await getManageGiftBoxTemplate(slug, giftboxId);
+  if (!saved) throw new Error("GiftBox non salvata.");
+  return saved;
+}
+
 async function getSingleInstallmentPlan(slug: string, id: number): Promise<InstallmentPlan> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "sale_installment_plans", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Piano rateale non trovato.");

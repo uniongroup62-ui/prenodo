@@ -1,8 +1,16 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
-import { issueDbGiftBox, listDbGiftBoxes, redeemDbGiftBox } from "@/lib/db-repositories";
+import {
+  getManageGiftBoxTemplate,
+  giftFormCatalog,
+  issueDbGiftBox,
+  listDbGiftBoxes,
+  listManageGiftBoxTemplates,
+  redeemDbGiftBox,
+  saveManageGiftBoxTemplate,
+} from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { canAny } from "@/lib/role-permissions";
+import { can, canAny } from "@/lib/role-permissions";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -16,6 +24,32 @@ export async function GET(request: Request) {
   if (!canAny(session.user.perms, giftBoxPerms)) return jsonError("Permesso GiftBox mancante.", 403);
 
   try {
+    const url = new URL(request.url);
+    const action = url.searchParams.get("action");
+
+    // Template grid (giftbox.php tab=boxes). The box catalog the POS issues from.
+    if (action === "templates") {
+      if (!can(session.user.perms, "giftbox.manage")) return jsonError("Permesso GiftBox mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", templates: await listManageGiftBoxTemplates(tenantSlug) });
+    }
+
+    // Template editor catalog (services/products for the items dropdowns).
+    if (action === "context") {
+      if (!can(session.user.perms, "giftbox.manage")) return jsonError("Permesso GiftBox mancante.", 403);
+      const { services, products } = await giftFormCatalog(tenantSlug);
+      return Response.json({ ok: true, sourceMode: "database", services, products });
+    }
+
+    // Edit-form prefill: ONE giftbox template + its items. Port of GiftBox::getGiftBox.
+    if (action === "get") {
+      if (!can(session.user.perms, "giftbox.manage")) return jsonError("Permesso GiftBox mancante.", 403);
+      const templateId = parseInteger(url.searchParams.get("id"), 0);
+      if (templateId <= 0) return jsonError("ID GiftBox mancante.");
+      const template = await getManageGiftBoxTemplate(tenantSlug, templateId);
+      if (!template) return jsonError("GiftBox non trovata.", 404);
+      return Response.json({ ok: true, source: "giftbox?action=get", sourceMode: "database", template });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -36,6 +70,14 @@ export async function POST(request: Request) {
   const action = body.action ?? "issue";
 
   try {
+    // Faithful giftbox TEMPLATE editor save (port of giftbox.php POST
+    // action=new|edit / GiftBox::saveGiftBox). id=0 creates, id>0 updates.
+    if (action === "save" || action === "new" || action === "edit") {
+      if (!can(session.user.perms, "giftbox.manage")) return jsonError("Permesso GiftBox mancante.", 403);
+      const template = await saveManageGiftBoxTemplate(tenantSlug, body, parseInteger(body.id, 0));
+      return Response.json({ ok: true, source: "giftbox?action=save", sourceMode: "database", template, templates: await listManageGiftBoxTemplates(tenantSlug) });
+    }
+
     if (action === "issue") {
       const input = {
         clientId: parseInteger(body.client_id, 0),

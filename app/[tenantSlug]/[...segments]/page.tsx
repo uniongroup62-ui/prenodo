@@ -20,6 +20,8 @@ import { SupplierFormContent } from "@/components/modules/supplier_form-content"
 import { CabinsContent } from "@/components/modules/cabins-content";
 import { GiftcardContent } from "@/components/modules/giftcard-content";
 import { GiftsContent } from "@/components/modules/gifts-content";
+import { GiftFormContent } from "@/components/modules/gift_form-content";
+import { GiftBoxFormContent } from "@/components/modules/giftbox_form-content";
 import { HoursContent } from "@/components/modules/hours-content";
 import { ProductsContent } from "@/components/modules/products-content";
 import { ProductFormContent } from "@/components/modules/product_form-content";
@@ -268,6 +270,28 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <SupplierFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful gift CAMPAIGN editor (gifts.php action=new|edit). The gifts
+  // campaigns list links to index.php?page=gifts&action=new|edit; route those to
+  // the faithful campaign editor (instead of the Tailwind ManagementApp fallback).
+  if (page === "gifts" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <GiftFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful giftbox TEMPLATE editor (giftbox.php tab=boxes action=new|edit). The
+  // giftbox templates grid links to index.php?page=giftbox&action=new|edit; route
+  // those to the faithful template editor (instead of the Tailwind fallback).
+  if (page === "giftbox" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <GiftBoxFormContent />
       </ManageShell>
     );
   }

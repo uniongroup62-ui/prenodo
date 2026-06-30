@@ -1,8 +1,8 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { issueDbGift, listDbGifts, redeemDbGift } from "@/lib/db-repositories";
+import { getManageGift, giftFormCatalog, issueDbGift, listDbGifts, redeemDbGift, saveManageGift } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { canAny } from "@/lib/role-permissions";
+import { can, canAny } from "@/lib/role-permissions";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -17,6 +17,27 @@ export async function GET(request: Request) {
   if (!canAny(session.user.perms, giftPerms)) return jsonError("Permesso omaggi mancante.", 403);
 
   try {
+    const url = new URL(request.url);
+    const action = url.searchParams.get("action");
+
+    // Campaign editor catalog (services/products/locations for the item + sedi
+    // dropdowns). Port of the SELECTs in gifts.php action=new|edit.
+    if (action === "context") {
+      if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", ...(await giftFormCatalog(tenantSlug)) });
+    }
+
+    // Edit-form prefill: ONE gift campaign's editable fields. Port of gifts.php
+    // action=edit. Gated by gifts.manage like the save action.
+    if (action === "get") {
+      if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
+      const giftId = parseInteger(url.searchParams.get("id"), 0);
+      if (giftId <= 0) return jsonError("ID campagna mancante.");
+      const gift = await getManageGift(tenantSlug, giftId);
+      if (!gift) return jsonError("Campagna non trovata.", 404);
+      return Response.json({ ok: true, source: "gifts?action=get", sourceMode: "database", gift });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -37,6 +58,14 @@ export async function POST(request: Request) {
   const action = body.action ?? "issue";
 
   try {
+    // Faithful gift CAMPAIGN editor save (port of gifts.php POST action=new|edit
+    // / Gifts::saveGift). id=0 creates, id>0 updates. Gated by gifts.manage.
+    if (action === "save" || action === "new" || action === "edit") {
+      if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
+      const gift = await saveManageGift(tenantSlug, body, parseInteger(body.id, 0));
+      return Response.json({ ok: true, source: "gifts?action=save", sourceMode: "database", gift, gifts: await listDbGifts(tenantSlug) });
+    }
+
     if (action === "issue") {
       const input = {
         clientId: parseInteger(body.client_id, 0),
