@@ -1,13 +1,31 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import { currentManageSession, setManageSessionCookie } from "@/lib/manage-auth";
-import { filterLocationsForManageSession, getManageLocationContext } from "@/lib/manage-locations";
+import { filterLocationsForManageSession, getManageLocation, getManageLocationContext } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
+import { can } from "@/lib/role-permissions";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const tenantSlug = manageTenantSlugFromRequest(request);
+
+  // Edit-form prefill: return ONE location's editable fields for one id. Port of
+  // locations.php locationModal data-location-edit prefill. Gated by
+  // settings.location like the location_save action (handled by the
+  // business-settings route).
+  const url = new URL(request.url);
+  if (url.searchParams.get("action") === "get") {
+    const session = await currentManageSession(tenantSlug);
+    if (!session) return jsonError("Sessione gestionale scaduta.", 401);
+    if (!can(session.user.perms, "settings.location")) return jsonError("Permesso Sedi richiesto.", 403);
+    const locationId = parseInteger(url.searchParams.get("id"), 0);
+    if (locationId <= 0) return jsonError("ID sede mancante.");
+    const location = await getManageLocation(tenantSlug, locationId);
+    if (!location) return jsonError("Sede non trovata.", 404);
+    return Response.json({ ok: true, source: "locations?action=get", sourceMode: "database", location });
+  }
+
   const locationContext = await getManageLocationContext(tenantSlug);
 
   return Response.json({

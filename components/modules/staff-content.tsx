@@ -103,15 +103,10 @@ export function StaffContent() {
           <div className="bs-page-subtitle">Gestisci operatori, ruoli e sedi abilitate.</div>
         </div>
         <div className="bs-page-actions">
-          <button
-            className="btn btn-primary"
-            type="button"
-            data-bs-toggle="modal"
-            data-bs-target="#staffOperatorCreateModal"
-          >
+          <a className="btn btn-primary" href={href("&action=new")}>
             <i className="bi bi-plus-lg me-1" />
             Nuovo operatore
-          </button>
+          </a>
         </div>
       </div>
 

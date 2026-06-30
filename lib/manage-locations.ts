@@ -2,6 +2,7 @@ import "server-only";
 
 import { listDbLocations } from "@/lib/db-repositories";
 import { currentManageSession, type ManageSession } from "@/lib/manage-auth";
+import { tenantSelect, type RowDataPacket } from "@/lib/tenant-db";
 
 type SourceMode = "database";
 type Location = {
@@ -90,4 +91,57 @@ export function resolveCurrentManageLocationId<T extends { id: number }>(
 ): number {
   if (locations.some((location) => location.id === currentLocationId)) return currentLocationId;
   return locations.length === 1 ? locations[0]?.id ?? 0 : 0;
+}
+
+export type ManageLocationEdit = {
+  id: number;
+  name: string;
+  address: string;
+  legalRegion: string;
+  legalProvince: string;
+  legalCity: string;
+  legalCap: string;
+  phone: string;
+  email: string;
+  whatsapp: string;
+  facebookUrl: string;
+  instagramUrl: string;
+  tiktokUrl: string;
+  bookingEnabled: boolean;
+  marketplaceEnabled: boolean;
+};
+
+// Edit-form prefill for ONE location. Port of locations.php loadLocationForm
+// (the locationModal data-location-edit prefill): returns the editable fields
+// posted by the locationModalForm (action=location_save). Narrowed by id from
+// the same tenant-scoped locations table the list/context pipeline uses.
+export async function getManageLocation(slug: string, id: number): Promise<ManageLocationEdit | null> {
+  if (!(id > 0)) return null;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "locations",
+    columns: "*",
+    where: "id = ?",
+    params: [id],
+    limit: 1,
+  });
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    id: Number(row.id ?? id),
+    name: String(row.name ?? ""),
+    address: String(row.address ?? ""),
+    legalRegion: String(row.legal_region ?? ""),
+    legalProvince: String(row.legal_province ?? ""),
+    legalCity: String(row.legal_city ?? ""),
+    legalCap: String(row.legal_cap ?? ""),
+    phone: String(row.phone ?? ""),
+    email: String(row.email ?? ""),
+    whatsapp: String(row.whatsapp ?? ""),
+    facebookUrl: String(row.facebook_url ?? ""),
+    instagramUrl: String(row.instagram_url ?? ""),
+    tiktokUrl: String(row.tiktok_url ?? ""),
+    bookingEnabled: Number(row.booking_enabled ?? 1) === 1,
+    marketplaceEnabled: Number(row.marketplace_enabled ?? 0) === 1,
+  };
 }

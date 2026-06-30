@@ -8,10 +8,13 @@ import {
   deleteExceptionRange,
   deleteSharedResource,
   deleteStaffMember,
+  getManageCabin,
+  getManageStaffMember,
   resourceContext,
   saveAvailabilityEvent,
   saveBusinessHours,
   saveCabin,
+  saveCabinsBulk,
   saveClosure,
   saveException,
   saveSharedResource,
@@ -34,6 +37,31 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const section = url.searchParams.get("section") ?? "resources";
   if (!can(activeUser.perms, permissionForResourceSection(section))) return jsonError("Permesso negato.", 403);
+
+  // Edit-form prefill: return ONE staff/cabin record for one id. Port of
+  // staff.php / cabins.php action=edit. Gated by the same section permission as
+  // the matching save (staff.manage / cabins.manage).
+  if (url.searchParams.get("action") === "get") {
+    const id = parseInteger(url.searchParams.get("id"), 0);
+    if (id <= 0) return jsonError("ID mancante.");
+    try {
+      if (section === "staff") {
+        if (!can(activeUser.perms, "staff.manage")) return jsonError("Permesso Operatori richiesto.", 403);
+        const staff = await getManageStaffMember(tenantSlug, id);
+        if (!staff) return jsonError("Operatore non trovato.", 404);
+        return Response.json({ ok: true, source: "resources?section=staff&action=get", sourceMode: "database", staff });
+      }
+      if (section === "cabins") {
+        if (!can(activeUser.perms, "cabins.manage")) return jsonError("Permesso Cabine richiesto.", 403);
+        const cabin = await getManageCabin(tenantSlug, id);
+        if (!cabin) return jsonError("Cabina non trovata.", 404);
+        return Response.json({ ok: true, source: "resources?section=cabins&action=get", sourceMode: "database", cabin });
+      }
+      return jsonError("Sezione non supportata per il get.", 400);
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Record non disponibile.", 400);
+    }
+  }
 
   try {
     const context = await resourceContext({
@@ -73,6 +101,15 @@ export async function POST(request: Request) {
       if (!can(activeUser.perms, "cabins.manage")) return jsonError("Permesso Cabine richiesto.", 403);
       const cabin = await saveCabin(tenantSlug, body);
       return Response.json({ ok: true, cabin });
+    }
+
+    // Bulk cabins save (port of cabins.php #cabinsForm POST): count + names +
+    // ids for the active location. Returns ok:false + blockingServices when a
+    // removed cabin is still linked to a service / future appointment.
+    if (action === "cabins_save") {
+      if (!can(activeUser.perms, "cabins.manage")) return jsonError("Permesso Cabine richiesto.", 403);
+      const result = await saveCabinsBulk(tenantSlug, body);
+      return Response.json(result, { status: result.ok ? 200 : 400 });
     }
 
     if (action === "cabin_delete") {

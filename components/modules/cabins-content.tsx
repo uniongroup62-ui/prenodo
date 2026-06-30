@@ -64,6 +64,8 @@ export function CabinsContent() {
   const [count, setCount] = useState<number>(0);
   const [rows, setRows] = useState<CabinRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   // Block modal state (mirrors cabins.js showCabinBlockPopup()).
   const [blockModal, setBlockModal] = useState<{
@@ -194,6 +196,81 @@ export function CabinsContent() {
     return `${cabinName} → ${serviceName} (${active})`;
   }
 
+  // Bulk save (port of cabins.php #cabinsForm POST): submit count + names + ids
+  // for the active location to /api/manage/resources (action=cabins_save).
+  // Mirrors the cabins.js submit guard: first block locally if removed cabins
+  // still have linked services; otherwise POST. The server re-checks and, when a
+  // removed cabin is still linked, returns ok:false + blockingServices, which we
+  // surface in the same delete-block popup the legacy page shows.
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError("");
+
+    const keptIds = new Set(rows.map((r) => r.id).filter((id) => id > 0));
+    let blocking: ServiceLink[] = [];
+    for (const cabin of initialCabins) {
+      if (cabin.id > 0 && !keptIds.has(cabin.id) && Array.isArray(cabin.serviceLinks) && cabin.serviceLinks.length > 0) {
+        blocking = blocking.concat(cabin.serviceLinks);
+      }
+    }
+    if (blocking.length > 0) {
+      setBlockModal({
+        open: true,
+        title: "Impossibile eliminare la cabina",
+        message:
+          "Una o più cabine che stai rimuovendo sono associate ai servizi elencati. Rimuovi prima la cabina dai servizi collegati e poi riprova.",
+        services: blocking,
+      });
+      return;
+    }
+
+    // Client-side required-name check (faithful to the legacy "Inserisci un nome
+    // per tutte le cabine.").
+    for (let i = 0; i < count; i++) {
+      if (((rows[i]?.name ?? "").trim()) === "") {
+        setError("Inserisci un nome per tutte le cabine.");
+        return;
+      }
+    }
+
+    setSaving(true);
+    try {
+      const payload: Record<string, unknown> = {
+        action: "cabins_save",
+        location_id: String(activeLocationId || ""),
+        cabins_count: String(count),
+        cabin_names_json: JSON.stringify(rows.slice(0, count).map((r) => r.name)),
+        cabin_ids_json: JSON.stringify(rows.slice(0, count).map((r) => r.id)),
+      };
+      const res = await fetch(`/api/manage/resources?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify(payload),
+      });
+      const j = await res.json();
+      if (!res.ok || !j.ok) {
+        if (Array.isArray(j.blockingServices) && j.blockingServices.length > 0) {
+          setBlockModal({
+            open: true,
+            title: "Impossibile eliminare la cabina",
+            message:
+              "Una o più cabine che stai rimuovendo sono associate ai servizi elencati. Rimuovi prima la cabina dai servizi collegati e poi riprova.",
+            services: j.blockingServices as ServiceLink[],
+          });
+        } else {
+          setError(String(j.error ?? "Errore nel salvataggio delle cabine."));
+        }
+        setSaving(false);
+        return;
+      }
+      setSaving(false);
+      load(activeLocationId);
+    } catch {
+      setError("Errore nel salvataggio delle cabine.");
+      setSaving(false);
+    }
+  }
+
   return (
     <div className="container-fluid">
       <link rel="stylesheet" href="/assets/css/pages/cabins.css" />
@@ -213,37 +290,9 @@ export function CabinsContent() {
           <div className="card p-4">
             <div className="h5 fw-bold mb-3">Cabine - {selectedLocationName}</div>
 
-            <form
-              method="post"
-              className="row g-3"
-              id="cabinsForm"
-              onSubmit={(e) => {
-                e.preventDefault();
-                // Mirror cabins.js submit guard: block if removed cabins still
-                // have linked services.
-                const keptIds = new Set(rows.map((r) => r.id).filter((id) => id > 0));
-                let blocking: ServiceLink[] = [];
-                for (const cabin of initialCabins) {
-                  if (
-                    cabin.id > 0 &&
-                    !keptIds.has(cabin.id) &&
-                    Array.isArray(cabin.serviceLinks) &&
-                    cabin.serviceLinks.length > 0
-                  ) {
-                    blocking = blocking.concat(cabin.serviceLinks);
-                  }
-                }
-                if (blocking.length > 0) {
-                  setBlockModal({
-                    open: true,
-                    title: "Impossibile eliminare la cabina",
-                    message:
-                      "Una o più cabine che stai rimuovendo sono associate ai servizi elencati. Rimuovi prima la cabina dai servizi collegati e poi riprova.",
-                    services: blocking,
-                  });
-                }
-              }}
-            >
+            {error ? <div className="alert alert-danger">{error}</div> : null}
+
+            <form method="post" className="row g-3" id="cabinsForm" onSubmit={onSubmit}>
               <input type="hidden" name="location_id" value={activeLocationId || ""} />
 
               <div className="col-12">
@@ -318,9 +367,9 @@ export function CabinsContent() {
               </div>
 
               <div className="col-12 d-flex gap-2">
-                <button className="btn btn-primary btn-pill" type="submit">
+                <button className="btn btn-primary btn-pill" type="submit" disabled={saving}>
                   <i className="bi bi-check2-circle me-1" />
-                  Salva
+                  {saving ? "Salvataggio…" : "Salva"}
                 </button>
                 <a
                   className="btn btn-outline-secondary btn-pill"

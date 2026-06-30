@@ -9,6 +9,7 @@ import { CommissionsContent } from "@/components/modules/commissions-content";
 import { CostsContent } from "@/components/modules/costs-content";
 import { CouponsContent } from "@/components/modules/coupons-content";
 import { LocationsContent } from "@/components/modules/locations-content";
+import { LocationFormContent } from "@/components/modules/location_form-content";
 import { PromotionsContent } from "@/components/modules/promotions-content";
 import { QuotesContent } from "@/components/modules/quotes-content";
 import { RechargesContent } from "@/components/modules/recharges-content";
@@ -20,6 +21,7 @@ import { HoursContent } from "@/components/modules/hours-content";
 import { ProductsContent } from "@/components/modules/products-content";
 import { ProductFormContent } from "@/components/modules/product_form-content";
 import { StaffContent } from "@/components/modules/staff-content";
+import { StaffFormContent } from "@/components/modules/staff_form-content";
 import { ResourcesContent } from "@/components/modules/resources-content";
 import { GiftboxContent } from "@/components/modules/giftbox-content";
 import { WalletContent } from "@/components/modules/wallet-content";
@@ -208,6 +210,28 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ProductFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful location NEW / EDIT form. The locations list links to
+  // index.php?page=locations&action=new|edit; route those to the faithful editor
+  // (instead of the Tailwind ManagementApp fallback).
+  if (page === "locations" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <LocationFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful operator (staff) NEW / EDIT form. The staff list links to
+  // index.php?page=staff&action=new|edit; route those to the faithful editor
+  // (instead of the Tailwind ManagementApp fallback).
+  if (page === "staff" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <StaffFormContent />
       </ManageShell>
     );
   }

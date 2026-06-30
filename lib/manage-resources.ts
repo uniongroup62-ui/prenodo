@@ -206,6 +206,70 @@ export async function deleteSharedResource(slug: string, id: number): Promise<vo
   await tenantDelete({ slug, table: "resources", id: resourceId });
 }
 
+// Edit-form prefill for ONE cabin. Port of cabins.php action=edit (the cabin
+// modal data-cabin-edit prefill): reads the single cabins row by id directly
+// (so a cabin in any location is editable, not only those in the active sede)
+// and shapes it like the list rows. Returns null when missing so the route can
+// answer a clean 404.
+export async function getManageCabin(slug: string, id: number): Promise<ResourceCabin | null> {
+  if (!(id > 0)) return null;
+  await ensureResourceColumns(slug);
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cabins", columns: "*", where: "id = ?", params: [id], limit: 1 }).catch(() => []);
+  const row = rows[0];
+  if (!row) return null;
+  const locations = await listLocations(slug);
+  const serviceMap = await cabinServiceLinks(slug, [id]);
+  const locationId = nullableNumber(row.location_id);
+  return {
+    id: Number(row.id ?? id),
+    name: String(row.name ?? ""),
+    position: Number(row.position ?? 0),
+    isActive: Number(row.is_active ?? 1) === 1,
+    locationId,
+    locationName: locationName(locations, locationId),
+    serviceLinks: serviceMap.get(id) ?? [],
+  };
+}
+
+// Edit-form prefill for ONE operator. Port of staff.php action=edit (the
+// operator edit form prefill): reads the single staff row by id directly (with
+// its login user role + assigned locations), independent of the active-sede
+// filter, and shapes it like the list rows.
+export async function getManageStaffMember(slug: string, id: number): Promise<ResourceStaff | null> {
+  if (!(id > 0)) return null;
+  await ensureResourceColumns(slug);
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "staff", columns: "*", where: "id = ?", params: [id], limit: 1 }).catch(() => []);
+  const row = rows[0];
+  if (!row) return null;
+  if (String(row.full_name ?? "").trim().toUpperCase() === "SSO") return null;
+  const locations = await listLocations(slug);
+  const email = normalizeEmail(row.email ?? "");
+  const [locationsMap, serviceMap, userRows] = await Promise.all([
+    staffLocations(slug, [id]),
+    staffServiceLinks(slug, [id]),
+    email
+      ? tenantSelect<RowDataPacket>({ slug, table: "users", columns: "id,name,email,role", where: "LOWER(email) = ?", params: [email], limit: 1 }).catch(() => [])
+      : Promise.resolve([] as RowDataPacket[]),
+  ]);
+  const user = userRows[0] ?? null;
+  const locationIds = locationsMap.get(id) ?? [];
+  const resolvedLocations = locationIds.length ? locations.filter((location) => locationIds.includes(location.id)) : locations;
+  return {
+    id: Number(row.id ?? id),
+    fullName: String(row.full_name ?? ""),
+    phone: String(row.phone ?? ""),
+    email,
+    role: normalizeRole(user?.role),
+    isActive: Number(row.is_active ?? 1) === 1,
+    color: normalizeColor(row.calendar_color, 0),
+    photoPath: String(row.photo_path ?? ""),
+    locationIds,
+    locations: resolvedLocations,
+    serviceLinks: serviceMap.get(id) ?? [],
+    isOwner: Number(user?.id ?? 0) === 1 && String(user?.role ?? "") === "admin",
+  };
+}
+
 export async function saveCabin(slug: string, body: Record<string, string>): Promise<ResourceCabin> {
   const table = await tenantTable(slug, "cabins");
   const id = parseInteger(body.id, 0);
@@ -221,6 +285,112 @@ export async function saveCabin(slug: string, body: Record<string, string>): Pro
   }
   const newId = await tenantInsert(table, values);
   return mustFindCabin(slug, newId);
+}
+
+export type SaveCabinsBulkResult =
+  | { ok: true; cabins: ResourceCabin[] }
+  | { ok: false; error: string; blockingServices?: LinkedService[]; cabins: ResourceCabin[] };
+
+// Faithful port of cabins.php POST bulk-save (the #cabinsForm with cabins_count
+// + cabin_names[] + cabin_ids[], scoped to location_id). Upserts the kept rows
+// (position = index+1, is_active=1), deactivates the removed ones, and blocks
+// the whole save when a removed cabin is still linked to services / future
+// appointments — returning the blocking services so the UI can show the same
+// "Impossibile eliminare la cabina" popup the legacy page does.
+export async function saveCabinsBulk(slug: string, body: Record<string, string>): Promise<SaveCabinsBulkResult> {
+  await ensureResourceColumns(slug);
+  const table = await tenantTable(slug, "cabins");
+  const hasLocationCol = await columnExists(table.name, "location_id");
+  const locationId = parseInteger(body.location_id ?? body.locationId, 0);
+
+  let count = parseInteger(body.cabins_count ?? body.cabinsCount, 0);
+  if (count < 0) count = 0;
+  if (count > 50) count = 50;
+
+  // Names/ids arrive as JSON arrays to preserve order and exact name content
+  // (cabin names may contain commas/spaces, so a CSV split would corrupt them).
+  const names = parseJsonArray<unknown>(body.cabin_names_json ?? body.cabin_names ?? "[]")
+    .slice(0, count)
+    .map((value) => cleanName(value, 120));
+  while (names.length < count) names.push("");
+  const ids = parseJsonArray<unknown>(body.cabin_ids_json ?? body.cabin_ids ?? "[]")
+    .slice(0, count)
+    .map((value) => Math.max(0, Number.parseInt(String(value ?? "0"), 10) || 0));
+  while (ids.length < count) ids.push(0);
+
+  if (hasLocationCol && locationId <= 0) {
+    return { ok: false, error: "Seleziona una sede per configurare le cabine.", cabins: await listCabins(slug, locationId, await listLocations(slug)) };
+  }
+  for (let i = 0; i < count; i++) {
+    if ((names[i] ?? "") === "") {
+      return { ok: false, error: "Inserisci un nome per tutte le cabine.", cabins: await listCabins(slug, locationId, await listLocations(slug)) };
+    }
+  }
+
+  // Active rows for this scope, keyed by id (legacy cabin_fetch_active_rows).
+  const activeRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "cabins",
+    columns: "*",
+    where: hasLocationCol && locationId > 0 ? "COALESCE(is_active,1)=1 AND (location_id = ? OR location_id IS NULL)" : "COALESCE(is_active,1)=1",
+    params: hasLocationCol && locationId > 0 ? [locationId] : [],
+    orderBy: "position ASC, id ASC",
+  }).catch(() => []);
+  const activeById = new Map<number, RowDataPacket>();
+  for (const row of activeRows) {
+    const rid = Number(row.id ?? 0);
+    if (rid > 0) activeById.set(rid, row);
+  }
+
+  // Removed = active rows whose id was not resubmitted. Block if any of those is
+  // still linked to a service / future appointment.
+  const submittedExistingIds = new Set<number>();
+  for (const pid of ids) {
+    if (pid > 0 && activeById.has(pid)) submittedExistingIds.add(pid);
+  }
+  const blockingServices: LinkedService[] = [];
+  for (const rid of activeById.keys()) {
+    if (!submittedExistingIds.has(rid)) {
+      const blockers = await cabinBlockers(slug, rid);
+      if (blockers.length) blockingServices.push(...blockers);
+    }
+  }
+  if (blockingServices.length) {
+    return {
+      ok: false,
+      error: "Impostazioni non salvate: una o piu cabine sono associate a servizi o prenotazioni future.",
+      blockingServices,
+      cabins: await listCabins(slug, locationId, await listLocations(slug)),
+    };
+  }
+
+  // Upsert kept rows in submitted order (position = index+1), then deactivate
+  // the removed ones.
+  const keptIds = new Set<number>();
+  for (let i = 0; i < count; i++) {
+    const name = cleanName(names[i] ?? "", 120);
+    const id = ids[i] ?? 0;
+    const position = i + 1;
+    if (id > 0 && activeById.has(id)) {
+      const existingLocationId = hasLocationCol ? Number(activeById.get(id)?.location_id ?? 0) : 0;
+      const values: Record<string, unknown> = { name, position, is_active: 1 };
+      if (hasLocationCol && locationId > 0 && existingLocationId > 0) values.location_id = locationId;
+      await tenantUpdate({ slug, table: "cabins", id, values: await filterColumns(table.name, values) });
+      keptIds.add(id);
+    } else {
+      const values: Record<string, unknown> = { name, position, is_active: 1 };
+      if (hasLocationCol && locationId > 0) values.location_id = locationId;
+      const newId = await tenantInsert(table, await filterColumns(table.name, values));
+      if (newId > 0) keptIds.add(newId);
+    }
+  }
+  for (const rid of activeById.keys()) {
+    if (!keptIds.has(rid)) {
+      await tenantUpdate({ slug, table: "cabins", id: rid, values: { is_active: 0 } });
+    }
+  }
+
+  return { ok: true, cabins: await listCabins(slug, locationId, await listLocations(slug)) };
 }
 
 export async function deleteCabin(slug: string, id: number): Promise<void> {
