@@ -17,6 +17,7 @@ import {
   type AppointmentPrepaidRedeem,
   type AppointmentGiftcardRedeem,
   type AppointmentGiftboxRedeem,
+  type AppointmentGiftRedeem,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -331,6 +332,14 @@ export async function POST(request: Request) {
     // covered by a package OR prepaid redeem is skipped there (one service is covered once).
     const giftboxRedeems = parseGiftboxRedeem(body.giftbox_redeem);
     const giftboxWarnings: string[] = [];
+    // Quick-booking GIFT (omaggio) redeem (#qb_gift_redeem JSON array): per-service requests
+    // to cover a service with ONE REWARD from the client's gift (a service reward is a free
+    // service; one reward unit is consumed, the service is zero-charged). Parsed here,
+    // re-validated + the redemption recorded server-side inside createDbAppointment (never
+    // trusted). A service already covered by a package, prepaid OR giftbox redeem is skipped
+    // there (one service is covered once).
+    const giftRedeems = parseGiftRedeem(body.gift_redeem);
+    const giftWarnings: string[] = [];
     let serviceNames = parseServiceNamesFromBody(body);
     if (serviceIds.length > 0) {
       // `service_ids` is unambiguous (no comma-in-name issue) so it wins when sent.
@@ -366,6 +375,8 @@ export async function POST(request: Request) {
       giftcardWarnings,
       giftboxRedeems,
       giftboxWarnings,
+      giftRedeems,
+      giftWarnings,
     };
 
     let appointment;
@@ -407,6 +418,10 @@ export async function POST(request: Request) {
       // GiftBox-redeem skip messages (not the client's / expired / item not covering /
       // exhausted / already covered by a package/prepaid): same best-effort parity.
       ...(giftboxWarnings.length > 0 ? { giftboxWarnings } : {}),
+      // Gift (omaggio) redeem skip messages (not the client's / not available / expired /
+      // reward not covering / exhausted / already covered by a package/prepaid/giftbox):
+      // same best-effort parity; the drawer may show them.
+      ...(giftWarnings.length > 0 ? { giftWarnings } : {}),
     });
   } catch (error) {
     return Response.json(
@@ -683,6 +698,45 @@ function parseGiftboxRedeem(raw: unknown): AppointmentGiftboxRedeem[] {
     if (seenService.has(serviceId)) continue;
     seenService.add(serviceId);
     out.push({ instanceId, giftboxItemId, serviceId });
+  }
+  return out;
+}
+
+// Parse the quick-booking `gift_redeem` payload — a JSON array (or already an array) of
+// { instance_id, reward_item_index, service_id } items — into AppointmentGiftRedeem[].
+// Mirrors assets/js/app.js #qb_gift_redeem (and parseRequestBody stringifies body values,
+// so the drawer sends this as a JSON STRING, handled here). A GIFT is per-service +
+// REWARD-based: one reward (a free service) covers one service. Items missing a positive
+// instance_id or service_id are dropped (reward_item_index defaults to 0 when not finite,
+// parity with qbReadGiftRedeem), and a service is kept at most once (first wins) since one
+// service is covered by one reward. The real validation (ownership/availability/coverage/
+// residual) happens server-side in applyAppointmentGiftRedeems — this only shapes the input.
+function parseGiftRedeem(raw: unknown): AppointmentGiftRedeem[] {
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      source = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(source)) return [];
+  const out: AppointmentGiftRedeem[] = [];
+  const seenService = new Set<number>();
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    const instanceId = Number.parseInt(String(entry.instance_id ?? ""), 10);
+    const serviceId = Number.parseInt(String(entry.service_id ?? ""), 10);
+    const rawIndex = Number.parseInt(String(entry.reward_item_index ?? ""), 10);
+    if (!Number.isFinite(instanceId) || instanceId <= 0) continue;
+    if (!Number.isFinite(serviceId) || serviceId <= 0) continue;
+    const rewardItemIndex = Number.isFinite(rawIndex) && rawIndex >= 0 ? rawIndex : 0;
+    if (seenService.has(serviceId)) continue;
+    seenService.add(serviceId);
+    out.push({ instanceId, rewardItemIndex, serviceId });
   }
   return out;
 }

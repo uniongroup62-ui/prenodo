@@ -61,6 +61,11 @@ export async function GET(request: Request) {
         // entry covers exactly its service_id and pins the redeem via
         // instance_id + giftbox_item_id.
         giftboxes: context.giftboxes,
+        // Available GIFT (omaggio) SERVICE REWARDS for the drawer's per-service "Usa
+        // Omaggio" control (see quickBookClientGifts). A gift instance holds reward items;
+        // each entry is a still-available service reward covering its service_id, pinned by
+        // instance_id + reward_item_index (the reward's array index in reward_items_json).
+        gifts: context.gifts,
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");

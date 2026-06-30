@@ -188,6 +188,16 @@ CREATE TABLE "appointment_services" (
   -- covered service consumes exactly one giftbox item.
   "giftbox_instance_id" integer,
   "giftbox_item_id" integer,
+  -- Gift (omaggio) redeem linkage (quick-booking "Usa Omaggio"): when a service is covered
+  -- by ONE reward from a client's gift the row is linked to the consumed gift instance +
+  -- the specific reward's array index in gifts.reward_items_json (reward_item_index) that was
+  -- redeemed, and its `price` is zeroed (the catalog price is preserved in list_price with an
+  -- 'Omaggio' discount_badge). The redemption itself is recorded in appointment_gift_items
+  -- (redeemed_at set, qty 1); these columns are only the back-link on the appointment_services
+  -- snapshot (parity with the package/prepaid/giftbox linkage above). A gift is per-service +
+  -- REWARD-based, so each covered service consumes exactly one gift reward unit.
+  "gift_instance_id" integer,
+  "reward_item_index" integer,
   PRIMARY KEY ("tenant_id", "appointment_id", "service_id")
 );
 

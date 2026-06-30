@@ -421,6 +421,15 @@ export type MultiServiceAppointmentInput = {
   giftboxRedeems?: AppointmentGiftboxRedeem[];
   // Mutable collector the save pushes per-giftbox-redeem skip warnings into. Optional.
   giftboxWarnings?: string[];
+  // Quick-booking GIFT (omaggio) redeem (assets/js/app.js #qb_gift_redeem): per-service
+  // requests to cover a service with ONE REWARD from the client's gift (a service reward is
+  // a free service; one reward unit is consumed, the service is zero-charged). Re-validated +
+  // the redemption recorded server-side as part of the save (see applyAppointmentGiftRedeems).
+  // Optional/empty -> the non-redeem save path is unchanged. A service already covered by a
+  // package, prepaid OR giftbox redeem is NOT also gift-redeemed (the apply dedupes).
+  giftRedeems?: AppointmentGiftRedeem[];
+  // Mutable collector the save pushes per-gift-redeem skip warnings into. Optional.
+  giftWarnings?: string[];
 };
 
 // Resolved multi-service plan: the ordered services, the per-position segment
@@ -539,6 +548,8 @@ export async function createDbAppointment({
   giftcardWarnings,
   giftboxRedeems = [],
   giftboxWarnings,
+  giftRedeems = [],
+  giftWarnings,
 }: {
   slug: string;
   clientName: string;
@@ -646,7 +657,7 @@ export async function createDbAppointment({
   // per-service + ITEM-based (one item covers one service); a covered service is
   // zero-charged. Skipped entries become warnings; the booking is never failed.
   if (giftboxRedeems.length > 0) {
-    const { warnings } = await applyAppointmentGiftboxRedeems({
+    const { applied, warnings } = await applyAppointmentGiftboxRedeems({
       slug,
       appointmentId: id,
       clientId: client.id,
@@ -654,7 +665,24 @@ export async function createDbAppointment({
       redeems: giftboxRedeems,
       coveredServiceIds: redeemCoveredServiceIds,
     });
+    for (const entry of applied) redeemCoveredServiceIds.add(Number(entry.serviceId ?? 0));
     if (giftboxWarnings) giftboxWarnings.push(...warnings);
+  }
+  // GIFT (omaggio) redeem: re-validate + RECORD (appointment_gift_items, redeemed_at set,
+  // qty 1) + link AFTER the appointment_services rows exist, and AFTER package + prepaid +
+  // giftbox so a service already covered is skipped (dedupe via redeemCoveredServiceIds). A
+  // gift instance holds reward items; a service reward applied to a service zero-charges it.
+  // Skipped entries become warnings; the booking is never failed (legacy best-effort parity).
+  if (giftRedeems.length > 0) {
+    const { warnings } = await applyAppointmentGiftRedeems({
+      slug,
+      appointmentId: id,
+      clientId: client.id,
+      serviceIds: plan.services.map((service) => Number(service.id ?? 0)),
+      redeems: giftRedeems,
+      coveredServiceIds: redeemCoveredServiceIds,
+    });
+    if (giftWarnings) giftWarnings.push(...warnings);
   }
   // GIFTCARD redeem: re-validate + decrement + link AFTER the appointment_services
   // rows (and any package/prepaid zeroing) exist, because the payable total is
@@ -2294,6 +2322,250 @@ async function updateAppointmentServiceGiftboxLink(
   ];
   const params: unknown[] = [link.instanceId, link.giftboxItemId];
   if (await columnExists(table.name, "discount_badge")) assignments.push("discount_badge = 'GiftBox'");
+  const clauses = ["appointment_id = ?", "service_id = ?"];
+  params.push(appointmentId, serviceId);
+  if (table.mode === "shared" && (await columnExists(table.name, "tenant_id"))) {
+    clauses.push("tenant_id = ?");
+    params.push(table.tenantId ?? 0);
+  }
+  await dbExecute(
+    `UPDATE ${quoteIdentifier(table.name)} SET ${assignments.join(", ")} WHERE ${clauses.join(" AND ")}`,
+    params,
+  );
+}
+
+// One entry from the quick-booking `gift_redeem` JSON array (assets/js/app.js
+// #qb_gift_redeem): cover a service with ONE REWARD from a client's GIFT (omaggio). A gift
+// INSTANCE holds REWARD ITEMS (gifts.reward_items_json); a SERVICE reward (type='service')
+// is a free service. A redeem applies ONE reward — identified by instance_id +
+// reward_item_index (the reward's ARRAY INDEX in reward_items_json) — to a booked service
+// (zero-charge), consuming one unit of that reward. `serviceId` must be on the appointment
+// and must match the reward's service. The redemption is recorded in appointment_gift_items
+// (redeemed_at set), keyed by the legacy composite (instance + reward_item_index + service).
+export type AppointmentGiftRedeem = {
+  instanceId: number;
+  rewardItemIndex: number; // = array index in gifts.reward_items_json
+  serviceId: number;
+};
+
+// Apply the quick-booking GIFT (omaggio) redeems for an appointment AS PART of the save.
+// For each requested redeem this RE-VALIDATES server-side (never trusting the client): the
+// gift instance exists, belongs to the appointment's client (gift_instances.client_id), is
+// state='disponibile' + active + not expired; the reward at `reward_item_index` (from the
+// instance's gift.reward_items_json) is a SERVICE reward for exactly `serviceId`; and that
+// reward's residual (reward qty MINUS already-redeemed via giftRewardRedeemedQty) is > 0. On
+// success it RECORDS the redemption — an appointment_gift_items row (appointment_id,
+// instance_id, gift_id, reward_item_index, service_id, qty 1, redeemed_at=NOW) — the same
+// table the legacy Gifts redemption writes — so giftRewardRedeemedQty immediately reflects
+// the consumption and the reward can never be double-redeemed within or across saves. It then
+// links the matching appointment_services row (gift_instance_id + reward_item_index,
+// columnExists-guarded) and zeroes its charge (price 0, list_price kept, 'Omaggio' badge).
+// When the reward is the instance's LAST residual SERVICE reward the instance is flipped to
+// state='riscattato' (parity with the legacy auto-redeem). A redeem that fails validation is
+// SKIPPED (collected as a warning) and never fails the whole booking (legacy best-effort
+// parity).
+//
+// `coveredServiceIds` are the services already covered by a PACKAGE, PREPAID or GIFTBOX
+// redeem in this same save — those are skipped so a service is covered at most once (dedupe).
+// Like the other applies we additionally dedupe so a service is gift-covered by at most one
+// reward (first wins). Faithful to api_appointments.php + Gifts (reward-item redemption),
+// adapted to the Next port's consume-on-save + columnExists-guarded link.
+export async function applyAppointmentGiftRedeems({
+  slug,
+  appointmentId,
+  clientId,
+  serviceIds,
+  redeems,
+  coveredServiceIds,
+}: {
+  slug: string;
+  appointmentId: number;
+  clientId: number;
+  serviceIds: number[]; // service_ids actually on this appointment (the redeem is filtered to these)
+  redeems: AppointmentGiftRedeem[];
+  coveredServiceIds?: Set<number>; // services already covered by a package/prepaid/giftbox redeem (skip)
+}): Promise<{ applied: AppointmentGiftRedeem[]; warnings: string[] }> {
+  const applied: AppointmentGiftRedeem[] = [];
+  const warnings: string[] = [];
+  if (!redeems.length) return { applied, warnings };
+
+  // The tracking table must exist; without it we cannot consume a reward safely (the
+  // residual maths reads it), so we skip with a warning (best-effort).
+  const giftItemsTable = await tenantTable(slug, "appointment_gift_items").catch(() => null);
+  const hasTrackingTable = giftItemsTable ? await tableExists(giftItemsTable.name) : false;
+
+  // Only the appointment_services snapshot table can carry the linkage; if it lacks the
+  // gift columns (older installs) we still record + consume + log a warning.
+  const servicesTable = await tenantTable(slug, "appointment_services").catch(() => null);
+  const hasLinkColumns = servicesTable
+    ? (await columnExists(servicesTable.name, "gift_instance_id")) &&
+      (await columnExists(servicesTable.name, "reward_item_index"))
+    : false;
+
+  // Drop redeems for services not on this appointment, those a package/prepaid/giftbox
+  // already covers, and dedupe so a service is covered by at most ONE gift reward (first wins).
+  const onAppointment = new Set(serviceIds.filter((id) => id > 0));
+  const seenService = new Set<number>();
+
+  for (const redeem of redeems) {
+    const instanceId = Number(redeem.instanceId ?? 0);
+    const rewardItemIndex = Number(redeem.rewardItemIndex ?? 0);
+    const serviceId = Number(redeem.serviceId ?? 0);
+    if (instanceId <= 0 || serviceId <= 0 || rewardItemIndex < 0) continue;
+    if (!onAppointment.has(serviceId)) continue; // service not on the appointment
+    if (coveredServiceIds?.has(serviceId)) continue; // already covered by a package/prepaid/giftbox
+    if (seenService.has(serviceId)) continue; // already covered by another gift reward
+    seenService.add(serviceId);
+
+    if (!hasTrackingTable) {
+      warnings.push("Omaggio: schema riscatti non disponibile su questo archivio.");
+      continue;
+    }
+
+    try {
+      // 1) Load the gift instance, tenant-scoped (tenantSelect scopes to the tenant).
+      const instanceRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "gift_instances",
+        columns: "id, gift_id, client_id, state, is_active, expires_at",
+        where: "id = ?",
+        params: [instanceId],
+        limit: 1,
+      });
+      const instance = instanceRows[0];
+      if (!instance) {
+        warnings.push("Omaggio non trovato.");
+        continue;
+      }
+
+      // 2) Ownership: the instance must belong to the appointment's client.
+      if (Number(instance.client_id ?? 0) !== clientId) {
+        warnings.push("L'omaggio selezionato non appartiene al cliente.");
+        continue;
+      }
+
+      // 3) Availability: state='disponibile' + (is_active OR state in disponibile/riscattato)
+      //    + not expired (by calendar day) — parity with Gifts::clientAvailableInstances.
+      const state = String(instance.state ?? "").trim().toLowerCase();
+      const isActive = Number(instance.is_active ?? 0);
+      if (state !== "disponibile") {
+        warnings.push("Omaggio non riscattabile.");
+        continue;
+      }
+      if (!(isActive === 1 || state === "disponibile" || state === "riscattato")) {
+        warnings.push("Omaggio non attivo.");
+        continue;
+      }
+      const expiresYmd = instance.expires_at ? String(instance.expires_at).slice(0, 10) : "";
+      if (expiresYmd && expiresYmd < todayIso()) {
+        warnings.push("Omaggio scaduto.");
+        continue;
+      }
+
+      // 4) Coverage: the reward at reward_item_index (from the instance's gift) must be a
+      //    SERVICE reward for exactly this service. Read reward_items_json off the gift def.
+      const giftId = Number(instance.gift_id ?? 0);
+      const giftRows = giftId > 0
+        ? await tenantSelect<RowDataPacket>({ slug, table: "gifts", columns: "reward_items_json", where: "id = ?", params: [giftId], limit: 1 })
+        : [];
+      const rewardItems = parseGiftRewardItems(giftRows[0]?.reward_items_json);
+      const reward = rewardItems[rewardItemIndex];
+      if (!reward || reward.type !== "service" || reward.serviceId <= 0) {
+        warnings.push("Omaggio non valido per il servizio.");
+        continue;
+      }
+      if (reward.serviceId !== serviceId) {
+        warnings.push("L'omaggio selezionato non copre il servizio.");
+        continue;
+      }
+
+      // 5) Residual: reward qty - already-redeemed (by index + service) must be > 0. Reading
+      //    appointment_gift_items means a unit recorded earlier in THIS save (an earlier
+      //    redeem of the same reward) is already counted, so we never over-redeem.
+      const redeemedQty = await giftRewardRedeemedQty(slug, instanceId, rewardItemIndex, serviceId);
+      if (reward.qty - redeemedQty <= 0) {
+        warnings.push("Omaggio esaurito per la ricompensa selezionata.");
+        continue;
+      }
+
+      // 6) RECORD the redemption: an appointment_gift_items row with redeemed_at set (qty 1).
+      //    This is the consume — it makes giftRewardRedeemedQty reflect the unit immediately.
+      const insertId = await tenantInsert(await tenantTable(slug, "appointment_gift_items"), {
+        appointment_id: appointmentId,
+        instance_id: instanceId,
+        gift_id: giftId,
+        reward_item_index: rewardItemIndex,
+        service_id: serviceId,
+        qty: 1,
+        redeemed_at: new Date(),
+      });
+      if (insertId <= 0) {
+        warnings.push("Omaggio: impossibile registrare il riscatto.");
+        continue;
+      }
+
+      // 7) If this reward was the instance's LAST residual SERVICE reward, flip the instance
+      //    to state='riscattato' (parity with the legacy auto-close on service rewards).
+      try {
+        let anyRemaining = false;
+        for (let index = 0; index < rewardItems.length; index += 1) {
+          const it = rewardItems[index];
+          if (it.type !== "service" || it.serviceId <= 0) continue;
+          const used = await giftRewardRedeemedQty(slug, instanceId, index, it.serviceId);
+          if (it.qty - used > 0) {
+            anyRemaining = true;
+            break;
+          }
+        }
+        if (!anyRemaining) {
+          await tenantUpdate({
+            slug,
+            table: "gift_instances",
+            id: instanceId,
+            values: { state: "riscattato", redeemed_at: new Date(), redeemed_source_type: "appointment", redeemed_source_id: appointmentId },
+          });
+        }
+      } catch {
+        // best-effort: a state-flip failure must not fail the booking (unit is recorded).
+      }
+
+      // 8) Link the appointment_services row + zero its charge (keep list_price).
+      if (hasLinkColumns && servicesTable) {
+        await updateAppointmentServiceGiftLink(slug, servicesTable, appointmentId, serviceId, {
+          instanceId,
+          rewardItemIndex,
+        });
+      } else {
+        warnings.push("Omaggio consumato, ma il collegamento al servizio non è disponibile su questo archivio.");
+      }
+
+      applied.push({ instanceId, rewardItemIndex, serviceId });
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : "Errore riscatto Omaggio.");
+    }
+  }
+
+  return { applied, warnings };
+}
+
+// Set the gift linkage on a single appointment_services row (keyed by the composite
+// appointment_id + service_id — the table has no surrogate id) and zero its charge:
+// price 0, list_price preserved as the catalog reference, and an 'Omaggio' discount_badge
+// (faithful to the legacy zero-charge presentation, mirroring the package/prepaid/giftbox links).
+async function updateAppointmentServiceGiftLink(
+  slug: string,
+  table: TenantTable,
+  appointmentId: number,
+  serviceId: number,
+  link: { instanceId: number; rewardItemIndex: number },
+): Promise<void> {
+  const assignments: string[] = [
+    "gift_instance_id = ?",
+    "reward_item_index = ?",
+    "price = 0",
+  ];
+  const params: unknown[] = [link.instanceId, link.rewardItemIndex];
+  if (await columnExists(table.name, "discount_badge")) assignments.push("discount_badge = 'Omaggio'");
   const clauses = ["appointment_id = ?", "service_id = ?"];
   params.push(appointmentId, serviceId);
   if (table.mode === "shared" && (await columnExists(table.name, "tenant_id"))) {
@@ -4814,6 +5086,21 @@ export type QuickBookClientGiftbox = {
   name: string;
 };
 
+// One available (redeemable) GIFT (omaggio) SERVICE REWARD for the per-service "Usa
+// Omaggio" control (returned by quickbook_client_context). A gift INSTANCE holds REWARD
+// ITEMS (gifts.reward_items_json, an array); a SERVICE reward is one whose type='service'
+// with a positive service_id. Each entry here is a single still-available service reward
+// (qty_remaining > 0) from an available (state='disponibile', active, non-expired) instance
+// owned by the client. `instance_id` + `reward_item_index` (the reward's ARRAY INDEX in the
+// gift's reward_items_json) pin the redeem; `service_id` is the covered service; `name` is
+// the service label for the option. The drawer offers it on the service it covers.
+export type QuickBookClientGift = {
+  instance_id: number;
+  reward_item_index: number;
+  service_id: number;
+  name: string;
+};
+
 export type QuickBookClientContext = {
   history: QuickBookClientHistorySummary;
   residuals: QuickBookClientResidualsSummary;
@@ -4821,6 +5108,7 @@ export type QuickBookClientContext = {
   prepaids: QuickBookClientPrepaid[];
   giftcards: QuickBookClientGiftcard[];
   giftboxes: QuickBookClientGiftbox[];
+  gifts: QuickBookClientGift[];
 };
 
 // History summary — port of api_clients.php lines ~3926-3958:
@@ -5012,30 +5300,13 @@ async function quickBookClientResidualsSummary(
   }
 
   // Omaggi (gifts) — the legacy sums qty_remaining of SERVICE reward items
-  //   (Gifts::countAvailableServiceRewardsForClient), which needs the
-  //   gifts.reward_items_json + per-reward redemption tracking not ported here.
-  //   TODO(gifts-detail): port the reward-item maths; for now we count
-  //   instance-level availability (gift_instances state='disponibile',
-  //   active, not expired) — the closest tractable definition and what
-  //   Gifts::clientAvailableInstances filters on at the instance level.
+  //   (Gifts::countAvailableServiceRewardsForClient). We now port the reward-item
+  //   maths via quickBookClientGifts (the same available-instance + per-reward
+  //   residual rule the drawer's "Usa Omaggio" control uses), so the badge count
+  //   matches the redeemable rewards exactly (one count per available service reward).
   try {
-    const giftTable = await tenantTable(slug, "gift_instances");
-    const hasState = await columnExists(giftTable.name, "state");
-    const hasActive = await columnExists(giftTable.name, "is_active");
-    const hasExpiry = await columnExists(giftTable.name, "expires_at");
-    const clauses = ["client_id = ?"];
-    if (hasState) clauses.push("state = 'disponibile'");
-    if (hasActive && hasState) clauses.push("(is_active = 1 OR state IN ('disponibile','riscattato'))");
-    else if (hasActive) clauses.push("is_active = 1");
-    if (hasExpiry) clauses.push("(expires_at IS NULL OR expires_at >= CURRENT_DATE)");
-    const rows = await tenantSelect<RowDataPacket>({
-      slug,
-      table: "gift_instances",
-      columns: "COUNT(*) AS c",
-      where: clauses.join(" AND "),
-      params: [clientId],
-    });
-    out.gifts_count = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+    const gifts = await quickBookClientGifts(slug, clientId);
+    out.gifts_count = Math.max(0, gifts.length);
   } catch {
     out.gifts_count = 0;
   }
@@ -5065,15 +5336,16 @@ export async function quickBookClientContext({
   locationId?: number;
 }): Promise<QuickBookClientContext> {
   if (clientId <= 0) throw new Error("client_id mancante");
-  const [history, residuals, packages, prepaids, giftcards, giftboxes] = await Promise.all([
+  const [history, residuals, packages, prepaids, giftcards, giftboxes, gifts] = await Promise.all([
     quickBookClientHistorySummary(slug, clientId),
     quickBookClientResidualsSummary(slug, clientId),
     quickBookClientPackages(slug, clientId),
     quickBookClientPrepaids(slug, clientId),
     quickBookClientGiftcards(slug, clientId),
     quickBookClientGiftboxes(slug, clientId),
+    quickBookClientGifts(slug, clientId),
   ]);
-  return { history, residuals, packages, prepaids, giftcards, giftboxes };
+  return { history, residuals, packages, prepaids, giftcards, giftboxes, gifts };
 }
 
 // Available (redeemable) packages for a client, with the services each package
@@ -5325,6 +5597,155 @@ async function quickBookClientGiftboxes(slug: string, clientId: number): Promise
       }
     } catch {
       // tolerate giftbox item/redemption tables being absent for this instance
+    }
+  }
+  return out;
+}
+
+// One normalized GIFT reward item (parity with Gifts::normalizeRewardItems): a reward
+// has a `type` ('service' | 'product' | 'custom'), a positive `qty` (>= 1), and — for a
+// SERVICE reward — a `service_id`. The reward's identity in a redeem is its ARRAY INDEX
+// (`reward_item_index`) in the gift's reward_items_json, NOT a surrogate id. Only service
+// rewards are redeemable into a booked service here (a free service is a reward).
+type GiftRewardItem = { type: string; serviceId: number; qty: number };
+
+// Parse a gift's reward_items_json (a JSON array on the `gifts` row) into normalized
+// reward items, preserving ARRAY ORDER (the index is the reward_item_index). Mirrors
+// Gifts::normalizeRewardItems: each item carries a type (defaulting to 'custom') and a
+// qty (>= 1, defaulting to 1); a service reward additionally needs a positive service_id
+// (service_id | reward_service_id). Non-array / unparseable JSON -> empty list. IMPORTANT:
+// items are NOT filtered here (so a non-service reward still consumes an index) — the
+// caller filters to service rewards by `type === 'service' && serviceId > 0`.
+function parseGiftRewardItems(rawJson: unknown): GiftRewardItem[] {
+  if (typeof rawJson !== "string") return [];
+  const trimmed = rawJson.trim();
+  if (!trimmed) return [];
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(trimmed);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(decoded)) return [];
+  const out: GiftRewardItem[] = [];
+  for (const raw of decoded) {
+    if (!raw || typeof raw !== "object") {
+      out.push({ type: "custom", serviceId: 0, qty: 1 }); // keep the index stable
+      continue;
+    }
+    const entry = raw as Record<string, unknown>;
+    let type = String(entry.type ?? entry.reward_type ?? "custom").trim().toLowerCase();
+    if (type !== "service" && type !== "product" && type !== "custom") type = "custom";
+    let qty = Number.parseInt(String(entry.qty ?? entry.reward_qty ?? entry.quantity ?? 1), 10);
+    if (!Number.isFinite(qty) || qty <= 0) qty = 1;
+    if (qty > 1000000) qty = 1000000;
+    const serviceId =
+      type === "service" ? Number.parseInt(String(entry.service_id ?? entry.reward_service_id ?? 0), 10) || 0 : 0;
+    out.push({ type, serviceId, qty });
+  }
+  return out;
+}
+
+// Units already REDEEMED for a SINGLE gift reward, keyed by the legacy composite
+// (reward_item_index + service_id) — exactly Gifts::redeemedRewardQtyByInstance's key.
+// The authoritative consumed count is SUM(qty) of appointment_gift_items rows for this
+// instance whose redeemed_at IS NOT NULL and that target this reward_item_index +
+// service_id. Recording a redeem (an appointment_gift_items row with redeemed_at set and
+// qty 1 for that index/service) therefore makes this reflect the consumption, so a reward
+// can never be double-redeemed within or across saves. Tolerates the tracking table being
+// absent (-> 0). (The legacy also reads gift_transactions; the Next port does not write
+// those, so appointment_gift_items is the single source of truth here.)
+async function giftRewardRedeemedQty(
+  slug: string,
+  instanceId: number,
+  rewardItemIndex: number,
+  serviceId: number,
+): Promise<number> {
+  if (instanceId <= 0) return 0;
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_gift_items",
+      columns: "COALESCE(SUM(qty), 0) AS c",
+      where: "instance_id = ? AND reward_item_index = ? AND service_id = ? AND redeemed_at IS NOT NULL",
+      params: [instanceId, rewardItemIndex, serviceId],
+    });
+    return Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+  } catch {
+    return 0;
+  }
+}
+
+// Available (redeemable) GIFT (omaggio) SERVICE REWARDS for a client — drives the drawer's
+// per-service "Usa Omaggio" control. A gift INSTANCE holds REWARD ITEMS (the reward set
+// lives in gifts.reward_items_json, joined from the instance's gift_id); a SERVICE reward
+// (type='service', positive service_id) can be applied to a booked service (zero-charge).
+// This exposes one entry PER still-available service reward (qty_remaining > 0) so the
+// drawer can offer it on the service it covers. Tenant-scoped via tenantSelect; every read
+// is guarded so a missing table/column degrades to an empty list.
+//
+// "Available" mirrors Gifts::clientAvailableInstances + listAvailableServiceRewardsForClient
+// exactly: the instance belongs to the client (gift_instances.client_id), is state =
+// 'disponibile' (the legacy normalizes derived state to this), (is_active = 1 OR state IN
+// ('disponibile','riscattato')), and not expired (expires_at IS NULL OR by calendar day);
+// then for each reward item of type 'service' with a positive service_id, qty_remaining =
+// reward qty MINUS giftRewardRedeemedQty(index, service_id) must be > 0. `reward_item_index`
+// is the reward's ARRAY INDEX in reward_items_json (parity with the legacy index).
+async function quickBookClientGifts(slug: string, clientId: number): Promise<QuickBookClientGift[]> {
+  if (clientId <= 0) return [];
+  let instances: RowDataPacket[] = [];
+  try {
+    const giftTable = await tenantTable(slug, "gift_instances");
+    if (!(await tableExists(giftTable.name))) return [];
+    const hasState = await columnExists(giftTable.name, "state");
+    const hasActive = await columnExists(giftTable.name, "is_active");
+    const hasExpiry = await columnExists(giftTable.name, "expires_at");
+    const clauses = ["client_id = ?"];
+    if (hasState) clauses.push("state = 'disponibile'");
+    if (hasActive && hasState) clauses.push("(is_active = 1 OR state IN ('disponibile','riscattato'))");
+    else if (hasActive) clauses.push("is_active = 1");
+    if (hasExpiry) clauses.push("(expires_at IS NULL OR expires_at >= CURRENT_DATE)");
+    instances = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "gift_instances",
+      columns: "id, gift_id",
+      where: clauses.join(" AND "),
+      params: [clientId],
+      orderBy: hasExpiry ? "(expires_at IS NULL) DESC, expires_at ASC, id DESC" : "id DESC",
+      limit: 100,
+    });
+  } catch {
+    return [];
+  }
+  if (instances.length === 0) return [];
+
+  const out: QuickBookClientGift[] = [];
+  for (const inst of instances) {
+    const instanceId = Number(inst.id ?? 0);
+    const giftId = Number(inst.gift_id ?? 0);
+    if (instanceId <= 0 || giftId <= 0) continue;
+    try {
+      // The reward set lives on the gift definition (gifts.reward_items_json), joined by
+      // the instance's gift_id (parity with Gifts::clientAvailableInstances' JOIN gifts).
+      const giftRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "gifts",
+        columns: "reward_items_json",
+        where: "id = ?",
+        params: [giftId],
+        limit: 1,
+      });
+      const rewardItems = parseGiftRewardItems(giftRows[0]?.reward_items_json);
+      for (let index = 0; index < rewardItems.length; index += 1) {
+        const item = rewardItems[index];
+        if (item.type !== "service" || item.serviceId <= 0) continue; // only service rewards cover a service
+        const redeemed = await giftRewardRedeemedQty(slug, instanceId, index, item.serviceId);
+        if (item.qty - redeemed <= 0) continue; // exhausted -> not offerable
+        const name = await serviceNameById(slug, item.serviceId, "Servizio");
+        out.push({ instance_id: instanceId, reward_item_index: index, service_id: item.serviceId, name });
+      }
+    } catch {
+      // tolerate the gifts row / tracking table being absent for this instance
     }
   }
   return out;
