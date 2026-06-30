@@ -431,6 +431,51 @@ function snapMin(min: number, step: number): number {
   return Math.round(min / step) * step;
 }
 
+// Slot-rounding for the dynamic axis (port of calendar.js _roundDown / _roundUp):
+// round a minute-of-day DOWN / UP to the slot granularity (SLOT_MIN_PER_ROW).
+function roundDownToSlot(min: number): number {
+  return Math.floor(min / SLOT_MIN_PER_ROW) * SLOT_MIN_PER_ROW;
+}
+function roundUpToSlot(min: number): number {
+  return Math.ceil(min / SLOT_MIN_PER_ROW) * SLOT_MIN_PER_ROW;
+}
+
+// DYNAMIC AXIS (port of calendar.js _computeDynamicAxisForEvents): expand the
+// business-hours window [open, close] so every appointment fits. If any appointment
+// STARTS before `open`, drop the window start down to that start (rounded DOWN to the
+// slot); if any ENDS after `close`, push the window end up to that end (rounded UP to
+// the slot). With no events the window stays at the business-hours baseline.
+function expandWindowForAppointments(
+  open: number,
+  close: number,
+  appts: Appointment[],
+): { open: number; close: number } {
+  let evMin: number | null = null;
+  let evMax: number | null = null;
+  for (const a of appts) {
+    const sMin = timeToMin(a.time);
+    if (sMin !== null) evMin = evMin === null ? sMin : Math.min(evMin, sMin);
+    // End falls back to the start when no end is recorded (mirrors the legacy, which
+    // uses the start as the end when ev.end is null).
+    let eMin = timeToMin(a.endTime ?? "");
+    if (eMin === null) eMin = sMin;
+    if (eMin !== null) evMax = evMax === null ? eMin : Math.max(evMax, eMin);
+  }
+  let outOpen = open;
+  let outClose = close;
+  if (evMin !== null) outOpen = Math.min(outOpen, roundDownToSlot(evMin));
+  if (evMax !== null) outClose = Math.max(outClose, roundUpToSlot(evMax));
+  // Sanity: keep a positive range (port of the legacy outMax <= outMin guard).
+  if (outClose <= outOpen) outClose = Math.min(24 * 60, outOpen + SLOT_MIN_PER_ROW);
+  return { open: outOpen, close: outClose };
+}
+
+// Current minute-of-day from the local clock — drives the now-indicator line.
+function nowMinutesOfDay(): number {
+  const d = new Date();
+  return d.getHours() * 60 + d.getMinutes();
+}
+
 // Drag payload moved between an appointment block and a staff/grid drop target.
 type CalendarDrag = {
   id: number;
@@ -467,6 +512,12 @@ export function CalendarContent() {
   // Note count per ISO date for the visible range (Week/Month note markers).
   const [countByDate, setCountByDate] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
+
+  // Current minute-of-day for the now-indicator line (port of FullCalendar's
+  // nowIndicator + calendar.js installStaffNowIndicatorFix). Ticked every 30s by an
+  // effect-scoped interval; only set inside the interval callback (never synchronously
+  // in the effect body), so it never re-binds per render and stays lint-clean.
+  const [nowMinutes, setNowMinutes] = useState<number>(() => nowMinutesOfDay());
 
   // Filters (drive React state; faithful to #filterStaff/#filterService/#filterStatus).
   const [filterStaff, setFilterStaff] = useState("");
@@ -596,20 +647,33 @@ export function CalendarContent() {
     [businessHours],
   );
 
-  // Visible time window from business hours for the focused day-of-week (Day view).
+  // Visible time window from business hours for the focused day-of-week (Day view),
+  // EXPANDED by the dynamic axis so out-of-hours appointments are not clipped: if a
+  // booking on `date` starts before open or ends after close, the window grows to fit
+  // it (rounded to the slot). Falls back to plain business hours when the day is empty.
   const { minMin, maxMin } = useMemo(() => {
     const { open, close } = windowForDow(new Date(`${date}T12:00:00`).getDay());
-    return { minMin: open, maxMin: close };
-  }, [windowForDow, date]);
+    const dayAppts = appointments.filter((a) => a.date === date);
+    const { open: o, close: c } = expandWindowForAppointments(open, close, dayAppts);
+    return { minMin: o, maxMin: c };
+  }, [windowForDow, date, appointments]);
 
   // Week time window: the UNION (min open .. max close) of the 7 days' business
-  // hours, so every day's appointments fit in the shared Week grid.
+  // hours, so every day's appointments fit in the shared Week grid — then EXPANDED by
+  // the dynamic axis over the whole week's appointments (any booking starting before /
+  // ending after the union window widens it, rounded to the slot).
   const { weekMinMin, weekMaxMin } = useMemo(() => {
-    const dows = weekDates(date).map((d) => new Date(`${d}T12:00:00`).getDay());
+    const days = weekDates(date);
+    const dows = days.map((d) => new Date(`${d}T12:00:00`).getDay());
     const opens = dows.map((d) => windowForDow(d).open);
     const closes = dows.map((d) => windowForDow(d).close);
-    return { weekMinMin: Math.min(...opens), weekMaxMin: Math.max(...closes) };
-  }, [windowForDow, date]);
+    const baseOpen = Math.min(...opens);
+    const baseClose = Math.max(...closes);
+    const weekSet = new Set(days);
+    const weekAppts = appointments.filter((a) => weekSet.has(a.date));
+    const { open: o, close: c } = expandWindowForAppointments(baseOpen, baseClose, weekAppts);
+    return { weekMinMin: o, weekMaxMin: c };
+  }, [windowForDow, date, appointments]);
 
   const rows = useMemo(() => {
     const out: number[] = [];
@@ -702,6 +766,33 @@ export function CalendarContent() {
   const notesCount = notes.length;
   const gridHeight = (rows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
   const weekGridHeight = (weekRows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
+
+  // === NOW-INDICATOR position/visibility (port of FullCalendar nowIndicator +
+  // updateStaffNowIndicator) ===
+  // Day view: the line shows only when the focused day IS today and the current
+  // minute-of-day falls inside the (dynamically-expanded) visible window
+  // [minMin, maxMin]; its Y is mapped like an appointment block (minutes from the
+  // window start * PX_PER_MIN). It spans ALL staff columns (the line lives in the
+  // staff-columns container), matching updateStaffNowIndicator stretching the red
+  // line across every fake-day column.
+  const dayNowIndicator = useMemo(() => {
+    if (view !== "staffTimeGridDay") return null;
+    if (date !== isoLocal(new Date())) return null;
+    if (nowMinutes < minMin || nowMinutes > maxMin) return null;
+    return { top: (nowMinutes - minMin) * PX_PER_MIN, label: minToTime(nowMinutes) };
+  }, [view, date, nowMinutes, minMin, maxMin]);
+
+  // Week view: the line shows only when the visible week CONTAINS today and now is
+  // inside the union window [weekMinMin, weekMaxMin]; Y uses weekMinMin. It spans all
+  // 7 day columns (the line lives in the day-columns container), like FullCalendar's
+  // nowIndicator drawn across the timegrid body.
+  const weekNowIndicator = useMemo(() => {
+    if (view !== "timeGridWeek") return null;
+    const todayIso = isoLocal(new Date());
+    if (!weekDates(date).includes(todayIso)) return null;
+    if (nowMinutes < weekMinMin || nowMinutes > weekMaxMin) return null;
+    return { top: (nowMinutes - weekMinMin) * PX_PER_MIN, label: minToTime(nowMinutes) };
+  }, [view, date, nowMinutes, weekMinMin, weekMaxMin]);
 
   function go(deltaDays: number) {
     setDate((d) => addDays(d, deltaDays));
@@ -870,6 +961,19 @@ export function CalendarContent() {
       window.removeEventListener("mouseup", onUp);
     };
   }, [resizing, minMin, maxMin, resizeAppointment]);
+
+  // NOW-INDICATOR tick (port of installStaffNowIndicatorFix): keep nowMinutes in sync
+  // with the wall clock via a 30s interval, mirroring FullCalendar's minute-based
+  // nowIndicator refresh. setState is called ONLY inside the interval callback (never
+  // synchronously in the effect body) so the effect binds once and stays lint-clean;
+  // the interval is cleared on unmount.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const id = window.setInterval(() => {
+      setNowMinutes(nowMinutesOfDay());
+    }, 30000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Open the GLOBAL quick-booking drawer in EDIT mode for an appointment block. The
   // drawer's document-level [data-qb-edit] listener catches a click on any element
@@ -1232,8 +1336,49 @@ export function CalendarContent() {
     return (
       <div className="cal-static-grid" style={{ display: "flex", minHeight: weekGridHeight }}>
         {/* Time axis */}
-        <div className="cal-static-axis" style={{ flex: "0 0 56px", borderRight: "1px solid var(--calendar-line, #e2e8f0)" }}>
+        <div className="cal-static-axis" style={{ flex: "0 0 56px", borderRight: "1px solid var(--calendar-line, #e2e8f0)", position: "relative" }}>
           <div style={{ height: 44 }} />
+          {/* NOW-INDICATOR axis side (Settimana): red arrow + HH:MM label at the now
+              line's Y plus the 44px header offset. */}
+          {weekNowIndicator ? (
+            <>
+              <span
+                className="fc-timegrid-now-indicator-arrow"
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  right: 0,
+                  top: 44 + weekNowIndicator.top,
+                  marginTop: -5,
+                  width: 0,
+                  height: 0,
+                  borderTop: "5px solid transparent",
+                  borderBottom: "5px solid transparent",
+                  borderRight: "6px solid #ef4444",
+                  pointerEvents: "none",
+                  zIndex: 7,
+                }}
+              />
+              <span
+                className="fc-timegrid-now-indicator-label"
+                style={{
+                  position: "absolute",
+                  right: 8,
+                  top: 44 + weekNowIndicator.top,
+                  transform: "translateY(-50%)",
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: "#ef4444",
+                  background: "#fff",
+                  padding: "0 2px",
+                  pointerEvents: "none",
+                  zIndex: 7,
+                }}
+              >
+                {weekNowIndicator.label}
+              </span>
+            </>
+          ) : null}
           {weekRows.map((m) => (
             <div
               key={m}
@@ -1246,7 +1391,26 @@ export function CalendarContent() {
         </div>
 
         {/* Day columns */}
-        <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0 }}>
+        <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0, position: "relative" }}>
+          {/* NOW-INDICATOR line (Settimana): a single red line spanning all 7 day
+              columns, like FullCalendar's nowIndicator across the timegrid body.
+              Reuses the legacy .fc-timegrid-now-indicator-line class; positioned at
+              the now Y plus the 44px column-header offset. */}
+          {weekNowIndicator ? (
+            <div
+              className="fc-timegrid-now-indicator-line"
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: 44 + weekNowIndicator.top,
+                borderTop: "2px solid #ef4444",
+                pointerEvents: "none",
+                zIndex: 6,
+              }}
+            />
+          ) : null}
           {days.map((iso, i) => {
             const d = new Date(`${iso}T12:00:00`);
             const isToday = iso === todayIso;
@@ -1784,8 +1948,50 @@ export function CalendarContent() {
                   ) : (
                     <div className="cal-static-grid" style={{ display: "flex", minHeight: gridHeight }}>
                       {/* Time axis */}
-                      <div className="cal-static-axis" style={{ flex: "0 0 56px", borderRight: "1px solid var(--calendar-line, #e2e8f0)" }}>
+                      <div className="cal-static-axis" style={{ flex: "0 0 56px", borderRight: "1px solid var(--calendar-line, #e2e8f0)", position: "relative" }}>
                         <div style={{ height: 44 }} />
+                        {/* NOW-INDICATOR axis side: the red arrow (legacy
+                            .fc-timegrid-now-indicator-arrow) + the current HH:MM label.
+                            Positioned at the now line's Y plus the 44px header offset. */}
+                        {dayNowIndicator ? (
+                          <>
+                            <span
+                              className="fc-timegrid-now-indicator-arrow"
+                              aria-hidden="true"
+                              style={{
+                                position: "absolute",
+                                right: 0,
+                                top: 44 + dayNowIndicator.top,
+                                marginTop: -5,
+                                width: 0,
+                                height: 0,
+                                borderTop: "5px solid transparent",
+                                borderBottom: "5px solid transparent",
+                                borderRight: "6px solid #ef4444",
+                                pointerEvents: "none",
+                                zIndex: 7,
+                              }}
+                            />
+                            <span
+                              className="fc-timegrid-now-indicator-label"
+                              style={{
+                                position: "absolute",
+                                right: 8,
+                                top: 44 + dayNowIndicator.top,
+                                transform: "translateY(-50%)",
+                                fontSize: 11,
+                                fontWeight: 600,
+                                color: "#ef4444",
+                                background: "#fff",
+                                padding: "0 2px",
+                                pointerEvents: "none",
+                                zIndex: 7,
+                              }}
+                            >
+                              {dayNowIndicator.label}
+                            </span>
+                          </>
+                        ) : null}
                         {rows.map((m) => (
                           <div
                             key={m}
@@ -1805,7 +2011,27 @@ export function CalendarContent() {
                       </div>
 
                       {/* Staff columns */}
-                      <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0 }}>
+                      <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0, position: "relative" }}>
+                        {/* NOW-INDICATOR line (Giorno): a single red line spanning ALL
+                            staff columns, faithful to updateStaffNowIndicator. Uses the
+                            legacy .fc-timegrid-now-indicator-line class (calendar.css
+                            paints it red) + an explicit 2px top border; positioned at the
+                            now Y plus the 44px column-header offset. */}
+                        {dayNowIndicator ? (
+                          <div
+                            className="fc-timegrid-now-indicator-line"
+                            aria-hidden="true"
+                            style={{
+                              position: "absolute",
+                              left: 0,
+                              right: 0,
+                              top: 44 + dayNowIndicator.top,
+                              borderTop: "2px solid #ef4444",
+                              pointerEvents: "none",
+                              zIndex: 6,
+                            }}
+                          />
+                        ) : null}
                         {staffCols.length === 0 ? (
                           <div className="text-muted small p-4">{loading ? "Caricamento prenotazioni..." : "Nessun operatore attivo."}</div>
                         ) : (
