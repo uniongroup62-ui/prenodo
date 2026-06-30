@@ -206,9 +206,11 @@ function normalizeSaleItemInput(item: Record<string, unknown>): PosSaleItemInput
     startDate: packageMetaString(item.startDate ?? item.start_date ?? item.package_start_date),
     expiresAt: packageMetaString(item.expiresAt ?? item.expires_at ?? item.package_expires_at),
     note: packageMetaString(item.note ?? item.package_note),
-    // GiftCard sale meta (faithful to the legacy issue_giftcard POST fields): the chosen
-    // recipient (client/free-text), optional custom code, expiry, dedica + hide-amount
-    // toggle. Read only for a type:"giftcard" line when issuing the giftcards row.
+    // GiftCard / GiftBox sale meta (faithful to the legacy issue_giftcard / issue_giftbox
+    // POST fields): the chosen recipient (client/free-text), optional custom code, expiry,
+    // dedica + hide-amount toggle + event type. Read for a type:"giftcard" line (issuing the
+    // giftcards row) and a type:"giftbox" line (issuing the giftbox_instances row, where
+    // refId is the chosen giftboxes TEMPLATE id and recipientClientId is the instance OWNER).
     recipientClientId: parseInteger(item.recipientClientId ?? item.recipient_client_id, 0) || undefined,
     recipientName: packageMetaString(item.recipientName ?? item.recipient_name),
     recipientEmail: packageMetaString(item.recipientEmail ?? item.recipient_email),

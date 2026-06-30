@@ -71,11 +71,15 @@ export type PosSaleItemInput = {
   startDate?: string;
   expiresAt?: string;
   note?: string;
-  // GiftCard sale meta (faithful to pos.php issue_giftcard + GiftCard::issueGiftCard):
-  // the giftcard configured in the "Emetti GiftCard" modal. Read only for a
-  // type:"giftcard" line at checkout; flows through to the issued giftcards row
-  // (recipient_client_id / recipient_name / code / expires_at / gift_message /
-  // voucher_hide_amount). The card amount is the line unitPrice. Ignored for other types.
+  // GiftCard / GiftBox sale meta (faithful to pos.php issue_giftcard + GiftCard::issueGiftCard
+  // and GiftBox::issueInstance): the voucher configured in the "Emetti GiftCard" / "Emetti
+  // GiftBox" modal. Read only for a type:"giftcard" / type:"giftbox" line at checkout.
+  // For a GIFTCARD it flows to the issued giftcards row (recipient_client_id / recipient_name /
+  // code / expires_at / gift_message / voucher_hide_amount; the card amount is the line
+  // unitPrice). For a GIFTBOX it flows to the issued giftbox_instances row (refId = the chosen
+  // giftboxes TEMPLATE id, recipient_client_id = the OWNER so it shows in residui,
+  // recipient_name / recipient_email / expires_at / event_type / gift_message /
+  // voucher_hide_amount; the box price is the line unitPrice). Ignored for other types.
   recipientClientId?: number;
   recipientName?: string;
   recipientEmail?: string;
@@ -107,8 +111,10 @@ export type PosSaleItem = {
   startDate?: string;
   expiresAt?: string;
   note?: string;
-  // GiftCard sale meta carried from the cart to issueGiftcardFromSale (recipient/code/
-  // expiry/dedica/hide-amount). Only set on a type:"giftcard" line.
+  // GiftCard / GiftBox sale meta carried from the cart to issueGiftcardFromSale /
+  // issueGiftboxFromSale (recipient/code/expiry/dedica/hide-amount). Set on a
+  // type:"giftcard" line and on a type:"giftbox" line (where refId is the chosen
+  // giftboxes TEMPLATE id and recipientClientId is the OWNER of the issued instance).
   recipientClientId?: number;
   recipientName?: string;
   recipientEmail?: string;

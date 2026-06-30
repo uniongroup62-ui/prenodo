@@ -53,6 +53,10 @@ export type ManagePosContext = {
     // Sellable PACKAGE templates (id, name, price, total sessions, validity days) for the
     // "Vendi pacchetto" modal; selling one issues a client_packages row at checkout.
     packages: SellablePackage[];
+    // Sellable GIFTBOX templates (id, name, default price, validity days, contents) for the
+    // "Emetti GiftBox" modal; selling one issues a giftbox_instances row (+ its items copied
+    // from the template's giftbox_items) owned by the recipient at checkout.
+    giftboxes: SellableGiftbox[];
   };
   locations: Array<{ id: number; name: string }>;
 };
@@ -70,6 +74,33 @@ export type SellablePackage = {
   validityDays: number;
 };
 
+// A single content item of a sellable GiftBox template (one giftbox_items row): the source
+// template item id (giftbox_items.id — copied into giftbox_instance_items.giftbox_item_id at
+// issue), the item kind, the service/product it covers, the qty (units of that item), and the
+// label. Mirrors the giftbox_items columns used by the redeem reader.
+export type SellableGiftboxItem = {
+  giftboxItemId: number;
+  itemType: "service" | "product" | "custom";
+  serviceId: number;
+  productId: number;
+  qty: number;
+  label: string;
+};
+
+// A GiftBox template the POS can SELL (port of the GiftBox catalog: SELECT id, name,
+// active, valid_from/valid_to/expires_after_days FROM giftboxes WHERE active=1 AND deleted_at
+// IS NULL). The legacy `giftboxes` table has NO price column (a GiftBox is a fidelity-redeem
+// voucher), so the SALE price is staff-entered in the modal (seeded by `price` = 0 here).
+// `validityDays` seeds the proposed expiry (today + N days, from expires_after_days). `items`
+// are the template's giftbox_items, copied into giftbox_instance_items when the box is issued.
+export type SellableGiftbox = {
+  id: number;
+  name: string;
+  price: number;
+  validityDays: number;
+  items: SellableGiftboxItem[];
+};
+
 const sourceLabel = "app/pages/pos.php + app/pages/pos_history.php";
 
 export async function getManagePosContext(
@@ -78,12 +109,13 @@ export async function getManagePosContext(
 ): Promise<ManagePosContext> {
   const locationContext = await getManageLocationContext(slug);
   const activeLocationId = normalizeLocationId(options.locationId ?? locationContext.currentLocationId, locationContext.locations);
-  const [sales, clients, services, products, packages] = await Promise.all([
+  const [sales, clients, services, products, packages, giftboxes] = await Promise.all([
     listPosSales(slug, { locationId: activeLocationId, includeCancelled: options.includeCancelled ?? true, query: options.query ?? "" }),
     listPosClients(slug),
     listPosServices(slug, activeLocationId),
     listPosProducts(slug, activeLocationId),
     listPosPackages(slug, activeLocationId),
+    listPosGiftboxes(slug, activeLocationId),
   ]);
 
   return {
@@ -93,7 +125,7 @@ export async function getManagePosContext(
     activeLocationId,
     summary: summarizeSales(sales),
     sales,
-    catalog: { clients, services, products, packages },
+    catalog: { clients, services, products, packages, giftboxes },
     locations: locationContext.locations.map((location) => ({ id: location.id, name: location.name })),
   };
 }
@@ -300,6 +332,11 @@ export async function checkoutManageSale(
     // bench sale (no buyer + no recipient picked) cannot own a card, so it is gated on a
     // resolvable recipient inside issueGiftcardFromSale.
     if (item.type === "giftcard") await issueGiftcardFromSale(slug, saleId, client.id, item, locationId);
+    // SELL a GiftBox: issue a real giftbox_instances row (+ its items copied from the chosen
+    // giftboxes template) OWNED by the recipient (defaults to the sale client), so it appears
+    // in their residui and the drawer's giftbox redeem can consume it. A bench sale with no
+    // resolvable recipient is skipped inside issueGiftboxFromSale.
+    if (item.type === "giftbox") await issueGiftboxFromSale(slug, saleId, client.id, item, locationId);
   }
 
   if (input.appointmentId && input.appointmentId > 0) {
@@ -579,6 +616,78 @@ async function packageLocationFilter(slug: string, locationId: number): Promise<
   };
 }
 
+// Sellable GIFTBOX templates for the POS "Emetti GiftBox" modal — port of the GiftBox
+// catalog (SELECT id, name, active, valid_from/valid_to/expires_after_days FROM giftboxes
+// WHERE active=1 AND deleted_at IS NULL). Each template's contents are read from giftbox_items
+// (item_type/service_id/product_id/qty/custom_label), so issueGiftboxFromSale can copy each
+// into giftbox_instance_items. There is NO giftbox_locations table (only services/products are
+// location-filtered, enforced per-item at issue time), so the catalog is not location-filtered
+// here; `locationId` is accepted for signature parity with listPosPackages. Tolerates the
+// giftbox tables being absent (-> empty list). The price is staff-entered in the modal (the
+// giftboxes table has no price column), so `price` is 0 here.
+async function listPosGiftboxes(slug: string, locationId: number): Promise<SellableGiftbox[]> {
+  void locationId;
+  const giftboxesTable = await tenantTable(slug, "giftboxes").catch(() => null);
+  if (!giftboxesTable) return [];
+  const clauses = ["COALESCE(g.active,1)=1"];
+  const params: unknown[] = [];
+  if (giftboxesTable.mode === "shared" && await columnExists(giftboxesTable.name, "tenant_id")) {
+    clauses.unshift("g.tenant_id=?");
+    params.unshift(giftboxesTable.tenantId ?? 0);
+  }
+  if (await columnExists(giftboxesTable.name, "deleted_at")) clauses.push("g.deleted_at IS NULL");
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT g.*
+       FROM ${quoteIdentifier(giftboxesTable.name)} g
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY COALESCE(g.sort_order,0) ASC, g.name ASC, g.id ASC`,
+    params,
+  ).catch(() => [] as RowDataPacket[]);
+  return Promise.all(
+    rows.map(async (row) => {
+      const id = Number(row.id ?? 0);
+      return {
+        id,
+        name: String(row.name ?? "GiftBox"),
+        // No price column on giftboxes — the staff enters the SALE price in the modal.
+        price: 0,
+        // Validity days for the proposed expiry: the template's expires_after_days, else 0
+        // (the issuer then falls back to the settings default or +180d).
+        validityDays: Math.max(0, Number(row.expires_after_days ?? 0) || 0),
+        items: await giftboxTemplateItems(slug, id),
+      };
+    }),
+  );
+}
+
+// The content rows of a giftbox TEMPLATE (giftbox_items WHERE giftbox_id=?), normalized for
+// the catalog + for issueGiftboxFromSale to copy into giftbox_instance_items. Preserves the
+// template item id (giftbox_items.id), kind, service/product, qty + label. Tolerates the
+// table being absent (-> empty list).
+async function giftboxTemplateItems(slug: string, giftboxId: number): Promise<SellableGiftboxItem[]> {
+  if (giftboxId <= 0) return [];
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "giftbox_items",
+    columns: "id, item_type, service_id, product_id, qty, custom_label",
+    where: "giftbox_id=?",
+    params: [giftboxId],
+    orderBy: "sort_order ASC, id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  return rows.map((row) => {
+    const rawType = String(row.item_type ?? "service").toLowerCase();
+    const itemType: SellableGiftboxItem["itemType"] = rawType === "product" ? "product" : rawType === "custom" ? "custom" : "service";
+    return {
+      giftboxItemId: Number(row.id ?? 0) || 0,
+      itemType,
+      serviceId: Number(row.service_id ?? 0) || 0,
+      productId: Number(row.product_id ?? 0) || 0,
+      qty: Math.max(1, Number(row.qty ?? 1) || 1),
+      label: String(row.custom_label ?? ""),
+    };
+  });
+}
+
 async function mapSale(slug: string, row: RowDataPacket): Promise<PosSale> {
   const id = Number(row.id ?? 0);
   const items = await saleItems(slug, id);
@@ -676,9 +785,13 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
     // issue_giftcard sale_items row: qty 1, unit_price = line_total = amount), so the sale
     // TOTAL equals the giftcard amount. The recipient/code/expiry/dedica/hide-amount ride
     // on the line meta and are read by issueGiftcardFromSale at checkout.
+    // A GIFTBOX line is also a single unit at the box price (like a giftcard); the recipient
+    // OWNER + expiry/event/dedica ride on the line meta and are read by issueGiftboxFromSale.
     const isPackage = input.type === "package";
     const isGiftcard = input.type === "giftcard";
-    const lineQty = isPackage || isGiftcard ? 1 : quantity;
+    const isGiftbox = input.type === "giftbox";
+    const isVoucher = isGiftcard || isGiftbox; // shares the recipient/expiry/event/dedica meta
+    const lineQty = isPackage || isVoucher ? 1 : quantity;
     const unitPrice = roundMoney(input.unitPrice ?? 0);
     items.push({
       id: index + 1,
@@ -692,13 +805,13 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
       startDate: clean(input.startDate, 10) || undefined,
       expiresAt: clean(input.expiresAt, 10) || undefined,
       note: clean(input.note, 255) || undefined,
-      recipientClientId: isGiftcard ? Math.max(0, Number(input.recipientClientId ?? 0) || 0) || undefined : undefined,
-      recipientName: isGiftcard ? clean(input.recipientName, 120) || undefined : undefined,
-      recipientEmail: isGiftcard ? clean(input.recipientEmail, 190) || undefined : undefined,
+      recipientClientId: isVoucher ? Math.max(0, Number(input.recipientClientId ?? 0) || 0) || undefined : undefined,
+      recipientName: isVoucher ? clean(input.recipientName, 120) || undefined : undefined,
+      recipientEmail: isVoucher ? clean(input.recipientEmail, 190) || undefined : undefined,
       code: isGiftcard ? clean(input.code, 24).toUpperCase() || undefined : undefined,
-      eventType: isGiftcard ? clean(input.eventType, 32) || undefined : undefined,
-      message: isGiftcard ? clean(input.message, 2000) || undefined : undefined,
-      hideAmount: isGiftcard ? input.hideAmount === true : undefined,
+      eventType: isVoucher ? clean(input.eventType, 40) || undefined : undefined,
+      message: isVoucher ? clean(input.message, 2000) || undefined : undefined,
+      hideAmount: isVoucher ? input.hideAmount === true : undefined,
     });
   }
   return items.filter((item) => item.quantity > 0);
@@ -883,6 +996,13 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   // restored below). Keyed off the sale linkage so the two never collide.
   await cancelIssuedSaleGiftcards(slug, saleId, reason);
 
+  // CANCEL the GiftBox this sale ISSUED (the SELL path): flip the issued instance to
+  // 'cancelled'. Found by the instance's sale-linkage note ('Vendita #saleId') since
+  // giftbox_instances has no sale_id column. Kept distinct from the drawer's giftbox-redeem
+  // restore (which reverses a CONSUMED giftbox via giftbox_redemptions) — a different
+  // operation keyed off the sale linkage, so the two never collide.
+  await cancelIssuedSaleGiftboxes(slug, saleId, reason);
+
   // Restore the residui consumed at checkout: refund the GiftCard balance (re-activating
   // a card the redeem flipped to 'redeemed') and credit the wallet back. Both are linked
   // by the sale row's credit_used / giftcard_id / giftcard_used columns. Best-effort and
@@ -996,6 +1116,59 @@ async function cancelIssuedSaleGiftcards(slug: string, saleId: number, reason: s
   }
 }
 
+// Cancel any GiftBox instance(s) this sale ISSUED (the SELL path), found via the sale-linkage
+// note 'Vendita #saleId' written by issueGiftboxFromSale (giftbox_instances has no sale_id
+// column). Flips each still-issued instance to status='cancelled' (+ cancelled_at) and writes a
+// 'cancel' giftbox_transactions audit row, leaving its giftbox_instance_items intact. Best-effort
+// + idempotent: only an 'issued'/'active' instance is touched (one already cancelled/redeemed/
+// expired is left as-is), so a re-void is a no-op. This is distinct from the drawer's giftbox-
+// redeem restore (restoreGiftboxRedemption), which reverses a CONSUMED giftbox via
+// giftbox_redemptions — keyed off the sale linkage so the issued vs consumed boxes never collide.
+async function cancelIssuedSaleGiftboxes(slug: string, saleId: number, reason: string): Promise<void> {
+  const instanceTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
+  if (!instanceTable) return;
+  if (!(await columnExists(instanceTable.name, "note"))) return;
+
+  const marker = `${GIFTBOX_SALE_MARKER}${saleId}`;
+  // Exact-note match (the issuer writes the note as exactly 'Vendita #saleId'). LIKE-escape the
+  // marker so a numeric saleId can't introduce wildcards (it can't, but stay defensive).
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: instanceTable.name,
+    columns: "id, status",
+    where: "note = ?",
+    params: [marker],
+  }).catch(() => [] as RowDataPacket[]);
+
+  const txTable = await tenantTable(slug, "giftbox_transactions").catch(() => null);
+  for (const row of rows) {
+    const instanceId = Math.max(0, Number(row.id ?? 0) || 0);
+    if (instanceId <= 0) continue;
+    const status = String(row.status ?? "").toLowerCase();
+    // Idempotent: only an issued/active instance is cancelled (a re-void must not re-cancel a
+    // box already cancelled/redeemed/expired).
+    if (status !== "issued" && status !== "active") continue;
+
+    await tenantUpdate({
+      slug,
+      table: instanceTable.name,
+      id: instanceId,
+      values: { status: "cancelled", cancelled_at: new Date() },
+    }).catch(() => 0);
+
+    if (txTable) {
+      await tenantInsert(txTable, await filterColumns(txTable.name, {
+        instance_id: instanceId,
+        type: "cancel",
+        amount: 0,
+        note: clean(`Annullamento GiftBox (storno vendita #${saleId}): ${reason}`, 255),
+        meta_json: JSON.stringify({ source: "sale_cancel", sale_id: saleId }),
+        created_at: new Date(),
+      })).catch(() => undefined);
+    }
+  }
+}
+
 async function issuePrepaidFromSale(slug: string, saleId: number, saleItemId: number, clientId: number, item: PosSaleItem): Promise<void> {
   const table = await tenantTable(slug, "client_prepaid_services").catch(() => null);
   if (!table) return;
@@ -1059,6 +1232,14 @@ async function packageRowById(slug: string, id: number): Promise<RowDataPacket |
 // back to flip the issued card to 'cancelled' (kept distinct from a RESIDUI giftcard that
 // was merely spent on the sale — that is a different card, keyed off sales.giftcard_id).
 const GIFTCARD_SALE_MARKER = "[possale:";
+
+// Marker stored on the issued giftbox_instances.note so a later sale VOID can find the
+// giftbox(es) this sale ISSUED — the giftbox_instances table has NO sale_id column, so the
+// sale linkage rides on the note (faithful to the legacy 'Vendita #saleId' note convention).
+// cancelLinkedSaleResidues parses it back to flip the issued instance to 'cancelled'. Kept
+// distinct from the drawer's giftbox-redeem restore (that reverses a CONSUMED giftbox via
+// giftbox_redemptions, a different operation), so the two never collide.
+const GIFTBOX_SALE_MARKER = "Vendita #";
 
 // SELL a GiftCard at checkout — faithful port of GiftCard::issueGiftCard (app/lib/GiftCard.php
 // ~1465) + the pos.php issue_giftcard action (~2781). Inserts a `giftcards` row owned by the
@@ -1209,6 +1390,174 @@ async function defaultGiftcardExpiry(slug: string, issuedAtYmd: string): Promise
     // missing column / table -> fall through to the +365d default
   }
   return addDaysIso(issuedAtYmd, 365);
+}
+
+// SELL a GiftBox at checkout — faithful port of GiftBox::issueInstance (app/lib/GiftBox.php
+// ~2438) for the CORE TEMPLATE sale. Inserts a `giftbox_instances` row OWNED by the recipient
+// (recipient_client_id = the chosen recipient, defaulting to the sale buyer — THIS is what
+// makes it appear in their residui + lets the drawer's giftbox redeem consume it) with a unique
+// GBX-XXXXXX code, status 'issued' (the value the redeem reader treats as available), issued_at,
+// expires_at (the custom "Valida al", else the template expires_after_days, else the settings
+// default, else +180d), a voucher_public_token, the event/dedica/hide-amount voucher fields, and
+// the sale-linkage note ('Vendita #saleId'). Then copies EACH template giftbox_items row into
+// giftbox_instance_items (giftbox_item_id = the template item id, item_type/service_id/product_id/
+// qty/custom_label) so the redeem reader sees the box contents. Returns the new instance id (0
+// when not issued). Optional issue email is OUT OF SCOPE (see TODO). The box PRICE is the line
+// price (qty 1) — set as the sale_items line, so the sale TOTAL equals the giftbox price.
+async function issueGiftboxFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<number> {
+  const instanceTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
+  if (!instanceTable) return 0;
+
+  // The chosen giftboxes TEMPLATE (the cart line refId). A giftbox sale always picks a
+  // template; without one there are no contents to copy, so skip silently.
+  const giftboxId = Math.max(0, Number(item.refId ?? 0) || 0);
+  if (giftboxId <= 0) return 0;
+  const template = await giftboxTemplateRow(slug, giftboxId);
+  if (!template) return 0;
+
+  // Owner = the recipient client the staff picked (defaults to the sale buyer). An instance
+  // with no owner cannot show in any residui, so a bench sale with no recipient is skipped.
+  const recipientClientId = Math.max(0, Number(item.recipientClientId ?? 0) || 0) || (clientId > 0 ? clientId : 0);
+  const hasRecipientColumn = await columnExists(instanceTable.name, "recipient_client_id");
+  if (recipientClientId <= 0 && (!item.recipientName || !item.recipientName.trim())) return 0;
+
+  const recipientName = clean(item.recipientName, 120)
+    || (recipientClientId > 0 ? await clientName(slug, recipientClientId) : "")
+    || "Destinatario";
+  const recipientEmail = clean(item.recipientEmail, 190) || null;
+
+  // Unique GBX-XXXXXX code (port of GiftBox::generateCode + the 25-try uniqueness loop).
+  const code = await resolveUniqueGiftboxCode(slug, instanceTable.name);
+
+  // EXPIRY: the custom "Valida al" the staff set, else today + the template expires_after_days,
+  // else the giftbox settings default (value + unit), else +180d (task fallback). YYYY-MM-DD.
+  const issuedAtYmd = todayIso();
+  let expiresAt: string | null = item.expiresAt && /^\d{4}-\d{2}-\d{2}$/.test(item.expiresAt) ? item.expiresAt : null;
+  if (!expiresAt) {
+    const templateDays = Math.max(0, Number(template.expires_after_days ?? 0) || 0);
+    if (templateDays > 0) expiresAt = addDaysIso(issuedAtYmd, templateDays);
+  }
+  if (!expiresAt) expiresAt = await defaultGiftboxExpiry(slug, issuedAtYmd);
+
+  const hideAmount = item.hideAmount === true ? 1 : 0;
+  const hasTokenColumn = await columnExists(instanceTable.name, "voucher_public_token");
+
+  const instanceId = await tenantInsert(instanceTable, await filterColumns(instanceTable.name, {
+    voucher_public_token: hasTokenColumn ? randomHex(64) : undefined,
+    giftbox_id: giftboxId,
+    code,
+    client_id: clientId > 0 ? clientId : null,
+    recipient_client_id: hasRecipientColumn ? (recipientClientId > 0 ? recipientClientId : null) : undefined,
+    recipient_name: recipientName,
+    recipient_email: recipientEmail,
+    event_type: clean(item.eventType, 40) || "giftbox",
+    voucher_hide_amount: hideAmount,
+    // status 'issued' is what the residui/redeem readers treat as available (NOT 'active').
+    status: "issued",
+    issued_at: new Date(),
+    expires_at: expiresAt,
+    points_cost: 0,
+    gift_message: clean(item.message, 2000) || null,
+    // Sale linkage marker (no sale_id column on giftbox_instances) for the void reversal.
+    note: `${GIFTBOX_SALE_MARKER}${saleId}`,
+    location_id: locationId > 0 ? locationId : null,
+  })).catch(() => 0);
+  if (!instanceId) return 0;
+
+  // Copy EACH template giftbox_items row into giftbox_instance_items: the redeem reader keys
+  // the per-item residual off giftbox_instance_items.giftbox_item_id (= the template item id),
+  // so this is what makes the box redeemable. Best-effort per row (a missing items table is a
+  // no-op); a template with no items still issues (an empty but valid voucher).
+  const itemsTable = await tenantTable(slug, "giftbox_instance_items").catch(() => null);
+  if (itemsTable) {
+    const templateItems = await giftboxTemplateItems(slug, giftboxId);
+    for (const [index, tplItem] of templateItems.entries()) {
+      if (tplItem.giftboxItemId <= 0) continue;
+      await tenantInsert(itemsTable, await filterColumns(itemsTable.name, {
+        instance_id: instanceId,
+        giftbox_item_id: tplItem.giftboxItemId,
+        item_type: tplItem.itemType,
+        service_id: tplItem.itemType === "service" && tplItem.serviceId > 0 ? tplItem.serviceId : null,
+        product_id: tplItem.itemType === "product" && tplItem.productId > 0 ? tplItem.productId : null,
+        qty: tplItem.qty,
+        custom_label: tplItem.label || null,
+        sort_order: index,
+      })).catch(() => undefined);
+    }
+  }
+
+  // TODO: the in-GiftBox custom-build mode (the legacy pos.php issue_giftbox action that builds
+  // a one-off giftbox from cart services/products via GiftBox::saveGiftBox before issuing) is
+  // OUT OF SCOPE — only the template sale is wired. TODO: the optional issue email (recipient_
+  // email / scheduled_send_on) is also out of scope; the giftbox-send cron handles delivery.
+  return instanceId;
+}
+
+async function giftboxTemplateRow(slug: string, giftboxId: number): Promise<RowDataPacket | null> {
+  if (giftboxId <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftboxes", where: "id=?", params: [giftboxId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  return rows[0] ?? null;
+}
+
+// Unique GBX-XXXXXX giftbox instance CODE — port of GiftBox::generateCode (unambiguous
+// alphabet, no O/0 or I/1) + the issueInstance 25-try uniqueness loop, mirroring the giftcard
+// resolveUniqueGiftcardCode pattern. Codes are generated until one is unused in giftbox_instances.
+async function resolveUniqueGiftboxCode(slug: string, tableName: string): Promise<string> {
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const code = generateGiftboxCode();
+    if (!(await giftboxCodeExists(slug, tableName, code))) return code;
+  }
+  // Extremely unlikely fallthrough: append a timestamp suffix to force uniqueness (<= 20 chars).
+  return (`GBX-${Date.now().toString(36).toUpperCase()}`).slice(0, 20);
+}
+
+async function giftboxCodeExists(slug: string, tableName: string, code: string): Promise<boolean> {
+  if (!code) return false;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: tableName,
+    columns: "id",
+    where: "code = ?",
+    params: [code],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  return rows.length > 0;
+}
+
+// GBX-XXXXXX with the legacy unambiguous alphabet (no O/0, I/1) — GiftBox::generateCode.
+function generateGiftboxCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 6; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return `GBX-${out}`;
+}
+
+// Default giftbox expiry when the staff leaves "Valida al" blank AND the template has no
+// expires_after_days — port of the issueInstance settings fallback: read businesses
+// giftbox_default_validity_value/_unit (days/months/years) and add it to the issue date. Falls
+// back to +180d (the task default, matching issueDbGiftBox) when unset/zero or the column is
+// missing. Returns YYYY-MM-DD.
+async function defaultGiftboxExpiry(slug: string, issuedAtYmd: string): Promise<string> {
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "giftbox_default_validity_value, giftbox_default_validity_unit",
+      orderBy: "id ASC",
+      limit: 1,
+    });
+    const row = rows[0];
+    const value = Math.max(0, Math.floor(Number(row?.giftbox_default_validity_value ?? 0) || 0));
+    const unit = String(row?.giftbox_default_validity_unit ?? "days").toLowerCase();
+    if (value > 0) {
+      if (unit === "months") return addMonthsIso(issuedAtYmd, value);
+      if (unit === "years") return addMonthsIso(issuedAtYmd, value * 12);
+      return addDaysIso(issuedAtYmd, value);
+    }
+  } catch {
+    // missing column / table -> fall through to the +180d default
+  }
+  return addDaysIso(issuedAtYmd, 180);
 }
 
 // start-date + N months as YYYY-MM-DD with day clamping (port of GiftCard::addMonthsClamped).
