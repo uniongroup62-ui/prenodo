@@ -32,11 +32,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // {baseMethod, remainder}] (non-zero only). Checkout is blocked when residui exceed
 // the balances or the tendered sum < total (mirrors the backend validation + consume).
 //
+// WIRED (fidelity points redemption): when the selected client has points and the
+// business has redemption enabled, the "Punti da usare" box (#posFidelityRedeemBox)
+// reveals; the staff types points to spend (or "Max"), the € discount (punti x
+// euroPerPoint, clamped to min(balance, floor(payable / euroPerPoint))) is shown on the
+// "Sconto Punti" row (#posFidelityRow) and subtracted from the total, composed with the
+// manual discount + coupon + residui. fidelity_points_use is sent on checkout; the
+// backend re-validates against the live balance + redeem settings, applies the discount,
+// and consumes the points (a points_redeem wallet movement). Checkout is blocked below
+// the configured minimum or above the balance (mirrors the backend).
+//
 // LEFT STATIC / NON-WIRED (rendered faithfully for visual fidelity only): the
 // advanced line types and their modals — Pacchetti, Ricariche, GiftBox, GiftCard
-// (ISSUE), the installment (rate) plan, and fidelity points. These dialogs are
-// reproduced verbatim but their buttons do not mutate state yet. The checkout only
-// sends service/product lines plus the base method + residui tenders.
+// (ISSUE), and the installment (rate) plan. These dialogs are reproduced verbatim but
+// their buttons do not mutate state yet. The checkout only sends service/product lines
+// plus the base method + residui tenders + the fidelity points discount.
 
 type CatalogService = {
   id: number;
@@ -71,12 +81,15 @@ type PosContext = {
   };
 };
 
-// The client's spendable residui (wallet CREDIT + GiftCards), fetched from
-// GET /api/manage/pos?action=client_residuals&client_id= when a client is selected.
+// The client's spendable residui (wallet CREDIT + GiftCards) + the FIDELITY points balance
+// and redeem settings, fetched from GET /api/manage/pos?action=client_residuals&client_id=
+// when a client is selected.
 type ClientResiduals = {
   clientId: number;
   credit: number;
   giftcards: Array<{ id: number; code: string; balance: number }>;
+  points: number;
+  fidelity: { enabled: boolean; euroPerPoint: number; minPoints: number };
 };
 
 type CartLine = {
@@ -188,6 +201,8 @@ export function PosContent() {
   const [creditUseInput, setCreditUseInput] = useState("0");
   const [giftcardId, setGiftcardId] = useState(0);
   const [giftcardUseInput, setGiftcardUseInput] = useState("0");
+  // FIDELITY points the staff applies as a discount (raw typed value; re-clamped below).
+  const [pointsUseInput, setPointsUseInput] = useState("0");
   const residualsReqRef = useRef(0);
 
   // Checkout state.
@@ -259,9 +274,56 @@ export function PosContent() {
     [couponDiscount, subtotal, manualDiscount],
   );
 
-  const total = useMemo(
+  // ---- fidelity points redemption math ----
+  // Redemption is offered only when the backend reports it enabled for this client (global
+  // fidelity_enabled + fidelity_redeem_enabled + the client has points). The € discount is
+  // pointsUsed x euroPerPoint, capped by the client's balance AND by the amount payable
+  // after the manual + coupon discount (baseForPoints) — faithful to the backend, so the
+  // shown discount always equals the charged one. Points are whole numbers.
+  const fidelityEnabled = useMemo(
+    () => !!residuals?.fidelity.enabled && (residuals?.points ?? 0) > 0,
+    [residuals],
+  );
+  const euroPerPoint = useMemo(() => {
+    const epp = roundMoney(Math.max(0, residuals?.fidelity.euroPerPoint ?? 0.1));
+    return epp > 0 ? epp : 0.1;
+  }, [residuals]);
+  const pointsBalance = useMemo(() => Math.max(0, Math.floor(residuals?.points ?? 0)), [residuals]);
+  const minPoints = useMemo(() => Math.max(0, Math.floor(residuals?.fidelity.minPoints ?? 0)), [residuals]);
+  // The amount still payable after manual + coupon — the cap the points discount fits into.
+  const baseForPoints = useMemo(
     () => roundMoney(Math.max(0, subtotal - manualDiscount - codeDiscount)),
     [subtotal, manualDiscount, codeDiscount],
+  );
+  // The most whole points the payable amount allows: floor(baseForPoints / euroPerPoint).
+  const maxPointsByAmount = useMemo(
+    () => (euroPerPoint > 0 ? Math.floor((baseForPoints + 1e-9) / euroPerPoint) : 0),
+    [baseForPoints, euroPerPoint],
+  );
+  // The points actually used = min(requested, balance, maxByAmount), whole.
+  const pointsUsed = useMemo(() => {
+    if (!fidelityEnabled) return 0;
+    const typed = Math.max(0, Math.floor(Number.parseInt(pointsUseInput, 10) || 0));
+    return Math.max(0, Math.min(typed, pointsBalance, maxPointsByAmount));
+  }, [fidelityEnabled, pointsUseInput, pointsBalance, maxPointsByAmount]);
+  const fidelityDiscount = useMemo(
+    () => roundMoney(Math.min(baseForPoints, pointsUsed * euroPerPoint)),
+    [baseForPoints, pointsUsed, euroPerPoint],
+  );
+  // Whether the typed points are below the configured minimum (blocks checkout + warns).
+  const pointsBelowMin = useMemo(() => {
+    const typed = Math.max(0, Math.floor(Number.parseInt(pointsUseInput, 10) || 0));
+    return fidelityEnabled && minPoints > 0 && typed > 0 && typed < minPoints;
+  }, [fidelityEnabled, pointsUseInput, minPoints]);
+  // Whether the typed points exceed the client's balance (blocks checkout + warns).
+  const pointsOverBalance = useMemo(() => {
+    const typed = Math.max(0, Math.floor(Number.parseInt(pointsUseInput, 10) || 0));
+    return fidelityEnabled && typed > pointsBalance;
+  }, [fidelityEnabled, pointsUseInput, pointsBalance]);
+
+  const total = useMemo(
+    () => roundMoney(Math.max(0, subtotal - manualDiscount - codeDiscount - fidelityDiscount)),
+    [subtotal, manualDiscount, codeDiscount, fidelityDiscount],
   );
 
   // ---- residui math ----
@@ -305,6 +367,7 @@ export function PosContent() {
     setCreditUseInput("0");
     setGiftcardId(0);
     setGiftcardUseInput("0");
+    setPointsUseInput("0");
   }, []);
 
   function selectClient(id: number, name: string) {
@@ -330,8 +393,9 @@ export function PosContent() {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
-      .then((j: { ok?: boolean; clientId?: number; credit?: number; giftcards?: ClientResiduals["giftcards"] }) => {
+      .then((j: { ok?: boolean; clientId?: number; credit?: number; giftcards?: ClientResiduals["giftcards"]; points?: number; fidelity?: ClientResiduals["fidelity"] }) => {
         if (!active || myReq !== residualsReqRef.current) return; // stale
+        const epp = roundMoney(Math.max(0, Number(j?.fidelity?.euroPerPoint ?? 0.1))) || 0.1;
         setResiduals({
           clientId: Number(j?.clientId ?? clientId),
           credit: j?.ok === false ? 0 : roundMoney(Math.max(0, Number(j?.credit ?? 0))),
@@ -340,10 +404,18 @@ export function PosContent() {
                 .map((card) => ({ id: Number(card.id ?? 0), code: String(card.code ?? ""), balance: roundMoney(Math.max(0, Number(card.balance ?? 0))) }))
                 .filter((card) => card.id > 0 && card.balance > 0)
             : [],
+          points: j?.ok === false ? 0 : Math.max(0, Math.floor(Number(j?.points ?? 0))),
+          fidelity: {
+            enabled: j?.ok !== false && j?.fidelity?.enabled === true,
+            euroPerPoint: epp,
+            minPoints: Math.max(0, Math.floor(Number(j?.fidelity?.minPoints ?? 0))),
+          },
         });
       })
       .catch(() => {
-        if (active && myReq === residualsReqRef.current) setResiduals({ clientId, credit: 0, giftcards: [] });
+        if (active && myReq === residualsReqRef.current) {
+          setResiduals({ clientId, credit: 0, giftcards: [], points: 0, fidelity: { enabled: false, euroPerPoint: 0.1, minPoints: 0 } });
+        }
       });
     return () => {
       active = false;
@@ -471,6 +543,11 @@ export function PosContent() {
     setGiftcardId(id);
     setGiftcardUseInput("0");
   }
+  // "Max" for fidelity points: apply the most the client can spend on this sale —
+  // min(balance, floor(payable / euroPerPoint)). The pointsUsed memo re-clamps.
+  function useMaxPoints() {
+    setPointsUseInput(String(Math.max(0, Math.min(pointsBalance, maxPointsByAmount))));
+  }
 
   async function handleCheckout(event: React.FormEvent) {
     event.preventDefault();
@@ -488,6 +565,20 @@ export function PosContent() {
     // Residui require a real client (the backend rejects residui on a bench sale).
     if (residuiTotal > 0 && (!clientId || clientId <= 0)) {
       setErrorMsg("Seleziona un cliente per usare credito o GiftCard.");
+      return;
+    }
+    // FIDELITY: block below the configured minimum or above the balance (the backend
+    // re-validates + throws, this mirrors it for a clean client-side error).
+    if (pointsBelowMin) {
+      setErrorMsg(`Minimo punti utilizzabile: ${minPoints}.`);
+      return;
+    }
+    if (pointsOverBalance) {
+      setErrorMsg("Punti insufficienti.");
+      return;
+    }
+    if (pointsUsed > 0 && (!clientId || clientId <= 0)) {
+      setErrorMsg("Seleziona un cliente per usare i punti.");
       return;
     }
 
@@ -522,6 +613,8 @@ export function PosContent() {
       payments_json: paymentsJson,
       discount: manualDiscount,
       coupon_code: couponCode.trim(),
+      // FIDELITY points to spend as a discount (the backend re-validates + consumes them).
+      fidelity_points_use: pointsUsed,
       notes: notes.trim(),
     };
 
@@ -877,7 +970,7 @@ export function PosContent() {
                   Fidelity: <span id="posClientAdhering">—</span>
                 </span>
                 <span className="badge bg-light text-dark">
-                  Punti: <span id="posClientPoints">0</span>
+                  Punti: <span id="posClientPoints">{clientId ? pointsBalance : 0}</span>
                 </span>
               </div>
               <div className="small text-muted mb-3" id="posRedeemInfo">
@@ -981,9 +1074,15 @@ export function PosContent() {
                 </div>
               </div>
 
-              {/* Fidelity / punti — reso fedelmente, non collegato. */}
-              <div id="posFidelityRedeemBox" className="d-none">
-                <label className="form-label small text-muted mb-1">Punti da usare</label>
+              {/* Fidelity / punti — WIRED: shown when the selected client has points and the
+                  business has redemption enabled. The staff types points to use; the € discount
+                  (punti x euroPerPoint) is clamped to min(balance, floor(payable / euroPerPoint))
+                  and subtracted from the total. "Max" applies the most spendable. fidelity_points_use
+                  is sent on checkout (the backend re-validates + consumes the points). */}
+              <div id="posFidelityRedeemBox" className={fidelityEnabled ? "" : "d-none"}>
+                <label className="form-label small text-muted mb-1">
+                  Punti da usare (disp. <strong>{pointsBalance}</strong>)
+                </label>
                 <div className="input-group input-group-sm mb-1">
                   <input
                     type="number"
@@ -992,13 +1091,25 @@ export function PosContent() {
                     className="form-control"
                     name="fidelity_points_use"
                     id="fidelity_points_use"
-                    defaultValue="0"
+                    value={pointsUseInput}
+                    onChange={(e) => setPointsUseInput(e.target.value)}
                   />
-                  <button type="button" className="btn btn-outline-secondary" id="pointsMaxBtn">
+                  <button type="button" className="btn btn-outline-secondary" id="pointsMaxBtn" onClick={useMaxPoints}>
                     Max
                   </button>
                 </div>
-                <div className="small text-muted mb-2" id="fidelityHelp"></div>
+                <div
+                  className={`small mb-2${pointsBelowMin || pointsOverBalance ? " text-danger" : " text-muted"}`}
+                  id="fidelityHelp"
+                >
+                  {pointsOverBalance
+                    ? "Punti insufficienti."
+                    : pointsBelowMin
+                      ? `Per usare i punti devi usarne almeno ${minPoints}.`
+                      : pointsUsed > 0
+                        ? `${pointsUsed} punti = sconto ${fmtEUR(fidelityDiscount)} (${fmtEUR(euroPerPoint)}/punto).`
+                        : `1 punto = ${fmtEUR(euroPerPoint)}${minPoints > 0 ? `, minimo ${minPoints} punti.` : "."}`}
+                </div>
               </div>
 
               {/* Residui (credito/giftcard) — WIRED: shown when the selected client has a
@@ -1218,9 +1329,12 @@ export function PosContent() {
                   <span id="posManualDiscountVal">- {fmtEUR(manualDiscount)}</span>
                 </div>
 
-                <div className="d-flex justify-content-between text-muted small d-none" id="posFidelityRow">
-                  <span id="posFidelityLabel">Sconto Punti</span>
-                  <span id="posFidelityVal">- € 0,00</span>
+                <div
+                  className={`d-flex justify-content-between text-muted small${fidelityDiscount > 0 ? "" : " d-none"}`}
+                  id="posFidelityRow"
+                >
+                  <span id="posFidelityLabel">Sconto Punti{pointsUsed > 0 ? ` (${pointsUsed} pt)` : ""}</span>
+                  <span id="posFidelityVal">- {fmtEUR(fidelityDiscount)}</span>
                 </div>
 
                 <div className={`d-flex justify-content-between text-muted small${giftcardUse > 0 ? "" : " d-none"}`} id="posGiftcardRow">
@@ -1256,7 +1370,7 @@ export function PosContent() {
                 className="btn btn-success w-100 mt-3"
                 type="submit"
                 id="posConcludeBtn"
-                disabled={submitting || paymentInsufficient || cart.length === 0}
+                disabled={submitting || paymentInsufficient || pointsBelowMin || pointsOverBalance || cart.length === 0}
               >
                 <i className="bi bi-check2-circle me-1"></i>
                 {submitting ? "Conclusione…" : "Concludi"}

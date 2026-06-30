@@ -116,6 +116,8 @@ async function checkoutInputFromBody(body: Record<string, string>, tenantSlug: s
     notes: body.notes,
     promotionId: parseInteger(body.promotion_id, 0),
     installments: parseInteger(body.installments, 0),
+    // FIDELITY points the staff applies as a discount (legacy POST field fidelity_points_use).
+    fidelityPointsUse: parseNumber(body.fidelity_points_use, 0),
     items: saleItemsFromBody(body),
     payments: paymentsFromBody(body),
   };

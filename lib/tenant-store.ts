@@ -125,6 +125,10 @@ export type PosCheckoutInput = {
   notes?: string;
   promotionId?: number;
   installments?: number;
+  // FIDELITY redemption: the points the staff wants to spend as a discount at checkout.
+  // The backend converts points -> euro discount (points x euro_per_point), validates
+  // against the client balance + redeem settings, and consumes them. 0 / undefined = none.
+  fidelityPointsUse?: number;
   items: PosSaleItemInput[];
   payments: PosPaymentInput[];
 };

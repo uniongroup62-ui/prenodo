@@ -91,21 +91,77 @@ export type ManagePosResiduals = {
   clientId: number;
   credit: number;
   giftcards: Array<{ id: number; code: string; balance: number }>;
+  // FIDELITY redemption: the client's spendable POINTS balance (clients.points) plus the
+  // business redeem settings, so the UI can render the "punti da usare" box and compute the
+  // resulting € discount (points x euroPerPoint). `enabled` mirrors the legacy gate:
+  // fidelity_enabled AND fidelity_redeem_enabled AND the client actually has points.
+  points: number;
+  fidelity: {
+    enabled: boolean;
+    euroPerPoint: number;
+    minPoints: number;
+  };
 };
 
 export async function getManagePosResiduals(slug: string, clientId: number): Promise<ManagePosResiduals> {
   const id = Math.max(0, Number(clientId) || 0);
-  if (id <= 0) return { ok: true, clientId: 0, credit: 0, giftcards: [] };
-  const [{ credit }, giftcards] = await Promise.all([
+  const settings = await getFidelityRedeemSettings(slug);
+  if (id <= 0) {
+    return { ok: true, clientId: 0, credit: 0, giftcards: [], points: 0, fidelity: { enabled: false, euroPerPoint: settings.euroPerPoint, minPoints: settings.minPoints } };
+  }
+  const [{ credit, points }, giftcards] = await Promise.all([
     dbWalletBalance(id, slug).catch(() => ({ credit: 0, points: 0 })),
     dbClientGiftcards(slug, id).catch(() => []),
   ]);
+  const normalizedPoints = normalizePoints(points);
   return {
     ok: true,
     clientId: id,
     credit: roundMoney(Math.max(0, credit)),
     giftcards: giftcards.map((card) => ({ id: card.id, code: card.code, balance: roundMoney(Math.max(0, card.balance)) })),
+    points: normalizedPoints,
+    // Redemption is offered only when globally enabled AND the client has points to spend
+    // (faithful to pos.php: `$client_id && $fid['enabled'] && $fid['redeem_enabled']`).
+    fidelity: {
+      enabled: settings.redeemEnabled && normalizedPoints > 0,
+      euroPerPoint: settings.euroPerPoint,
+      minPoints: settings.minPoints,
+    },
   };
+}
+
+// Port of Fidelity::settings() redeem block (app/lib/Fidelity.php ~610-620): read the
+// fidelity redeem config off the single `businesses` row, with the legacy defaults +
+// clamps. euroPerPoint defaults to 0.10, must be > 0 and <= 100000; minPoints defaults to
+// 0, clamped to [0, 100000000] and floored to an integer (points are always whole).
+// Schema-guarded: if the install lacks the columns, falls back to the defaults so the
+// flow still works (euroPerPoint=0.10, minPoints=0) while staying disabled by default.
+type FidelityRedeemSettings = { redeemEnabled: boolean; euroPerPoint: number; minPoints: number };
+
+async function getFidelityRedeemSettings(slug: string): Promise<FidelityRedeemSettings> {
+  const defaults: FidelityRedeemSettings = { redeemEnabled: false, euroPerPoint: 0.1, minPoints: 0 };
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "fidelity_enabled,fidelity_redeem_enabled,fidelity_redeem_euro_per_point,fidelity_redeem_min_points",
+      orderBy: "id ASC",
+      limit: 1,
+    });
+    const row = rows[0];
+    if (!row) return defaults;
+    const enabled = Number(row.fidelity_enabled ?? 0) === 1 && Number(row.fidelity_redeem_enabled ?? 0) === 1;
+    let euroPerPoint = Number(row.fidelity_redeem_euro_per_point ?? 0.1);
+    if (!Number.isFinite(euroPerPoint) || euroPerPoint <= 0) euroPerPoint = 0.1;
+    if (euroPerPoint > 100000) euroPerPoint = 100000;
+    let minPoints = Number(row.fidelity_redeem_min_points ?? 0);
+    if (!Number.isFinite(minPoints) || minPoints < 0) minPoints = 0;
+    if (minPoints > 100000000) minPoints = 100000000;
+    minPoints = normalizePoints(minPoints);
+    return { redeemEnabled: enabled, euroPerPoint: roundMoney(euroPerPoint), minPoints };
+  } catch {
+    return defaults;
+  }
 }
 
 export async function checkoutManageSale(
@@ -131,7 +187,13 @@ export async function checkoutManageSale(
     if (!coupon.valid) throw new Error(coupon.reason || "Coupon non valido.");
     couponDiscount = coupon.discount;
   }
-  const discount = Math.min(subtotal, roundMoney(manualDiscount + couponDiscount));
+  // FIDELITY points redemption: convert the requested points into an euro discount,
+  // capped by the client balance + the amount still payable after manual + coupon. The
+  // points discount is ADDED to the sale discount (so the total drops) and the points are
+  // consumed below, linked to the sale id. Mirrors pos.php: discount += fid_discount.
+  const baseForPoints = roundMoney(Math.max(0, subtotal - manualDiscount - couponDiscount));
+  const redemption = await resolveFidelityRedemption(slug, client.id, input.fidelityPointsUse ?? 0, baseForPoints);
+  const discount = Math.min(subtotal, roundMoney(manualDiscount + couponDiscount + redemption.discount));
   const total = roundMoney(Math.max(0, subtotal - discount));
   const payments = normalizePayments(input.payments, total);
   const paidAmount = roundMoney(payments.reduce((sum, payment) => sum + payment.amount, 0));
@@ -170,6 +232,10 @@ export async function checkoutManageSale(
     credit_used: residui.creditUsed,
     giftcard_id: residui.giftcardId > 0 ? residui.giftcardId : null,
     giftcard_used: residui.giftcardUsed,
+    // Persist the FIDELITY points spent + their euro discount (sales.fidelity_points_used /
+    // sales.fidelity_discount), so a later void can refund them. Schema-guarded.
+    fidelity_points_used: redemption.pointsUsed,
+    fidelity_discount: redemption.discount,
     // Persist the faithful base payment method. Schema-guarded: a no-op on installs
     // without the column (the notes marker keeps derivePayments correct regardless).
     payment_methods: JSON.stringify({ base: baseMethod }),
@@ -185,6 +251,21 @@ export async function checkoutManageSale(
     // clients.credit_balance (the same path the legacy credit_wallet_adjust uses).
     await addDbWalletMovement(
       { clientId: client.id, type: "debit", amount: -residui.creditUsed, note: `Credito utilizzato vendita #${saleId}` },
+      slug,
+    );
+  }
+  // CONSUME the redeemed FIDELITY points: a negative points_redeem movement inserts a
+  // transactions row (kind=redeem, source_type=sale) + decrements clients.points — the
+  // points analog of the credit consume. Linked to the sale id for the void refund below.
+  if (redemption.pointsUsed > 0 && client.id > 0) {
+    await addDbWalletMovement(
+      {
+        clientId: client.id,
+        type: "points_redeem",
+        points: -redemption.pointsUsed,
+        source: "sale",
+        note: `Sconto Fidelity vendita #${saleId}`,
+      },
       slug,
     );
   }
@@ -679,6 +760,7 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   const giftcardUsed = roundMoney(Number(saleRow.giftcard_used ?? 0) || 0);
   const giftcardId = Math.max(0, Number(saleRow.giftcard_id ?? 0) || 0);
   const clientId = Math.max(0, Number(saleRow.client_id ?? 0) || 0);
+  const pointsUsed = normalizePoints(Number(saleRow.fidelity_points_used ?? 0) || 0);
 
   if (giftcardId > 0 && giftcardUsed > 0) {
     await refundDbGiftCard(giftcardId, giftcardUsed, slug, `Storno vendita #${saleId}`).catch(() => undefined);
@@ -689,8 +771,23 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
       slug,
     ).catch(() => undefined);
   }
-  if ((creditUsed > 0 || giftcardUsed > 0) && (await columnExists((await tenantTable(slug, "sales")).name, "credit_used"))) {
+  // REFUND the redeemed FIDELITY points: a positive points_earn movement re-credits
+  // clients.points (the inverse of the points_redeem consumed at checkout), mirroring the
+  // legacy `Fidelity::addTransaction(clientId, +ptsUsed, ...)` on sale cancel.
+  if (pointsUsed > 0 && clientId > 0) {
+    await addDbWalletMovement(
+      { clientId, type: "points_earn", points: pointsUsed, source: "sale", note: `Storno punti Fidelity vendita #${saleId}` },
+      slug,
+    ).catch(() => undefined);
+  }
+  const salesTableName = (await tenantTable(slug, "sales")).name;
+  if ((creditUsed > 0 || giftcardUsed > 0) && (await columnExists(salesTableName, "credit_used"))) {
     await tenantUpdate({ slug, table: "sales", id: saleId, values: { credit_used: 0, giftcard_used: 0 } }).catch(() => 0);
+  }
+  // Zero the stored points so a re-void cannot double-refund (idempotency guard, like the
+  // credit_used/giftcard_used reset above).
+  if (pointsUsed > 0 && (await columnExists(salesTableName, "fidelity_points_used"))) {
+    await tenantUpdate({ slug, table: "sales", id: saleId, values: { fidelity_points_used: 0, fidelity_discount: 0 } }).catch(() => 0);
   }
 }
 
@@ -878,6 +975,54 @@ async function resolveResiduiTenders(
   return { creditUsed, giftcardId, giftcardUsed };
 }
 
+type FidelityRedemption = { pointsUsed: number; discount: number };
+
+// Validate + convert a FIDELITY points redemption request into an euro discount, faithful
+// to pos.php (~4517-4566) + Fidelity::normalizeRedeem. Points are whole; the discount is
+// pointsUsed x euroPerPoint, capped by the client's balance AND by `baseAmount` (what is
+// still payable after the manual + coupon discount). Throws cleanly on an over-spend /
+// below-minimum BEFORE any row is written. Returns {0,0} when no redemption is requested
+// or redemption is disabled.
+async function resolveFidelityRedemption(
+  slug: string,
+  clientId: number,
+  requestedPointsUse: number,
+  baseAmount: number,
+): Promise<FidelityRedemption> {
+  const requested = normalizePoints(Math.max(0, Number(requestedPointsUse) || 0));
+  if (requested <= 0) return { pointsUsed: 0, discount: 0 };
+
+  const settings = await getFidelityRedeemSettings(slug);
+  if (!settings.redeemEnabled) throw new Error("Sconto punti non abilitato.");
+  if (clientId <= 0) throw new Error("Seleziona un cliente per usare i punti.");
+
+  const { points } = await dbWalletBalance(clientId, slug);
+  const available = normalizePoints(Math.max(0, points));
+  if (available <= 0) throw new Error("Punti non disponibili.");
+  if (requested > available) throw new Error("Punti insufficienti.");
+  if (settings.minPoints > 0 && requested < settings.minPoints) {
+    throw new Error(`Minimo punti utilizzabile: ${settings.minPoints}.`);
+  }
+  if (baseAmount <= 0.00001) throw new Error("Importo insufficiente per applicare lo sconto punti.");
+
+  // Cap the points used by the payable amount (whole points only), then derive the euro
+  // discount and hard-clamp it to baseAmount (legacy normalizeRedeem).
+  const maxByAmount = normalizePoints(baseAmount / settings.euroPerPoint);
+  let pointsUsed = Math.min(requested, available, maxByAmount);
+  if (pointsUsed <= 0) return { pointsUsed: 0, discount: 0 };
+  if (settings.minPoints > 0 && pointsUsed < settings.minPoints) {
+    throw new Error("Con l'importo attuale non puoi usare il minimo punti richiesto.");
+  }
+  let discount = roundMoney(pointsUsed * settings.euroPerPoint);
+  if (discount > baseAmount + 0.000001) {
+    discount = roundMoney(baseAmount);
+    pointsUsed = normalizePoints(discount / settings.euroPerPoint);
+    discount = roundMoney(pointsUsed * settings.euroPerPoint);
+  }
+  if (pointsUsed <= 0 || discount <= 0) return { pointsUsed: 0, discount: 0 };
+  return { pointsUsed, discount };
+}
+
 async function filterColumns(table: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
   const entries = await Promise.all(
     Object.entries(values).map(async ([key, value]) => [key, value, await columnExists(table, key)] as const),
@@ -1003,6 +1148,16 @@ function clean(value: unknown, max: number): string {
 
 function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+// Fidelity points are always whole numbers (port of Fidelity::normalizePoints):
+// floor toward zero with a tiny epsilon to absorb float leaks.
+function normalizePoints(value: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  if (n > 0) return Math.floor(n + 1e-9);
+  if (n < 0) return Math.ceil(n - 1e-9);
+  return 0;
 }
 
 function roundQuantity(value: number): number {
