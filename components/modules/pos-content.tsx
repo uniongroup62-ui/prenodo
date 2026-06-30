@@ -155,6 +155,17 @@ type SaleResponsePayment = {
   giftcardId?: number;
 };
 
+// A voucher ISSUED by the sale (checkout response `issuedVouchers`): the generated GiftCard
+// (GC-XXXX-XXXX-XXXX) or GiftBox (GBX-XXXXXX) CODE + recipient + amount. Rendered in the
+// receipt's "Buoni emessi" section so staff can hand the code to the customer — port of
+// pos_success.php's "GiftCard/GiftBox emessa (CODE)" presentation.
+type IssuedVoucher = {
+  type?: string;
+  code?: string;
+  recipientName?: string;
+  amount?: number;
+};
+
 // The completed `sale` the checkout response returns (a subset of PosSale) — the authoritative
 // sale the receipt is built from.
 type SaleResponse = {
@@ -191,6 +202,9 @@ type ReceiptData = {
   giftcardCode: string;
   baseMethodLabel: string;
   baseAmount: number;
+  // GiftCard/GiftBox codes this sale ISSUED (from the checkout response `issuedVouchers`),
+  // shown in the "Buoni emessi" receipt section so staff can give the code to the customer.
+  issuedVouchers: IssuedVoucher[];
 };
 
 type PosContext = {
@@ -285,6 +299,15 @@ const SALE_PAYMENT_METHOD_LABELS: Record<string, string> = {
 function salePaymentMethodLabel(method: string | undefined): string {
   const key = String(method ?? "").toLowerCase();
   return SALE_PAYMENT_METHOD_LABELS[key] ?? (key ? key : "Pagamento");
+}
+
+// Label for an ISSUED voucher type on the receipt (port of pos_success.php's "GiftCard/GiftBox
+// emessa"). Unknown types fall back to a generic "Buono".
+function issuedVoucherTypeLabel(type: string | undefined): string {
+  const key = String(type ?? "").toLowerCase();
+  if (key === "giftcard") return "GiftCard";
+  if (key === "giftbox") return "GiftBox";
+  return "Buono";
 }
 
 // Format the sale date/time for the receipt as "dd/mm/yyyy HH:MM" (it-IT), faithful to the
@@ -1558,6 +1581,11 @@ export function PosContent() {
       // business header rides on the same response (json.business, from getPosBusinessHeader).
       const saleResponse: SaleResponse = (json?.sale ?? {}) as SaleResponse;
       const receiptBusiness: PosBusinessHeader = (json?.business ?? business ?? {}) as PosBusinessHeader;
+      // GiftCard/GiftBox codes the backend issued for this sale (only present when a giftcard/
+      // giftbox line was actually issued). Captured for the receipt's "Buoni emessi" section.
+      const issuedVouchers: IssuedVoucher[] = Array.isArray(json?.issuedVouchers)
+        ? (json.issuedVouchers as IssuedVoucher[]).filter((v) => v && String(v.code ?? "").trim() !== "")
+        : [];
       setLastSale({
         sale: saleResponse,
         business: receiptBusiness,
@@ -1572,6 +1600,7 @@ export function PosContent() {
         giftcardCode: selectedGiftcard?.code ?? "",
         baseMethodLabel: PAYMENT_METHOD_LABELS[baseMethod],
         baseAmount,
+        issuedVouchers,
       });
       // Reset the sale state.
       const saleCode = json?.sale?.code ? ` (${json.sale.code})` : "";
@@ -3627,6 +3656,35 @@ export function PosContent() {
               <span className="fw-semibold">Totale</span>
               <span className="fw-semibold">{fmtEUR(Number(lastSale.sale.total ?? 0))}</span>
             </div>
+
+            {/* Buoni emessi: the GiftCard/GiftBox codes this sale ISSUED (from the checkout
+                response), so staff can hand the code to the customer. Port of pos_success.php's
+                "GiftCard/GiftBox emessa (CODE)" — each row shows the type label, the generated
+                code (the load-bearing value), the recipient, and the amount. */}
+            {lastSale.issuedVouchers.length > 0 ? (
+              <>
+                <hr />
+                <div className="mt-1">
+                  <div className="fw-semibold mb-1">Buoni emessi</div>
+                  <ul className="list-unstyled mb-0 small">
+                    {lastSale.issuedVouchers.map((voucher, idx) => (
+                      <li className="d-flex justify-content-between gap-3 mt-1" key={`${voucher.code ?? ""}-${idx}`}>
+                        <span>
+                          {issuedVoucherTypeLabel(voucher.type)}{" "}
+                          <span className="fw-semibold font-monospace">{voucher.code}</span>
+                          {voucher.recipientName && voucher.recipientName.trim() ? (
+                            <span className="text-muted"> — {voucher.recipientName}</span>
+                          ) : null}
+                        </span>
+                        {Number(voucher.amount ?? 0) > 0.00001 ? (
+                          <span className="text-nowrap">{fmtEUR(Number(voucher.amount ?? 0))}</span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </>
+            ) : null}
 
             {/* Payment method(s) + amounts. Falls back to the captured base method when the
                 server response carries no payments array. */}

@@ -82,6 +82,18 @@ export type ManagePosContext = {
   locations: Array<{ id: number; name: string }>;
 };
 
+// A voucher ISSUED by a sale at checkout — the generated GiftCard (GC-XXXX-XXXX-XXXX) or
+// GiftBox (GBX-XXXXXX) CODE plus its recipient + amount. Surfaced on the checkout response
+// (ManagePosContext.issuedVouchers) so the printable receipt can show staff the code to hand
+// to the customer — port of pos_success.php's "GiftCard/GiftBox emessa (CODE)" presentation.
+// (The code is otherwise written only to the giftcards / giftbox_instances tables.)
+export type IssuedVoucher = {
+  type: "giftcard" | "giftbox";
+  code: string;
+  recipientName?: string;
+  amount?: number;
+};
+
 // A package template the POS can SELL (port of the pos.php $packages query:
 // SELECT id, name, price, sessions_total, validity_days FROM packages WHERE is_active=1).
 // `sessions` is the bundle's total sessions (sum of package_services / package_items, or
@@ -375,7 +387,7 @@ export async function checkoutManageSale(
   slug: string,
   input: PosCheckoutInput,
   operator: { id: number | null; name: string },
-): Promise<ManagePosContext & { sale: PosSale }> {
+): Promise<ManagePosContext & { sale: PosSale; issuedVouchers: IssuedVoucher[] }> {
   const locationContext = await getManageLocationContext(slug);
   const locationId = normalizeLocationId(input.locationId ?? locationContext.currentLocationId, locationContext.locations);
   if (locationId <= 0) throw new Error("Seleziona una sede per la vendita.");
@@ -497,6 +509,12 @@ export async function checkoutManageSale(
     );
   }
 
+  // ISSUED VOUCHERS: the generated GiftCard/GiftBox CODES (+ recipient/amount) created by this
+  // sale, collected from the issuance helpers so the checkout response can surface them on the
+  // printable receipt (the code is otherwise written only to the giftcards/giftbox_instances
+  // tables). Faithful to pos_success.php showing "GiftCard/GiftBox emessa (CODE)".
+  const issuedVouchers: IssuedVoucher[] = [];
+
   for (const item of items) {
     const saleItemId = await insertSaleItem(slug, saleId, item);
     if (item.type === "product" && item.refId > 0 && item.status !== "ordered") {
@@ -508,12 +526,18 @@ export async function checkoutManageSale(
     // appears in their residui/voucher). The card amount is the line price (qty 1). A
     // bench sale (no buyer + no recipient picked) cannot own a card, so it is gated on a
     // resolvable recipient inside issueGiftcardFromSale.
-    if (item.type === "giftcard") await issueGiftcardFromSale(slug, saleId, client.id, item, locationId);
+    if (item.type === "giftcard") {
+      const issued = await issueGiftcardFromSale(slug, saleId, client.id, item, locationId);
+      if (issued.voucher) issuedVouchers.push(issued.voucher);
+    }
     // SELL a GiftBox: issue a real giftbox_instances row (+ its items copied from the chosen
     // giftboxes template) OWNED by the recipient (defaults to the sale client), so it appears
     // in their residui and the drawer's giftbox redeem can consume it. A bench sale with no
     // resolvable recipient is skipped inside issueGiftboxFromSale.
-    if (item.type === "giftbox") await issueGiftboxFromSale(slug, saleId, client.id, item, locationId);
+    if (item.type === "giftbox") {
+      const issued = await issueGiftboxFromSale(slug, saleId, client.id, item, locationId);
+      if (issued.voucher) issuedVouchers.push(issued.voucher);
+    }
     // SELL a RECHARGE: insert a recharges row (base/bonus/total/points), CREDIT the wallet by
     // base+bonus, and EARN fidelity points (when earn_points + eligible). A recharge tops up
     // a real client's wallet, so it requires client.id > 0 (a bench sale has no wallet).
@@ -552,6 +576,8 @@ export async function checkoutManageSale(
   return {
     ...await getManagePosContext(slug, { locationId, includeCancelled: true }),
     sale,
+    // The GiftCard/GiftBox codes this sale issued, for the printable receipt (empty when none).
+    issuedVouchers,
   };
 }
 
@@ -2301,20 +2327,26 @@ const GIFTBOX_SALE_MARKER = "Vendita #";
 // Also writes the 'issue' giftcard_transactions ledger row tagged with the sale id (note +
 // meta_json) for the void reversal. Returns the new giftcards id (0 when not issued).
 // Optional issue email is OUT OF SCOPE (the giftcard-send cron delivers it) — see TODO below.
-async function issueGiftcardFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<number> {
+// Result of issuing a GiftCard/GiftBox at checkout: the new row id (0 when nothing was issued)
+// + the IssuedVoucher (code/recipient/amount) when a card/box was actually created, so the
+// checkout loop can collect it for the receipt. `voucher` is null on a skip (no recipient,
+// missing table, zero amount).
+type IssueResult = { id: number; voucher: IssuedVoucher | null };
+
+async function issueGiftcardFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<IssueResult> {
   const giftcardTable = await tenantTable(slug, "giftcards").catch(() => null);
-  if (!giftcardTable) return 0;
+  if (!giftcardTable) return { id: 0, voucher: null };
 
   // Amount = the line price (qty is forced to 1, so total === unitPrice). Faithful to the
   // legacy sale_items row: 1 @ amount. Skip silently when the amount is not positive.
   const amount = roundMoney(Math.max(0, item.total > 0 ? item.total : item.unitPrice));
-  if (amount <= 0) return 0;
+  if (amount <= 0) return { id: 0, voucher: null };
 
   // Owner = the recipient client the staff picked (defaults to the sale buyer). A card with
   // no owner cannot show in any residui, so a bench sale with no recipient is skipped.
   const recipientClientId = Math.max(0, Number(item.recipientClientId ?? 0) || 0) || (clientId > 0 ? clientId : 0);
   const hasRecipientColumn = await columnExists(giftcardTable.name, "recipient_client_id");
-  if (recipientClientId <= 0 && (!item.recipientName || !item.recipientName.trim())) return 0;
+  if (recipientClientId <= 0 && (!item.recipientName || !item.recipientName.trim())) return { id: 0, voucher: null };
 
   const recipientName = clean(item.recipientName, 120)
     || (recipientClientId > 0 ? await clientName(slug, recipientClientId) : "")
@@ -2355,7 +2387,7 @@ async function issueGiftcardFromSale(slug: string, saleId: number, clientId: num
     note: `Emessa da vendita #${saleId}`,
     location_id: locationId > 0 ? locationId : null,
   })).catch(() => 0);
-  if (!giftcardId) return 0;
+  if (!giftcardId) return { id: 0, voucher: null };
 
   // 'issue' ledger row, tagged with the sale id (note marker + meta_json) so the void
   // reversal can find this exact card. Best-effort: a missing transactions table is a no-op.
@@ -2374,7 +2406,7 @@ async function issueGiftcardFromSale(slug: string, saleId: number, clientId: num
 
   // TODO: optional issue email (recipient_email / scheduled_send_on). Out of scope here —
   // the giftcard-send cron (GiftCard::sendDueScheduledGiftCards) handles delivery.
-  return giftcardId;
+  return { id: giftcardId, voucher: { type: "giftcard", code, recipientName, amount } };
 }
 
 // Unique uppercase giftcard CODE — port of GiftCard::generateCode (GC-XXXX-XXXX-XXXX,
@@ -2455,22 +2487,26 @@ async function defaultGiftcardExpiry(slug: string, issuedAtYmd: string): Promise
 // qty/custom_label) so the redeem reader sees the box contents. Returns the new instance id (0
 // when not issued). Optional issue email is OUT OF SCOPE (see TODO). The box PRICE is the line
 // price (qty 1) — set as the sale_items line, so the sale TOTAL equals the giftbox price.
-async function issueGiftboxFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<number> {
+async function issueGiftboxFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<IssueResult> {
   const instanceTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
-  if (!instanceTable) return 0;
+  if (!instanceTable) return { id: 0, voucher: null };
 
   // The chosen giftboxes TEMPLATE (the cart line refId). A giftbox sale always picks a
   // template; without one there are no contents to copy, so skip silently.
   const giftboxId = Math.max(0, Number(item.refId ?? 0) || 0);
-  if (giftboxId <= 0) return 0;
+  if (giftboxId <= 0) return { id: 0, voucher: null };
   const template = await giftboxTemplateRow(slug, giftboxId);
-  if (!template) return 0;
+  if (!template) return { id: 0, voucher: null };
+
+  // The box PRICE is the line price (qty 1) — surfaced on the receipt voucher (the box is sold
+  // at this amount; the giftboxes table itself has no price column).
+  const amount = roundMoney(Math.max(0, item.total > 0 ? item.total : item.unitPrice));
 
   // Owner = the recipient client the staff picked (defaults to the sale buyer). An instance
   // with no owner cannot show in any residui, so a bench sale with no recipient is skipped.
   const recipientClientId = Math.max(0, Number(item.recipientClientId ?? 0) || 0) || (clientId > 0 ? clientId : 0);
   const hasRecipientColumn = await columnExists(instanceTable.name, "recipient_client_id");
-  if (recipientClientId <= 0 && (!item.recipientName || !item.recipientName.trim())) return 0;
+  if (recipientClientId <= 0 && (!item.recipientName || !item.recipientName.trim())) return { id: 0, voucher: null };
 
   const recipientName = clean(item.recipientName, 120)
     || (recipientClientId > 0 ? await clientName(slug, recipientClientId) : "")
@@ -2513,7 +2549,7 @@ async function issueGiftboxFromSale(slug: string, saleId: number, clientId: numb
     note: `${GIFTBOX_SALE_MARKER}${saleId}`,
     location_id: locationId > 0 ? locationId : null,
   })).catch(() => 0);
-  if (!instanceId) return 0;
+  if (!instanceId) return { id: 0, voucher: null };
 
   // Copy EACH template giftbox_items row into giftbox_instance_items: the redeem reader keys
   // the per-item residual off giftbox_instance_items.giftbox_item_id (= the template item id),
@@ -2541,7 +2577,7 @@ async function issueGiftboxFromSale(slug: string, saleId: number, clientId: numb
   // a one-off giftbox from cart services/products via GiftBox::saveGiftBox before issuing) is
   // OUT OF SCOPE — only the template sale is wired. TODO: the optional issue email (recipient_
   // email / scheduled_send_on) is also out of scope; the giftbox-send cron handles delivery.
-  return instanceId;
+  return { id: instanceId, voucher: { type: "giftbox", code, recipientName, amount } };
 }
 
 async function giftboxTemplateRow(slug: string, giftboxId: number): Promise<RowDataPacket | null> {
