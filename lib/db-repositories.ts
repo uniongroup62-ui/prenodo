@@ -2959,7 +2959,19 @@ export async function dbWalletBalance(clientId: number, slug: string): Promise<{
   };
 }
 
-export async function addDbWalletMovement(input: Partial<WalletMovement>, slug: string): Promise<WalletMovement> {
+export async function addDbWalletMovement(
+  input: Partial<WalletMovement> & {
+    // Optional EXPLICIT ledger linkage for the `transactions` row (points movements):
+    // source_type/source_id make the movement traceable so a later reversal (e.g. the
+    // appointment cancel-done storno) can find + reverse exactly this entry. When
+    // source_type is omitted the legacy behaviour stands (input.source ?? "manual"),
+    // so existing callers are unaffected. createdBy stamps transactions.created_by.
+    source_type?: string;
+    source_id?: number;
+    createdBy?: number;
+  },
+  slug: string,
+): Promise<WalletMovement> {
   const clientId = Math.max(0, Number(input.clientId ?? 0));
   if (clientId <= 0) throw new Error("Cliente mancante.");
   const type = normalizeWalletMovementType(input.type);
@@ -2993,10 +3005,15 @@ export async function addDbWalletMovement(input: Partial<WalletMovement>, slug: 
     const transactionId = await tenantInsert(await tenantTable(slug, "transactions"), {
       client_id: clientId,
       kind: type === "points_redeem" ? "redeem" : type === "points_earn" ? "earn" : "manual",
-      source_type: input.source ?? source,
+      // Prefer the EXPLICIT source_type (e.g. 'appointment'); fall back to the legacy
+      // input.source string, then the credit-side source. source_id/created_by are
+      // schema-guarded by tenantInsert (undefined values are dropped before the INSERT).
+      source_type: input.source_type ?? input.source ?? source,
+      source_id: input.source_id !== undefined && input.source_id > 0 ? input.source_id : undefined,
       delta_points: points,
       amount: amount || null,
       note,
+      created_by: input.createdBy !== undefined && input.createdBy > 0 ? input.createdBy : undefined,
       created_at: new Date(),
     });
     if (!id) id = transactionId;

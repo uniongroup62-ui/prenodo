@@ -2288,6 +2288,159 @@ function earnFidelityPoints(amount: number, earnStep: number): number {
   return normalizePoints(value / step);
 }
 
+// SETTLE the fidelity for an appointment that just transitioned to 'done' — faithful port
+// of Fidelity::handleAppointmentStatusChange (app/lib/Fidelity.php ~2321), the EARN side.
+// The legacy reserves points on pending/scheduled and only settles them when the booking
+// becomes 'Eseguito' ("punti NON scalati subito… solo quando passa a Eseguito"), so this is
+// invoked ONCE on the done transition (the caller already gates oldStatus!=='done').
+//
+// What it does (tenant-scoped throughout):
+//  • Earnable base = SUM(appointment_services.price) minus the manual sconto, clamped the
+//    faithful way (percent => subtotal*val/100, fixed => val; 0..subtotal). Covered/redeemed
+//    service lines are already 0, so they contribute nothing — the earn base is the net
+//    service value, matching the legacy (coupon is not persisted on appointments yet;
+//    credit/giftcard reduce the PAYMENT, not the earnable base).
+//  • EARN: when earn is enabled, award earnFidelityPoints(base, step) via a positive
+//    points_earn wallet movement tagged source_type='appointment'/source_id=appointmentId
+//    (so a later cancel-done storno can find + reverse it, exactly like the POS void reverses
+//    via sales.fidelity_points_earned) and stamp appointments.fidelity_points_earned.
+//  • REDEEM (reserved): when fidelity_points_used>0, settle it with a negative points_redeem
+//    movement tagged the same way. (fidelity_points_used is always 0 today — the drawer
+//    price-panel fidelity row is inert/Block 4 — so this branch is dormant but ported.)
+//
+// IDEMPOTENT: returns early when the appointment already has fidelity_points_earned>0 (never
+// double-awards); the redeem branch is guarded by an existing-redeem-transaction lookup. This
+// is BEST-EFFORT: any error is swallowed by the caller (.catch) and additionally contained
+// here, so a fidelity failure NEVER fails the status change. Does NOT implement the reversal
+// on LEAVING 'done' (the dedicated cancel-done flow handles the storno) — it only stamps +
+// tags so that reversal becomes possible later.
+// Legacy fidelity setting `earn_on_appointment_done`: whether completing an appointment
+// awards points. Default ENABLED when the column is absent/null (preserves earn on installs
+// without the flag), matching the legacy default. Best-effort.
+async function fidelityEarnOnAppointmentDone(slug: string): Promise<boolean> {
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "fidelity_earn_on_appointment_done",
+      orderBy: "id ASC",
+      limit: 1,
+    });
+    const value = rows[0]?.fidelity_earn_on_appointment_done;
+    return value === undefined || value === null || Number(value) === 1;
+  } catch {
+    return true;
+  }
+}
+
+export async function awardAppointmentFidelityOnDone(slug: string, appointmentId: number, createdBy?: number): Promise<void> {
+  try {
+    const id = Math.max(0, Number(appointmentId) || 0);
+    if (id <= 0) return;
+
+    // Load the appointment fidelity fields (tenant-scoped). No row / no client => nothing to do.
+    const appointmentRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointments",
+      columns: "client_id, discount_type, discount_value, fidelity_points_earned, fidelity_points_used",
+      where: "id = ?",
+      params: [id],
+      limit: 1,
+    });
+    const appointment = appointmentRows[0];
+    if (!appointment) return;
+
+    const clientId = Math.max(0, Number(appointment.client_id ?? 0) || 0);
+    const alreadyEarned = normalizePoints(Number(appointment.fidelity_points_earned ?? 0));
+    const pointsUsed = normalizePoints(Number(appointment.fidelity_points_used ?? 0));
+
+    // IDEMPOTENT EARN GUARD: already settled (a non-zero stamp). The legacy stamps with a
+    // GREATEST() so a re-settle is a no-op; here we simply skip when already > 0. We also
+    // skip when there is no client (points belong to a client wallet).
+    if (clientId <= 0 || alreadyEarned > 0) return;
+
+    // Earnable subtotal = sum of the per-line service prices (covered/redeemed lines are 0).
+    // qty is always 1 on appointment_services, so SUM(price) is the service-line total.
+    const subtotalRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      columns: "COALESCE(SUM(price), 0) AS subtotal",
+      where: "appointment_id = ?",
+      params: [id],
+    });
+    const subtotal = roundMoney(Math.max(0, Number(subtotalRows[0]?.subtotal ?? 0) || 0));
+
+    // Manual sconto clamp — faithful: percent => subtotal*val/100, fixed => val; the discount
+    // can never exceed the subtotal nor go negative (mirrors db-repositories.discountValue and
+    // the legacy renderPriceDetails math). Any other/empty type => no discount.
+    const discountType = String(appointment.discount_type ?? "");
+    const discountValue = Math.max(0, Number(appointment.discount_value ?? 0) || 0);
+    let discount = 0;
+    if (discountType === "percent") discount = (subtotal * discountValue) / 100;
+    else if (discountType === "fixed") discount = discountValue;
+    discount = roundMoney(Math.max(0, Math.min(subtotal, discount)));
+    const earnable = roundMoney(Math.max(0, subtotal - discount));
+
+    // EARN: gated on the tenant fidelity earn settings (fidelity_enabled + points_enabled +
+    // earn step) AND the appointment-specific toggle (legacy earn_on_appointment_done — a
+    // tenant can enable points generally but NOT for completed appointments). When earned,
+    // award the points (positive points_earn movement tagged to the appointment) and stamp
+    // appointments.fidelity_points_earned so a later storno can reverse.
+    const earnSettings = await getFidelityEarnSettings(slug);
+    if (earnSettings.enabled && (await fidelityEarnOnAppointmentDone(slug))) {
+      const pointsEarned = earnFidelityPoints(earnable, earnSettings.earnStep);
+      if (pointsEarned > 0) {
+        await addDbWalletMovement(
+          {
+            clientId,
+            type: "points_earn",
+            points: pointsEarned,
+            source_type: "appointment",
+            source_id: id,
+            createdBy: createdBy && createdBy > 0 ? createdBy : undefined,
+            note: `Punti appuntamento #${id}`,
+          },
+          slug,
+        );
+        await tenantUpdate({ slug, table: "appointments", id, values: { fidelity_points_earned: pointsEarned } });
+      }
+    }
+
+    // REDEEM (reserved): settle the points the appointment reserved at booking time (currently
+    // always 0 — the drawer fidelity row is inert/Block 4 — so this is dormant but ported
+    // faithfully). Idempotent: only when no points_redeem transaction already exists for this
+    // appointment (so a re-settle never double-debits the wallet).
+    if (pointsUsed > 0) {
+      const existingRedeem = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "transactions",
+        columns: "id",
+        where: "client_id = ? AND kind = 'redeem' AND source_type = 'appointment' AND source_id = ?",
+        params: [clientId, id],
+        limit: 1,
+      });
+      if (!existingRedeem[0]) {
+        await addDbWalletMovement(
+          {
+            clientId,
+            type: "points_redeem",
+            points: -pointsUsed,
+            source_type: "appointment",
+            source_id: id,
+            createdBy: createdBy && createdBy > 0 ? createdBy : undefined,
+            note: `Riscatto punti appuntamento #${id}`,
+          },
+          slug,
+        );
+      }
+    }
+  } catch {
+    // BEST-EFFORT: a fidelity error must NEVER fail the status change. Swallowed here in
+    // addition to the caller's .catch so a partial failure (e.g. the stamp after the earn)
+    // is contained.
+  }
+}
+
 // The recharge ledger note — faithful to the legacy "Ricarica credito: € base • +N Punti • user".
 function rechargeNote(baseAmount: number, bonusAmount: number, pointsEarned: number, userNote?: string): string {
   const parts = [`Ricarica credito: € ${formatMoney(baseAmount)}`];

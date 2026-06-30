@@ -23,6 +23,7 @@ import {
   type AppointmentGiftRedeem,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
+import { awardAppointmentFidelityOnDone } from "@/lib/manage-pos";
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
@@ -299,6 +300,17 @@ export async function POST(request: Request) {
       // all five statuses persist correctly (the bug was upstream, not here). The
       // appointment ROW is kept on cancel (legacy keeps canceled appointments).
       const appointment = await updateDbAppointmentStatus(tenantSlug, id, rawStatus);
+      // FIDELITY EARN-on-done (port of Fidelity::handleAppointmentStatusChange, the EARN
+      // side): only when the booking actually crosses INTO 'done' (newPhpStatus==='done' &&
+      // oldPhpStatus!=='done'), settle the reserved fidelity — award the earned points
+      // (tagged source_type='appointment'/source_id=id so a later cancel-done storno can
+      // reverse them) + stamp appointments.fidelity_points_earned, and settle any reserved
+      // redeem. Idempotent + best-effort: the helper swallows its own errors and the .catch
+      // here guarantees a fidelity problem NEVER fails the status change. The done->other
+      // storno is the dedicated cancel-done flow (a later step), not this call.
+      if (newPhpStatus === "done" && oldPhpStatus !== "done") {
+        await awardAppointmentFidelityOnDone(tenantSlug, id, session.user.id).catch(() => undefined);
+      }
       // Port of automation_send_email('approved'|'rejected', id): fire AFTER the
       // DB write, gated on emailConfigured() + the kind's toggle (all handled
       // inside the helper). Errors are swallowed there so a delivery problem
