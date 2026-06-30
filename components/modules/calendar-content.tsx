@@ -631,6 +631,34 @@ export function CalendarContent() {
   // in the effect body), so it never re-binds per render and stays lint-clean.
   const [nowMinutes, setNowMinutes] = useState<number>(() => nowMinutesOfDay());
 
+  // === HOVER TIME INDICATOR (port of calendar.js ensureCalendarHoverTimeIndicator /
+  // getCalendarHoverTimeInfoFromPoint / renderCalendarHoverTimeFromPoint) ===
+  // As the pointer moves over a column body, `hover` carries the column it is over
+  // (`col`: staff id in Day / iso date in Week), the snapped time's pixel offset
+  // (`lineTop`, from the window start), the SLOT band offset (`slotTop` — the 30-min
+  // row), and the HH:MM `label` (snapped to SNAP_MIN). null hides the overlay. It is
+  // set ONLY inside the rAF callback driven by the pointer handler (never in an
+  // effect), so there is no set-state-in-effect. A rAF id + last-point ref throttle the
+  // updates (port of scheduleCalendarHoverTimeUpdate).
+  const [hover, setHover] = useState<{ col: string; lineTop: number; slotTop: number; label: string } | null>(null);
+  const hoverRafRef = useRef<number>(0);
+  const hoverPendingRef = useRef<{ col: string; lineTop: number; slotTop: number; label: string } | null>(null);
+
+  // === DRAG-SELECT (port of the FullCalendar `select:` handler) ===
+  // While the pointer is pressed and dragging on an empty column body, `dragSelect`
+  // carries the column (`col`), the staff id to quick-book against (`staffId`, Day =
+  // the column's operator, Week = none), the press time (`startMin`) and the current
+  // pointer time (`curMin`), both snapped to SNAP_MIN within the window. A live band is
+  // drawn from min(start,cur) to max(start,cur); on release (mouseup) a span of >= one
+  // SNAP_MIN slot opens the quick-book drawer prefilled with both times (honoring the
+  // duration); a zero-length drag (a plain click) is handled by the body onClick.
+  const dragSelectRef = useRef<{ col: string; staffId: number; cellDate?: string; bodyTopPx: number; startMin: number; curMin: number } | null>(null);
+  const [dragSelect, setDragSelect] = useState<{ col: string; startMin: number; curMin: number } | null>(null);
+  // Set true on the mouseup that COMMITS a range (the drawer opened); the body's onClick
+  // checks + clears it so the trailing click of a drag does not also single-slot
+  // quick-book (a double-open). A zero-length drag leaves it false so the click books.
+  const dragSelectJustCommittedRef = useRef(false);
+
   // Filters (drive React state; faithful to #filterStaff/#filterService/#filterStatus).
   const [filterStaff, setFilterStaff] = useState("");
   const [filterService, setFilterService] = useState("");
@@ -1014,6 +1042,219 @@ export function CalendarContent() {
     [minMin, maxMin],
   );
 
+  // Map a Y offset (px, relative to a column body top) to a snapped MINUTE-of-day,
+  // clamped to the given window. Port of the calendar.js hover/select Y->time math:
+  //   minutes = winStart + round((offsetY) / PX_PER_MIN / SNAP_MIN) * SNAP_MIN
+  // The window start/end are passed so this serves both the Day (minMin/maxMin) and the
+  // Week (weekMinMin/weekMaxMin) grids with the SAME math the blocks/now-indicator use.
+  const snappedMinFromY = useCallback((offsetPx: number, winStart: number, winEnd: number): number => {
+    const rawMin = winStart + offsetPx / PX_PER_MIN;
+    const snapped = winStart + Math.round((rawMin - winStart) / SNAP_MIN) * SNAP_MIN;
+    return Math.min(Math.max(snapped, winStart), winEnd);
+  }, []);
+
+  // === HOVER INDICATOR + DRAG-SELECT START installer (faithful port of
+  // installCalendarHoverTimeIndicator + scheduleCalendarHoverTimeUpdate) ===
+  // A single root-level listener set (pointermove + mousedown + leave) on #calendar,
+  // attached imperatively in an effect — so every ref read/write happens inside the
+  // effect (never via a function passed to a JSX prop), keeping the no-ref-access-during-
+  // render lint clean while still serving BOTH the Day and Week grids. Each column body
+  // carries the geometry the handler needs as data-* attributes (data-cal-body, data-col,
+  // data-winstart/-winend, and for drag-select data-staffid/-celldate); the handler reads
+  // them from the .cal-col-body under the pointer, so it is view-agnostic.
+  //   - pointermove: computes the snapped time/line/slot for the hovered body, stores it
+  //     in a ref, and rAF-throttles a single setHover per frame (port of
+  //     scheduleCalendarHoverTimeUpdate). Hidden over an appointment block (.fc-event) or
+  //     while a block move / resize / range-select gesture is active.
+  //   - mousedown: starts a drag-select on an empty body (primary button, not on a block
+  //     / resize handle / store band), seeding dragSelectRef + the live band state.
+  // The window-level mousemove/mouseup that EXTEND + COMMIT the active drag-select live in
+  // their own effect (below). The listeners + any pending rAF are removed on unmount.
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof window === "undefined") return;
+    const root = document.getElementById("calendar");
+    if (!root) return;
+
+    const flushHover = () => {
+      hoverRafRef.current = 0;
+      setHover(hoverPendingRef.current);
+    };
+    const scheduleHover = () => {
+      if (!hoverRafRef.current) hoverRafRef.current = window.requestAnimationFrame(flushHover);
+    };
+
+    const onMove = (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement | null;
+      const body = target?.closest<HTMLElement>(".cal-col-body[data-cal-body]");
+      const overEvent = target?.closest?.(".fc-event") != null;
+      if (!body || overEvent || dragRef.current || resizeRef.current || dragSelectRef.current) {
+        hoverPendingRef.current = null;
+        scheduleHover();
+        return;
+      }
+      const col = body.getAttribute("data-col") || "";
+      const winStart = Number(body.getAttribute("data-winstart"));
+      const winEnd = Number(body.getAttribute("data-winend"));
+      if (!col || !Number.isFinite(winStart) || !Number.isFinite(winEnd)) {
+        hoverPendingRef.current = null;
+        scheduleHover();
+        return;
+      }
+      const rect = body.getBoundingClientRect();
+      const minutes = snappedMinFromY(ev.clientY - rect.top, winStart, winEnd);
+      const slotStart = Math.floor(minutes / SLOT_MIN_PER_ROW) * SLOT_MIN_PER_ROW;
+      hoverPendingRef.current = {
+        col,
+        lineTop: (minutes - winStart) * PX_PER_MIN,
+        slotTop: (Math.max(slotStart, winStart) - winStart) * PX_PER_MIN,
+        label: minToTime(minutes),
+      };
+      scheduleHover();
+    };
+
+    const onLeave = () => {
+      hoverPendingRef.current = null;
+      scheduleHover();
+    };
+
+    const onDown = (ev: MouseEvent) => {
+      if (ev.button !== 0) return; // primary button only
+      if (dragRef.current || resizeRef.current) return; // never during a block move/resize
+      const target = ev.target as HTMLElement | null;
+      // Never start a range-select on a block, its resize handle, or a store band.
+      if (target?.closest(".fc-event") || target?.closest(".cal-resize-handle")) return;
+      const body = target?.closest<HTMLElement>(".cal-col-body[data-cal-body]");
+      if (!body) return;
+      const col = body.getAttribute("data-col") || "";
+      const winStart = Number(body.getAttribute("data-winstart"));
+      const winEnd = Number(body.getAttribute("data-winend"));
+      if (!col || !Number.isFinite(winStart) || !Number.isFinite(winEnd)) return;
+      const staffId = Number(body.getAttribute("data-staffid")) || 0;
+      const cellDate = body.getAttribute("data-celldate") || undefined;
+      const bodyTopPx = body.getBoundingClientRect().top;
+      const startMin = snappedMinFromY(ev.clientY - bodyTopPx, winStart, winEnd);
+      dragSelectRef.current = { col, staffId, cellDate, bodyTopPx, startMin, curMin: startMin };
+      // Hide the hover indicator for the duration of the gesture (the live band leads).
+      hoverPendingRef.current = null;
+      setHover(null);
+      setDragSelect({ col, startMin, curMin: startMin });
+    };
+
+    root.addEventListener("mousemove", onMove);
+    root.addEventListener("mouseleave", onLeave);
+    root.addEventListener("mousedown", onDown);
+    return () => {
+      root.removeEventListener("mousemove", onMove);
+      root.removeEventListener("mouseleave", onLeave);
+      root.removeEventListener("mousedown", onDown);
+      if (hoverRafRef.current) {
+        window.cancelAnimationFrame(hoverRafRef.current);
+        hoverRafRef.current = 0;
+      }
+    };
+  }, [snappedMinFromY]);
+
+  // Render the hover indicator + live drag-select band for one column body (`col` is
+  // the column key, `winStart` the body's window start min). All three pieces are
+  // absolutely-positioned, pointer-events:none overlays so they never block the
+  // underlying empty-cell click / drag. Reuses the legacy CSS classes so they are
+  // styled identically by app.css / calendar.css:
+  //   - .calendar-hover-time-line  (guide line at the snapped time)
+  //   - .calendar-hover-slot-highlight (subtle band for the snapped 30-min slot)
+  //   - .calendar-hover-time-display.calendar-hover-time-display--floating (HH:MM label)
+  // The drag-select band reuses .calendar-hover-slot-highlight too (a stronger,
+  // explicitly-styled variant), matching the legacy selection look.
+  const renderHoverOverlay = useCallback(
+    (col: string, winStart: number) => {
+      const showHover = hover && hover.col === col;
+      const showSelect = dragSelect && dragSelect.col === col;
+      if (!showHover && !showSelect) return null;
+      const selA = showSelect ? Math.min(dragSelect.startMin, dragSelect.curMin) : 0;
+      const selB = showSelect ? Math.max(dragSelect.startMin, dragSelect.curMin) : 0;
+      const selTop = (selA - winStart) * PX_PER_MIN;
+      const selHeight = Math.max((selB - selA) * PX_PER_MIN, 2);
+      return (
+        <>
+          {showHover ? (
+            <>
+              {/* Subtle highlight band for the snapped 30-min slot. */}
+              <div
+                className="calendar-hover-slot-highlight is-visible"
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  right: 0,
+                  top: hover.slotTop,
+                  height: ROW_HEIGHT,
+                  zIndex: 4,
+                  pointerEvents: "none",
+                  // Minimal inline fallback in case the scoped CSS does not match.
+                  background: "rgba(47,99,216,.13)",
+                  boxShadow: "inset 0 0 0 1px rgba(47,99,216,.22)",
+                }}
+              />
+              {/* Thin guide line at the snapped (5-min) time. */}
+              <div
+                className="calendar-hover-time-line is-visible"
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  right: 0,
+                  top: hover.lineTop,
+                  zIndex: 5,
+                  pointerEvents: "none",
+                  borderTop: "1px dashed rgba(59,130,246,.7)",
+                }}
+              />
+              {/* HH:MM label following the pointer's snapped time. */}
+              <div
+                className="calendar-hover-time-display calendar-hover-time-display--floating is-visible"
+                aria-hidden="true"
+                style={{
+                  position: "absolute",
+                  left: 4,
+                  top: hover.lineTop,
+                  transform: "translateY(-50%)",
+                  zIndex: 8,
+                  pointerEvents: "none",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: "#0f172a",
+                  background: "rgba(255,255,255,.85)",
+                  borderRadius: 4,
+                  padding: "0 4px",
+                  lineHeight: 1.3,
+                }}
+              >
+                {hover.label}
+              </div>
+            </>
+          ) : null}
+          {showSelect ? (
+            <div
+              className="calendar-hover-slot-highlight is-visible"
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: selTop,
+                height: selHeight,
+                zIndex: 5,
+                pointerEvents: "none",
+                background: "rgba(47,99,216,.20)",
+                boxShadow: "inset 0 0 0 1px rgba(47,99,216,.40)",
+              }}
+            />
+          ) : null}
+        </>
+      );
+    },
+    [hover, dragSelect],
+  );
+
   // POST action=move with optimistic update + reconcile. The list is optimistically
   // patched (new time/operator) so the block jumps immediately; on success the server
   // list replaces local state, on error we revert by reloading the day. Tenant-scoped
@@ -1183,9 +1424,12 @@ export function CalendarContent() {
   // carrying data-qb-edit; from the block's onClick we dispatch a click on a hidden
   // anchor we set to data-qb-edit={id}, so a plain click (not a drag) opens edit while
   // the block's own drag handlers keep MOVE working.
-  const qbEditAnchorRef = useRef<HTMLAnchorElement | null>(null);
+  // The hidden bridge anchors are looked up by id (not a ref) so these openers do not
+  // read a ref — keeping them usable from the nested render helpers (renderWeekView /
+  // renderMonthView) without tripping the no-ref-access-during-render lint.
   const openGlobalEdit = useCallback((id: number) => {
-    const anchor = qbEditAnchorRef.current;
+    if (typeof document === "undefined") return;
+    const anchor = document.getElementById("calQbEditAnchor");
     if (!anchor) return;
     anchor.setAttribute("data-qb-edit", String(id));
     anchor.click();
@@ -1195,18 +1439,76 @@ export function CalendarContent() {
   // empty cell's date/time/operator. The drawer's [data-qb-new] listener reads the
   // data-qb-date/data-qb-time/data-qb-staff attributes we set on a hidden anchor, then
   // shows the offcanvas. Replaces the legacy #apptModal quick-book entirely.
-  const qbNewAnchorRef = useRef<HTMLAnchorElement | null>(null);
   const openGlobalQuickBook = useCallback(
-    (cellTime: string, staffId: number) => {
-      const anchor = qbNewAnchorRef.current;
+    (cellTime: string, staffId: number, endTime?: string, cellDate?: string) => {
+      if (typeof document === "undefined") return;
+      const anchor = document.getElementById("calQbNewAnchor");
       if (!anchor) return;
-      anchor.setAttribute("data-qb-date", date);
+      // cellDate lets the Week view book against the clicked DAY column's date (each
+      // column is a different day); the Day view omits it and uses the focused `date`.
+      anchor.setAttribute("data-qb-date", cellDate || date);
       anchor.setAttribute("data-qb-time", cellTime);
       anchor.setAttribute("data-qb-staff", staffId > 0 ? String(staffId) : "");
+      // DRAG-SELECT end (port of the FullCalendar `select:` handler): when the user
+      // drag-selected a TIME RANGE (not a plain click), pass the chosen end so the
+      // drawer honors the DURATION (the drawer reads data-qb-endtime; see
+      // quick-booking-drawer.tsx's [data-qb-new] handler). Cleared otherwise so a plain
+      // click keeps the services-derived end. The drawer ignores an end <= start.
+      if (endTime && endTime !== cellTime) anchor.setAttribute("data-qb-endtime", endTime);
+      else anchor.removeAttribute("data-qb-endtime");
       anchor.click();
     },
     [date],
   );
+
+  // While a drag-select is active, track the live end with a window mousemove and commit
+  // on mouseup. The effect keys off whether a select is active (a boolean), NOT its
+  // value, so the listeners bind once per gesture (not per mouse move), mirroring the
+  // resize wiring. A span of >= one SNAP_MIN slot opens the quick-book drawer prefilled
+  // with the start AND end (honoring the duration); a zero-length drag is left to the
+  // body onClick (the existing single-slot quick-book). The view's window (Day vs Week)
+  // is captured via the dependencies so the cursor->time map matches the active grid.
+  // (Placed after openGlobalQuickBook so it can call it.)
+  const dragSelecting = dragSelect !== null;
+  const dragWinStart = view === "timeGridWeek" ? weekMinMin : minMin;
+  const dragWinEnd = view === "timeGridWeek" ? weekMaxMin : maxMin;
+  useEffect(() => {
+    if (!dragSelecting) return;
+    if (typeof window === "undefined") return;
+
+    const onMove = (ev: MouseEvent) => {
+      const r = dragSelectRef.current;
+      if (!r) return;
+      const curMin = snappedMinFromY(ev.clientY - r.bodyTopPx, dragWinStart, dragWinEnd);
+      r.curMin = curMin; // keep the ref's live end in sync for the commit on mouseup
+      setDragSelect((cur) => (cur && cur.col === r.col ? { col: r.col, startMin: r.startMin, curMin } : cur));
+    };
+
+    // The commit reads the final range from the ref (no side effects inside the state
+    // updater, which React may invoke twice) and opens the drawer once on mouseup.
+    const onUp = () => {
+      const sel = dragSelectRef.current;
+      dragSelectRef.current = null;
+      setDragSelect(null);
+      if (!sel) return;
+      const a = Math.min(sel.startMin, sel.curMin);
+      const b = Math.max(sel.startMin, sel.curMin);
+      // A real range (>= one SNAP_MIN slot) -> open the drawer with start + end so the
+      // duration is honored. A zero-length drag falls through to the body onClick (the
+      // existing single-slot quick-book).
+      if (b - a >= SNAP_MIN) {
+        dragSelectJustCommittedRef.current = true;
+        openGlobalQuickBook(minToTime(a), sel.staffId, minToTime(b), sel.cellDate);
+      }
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragSelecting, dragWinStart, dragWinEnd, snappedMinFromY, openGlobalQuickBook]);
 
   // QUICK-BOOK is now handled by the GLOBAL quick-booking drawer
   // (components/quick-booking-drawer.tsx) via openGlobalQuickBook above — the legacy
@@ -1646,13 +1948,42 @@ export function CalendarContent() {
                   </span>
                 </div>
 
-                {/* Slot rows (background) + positioned appointment blocks */}
-                <div className="cal-col-body" style={{ position: "relative", height: weekGridHeight }}>
+                {/* Slot rows (background) + positioned appointment blocks. Doubles as the
+                    day column's quick-book surface (empty-cell click) + drag-select +
+                    hover indicator, mapping the Y offset within this body (window =
+                    weekMinMin..weekMaxMin). */}
+                <div
+                  className="cal-col-body"
+                  // Geometry the root-level hover / drag-select listeners read (see the
+                  // installer effect). data-staffid 0 = no operator in Week; data-celldate
+                  // is this column's day so the quick-book books that date.
+                  data-cal-body="1"
+                  data-col={`week-${iso}`}
+                  data-winstart={weekMinMin}
+                  data-winend={weekMaxMin}
+                  data-staffid={0}
+                  data-celldate={iso}
+                  style={{ position: "relative", height: weekGridHeight }}
+                  onClick={(e) => {
+                    // Plain-click quick-book on the empty background (blocks
+                    // stopPropagation). Skip right after a committed drag-select range.
+                    if (dragSelectJustCommittedRef.current) {
+                      dragSelectJustCommittedRef.current = false;
+                      return;
+                    }
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const rawMin = snappedMinFromY(e.clientY - rect.top, weekMinMin, weekMaxMin);
+                    openGlobalQuickBook(minToTime(rawMin), 0, undefined, iso);
+                  }}
+                >
                   {/* Store-background shading per DAY column (unavailable / lunch break /
                       closed), computed from THIS column's date over the shared week
                       window. Behind the slot lines + blocks + now-indicator and
                       non-interactive (pointer-events:none). */}
                   {renderStoreBands(iso, weekMinMin, weekMaxMin, false, false)}
+                  {/* HOVER guide-line / slot-highlight / time label + live drag-select
+                      band overlays for this day column (non-interactive). */}
+                  {renderHoverOverlay(`week-${iso}`, weekMinMin)}
                   {weekRows.map((m) => (
                     <div
                       key={m}
@@ -1677,6 +2008,8 @@ export function CalendarContent() {
                         href={href(`appointments&action=view&id=${a.id}`)}
                         className="fc-event fc-timegrid-event appt-soft-event"
                         title={`${a.time} ${a.client} • ${a.service}`}
+                        // A press on a block must not start the column drag-select.
+                        onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
@@ -1864,8 +2197,8 @@ export function CalendarContent() {
           edit anchor's data-qb-edit and clicks it (drawer opens in EDIT mode);
           clicking an empty cell sets the new anchor's data-qb-date/time/staff and
           clicks it (drawer opens prefilled in CREATE mode). Visually hidden. */}
-      <a ref={qbEditAnchorRef} data-qb-edit="" href="#" className="d-none" aria-hidden="true" tabIndex={-1} onClick={(e) => e.preventDefault()} />
-      <a ref={qbNewAnchorRef} data-qb-new="1" href="#" className="d-none" aria-hidden="true" tabIndex={-1} onClick={(e) => e.preventDefault()} />
+      <a id="calQbEditAnchor" data-qb-edit="" href="#" className="d-none" aria-hidden="true" tabIndex={-1} onClick={(e) => e.preventDefault()} />
+      <a id="calQbNewAnchor" data-qb-new="1" href="#" className="d-none" aria-hidden="true" tabIndex={-1} onClick={(e) => e.preventDefault()} />
 
       <div className="bs-page-header calendar-page-header">
         <div className="bs-page-heading">
@@ -2290,6 +2623,15 @@ export function CalendarContent() {
                                     body, which starts at minMin. */}
                                 <div
                                   className="cal-col-body"
+                                  // Geometry the root-level hover / drag-select listeners read
+                                  // (see the installer effect). data-col scopes the overlay to
+                                  // this column; data-winstart/-winend map Y->time; data-staffid
+                                  // is the column's operator for a drag-select quick-book.
+                                  data-cal-body="1"
+                                  data-col={`day-${s.id}`}
+                                  data-winstart={minMin}
+                                  data-winend={maxMin}
+                                  data-staffid={s.id}
                                   style={{ position: "relative", height: gridHeight }}
                                   onDragOver={(e) => {
                                     // Required so the browser fires onDrop on this element.
@@ -2310,8 +2652,13 @@ export function CalendarContent() {
                                   }}
                                   onClick={(e) => {
                                     // Quick-book only on the empty background, never on a block
-                                    // (blocks stopPropagation). Ignore right after a drag/resize.
+                                    // (blocks stopPropagation). Ignore right after a drag/resize
+                                    // or a committed drag-select range (which already opened it).
                                     if (dragRef.current || resizeRef.current) return;
+                                    if (dragSelectJustCommittedRef.current) {
+                                      dragSelectJustCommittedRef.current = false;
+                                      return;
+                                    }
                                     const rect = e.currentTarget.getBoundingClientRect();
                                     // Open the GLOBAL quick-booking drawer in CREATE mode,
                                     // prefilled with this cell's date/time/operator.
@@ -2324,6 +2671,9 @@ export function CalendarContent() {
                                       + now-indicator, pointer-events:none so quick-book /
                                       drag / resize still work on top. */}
                                   {renderStoreBands(date, minMin, maxMin, true, colIndex === 0)}
+                                  {/* HOVER guide-line / slot-highlight / time label + live
+                                      drag-select band overlays (non-interactive). */}
+                                  {renderHoverOverlay(`day-${s.id}`, minMin)}
                                   {rows.map((m) => (
                                     <div
                                       key={m}
@@ -2358,6 +2708,10 @@ export function CalendarContent() {
                                         className="fc-event fc-timegrid-event appt-soft-event"
                                         title={`${a.time} ${a.client} • ${a.service}`}
                                         draggable
+                                        // Keep a press on the block from starting a column
+                                        // drag-select; the HTML5 move-drag (onDragStart) and the
+                                        // hover-suppress-on-block are unaffected.
+                                        onMouseDown={(e) => e.stopPropagation()}
                                         onDragStart={(e) => {
                                           // Record the grabbed appointment + the pointer offset
                                           // from the block top, so the drop maps the block start.

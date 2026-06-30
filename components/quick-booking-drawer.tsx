@@ -450,6 +450,13 @@ export function QuickBookingDrawer() {
   // ---- Date / time / location / cabin / status / notes ----
   const [date, setDate] = useState<string>(() => todayIso());
   const [startTime, setStartTime] = useState<string>("");
+  // Explicit END time prefilled from a calendar DRAG-SELECT (data-qb-endtime, HH:MM).
+  // "" = no override -> the end is DERIVED from the selected services' total duration
+  // (the normal behavior). When set and no service has yet been chosen, it seeds the
+  // visible end / ends_at so the dragged DURATION is honored. It is cleared on reset,
+  // once any service is selected (services then drive the end), and when the start time
+  // is edited (so a stale fixed end can't outlive the start that defined it).
+  const [prefillEndTime, setPrefillEndTime] = useState<string>("");
   const [locationId, setLocationId] = useState<string>("");
   const [cabinId, setCabinId] = useState<string>("");
   const [status, setStatus] = useState<string>("scheduled");
@@ -531,6 +538,7 @@ export function QuickBookingDrawer() {
     setServiceSearch("");
     setDate(todayIso());
     setStartTime(nextStepTime());
+    setPrefillEndTime(""); // drop any drag-select end override (services drive the end)
     setCabinId("");
     setStatus("scheduled");
     setStaffId("");
@@ -582,8 +590,12 @@ export function QuickBookingDrawer() {
       const prefDate = btn.getAttribute("data-qb-date") ?? "";
       const prefTime = btn.getAttribute("data-qb-time") ?? "";
       const prefStaff = btn.getAttribute("data-qb-staff") ?? "";
+      // Calendar DRAG-SELECT end (data-qb-endtime, HH:MM): seeds the end time so the
+      // dragged DURATION is honored until a service is picked (services then drive it).
+      const prefEnd = btn.getAttribute("data-qb-endtime") ?? "";
       if (/^\d{4}-\d{2}-\d{2}$/.test(prefDate)) setDate(prefDate);
       if (/^\d{1,2}:\d{2}$/.test(prefTime)) setStartTime(prefTime);
+      setPrefillEndTime(/^\d{1,2}:\d{2}$/.test(prefEnd) ? prefEnd : "");
       if (prefStaff && Number.parseInt(prefStaff, 10) > 0) setStaffId(prefStaff);
       const el = document.getElementById("quickBooking");
       const api = bootstrap()?.Offcanvas;
@@ -618,12 +630,18 @@ export function QuickBookingDrawer() {
   );
 
   // syncEnd: the visible end time is DERIVED from start + total duration (no
-  // effect/state needed). Mirrors app.js syncEnd().
+  // effect/state needed). Mirrors app.js syncEnd(). FALLBACK: when no service is
+  // selected yet (totalDuration <= 0) but a calendar drag-select prefilled an explicit
+  // end (prefillEndTime, HH:MM, after the start), use that so the dragged DURATION is
+  // honored; selecting a service then takes over the end (services drive it).
   const endTime = useMemo(() => {
     const startMin = timeToMin(startTime);
-    if (startMin === null || totalDuration <= 0) return "";
-    return minToTime(startMin + totalDuration);
-  }, [startTime, totalDuration]);
+    if (startMin === null) return "";
+    if (totalDuration > 0) return minToTime(startMin + totalDuration);
+    const prefMin = timeToMin(prefillEndTime);
+    if (prefMin !== null && prefMin > startMin) return minToTime(prefMin);
+    return "";
+  }, [startTime, totalDuration, prefillEndTime]);
 
   // ---- Multi-service operator picker (port of renderMultiStaffPicker) ----
   // The legacy fetches eligible staff per service from the
@@ -804,6 +822,9 @@ export function QuickBookingDrawer() {
   const changeStartTime = useCallback((value: string) => {
     setHoldToken("");
     setStartTime(value);
+    // A manually edited start invalidates a drag-select end override (the fixed end was
+    // chosen relative to the original start) — fall back to the services-derived end.
+    setPrefillEndTime("");
   }, []);
   const changeLocation = useCallback((value: string) => {
     setHoldToken("");
