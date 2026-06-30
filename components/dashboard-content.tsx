@@ -45,7 +45,7 @@ function toneClass(tone?: string): string {
   return "text-muted";
 }
 
-export function DashboardContent({ sedeName }: { sedeName?: string }) {
+export function DashboardContent({ slug, sedeName }: { slug: string; sedeName?: string }) {
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState("");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -204,7 +204,7 @@ export function DashboardContent({ sedeName }: { sedeName?: string }) {
                     <i className="bi bi-clock" />
                     <span>Prossimi appuntamenti</span>
                   </span>
-                  <a className="btn btn-sm btn-outline-secondary" href="index.php?page=calendar">
+                  <a className="btn btn-sm btn-outline-secondary" href={`/${slug}/calendar`}>
                     <i className="bi bi-calendar3 me-1" />
                     Calendario
                   </a>
@@ -293,7 +293,7 @@ export function DashboardContent({ sedeName }: { sedeName?: string }) {
                     <i className="bi bi-calendar2-check" />
                     <span>Scadenziario e Costi</span>
                   </span>
-                  <a className="btn btn-sm btn-outline-secondary" href="index.php?page=costs">
+                  <a className="btn btn-sm btn-outline-secondary" href={`/${slug}/costs`}>
                     <i className="bi bi-box-arrow-up-right me-1" />
                     Apri
                   </a>
@@ -304,7 +304,7 @@ export function DashboardContent({ sedeName }: { sedeName?: string }) {
                       <div className="text-muted small">Scaduti</div>
                       <div className="h5 fw-bold mb-0">{fmtEuro(data?.costs.overdueAmount ?? 0)}</div>
                       <div className="small text-muted">{data?.costs.overdueCount ?? 0} voci</div>
-                      <a className="small dashboard-link-action" href="index.php?page=costs&tab=scadenziario&status=open">
+                      <a className="small dashboard-link-action" href={`/${slug}/costs?tab=scadenziario&status=open`}>
                         Vedi scaduti
                       </a>
                     </div>
@@ -312,7 +312,7 @@ export function DashboardContent({ sedeName }: { sedeName?: string }) {
                       <div className="text-muted small">Questo mese</div>
                       <div className="h5 fw-bold mb-0">{fmtEuro(data?.costs.monthAmount ?? 0)}</div>
                       <div className="small text-muted">{data?.costs.monthCount ?? 0} voci</div>
-                      <a className="small dashboard-link-action" href="index.php?page=costs&tab=scadenziario&status=open">
+                      <a className="small dashboard-link-action" href={`/${slug}/costs?tab=scadenziario&status=open`}>
                         Vedi mese
                       </a>
                     </div>

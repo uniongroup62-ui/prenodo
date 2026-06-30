@@ -509,7 +509,7 @@ export function ManageShell({
             <div className="small-muted px-2">
               <strong>Accesso:</strong> <strong>{userName}</strong>
             </div>
-            <a className="nav-item mt-2" href={`/${encodeURIComponent(slug)}/index.php?page=logout`}>
+            <a className="nav-item mt-2" href={`/${encodeURIComponent(slug)}/logout`}>
               <i className="bi bi-box-arrow-right" />
               Esci
             </a>
@@ -612,7 +612,7 @@ export function ManageShell({
                   <li><a className="dropdown-item" href={pageHref(slug, "accessibility")}><i className="bi bi-universal-access me-2" />Accessibilità</a></li>
                   <li><a className="dropdown-item" href={pageHref(slug, "roles")}><i className="bi bi-shield-lock me-2" />Ruoli</a></li>
                   <li><hr className="dropdown-divider" /></li>
-                  <li><a className="dropdown-item" href={`/${encodeURIComponent(slug)}/index.php?page=logout`}><i className="bi bi-box-arrow-right me-2" />Esci</a></li>
+                  <li><a className="dropdown-item" href={`/${encodeURIComponent(slug)}/logout`}><i className="bi bi-box-arrow-right me-2" />Esci</a></li>
                 </ul>
               </div>
             </div>
@@ -631,7 +631,7 @@ export function ManageShell({
                     {supportAccess.reason ? <> Motivo: {supportAccess.reason}.</> : null}
                     {supportExpiresLabel ? <> Scade: {supportExpiresLabel}.</> : null}
                   </div>
-                  <a className="btn btn-sm btn-outline-primary" href={`/${encodeURIComponent(slug)}/index.php?page=logout`}>
+                  <a className="btn btn-sm btn-outline-primary" href={`/${encodeURIComponent(slug)}/logout`}>
                     Termina accesso
                   </a>
                 </div>

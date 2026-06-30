@@ -315,11 +315,11 @@ async function getInstallmentDueAlertGroups(
       const linesMore = Math.max(0, bucket.count - bucket.previewRows.length);
       let link: string;
       if (bucket.daysDiff < 0) {
-        link = "index.php?page=installments_manage&status=overdue";
+        link = `/${slug}/installments_manage?status=overdue`;
       } else {
         const dueDate = normalizeYmd(String(bucket.previewRows[0]?.due_date ?? "")) ?? "";
         const enc = encodeURIComponent(dueDate);
-        link = `index.php?page=installments_manage&status=open&due_from=${enc}&due_to=${enc}`;
+        link = `/${slug}/installments_manage?status=open&due_from=${enc}&due_to=${enc}`;
       }
       if (filterByLocation) link += `&location_id=${currentLocationId}`;
       return {
@@ -478,7 +478,7 @@ async function getFidelityCardAlertGroups(slug: string, tenantId: number | null)
         kind: "danger",
         title,
         text: `${count} ${count === 1 ? "tessera già scaduta" : "tessere già scadute"}`,
-        link: "index.php?page=fidelity_membership",
+        link: `/${slug}/fidelity_membership`,
         lines: expiredRows.slice(0, previewLimit).map(lineFor),
         linesMore: Math.max(0, count - previewLimit),
       });
@@ -509,7 +509,7 @@ async function getFidelityCardAlertGroups(slug: string, tenantId: number | null)
         kind,
         title,
         text,
-        link: "index.php?page=fidelity_membership",
+        link: `/${slug}/fidelity_membership`,
         lines: items.slice(0, previewLimit).map(lineFor),
         linesMore: Math.max(0, count - previewLimit),
       });
@@ -564,7 +564,7 @@ export async function getDashboardAlerts(slug: string, options: DashboardAlertOp
       icon: "bi-hourglass-split",
       title: "Appuntamenti in attesa",
       text: `${pendingCount} da approvare`,
-      link: "index.php?page=notifications",
+      link: `/${slug}/notifications`,
       linkLabel: "Gestisci",
     });
   }
@@ -576,7 +576,7 @@ export async function getDashboardAlerts(slug: string, options: DashboardAlertOp
       icon: "bi-file-earmark-check",
       title: "Preventivi: risposte clienti",
       text: `${quoteRespCount} da leggere`,
-      link: "index.php?page=notifications_quotes",
+      link: `/${slug}/notifications_quotes`,
       linkLabel: "Vedi",
     });
   }
@@ -603,7 +603,7 @@ export async function getDashboardAlerts(slug: string, options: DashboardAlertOp
       icon: "bi-box-seam",
       title: "Prodotti quasi esauriti",
       text: `${lowStockCount} sotto la soglia minima`,
-      link: `index.php?page=products&low_stock=1${qs !== "" ? `&${qs}` : ""}`,
+      link: `/${slug}/products?low_stock=1${qs !== "" ? `&${qs}` : ""}`,
       linkLabel: "Vedi magazzino",
     });
   }
@@ -616,7 +616,7 @@ export async function getDashboardAlerts(slug: string, options: DashboardAlertOp
       icon: "bi-person-x",
       title: "Operatori assenti",
       text: `${staffOff.count} con un periodo di assenza attivo`,
-      link: "index.php?page=staff_availability",
+      link: `/${slug}/staff_availability`,
       linkLabel: "Dettagli",
       lines,
       linesMore: Math.max(0, staffOff.count - staffOff.preview.length),

@@ -41,7 +41,7 @@ export default async function TenantDashboardPage({
 
   return (
     <ManageShell slug={tenantSlug} userName={session.user.name} currentPage="dashboard">
-      <DashboardContent sedeName={sedeName} />
+      <DashboardContent slug={tenantSlug} sedeName={sedeName} />
     </ManageShell>
   );
 }
