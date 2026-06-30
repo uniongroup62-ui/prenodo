@@ -7,10 +7,23 @@ import { useEffect, useRef, useState } from "react";
 
 type Metric = { label: string; value: string; detail: string; tone?: string };
 type SeriesPoint = { date: string; label: string; revenue: number; appointments: number };
+// Grouped dashboard "Avvisi" alert — faithful port of the legacy $alerts[] item.
+type DashboardAlert = {
+  key: string;
+  kind: "warning" | "info" | "danger";
+  icon: string;
+  title: string;
+  text: string;
+  link: string;
+  linkLabel: string;
+  lines?: string[];
+  linesMore?: number;
+};
 type DashboardData = {
   stats: Metric[];
   weekly: { range: string; metrics: Metric[]; series: SeriesPoint[] };
   appointments: { today: Appt[]; upcoming: Appt[] };
+  alerts: DashboardAlert[];
   notifications: Array<{ id?: number | string; title?: string; message?: string }>;
   costs: { overdueAmount: number; monthAmount: number; overdueCount: number; monthCount: number };
 };
@@ -106,7 +119,7 @@ export function DashboardContent({ sedeName }: { sedeName?: string }) {
   }, [data]);
 
   const upcoming = data?.appointments.upcoming ?? [];
-  const notifications = data?.notifications ?? [];
+  const alerts = data?.alerts ?? [];
 
   return (
     <div className="container-fluid">
@@ -235,17 +248,42 @@ export function DashboardContent({ sedeName }: { sedeName?: string }) {
                     <i className="bi bi-bell" />
                     <span>Avvisi</span>
                   </span>
+                  {alerts.length > 0 ? <span className="badge text-bg-secondary">{alerts.length}</span> : null}
                 </div>
-                {notifications.length === 0 ? (
+
+                {alerts.length === 0 ? (
                   <div className="p-3 text-muted">Nessun avviso.</div>
                 ) : (
-                  <ul className="list-group list-group-flush">
-                    {notifications.map((n, i) => (
-                      <li className="list-group-item" key={n.id ?? i}>
-                        {n.title ?? n.message ?? ""}
-                      </li>
+                  <div className="list-group list-group-flush dashboard-alert-list">
+                    {alerts.map((al, i) => (
+                      <div className="list-group-item dashboard-alert-item" key={al.key ?? i}>
+                        <div className="d-flex justify-content-between align-items-start gap-3">
+                          <div className="d-flex align-items-start gap-2">
+                            <i className={`bi ${al.icon} text-${al.kind}`} />
+                            <div>
+                              <div className="fw-semibold">{al.title}</div>
+                              <div className="small text-muted">{al.text}</div>
+
+                              {al.lines && al.lines.length > 0 ? (
+                                <div className="small text-muted mt-1">
+                                  {al.lines.map((line, li) => (
+                                    <div key={li}>• {line}</div>
+                                  ))}
+                                  {al.linesMore && al.linesMore > 0 ? <div>…e altre {al.linesMore}</div> : null}
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+
+                          <div>
+                            <a className="btn btn-sm btn-outline-secondary" href={al.link}>
+                              {al.linkLabel || "Apri"}
+                            </a>
+                          </div>
+                        </div>
+                      </div>
                     ))}
-                  </ul>
+                  </div>
                 )}
               </div>
 

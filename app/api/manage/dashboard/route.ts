@@ -7,7 +7,9 @@ import {
   listDbNotifications,
   listDbSales,
 } from "@/lib/db-repositories";
+import { getDashboardAlerts } from "@/lib/manage-dashboard-alerts";
 import { currentManageSession } from "@/lib/manage-auth";
+import { getManageLocationContext } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
 import type { AppointmentWithMeta } from "@/lib/appointment-engine";
@@ -31,18 +33,28 @@ export async function GET(request: Request) {
   if (!can(session.user.perms, "dashboard.view")) return jsonError("Permesso dashboard mancante.", 403);
 
   try {
-    const [clients, appointments, sales, costs, notifications, costSummary] = await Promise.all([
+    const locationContext = await getManageLocationContext(tenantSlug);
+    const [clients, appointments, sales, costs, notifications, costSummary, alerts] = await Promise.all([
       listDbClients({ slug: tenantSlug, includeArchived: false }),
       listDbAppointments({ slug: tenantSlug }),
       listDbSales({ slug: tenantSlug, includeCancelled: true }),
       listDbCosts(tenantSlug),
       listDbNotifications(tenantSlug),
       costDbSummary(tenantSlug),
+      // Faithful port of the legacy dashboard "Avvisi" grouped alert list. Honors
+      // the same notifications/products/staff/installments permission + location
+      // gating as app/pages/dashboard.php.
+      getDashboardAlerts(tenantSlug, {
+        perms: session.user.perms,
+        currentLocationId: locationContext.currentLocationId,
+        needsLocationSelection: locationContext.needsLocationSelection,
+      }),
     ]);
 
     return Response.json({
       ok: true,
       sourceMode: "database",
+      alerts,
       ...buildDashboard({
         clients,
         appointments,
@@ -103,6 +115,24 @@ function buildDashboard({
     return date >= addDays(weekStart, -7) && date < weekStart;
   }).length;
 
+  // Previous week (the Mon-Sun before this one) — drives the week-over-week deltas
+  // (port of kpiApptDelta / kpiRevenueDelta / kpiHoursDelta).
+  const prevWeekStart = addDays(weekStart, -7);
+  const prevWeekEnd = addDays(weekStart, -1);
+  const prevWeeklyAppointments = appointments.filter((appointment) => {
+    const date = appointment.date ?? today;
+    return date >= prevWeekStart && date <= prevWeekEnd;
+  });
+  const prevWeeklySales = activeSales.filter((sale) => {
+    const date = sale.createdAt.slice(0, 10);
+    return date >= prevWeekStart && date <= prevWeekEnd;
+  });
+  // "Ore lavorate" = SUM of appointment durations in hours (port of kpiHours), NOT a
+  // count of completed appointments.
+  const weeklyHours = roundMoney(weeklyAppointments.reduce((sum, appointment) => sum + appointmentDurationMinutes(appointment), 0) / 60);
+  const prevWeeklyHours = roundMoney(prevWeeklyAppointments.reduce((sum, appointment) => sum + appointmentDurationMinutes(appointment), 0) / 60);
+  const prevWeeklyRevenue = roundMoney(prevWeeklySales.reduce((total, sale) => total + sale.total, 0));
+
   const series = weekDates.map((date) => ({
     date,
     label: date.slice(8, 10) + "/" + date.slice(5, 7),
@@ -121,9 +151,9 @@ function buildDashboard({
     weekly: {
       range: `${formatShortDate(weekStart)} - ${formatShortDate(weekEnd)}`,
       metrics: [
-        { label: "Appuntamenti", value: String(weeklyAppointments.length), detail: percentageDetail(weeklyAppointments.length, 0) },
-        { label: "Ricavi", value: formatEuro(weeklyRevenue), detail: percentageDetail(weeklyRevenue, 0) },
-        { label: "Ore lavorate", value: String(weeklyAppointments.filter((appointment) => appointment.status === "Completato").length), detail: percentageDetail(weeklyAppointments.length, 0) },
+        { label: "Appuntamenti", value: String(weeklyAppointments.length), detail: percentageDetail(weeklyAppointments.length, prevWeeklyAppointments.length), tone: weeklyAppointments.length >= prevWeeklyAppointments.length ? "good" : "bad" },
+        { label: "Ricavi", value: formatEuro(weeklyRevenue), detail: percentageDetail(weeklyRevenue, prevWeeklyRevenue), tone: weeklyRevenue >= prevWeeklyRevenue ? "good" : "bad" },
+        { label: "Ore lavorate", value: `${weeklyHours.toLocaleString("it-IT", { maximumFractionDigits: 1 })} h`, detail: percentageDetail(weeklyHours, prevWeeklyHours), tone: weeklyHours >= prevWeeklyHours ? "good" : "bad" },
         { label: "Nuovi clienti", value: String(newClientsThisWeek), detail: percentageDetail(newClientsThisWeek, newClientsPreviousWeek), tone: newClientsThisWeek >= newClientsPreviousWeek ? "good" : "bad" },
       ] satisfies DashboardMetric[],
       series,
@@ -179,6 +209,20 @@ function formatShortDate(date: string): string {
 
 function formatEuro(value: number): string {
   return `${roundMoney(value).toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} euro`;
+}
+
+function timeToMinutes(time: string): number | null {
+  const m = /^(\d{1,2}):(\d{2})/.exec(time || "");
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+
+// Worked minutes for one appointment = end - start (its real persisted duration via
+// endTime), falling back to 60 when no end time is stored. Powers "Ore lavorate".
+function appointmentDurationMinutes(appointment: AppointmentWithMeta): number {
+  const start = timeToMinutes(appointment.time);
+  const end = appointment.endTime ? timeToMinutes(appointment.endTime) : null;
+  if (start != null && end != null && end > start) return end - start;
+  return 60;
 }
 
 function percentageDetail(current: number, previous: number): string {

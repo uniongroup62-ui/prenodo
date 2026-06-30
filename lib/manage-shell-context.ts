@@ -44,7 +44,7 @@ const EMPTY_SUMMARY: ShellNotificationSummary = {
 
 // Tenant-aware column probe: resolves the (possibly prefixed/shared) physical
 // table name, then checks the column. Returns false if the table is missing.
-async function tenantColumnExists(slug: string, table: string, column: string): Promise<boolean> {
+export async function tenantColumnExists(slug: string, table: string, column: string): Promise<boolean> {
   try {
     const target = await tenantTable(slug, table);
     return await columnExists(target.name, column);
@@ -53,7 +53,7 @@ async function tenantColumnExists(slug: string, table: string, column: string): 
   }
 }
 
-async function tenantTableExists(slug: string, table: string): Promise<boolean> {
+export async function tenantTableExists(slug: string, table: string): Promise<boolean> {
   try {
     await tenantTable(slug, table);
     return true;
@@ -65,7 +65,7 @@ async function tenantTableExists(slug: string, table: string): Promise<boolean> 
 // Read an alert-days setting (installment_alert_days / client_birthday_alert_days)
 // from automation_settings, mirroring installment_notification_days() /
 // client_birthday_notification_days(): default 7, clamped to 0..365.
-async function automationAlertDays(slug: string, column: string): Promise<number> {
+export async function automationAlertDays(slug: string, column: string): Promise<number> {
   try {
     const rows = await tenantSelect<RowDataPacket>({
       slug,
@@ -86,7 +86,7 @@ async function automationAlertDays(slug: string, column: string): Promise<number
   }
 }
 
-async function countPendingAppointments(slug: string, currentLocationId: number): Promise<number> {
+export async function countPendingAppointments(slug: string, currentLocationId: number): Promise<number> {
   try {
     if (currentLocationId > 0) {
       const hasApptLocation = await tenantColumnExists(slug, "appointments", "location_id");
@@ -130,7 +130,7 @@ async function countPendingAppointments(slug: string, currentLocationId: number)
   }
 }
 
-async function countUnseenQuoteDecisions(slug: string, currentLocationId: number): Promise<number> {
+export async function countUnseenQuoteDecisions(slug: string, currentLocationId: number): Promise<number> {
   try {
     const useLocation = currentLocationId > 0 && (await tenantColumnExists(slug, "quotes", "location_id"));
     const locationSql = useLocation ? " AND location_id=?" : "";
