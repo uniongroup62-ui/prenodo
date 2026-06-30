@@ -2282,6 +2282,73 @@ export async function redeemDbGiftCard(id: number, amount: number, slug: string)
   return getSingleGiftCard(slug, id);
 }
 
+// Inverse of redeemDbGiftCard, exported for the POS void flow: refund `amount` back
+// to giftcards.balance, re-activating a card the redeem flipped to 'redeemed' when its
+// balance hit 0, and write a 'refund' giftcard_transactions ledger entry. Mirrors the
+// private restoreGiftcardBalance (used by the appointment delete flow) but as a clean
+// public primitive so cancelLinkedSaleResidues can reverse a POS giftcard tender.
+export async function refundDbGiftCard(id: number, amount: number, slug: string, note = "Storno vendita"): Promise<void> {
+  const refund = roundMoney(Math.max(0, amount));
+  if (id <= 0 || refund <= 0) return;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "giftcards",
+    columns: "id, balance, status",
+    where: "id = ?",
+    params: [id],
+    limit: 1,
+  });
+  if (!rows[0]) return;
+  const balance = roundMoney(Math.max(0, parseMoney(rows[0].balance, 0)) + refund);
+  const values: Record<string, unknown> = { balance };
+  if (String(rows[0].status ?? "") === "redeemed") {
+    values.status = "active";
+    values.redeemed_at = null;
+  }
+  await tenantUpdate({ slug, table: "giftcards", id, values });
+  await tenantInsert(await tenantTable(slug, "giftcard_transactions"), {
+    giftcard_id: id,
+    type: "refund",
+    amount: refund,
+    note,
+    created_at: new Date(),
+  }).catch(() => 0);
+}
+
+// Available (redeemable) GiftCards for a client — used by the POS "Residui" panel.
+// Same rule as quickBookClientGiftcards / quickBookClientResidualsSummary: a giftcard
+// the client OWNS (recipient_client_id when the column exists, else client_id),
+// status='active', balance > 0, not expired. Tenant-scoped + every read guarded.
+export async function dbClientGiftcards(slug: string, clientId: number): Promise<Array<{ id: number; code: string; balance: number }>> {
+  if (clientId <= 0) return [];
+  try {
+    const giftcardTable = await tenantTable(slug, "giftcards");
+    const hasRecipient = await columnExists(giftcardTable.name, "recipient_client_id");
+    const hasExpiry = await columnExists(giftcardTable.name, "expires_at");
+    const target = hasRecipient ? "recipient_client_id = ?" : "client_id = ?";
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftcards",
+      columns: "id, code, balance",
+      where: `${target} AND status = 'active' AND balance > 0${expiry}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 50,
+    });
+    const out: Array<{ id: number; code: string; balance: number }> = [];
+    for (const row of rows) {
+      const id = Number(row.id ?? 0);
+      const balance = roundMoney(Math.max(0, parseMoney(row.balance, 0)));
+      if (id <= 0 || balance <= 0) continue;
+      out.push({ id, code: String(row.code ?? ""), balance });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 export async function listDbPackageState(slug: string): Promise<{ catalog: PackageCatalog[]; clientPackages: ClientPackage[] }> {
   const catalogRows = await tenantSelect<RowDataPacket>({
     slug,

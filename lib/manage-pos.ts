@@ -16,7 +16,14 @@ import type {
   PosSaleItemType,
   PosSummary,
 } from "@/lib/tenant-store";
-import { previewDbCoupon } from "@/lib/db-repositories";
+import {
+  addDbWalletMovement,
+  dbClientGiftcards,
+  dbWalletBalance,
+  previewDbCoupon,
+  redeemDbGiftCard,
+  refundDbGiftCard,
+} from "@/lib/db-repositories";
 import { getManageLocationContext } from "@/lib/manage-locations";
 import {
   columnExists,
@@ -73,6 +80,34 @@ export async function getManagePosContext(
   };
 }
 
+// The "Residui" the POS can spend on a sale for a selected client: their wallet CREDIT
+// balance (clients.credit_balance, the same source Quick Booking + the wallet ledger
+// use) and each available (active, non-expired, balance > 0) GiftCard the client owns.
+// Port of pos_payment_residual_credit_data + the credit_wallet_balance/active_card
+// helpers (app/pages/pos.php), reusing the existing repo readers so the numbers match
+// what the rest of the app shows. Returns zeros / empty for "Cliente banco" (id <= 0).
+export type ManagePosResiduals = {
+  ok: true;
+  clientId: number;
+  credit: number;
+  giftcards: Array<{ id: number; code: string; balance: number }>;
+};
+
+export async function getManagePosResiduals(slug: string, clientId: number): Promise<ManagePosResiduals> {
+  const id = Math.max(0, Number(clientId) || 0);
+  if (id <= 0) return { ok: true, clientId: 0, credit: 0, giftcards: [] };
+  const [{ credit }, giftcards] = await Promise.all([
+    dbWalletBalance(id, slug).catch(() => ({ credit: 0, points: 0 })),
+    dbClientGiftcards(slug, id).catch(() => []),
+  ]);
+  return {
+    ok: true,
+    clientId: id,
+    credit: roundMoney(Math.max(0, credit)),
+    giftcards: giftcards.map((card) => ({ id: card.id, code: card.code, balance: roundMoney(Math.max(0, card.balance)) })),
+  };
+}
+
 export async function checkoutManageSale(
   slug: string,
   input: PosCheckoutInput,
@@ -102,6 +137,13 @@ export async function checkoutManageSale(
   const paidAmount = roundMoney(payments.reduce((sum, payment) => sum + payment.amount, 0));
   if (paidAmount + 0.00001 < total) throw new Error("Pagamento insufficiente.");
 
+  // Residui: validate the wallet CREDIT + GiftCard tenders against the client's real
+  // balances BEFORE writing anything. The base method (cash/card/transfer) covers the
+  // remainder. Faithful to pos.php: giftcard_used = min(giftcardBalance, total, req),
+  // credit_used = min(walletBalance, total - giftcard_used, req). Residui require a
+  // real client (id > 0); a bench sale ("Cliente banco") cannot spend residui.
+  const residui = await resolveResiduiTenders(slug, payments, client.id, total);
+
   for (const item of items) {
     if (item.type === "product" && item.refId > 0 && item.status !== "ordered") {
       const available = await currentProductStock(slug, item.refId, locationId);
@@ -109,6 +151,7 @@ export async function checkoutManageSale(
     }
   }
 
+  const baseMethod = resolveBaseMethod(payments);
   const salesTable = await tenantTable(slug, "sales");
   const saleId = await tenantInsert(salesTable, await filterColumns(salesTable.name, {
     client_id: client.id > 0 ? client.id : null,
@@ -117,16 +160,34 @@ export async function checkoutManageSale(
     discount,
     total,
     coupon_code: emptyToNull(couponCode),
-    notes: saleNotes(input.notes, input.appointmentId),
+    notes: saleNotes(input.notes, input.appointmentId, baseMethod),
     status: "done",
     source_quote_id: undefined,
     created_by: operator.id,
     operator_name: clean(operator.name, 120),
     location_id: locationId,
     promotion_applied_id: input.promotionId && input.promotionId > 0 ? input.promotionId : null,
-    credit_used: paymentAmount(payments, "wallet"),
-    giftcard_used: paymentAmount(payments, "giftcard"),
+    credit_used: residui.creditUsed,
+    giftcard_id: residui.giftcardId > 0 ? residui.giftcardId : null,
+    giftcard_used: residui.giftcardUsed,
+    // Persist the faithful base payment method. Schema-guarded: a no-op on installs
+    // without the column (the notes marker keeps derivePayments correct regardless).
+    payment_methods: JSON.stringify({ base: baseMethod }),
   }));
+
+  // CONSUME the residui, linking each consumption to the sale id so a later void can
+  // restore it (cancelLinkedSaleResidues reverses both). GiftCard first, then credit.
+  if (residui.giftcardId > 0 && residui.giftcardUsed > 0) {
+    await redeemDbGiftCard(residui.giftcardId, residui.giftcardUsed, slug);
+  }
+  if (residui.creditUsed > 0 && client.id > 0) {
+    // Negative wallet movement (debit): inserts a credit_adjustments row + decrements
+    // clients.credit_balance (the same path the legacy credit_wallet_adjust uses).
+    await addDbWalletMovement(
+      { clientId: client.id, type: "debit", amount: -residui.creditUsed, note: `Credito utilizzato vendita #${saleId}` },
+      slug,
+    );
+  }
 
   for (const item of items) {
     const saleItemId = await insertSaleItem(slug, saleId, item);
@@ -192,7 +253,7 @@ export async function cancelManageSale(
     reason,
     note: cancelNote(input.saleId, input.userName, reason, stockMode, productItems),
   });
-  await cancelLinkedSaleResidues(slug, input.saleId, reason);
+  await cancelLinkedSaleResidues(slug, input.saleId, reason, saleRow);
 
   const updated = await getSale(slug, input.saleId);
   return {
@@ -603,11 +664,34 @@ async function markSaleCancelled(slug: string, saleId: number, input: { userId: 
   }
 }
 
-async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: string): Promise<void> {
+async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: string, saleRow?: RowDataPacket): Promise<void> {
   await updateBySaleId(slug, "client_prepaid_services", saleId, { status: "cancelled", canceled_at: new Date(), cancel_note: reason });
   await updateBySaleId(slug, "client_packages", saleId, { status: "canceled", updated_at: new Date() });
   await updateBySaleId(slug, "sale_installment_plans", saleId, { status: "cancelled", cancelled_at: new Date(), cancelled_reason: reason });
   await updateBySaleId(slug, "sale_installments", saleId, { status: "cancelled", note: reason });
+
+  // Restore the residui consumed at checkout: refund the GiftCard balance (re-activating
+  // a card the redeem flipped to 'redeemed') and credit the wallet back. Both are linked
+  // by the sale row's credit_used / giftcard_id / giftcard_used columns. Best-effort and
+  // idempotency-guarded: zero the columns so a re-void cannot double-refund.
+  if (!saleRow) return;
+  const creditUsed = roundMoney(Number(saleRow.credit_used ?? 0) || 0);
+  const giftcardUsed = roundMoney(Number(saleRow.giftcard_used ?? 0) || 0);
+  const giftcardId = Math.max(0, Number(saleRow.giftcard_id ?? 0) || 0);
+  const clientId = Math.max(0, Number(saleRow.client_id ?? 0) || 0);
+
+  if (giftcardId > 0 && giftcardUsed > 0) {
+    await refundDbGiftCard(giftcardId, giftcardUsed, slug, `Storno vendita #${saleId}`).catch(() => undefined);
+  }
+  if (creditUsed > 0 && clientId > 0) {
+    await addDbWalletMovement(
+      { clientId, type: "recharge", amount: creditUsed, note: `Storno credito vendita #${saleId}` },
+      slug,
+    ).catch(() => undefined);
+  }
+  if ((creditUsed > 0 || giftcardUsed > 0) && (await columnExists((await tenantTable(slug, "sales")).name, "credit_used"))) {
+    await tenantUpdate({ slug, table: "sales", id: saleId, values: { credit_used: 0, giftcard_used: 0 } }).catch(() => 0);
+  }
 }
 
 async function updateBySaleId(slug: string, tableName: string, saleId: number, values: Record<string, unknown>): Promise<void> {
@@ -710,21 +794,31 @@ function summarizeSales(sales: PosSale[]): PosSummary {
   };
 }
 
+// Reconstruct the tenders from the stored sale row: the residui from credit_used /
+// giftcard_used (+ the linked giftcard_id), and the remainder as the persisted base
+// method (cash/card/transfer) — read back faithfully instead of always "card".
 function derivePayments(row: RowDataPacket, total: number): PosPayment[] {
   const wallet = roundMoney(Number(row.credit_used ?? 0) || 0);
   const giftcard = roundMoney(Number(row.giftcard_used ?? 0) || 0);
-  const card = roundMoney(Math.max(0, total - wallet - giftcard));
+  const giftcardId = Math.max(0, Number(row.giftcard_id ?? 0) || 0);
+  const base = roundMoney(Math.max(0, total - wallet - giftcard));
+  const baseMethod = readStoredBaseMethod(row);
   const payments: PosPayment[] = [];
   let id = 1;
   if (wallet > 0) payments.push({ id: id++, method: "wallet", amount: wallet });
-  if (giftcard > 0) payments.push({ id: id++, method: "giftcard", amount: giftcard });
-  if (card > 0 || !payments.length) payments.push({ id, method: "card", amount: card || total });
+  if (giftcard > 0) payments.push({ id: id++, method: "giftcard", amount: giftcard, giftcardId: giftcardId > 0 ? giftcardId : undefined });
+  if (base > 0 || !payments.length) payments.push({ id, method: baseMethod, amount: base || total });
   return payments;
 }
 
 function normalizePayments(payments: PosPaymentInput[], total: number): PosPayment[] {
   const out = payments
-    .map((payment, index) => ({ id: index + 1, method: normalizePaymentMethod(payment.method), amount: roundMoney(Math.max(0, Number(payment.amount ?? 0) || 0)) }))
+    .map((payment, index) => ({
+      id: index + 1,
+      method: normalizePaymentMethod(payment.method),
+      amount: roundMoney(Math.max(0, Number(payment.amount ?? 0) || 0)),
+      giftcardId: Math.max(0, Number(payment.giftcardId ?? 0) || 0) || undefined,
+    }))
     .filter((payment) => payment.amount > 0);
   if (!out.length && total > 0) return [{ id: 1, method: "card", amount: total }];
   return out;
@@ -732,6 +826,56 @@ function normalizePayments(payments: PosPaymentInput[], total: number): PosPayme
 
 function paymentAmount(payments: PosPayment[], method: PosPaymentMethod): number {
   return roundMoney(payments.filter((payment) => payment.method === method).reduce((sum, payment) => sum + payment.amount, 0));
+}
+
+// The faithful single base payment method (Contanti/Carta/Assegno/Bonifico) that covers
+// the remainder after residui. The wallet/giftcard tenders are residui, NOT the base
+// method, so they are excluded here; the first non-residual tender wins, defaulting to
+// "card" (mirrors the legacy single payment_type radio).
+function resolveBaseMethod(payments: PosPayment[]): PosPaymentMethod {
+  const base = payments.find((payment) => payment.method !== "wallet" && payment.method !== "giftcard");
+  return base ? base.method : "card";
+}
+
+type ResiduiTenders = { creditUsed: number; giftcardId: number; giftcardUsed: number };
+
+// Validate + clamp the residui tenders (wallet CREDIT + one GiftCard) against the
+// client's real balances and the sale total. Throws on an over-spend so the checkout
+// fails cleanly BEFORE any row is written. Returns the amounts actually consumable.
+async function resolveResiduiTenders(
+  slug: string,
+  payments: PosPayment[],
+  clientId: number,
+  total: number,
+): Promise<ResiduiTenders> {
+  const creditReq = paymentAmount(payments, "wallet");
+  const giftcardReq = paymentAmount(payments, "giftcard");
+  if (creditReq <= 0 && giftcardReq <= 0) return { creditUsed: 0, giftcardId: 0, giftcardUsed: 0 };
+  if (clientId <= 0) throw new Error("Seleziona un cliente per usare credito o GiftCard.");
+
+  // GiftCard first (legacy order): the picked card's id rides on the giftcard tender.
+  let giftcardId = 0;
+  let giftcardUsed = 0;
+  if (giftcardReq > 0) {
+    const tender = payments.find((payment) => payment.method === "giftcard" && payment.amount > 0);
+    giftcardId = Math.max(0, Number(tender?.giftcardId ?? 0) || 0);
+    if (giftcardId <= 0) throw new Error("Seleziona la GiftCard da utilizzare.");
+    const available = (await dbClientGiftcards(slug, clientId)).find((card) => card.id === giftcardId);
+    if (!available) throw new Error("La GiftCard selezionata non è disponibile per il cliente.");
+    giftcardUsed = roundMoney(Math.min(giftcardReq, available.balance, total));
+    if (giftcardUsed + 0.00001 < giftcardReq) throw new Error("Saldo GiftCard insufficiente.");
+  }
+
+  // Credit covers what is left of the total after the giftcard.
+  let creditUsed = 0;
+  if (creditReq > 0) {
+    const { credit } = await dbWalletBalance(clientId, slug);
+    const remaining = roundMoney(Math.max(0, total - giftcardUsed));
+    creditUsed = roundMoney(Math.min(creditReq, Math.max(0, credit), remaining));
+    if (creditUsed + 0.00001 < creditReq) throw new Error("Credito disponibile insufficiente.");
+  }
+
+  return { creditUsed, giftcardId, giftcardUsed };
 }
 
 async function filterColumns(table: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -817,12 +961,40 @@ function emptyToNull(value: unknown): string | null {
   return text || null;
 }
 
-function saleNotes(notes: unknown, appointmentId?: number): string | null {
+// Marker appended to sales.notes so the base payment method survives even on installs
+// whose sales table has no payment_methods column (derivePayments parses it back). The
+// legacy POS likewise records the payment type as a notes line ("Tipo pagamento: ...").
+const BASE_METHOD_MARKER = "[posmethod:";
+
+function saleNotes(notes: unknown, appointmentId?: number, baseMethod?: PosPaymentMethod): string | null {
   const lines = [];
   const text = clean(notes, 2000);
   if (text) lines.push(text);
   if (appointmentId && appointmentId > 0) lines.push(`Appuntamento #${appointmentId}`);
+  if (baseMethod) lines.push(`${BASE_METHOD_MARKER}${baseMethod}]`);
   return lines.length ? lines.join("\n") : null;
+}
+
+// Recover the persisted base payment method: prefer the structured payment_methods JSON
+// (when the column exists), else the notes marker, defaulting to "card".
+function readStoredBaseMethod(row: RowDataPacket): PosPaymentMethod {
+  const raw = row.payment_methods;
+  if (raw) {
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      const base = normalizePaymentMethod((parsed as { base?: unknown })?.base);
+      if (base === "cash" || base === "card" || base === "transfer") return base;
+    } catch {
+      // fall through to the notes marker
+    }
+  }
+  const notes = String(row.notes ?? "");
+  const at = notes.indexOf(BASE_METHOD_MARKER);
+  if (at >= 0) {
+    const end = notes.indexOf("]", at);
+    if (end > at) return normalizePaymentMethod(notes.slice(at + BASE_METHOD_MARKER.length, end));
+  }
+  return "card";
 }
 
 function clean(value: unknown, max: number): string {

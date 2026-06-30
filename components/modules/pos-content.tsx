@@ -20,19 +20,23 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // shown on invalid. coupon_code is still sent on checkout (the backend re-validates,
 // so the shown discount always equals the charged discount).
 //
-// WIRED (split payment): a multi-row payment editor replaces the single payment
-// (port of the legacy single payment_type radio, extended to a faithful split). A
-// list of {method, amount} rows, "+ Aggiungi pagamento" adds a row, methods =
-// Contanti/Carta/Bonifico/Assegno (mapped to the API cash/card/transfer). The bar
-// shows the running total paid, the remaining-to-pay and the change/resto when
-// overpaid in cash; checkout is blocked client-side when paid < total (mirrors the
-// backend "Pagamento insufficiente"). All rows are sent as payments_json.
+// WIRED (faithful payment + Residui): the legacy model is ONE base payment method
+// (Contanti/Carta/Assegno/Bonifico) for the REMAINDER, plus "Residui" — the client's
+// wallet CREDIT and a GiftCard balance can each cover part of the total. When a client
+// is selected the panel fetches GET ?action=client_residuals&client_id= (credit +
+// giftcards); the staff applies an amount from credit and/or a chosen giftcard, clamped
+// to min(balance, remaining). base = total − credit_use − giftcard_use. The hidden
+// inputs (#pos_credit_use / #pos_giftcard_id / #pos_giftcard_use) + the price rows
+// (#posCreditRow / #posGiftcardRow) reflect the applied residui; checkout sends
+// payments_json = [{wallet, credit_use}, {giftcard+giftcardId, giftcard_use},
+// {baseMethod, remainder}] (non-zero only). Checkout is blocked when residui exceed
+// the balances or the tendered sum < total (mirrors the backend validation + consume).
 //
 // LEFT STATIC / NON-WIRED (rendered faithfully for visual fidelity only): the
-// advanced line types and their modals — Pacchetti, Ricariche, GiftBox, GiftCard,
-// Residui (credit/giftcard), the installment (rate) plan, and fidelity points.
-// These dialogs are reproduced verbatim but their buttons do not mutate state yet.
-// The checkout only sends service/product lines.
+// advanced line types and their modals — Pacchetti, Ricariche, GiftBox, GiftCard
+// (ISSUE), the installment (rate) plan, and fidelity points. These dialogs are
+// reproduced verbatim but their buttons do not mutate state yet. The checkout only
+// sends service/product lines plus the base method + residui tenders.
 
 type CatalogService = {
   id: number;
@@ -67,6 +71,14 @@ type PosContext = {
   };
 };
 
+// The client's spendable residui (wallet CREDIT + GiftCards), fetched from
+// GET /api/manage/pos?action=client_residuals&client_id= when a client is selected.
+type ClientResiduals = {
+  clientId: number;
+  credit: number;
+  giftcards: Array<{ id: number; code: string; balance: number }>;
+};
+
 type CartLine = {
   key: string;
   type: "service" | "product";
@@ -77,12 +89,9 @@ type CartLine = {
   status: "executed" | "collected";
 };
 
-// Legacy POS payment types (the single payment_type radio: cash/card/check/bank).
+// Legacy POS base payment type (the single payment_type radio: cash/card/check/bank).
 // The Next API maps check -> card and bank -> transfer (see app/api/manage/pos route).
 type PaymentMethod = "cash" | "card" | "check" | "bank";
-
-// One row of the split-payment editor: a method + the raw amount text the staff types.
-type PaymentRow = { key: string; method: PaymentMethod; amount: string };
 
 const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
   cash: "Contanti",
@@ -97,10 +106,6 @@ function apiPaymentMethod(method: PaymentMethod): string {
   if (method === "cash") return "cash";
   if (method === "bank") return "transfer";
   return "card"; // card + check
-}
-
-function paymentRowKey(): string {
-  return `pay-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 }
 
 function tenantSlug(): string {
@@ -170,14 +175,20 @@ export function PosContent() {
   const [couponApplying, setCouponApplying] = useState(false);
   const couponReqRef = useRef(0);
 
-  // Payment (split): one cash row pre-filled with the total by default, so a simple
-  // sale is unchanged. "+ Aggiungi pagamento" adds rows; checkout sends them all.
-  const [payments, setPayments] = useState<PaymentRow[]>([{ key: "pay-initial", method: "cash", amount: "" }]);
-  // True until the staff edits any payment amount: while true, the single cash row's
-  // amount auto-tracks the total (so the default "one cash row = total" keeps working
-  // as the cart/discount change). Any manual amount edit switches it off.
-  const [paymentsAuto, setPaymentsAuto] = useState(true);
+  // Payment: ONE base method for the remainder after residui (faithful single
+  // payment_type radio). Defaults to Contanti.
+  const [baseMethod, setBaseMethod] = useState<PaymentMethod>("cash");
   const [notes, setNotes] = useState("");
+
+  // Residui: the selected client's spendable wallet CREDIT + GiftCards, and the amounts
+  // the staff applies. creditUse / giftcardUse are the applied (clamped) amounts;
+  // giftcardId is the chosen card. `residuals` is null until the fetch resolves for the
+  // current client, so "loading" is derived (a client is selected but residui not yet in).
+  const [residuals, setResiduals] = useState<ClientResiduals | null>(null);
+  const [creditUseInput, setCreditUseInput] = useState("0");
+  const [giftcardId, setGiftcardId] = useState(0);
+  const [giftcardUseInput, setGiftcardUseInput] = useState("0");
+  const residualsReqRef = useRef(0);
 
   // Checkout state.
   const [submitting, setSubmitting] = useState(false);
@@ -253,36 +264,48 @@ export function PosContent() {
     [subtotal, manualDiscount, codeDiscount],
   );
 
-  // ---- split-payment math ----
-  // Sum of the typed amounts. The single default cash row auto-tracks the total
-  // (paymentsAuto), so when paymentsAuto is on the first row's effective amount is
-  // the total even before the staff types anything.
-  const paymentRows = useMemo<Array<{ key: string; method: PaymentMethod; amount: number }>>(
-    () =>
-      payments.map((row, index) => {
-        const typed = Math.max(0, Number.parseFloat(String(row.amount).replace(",", ".")) || 0);
-        const amount = paymentsAuto && index === 0 && payments.length === 1 && !row.amount ? total : typed;
-        return { key: row.key, method: row.method, amount: roundMoney(amount) };
-      }),
-    [payments, paymentsAuto, total],
+  // ---- residui math ----
+  // The chosen giftcard's available balance (0 when none / not in the list anymore).
+  const selectedGiftcard = useMemo(
+    () => residuals?.giftcards.find((card) => card.id === giftcardId) ?? null,
+    [residuals, giftcardId],
   );
+  const creditAvailable = useMemo(() => roundMoney(Math.max(0, residuals?.credit ?? 0)), [residuals]);
 
-  const paidTotal = useMemo(
-    () => roundMoney(paymentRows.reduce((sum, row) => sum + row.amount, 0)),
-    [paymentRows],
-  );
+  // GiftCard is applied first (legacy order), so it is clamped to min(balance, total);
+  // credit then covers what is left of the total after the giftcard.
+  const giftcardUse = useMemo(() => {
+    if (!selectedGiftcard) return 0;
+    const typed = Math.max(0, Number.parseFloat(giftcardUseInput.replace(",", ".")) || 0);
+    return roundMoney(Math.min(typed, selectedGiftcard.balance, total));
+  }, [selectedGiftcard, giftcardUseInput, total]);
+
+  const creditUse = useMemo(() => {
+    const typed = Math.max(0, Number.parseFloat(creditUseInput.replace(",", ".")) || 0);
+    const remainingAfterGiftcard = roundMoney(Math.max(0, total - giftcardUse));
+    return roundMoney(Math.min(typed, creditAvailable, remainingAfterGiftcard));
+  }, [creditUseInput, creditAvailable, total, giftcardUse]);
+
+  const residuiTotal = useMemo(() => roundMoney(creditUse + giftcardUse), [creditUse, giftcardUse]);
+
+  // ---- base payment math ----
+  // The base method covers the remainder after residui: base = total − residui.
+  const baseAmount = useMemo(() => roundMoney(Math.max(0, total - residuiTotal)), [total, residuiTotal]);
+  const paidTotal = useMemo(() => roundMoney(residuiTotal + baseAmount), [residuiTotal, baseAmount]);
   const remainingToPay = useMemo(() => roundMoney(Math.max(0, total - paidTotal)), [total, paidTotal]);
-  // Change (resto) is only meaningful when overpaid in CASH (mirrors the backend's
-  // changeDue but gated on cash, like a real till).
-  const cashPaid = useMemo(
-    () => roundMoney(paymentRows.filter((row) => row.method === "cash").reduce((sum, row) => sum + row.amount, 0)),
-    [paymentRows],
-  );
-  const changeDue = useMemo(
-    () => (cashPaid > 0 ? roundMoney(Math.max(0, paidTotal - total)) : 0),
-    [cashPaid, paidTotal, total],
-  );
+  // Residui can never exceed the balances (they are clamped above) nor the total, so the
+  // base auto-covers the rest; "insufficiente" can only happen if the total is somehow
+  // not covered (defensive — mirrors the backend "Pagamento insufficiente").
   const paymentInsufficient = useMemo(() => total > 0 && paidTotal + 0.00001 < total, [total, paidTotal]);
+
+  // Reset every applied residui (used on client change, clear, and checkout success).
+  const resetResiduals = useCallback(() => {
+    residualsReqRef.current += 1;
+    setResiduals(null);
+    setCreditUseInput("0");
+    setGiftcardId(0);
+    setGiftcardUseInput("0");
+  }, []);
 
   function selectClient(id: number, name: string) {
     setClientId(id);
@@ -290,9 +313,49 @@ export function PosContent() {
   }
 
   function clearClient() {
+    // The residui fetch effect's cleanup resets the applied residui on the clientId change.
     setClientId(null);
     setClientName("");
   }
+
+  // Fetch the selected client's residui (wallet CREDIT + GiftCards) whenever the client
+  // changes. "Cliente banco" (no id) has no residui. A monotonic req-id discards stale
+  // responses (legacy pattern); the cleanup resets the applied residui before the next
+  // client's fetch (so a client switch never carries the previous client's residui).
+  useEffect(() => {
+    if (!clientId || clientId <= 0) return () => resetResiduals();
+    const myReq = ++residualsReqRef.current;
+    let active = true;
+    fetch(`/api/manage/pos?slug=${encodeURIComponent(slug)}&action=client_residuals&client_id=${clientId}`, {
+      headers: { "x-tenant-slug": slug },
+    })
+      .then((r) => r.json())
+      .then((j: { ok?: boolean; clientId?: number; credit?: number; giftcards?: ClientResiduals["giftcards"] }) => {
+        if (!active || myReq !== residualsReqRef.current) return; // stale
+        setResiduals({
+          clientId: Number(j?.clientId ?? clientId),
+          credit: j?.ok === false ? 0 : roundMoney(Math.max(0, Number(j?.credit ?? 0))),
+          giftcards: j?.ok !== false && Array.isArray(j?.giftcards)
+            ? j.giftcards
+                .map((card) => ({ id: Number(card.id ?? 0), code: String(card.code ?? ""), balance: roundMoney(Math.max(0, Number(card.balance ?? 0))) }))
+                .filter((card) => card.id > 0 && card.balance > 0)
+            : [],
+        });
+      })
+      .catch(() => {
+        if (active && myReq === residualsReqRef.current) setResiduals({ clientId, credit: 0, giftcards: [] });
+      });
+    return () => {
+      active = false;
+      resetResiduals();
+    };
+  }, [clientId, slug, resetResiduals]);
+
+  // "Loading" is derived: a client is selected but its residui have not resolved yet.
+  const residualsLoading = useMemo(
+    () => !!clientId && clientId > 0 && (!residuals || residuals.clientId !== clientId),
+    [clientId, residuals],
+  );
 
   function addTile(tile: { id: number; name: string; price: number }) {
     const type = catalogMode;
@@ -391,36 +454,22 @@ export function PosContent() {
     setCouponMsg(null);
   }, [clearCouponState]);
 
-  // ---- Split-payment row mutators ----
-  // Editing any amount switches off the auto-track default (the staff is now in control).
-  function setPaymentAmount(key: string, amount: string) {
-    setPaymentsAuto(false);
-    setPayments((prev) => prev.map((row) => (row.key === key ? { ...row, amount } : row)));
+  // ---- Residui mutators ----
+  // "Usa max" for credit: apply the most the credit can cover (clamped to the remaining
+  // total after the giftcard) — the creditUse memo re-clamps, so set the raw cap here.
+  function useMaxCredit() {
+    const remainingAfterGiftcard = roundMoney(Math.max(0, total - giftcardUse));
+    setCreditUseInput(roundMoney(Math.min(creditAvailable, remainingAfterGiftcard)).toFixed(2));
   }
-  function setPaymentMethod(key: string, method: PaymentMethod) {
-    setPayments((prev) => prev.map((row) => (row.key === key ? { ...row, method } : row)));
+  // "Usa max" for the chosen giftcard: apply the most it can cover (clamped to total).
+  function useMaxGiftcard() {
+    if (!selectedGiftcard) return;
+    setGiftcardUseInput(roundMoney(Math.min(selectedGiftcard.balance, total)).toFixed(2));
   }
-  // Add a new row pre-filled with what is still owed (so the running remaining hits 0).
-  function addPaymentRow() {
-    setPaymentsAuto(false);
-    setPayments((prev) => {
-      const owed = remainingToPay;
-      const amount = owed > 0 ? owed.toFixed(2) : "";
-      // If the single default row is still empty, materialize its auto amount first so
-      // the new row's prefill is correct.
-      const base =
-        prev.length === 1 && !prev[0].amount
-          ? [{ ...prev[0], amount: roundMoney(Math.max(0, total - owed)).toFixed(2) }]
-          : prev;
-      return [...base, { key: paymentRowKey(), method: "card", amount }];
-    });
-  }
-  function removePaymentRow(key: string) {
-    setPaymentsAuto(false);
-    setPayments((prev) => {
-      if (prev.length <= 1) return prev; // always keep at least one row
-      return prev.filter((row) => row.key !== key);
-    });
+  // Picking a different giftcard resets the applied amount (the balances differ).
+  function chooseGiftcard(id: number) {
+    setGiftcardId(id);
+    setGiftcardUseInput("0");
   }
 
   async function handleCheckout(event: React.FormEvent) {
@@ -436,6 +485,11 @@ export function PosContent() {
       setErrorMsg("Pagamento insufficiente.");
       return;
     }
+    // Residui require a real client (the backend rejects residui on a bench sale).
+    if (residuiTotal > 0 && (!clientId || clientId <= 0)) {
+      setErrorMsg("Seleziona un cliente per usare credito o GiftCard.");
+      return;
+    }
 
     // items_json / payments_json MUST be JSON strings: parseRequestBody() collapses
     // top-level arrays with join(","), so we stringify ourselves.
@@ -449,13 +503,15 @@ export function PosContent() {
         status: line.status,
       })),
     );
-    // Send ALL payment rows (method mapped to the API set, amount > 0). The backend
-    // re-validates the sum >= total.
-    const paymentsJson = JSON.stringify(
-      paymentRows
-        .filter((row) => row.amount > 0)
-        .map((row) => ({ method: apiPaymentMethod(row.method), amount: row.amount })),
-    );
+    // Faithful tenders: the residui (wallet credit + chosen giftcard) then the base
+    // method for the remainder. Only non-zero tenders are sent; the backend re-validates
+    // each residui against the real balances + consumes them, and persists the base
+    // method. The giftcard tender carries its giftcardId so the backend knows which card.
+    const tenders: Array<{ method: string; amount: number; giftcardId?: number }> = [];
+    if (creditUse > 0) tenders.push({ method: "wallet", amount: creditUse });
+    if (giftcardUse > 0 && giftcardId > 0) tenders.push({ method: "giftcard", amount: giftcardUse, giftcardId });
+    if (baseAmount > 0 || tenders.length === 0) tenders.push({ method: apiPaymentMethod(baseMethod), amount: baseAmount });
+    const paymentsJson = JSON.stringify(tenders.filter((tender) => tender.amount > 0));
 
     const body = {
       action: "checkout",
@@ -490,8 +546,7 @@ export function PosContent() {
       setCouponInput("");
       setCouponMsg(null);
       setCouponOpen(false);
-      setPayments([{ key: "pay-initial", method: "cash", amount: "" }]);
-      setPaymentsAuto(true);
+      setBaseMethod("cash");
       setNotes("");
       clearClient();
       setSuccessMsg(`Vendita conclusa${saleCode}.`);
@@ -826,7 +881,13 @@ export function PosContent() {
                 </span>
               </div>
               <div className="small text-muted mb-3" id="posRedeemInfo">
-                Seleziona un cliente per vedere credito disponibili.
+                {!clientId
+                  ? "Seleziona un cliente per vedere credito disponibili."
+                  : residualsLoading
+                    ? "Caricamento residui…"
+                    : creditAvailable > 0 || (residuals?.giftcards.length ?? 0) > 0
+                      ? `Residui disponibili: Credito ${fmtEUR(creditAvailable)}${(residuals?.giftcards.length ?? 0) > 0 ? `, ${residuals?.giftcards.length} GiftCard` : ""}.`
+                      : "Nessun credito o GiftCard disponibile per il cliente."}
               </div>
 
               <label className="form-label small text-muted mb-1">Coupon</label>
@@ -940,77 +1001,129 @@ export function PosContent() {
                 <div className="small text-muted mb-2" id="fidelityHelp"></div>
               </div>
 
-              {/* Residui (credito/giftcard) — reso fedelmente, non collegato. */}
-              <div className="card p-2 mb-2 d-none" id="posResidualsBox">
+              {/* Residui (credito/giftcard) — WIRED: shown when the selected client has a
+                  wallet credit balance and/or available GiftCards. The staff applies an
+                  amount from credit and/or a chosen giftcard (clamped to min(balance,
+                  remaining)); the applied amounts drive the price detail + the checkout
+                  tenders. The hidden inputs mirror the legacy POST field names. */}
+              <div
+                className={`card p-2 mb-2${clientId && (creditAvailable > 0 || (residuals?.giftcards.length ?? 0) > 0) ? "" : " d-none"}`}
+                id="posResidualsBox"
+              >
                 <div className="d-flex justify-content-between align-items-center">
                   <div className="fw-semibold">Residui</div>
-                  <a href="#" className="small text-decoration-none" id="posResidualsOpen">
-                    Apri scheda
-                  </a>
                 </div>
-                <div className="small mt-2" id="posResidualsSummary"></div>
-                <input type="hidden" name="credit_use" id="pos_credit_use" value="0" readOnly />
-                <input type="hidden" name="giftcard_id" id="pos_giftcard_id" value="0" readOnly />
-                <input type="hidden" name="giftcard_use" id="pos_giftcard_use" value="0" readOnly />
-              </div>
+                <div className="small mt-1 mb-2 text-muted" id="posResidualsSummary">
+                  Usa Credito e/o GiftCard per coprire il totale.
+                </div>
 
-              <div className="card p-3" id="posPriceDetails">
-                {/* SPLIT PAYMENT — a faithful multi-row payment editor. Each row is a
-                    method (Contanti/Carta/Assegno/Bonifico) + an amount; "+ Aggiungi
-                    pagamento" adds a row; the bar shows the running paid / remaining /
-                    change. Defaults to one cash row that auto-tracks the total, so a
-                    simple sale is unchanged. */}
-                <div className="mb-3 pos-payment-type-card" id="posPaymentTypeBox">
-                  <div className="d-flex justify-content-between align-items-center mb-2">
-                    <div className="small text-muted">Pagamento</div>
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-outline-primary"
-                      id="posPaymentAddBtn"
-                      onClick={addPaymentRow}
-                    >
-                      <i className="bi bi-plus-lg me-1"></i>Aggiungi pagamento
-                    </button>
+                {/* Credito */}
+                {creditAvailable > 0 ? (
+                  <div className="mb-2" id="posResidualCreditInline">
+                    <label className="form-label small text-muted mb-1">
+                      Credito (disp. <strong>{fmtEUR(creditAvailable)}</strong>)
+                    </label>
+                    <div className="input-group input-group-sm">
+                      <span className="input-group-text">€</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        className="form-control text-end"
+                        id="posResidualCreditAmount"
+                        value={creditUseInput}
+                        onChange={(e) => setCreditUseInput(e.target.value)}
+                      />
+                      <button type="button" className="btn btn-outline-secondary" id="posResidualCreditMaxBtn" onClick={useMaxCredit}>
+                        Usa max
+                      </button>
+                    </div>
                   </div>
+                ) : null}
 
-                  <div className="pos-payment-rows" id="posPaymentRows">
-                    {payments.map((row, index) => (
-                      <div className="input-group input-group-sm mb-2 pos-payment-row" key={row.key}>
-                        <select
-                          className="form-select pos-payment-row-method"
-                          aria-label="Metodo di pagamento"
-                          value={row.method}
-                          onChange={(e) => setPaymentMethod(row.key, e.target.value as PaymentMethod)}
-                        >
-                          <option value="cash">{PAYMENT_METHOD_LABELS.cash}</option>
-                          <option value="card">{PAYMENT_METHOD_LABELS.card}</option>
-                          <option value="check">{PAYMENT_METHOD_LABELS.check}</option>
-                          <option value="bank">{PAYMENT_METHOD_LABELS.bank}</option>
-                        </select>
+                {/* GiftCard */}
+                {(residuals?.giftcards.length ?? 0) > 0 ? (
+                  <div className="mb-1" id="posResidualGiftcardInline">
+                    <label className="form-label small text-muted mb-1">GiftCard</label>
+                    <select
+                      className="form-select form-select-sm mb-1"
+                      id="posResidualGiftcardSelect"
+                      value={giftcardId}
+                      onChange={(e) => chooseGiftcard(Number.parseInt(e.target.value, 10) || 0)}
+                    >
+                      <option value={0}>Nessuna</option>
+                      {residuals?.giftcards.map((card) => (
+                        <option value={card.id} key={card.id}>
+                          {card.code || `GiftCard #${card.id}`} — {fmtEUR(card.balance)}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedGiftcard ? (
+                      <div className="input-group input-group-sm">
                         <span className="input-group-text">€</span>
                         <input
-                          className="form-control text-end pos-payment-row-amount"
                           type="number"
                           step="0.01"
                           min="0"
-                          inputMode="decimal"
-                          placeholder={index === 0 ? total.toFixed(2) : "0.00"}
-                          value={row.amount}
-                          onChange={(e) => setPaymentAmount(row.key, e.target.value)}
+                          className="form-control text-end"
+                          id="posResidualGiftcardAmount"
+                          value={giftcardUseInput}
+                          onChange={(e) => setGiftcardUseInput(e.target.value)}
                         />
-                        <button
-                          type="button"
-                          className="btn btn-outline-danger"
-                          title="Rimuovi pagamento"
-                          disabled={payments.length <= 1}
-                          onClick={() => removePaymentRow(row.key)}
-                        >
-                          <i className="bi bi-x-lg"></i>
+                        <button type="button" className="btn btn-outline-secondary" id="posResidualGiftcardMaxBtn" onClick={useMaxGiftcard}>
+                          Usa max
                         </button>
                       </div>
-                    ))}
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <input type="hidden" name="credit_use" id="pos_credit_use" value={creditUse} readOnly />
+                <input type="hidden" name="giftcard_id" id="pos_giftcard_id" value={giftcardId} readOnly />
+                <input type="hidden" name="giftcard_use" id="pos_giftcard_use" value={giftcardUse} readOnly />
+              </div>
+
+              <div className="card p-3" id="posPriceDetails">
+                {/* BASE PAYMENT — the faithful single payment_type selector
+                    (Contanti/Carta/Assegno/Bonifico) for the REMAINDER after residui.
+                    base = total − credito − giftcard; the residui are applied in the
+                    Residui panel above. The bar shows the residui applied + the base. */}
+                <div className="mb-3 pos-payment-type-card" id="posPaymentTypeBox">
+                  <div className="d-flex justify-content-between align-items-center mb-2">
+                    <div className="small text-muted">Pagamento</div>
                   </div>
 
+                  <div className="input-group input-group-sm mb-2" id="posPaymentBaseRow">
+                    <select
+                      className="form-select"
+                      name="payment_type"
+                      id="posPaymentType"
+                      aria-label="Metodo di pagamento"
+                      value={baseMethod}
+                      onChange={(e) => setBaseMethod(e.target.value as PaymentMethod)}
+                    >
+                      <option value="cash">{PAYMENT_METHOD_LABELS.cash}</option>
+                      <option value="card">{PAYMENT_METHOD_LABELS.card}</option>
+                      <option value="check">{PAYMENT_METHOD_LABELS.check}</option>
+                      <option value="bank">{PAYMENT_METHOD_LABELS.bank}</option>
+                    </select>
+                    <span className="input-group-text">€</span>
+                    <input
+                      className="form-control text-end"
+                      id="posPaymentBaseAmount"
+                      type="text"
+                      readOnly
+                      value={baseAmount.toFixed(2)}
+                      aria-label="Importo a carico del metodo base"
+                    />
+                  </div>
+
+                  {residuiTotal > 0 ? (
+                    <div className="d-flex justify-content-between small text-muted" id="posPaymentResiduiRow">
+                      <span>Residui applicati</span>
+                      <span id="posPaymentResiduiVal">- {fmtEUR(residuiTotal)}</span>
+                    </div>
+                  ) : null}
                   <div className="d-flex justify-content-between small" id="posPaymentPaidRow">
                     <span className="text-muted">Pagato</span>
                     <span id="posPaymentPaidVal">{fmtEUR(paidTotal)}</span>
@@ -1022,18 +1135,11 @@ export function PosContent() {
                     <span>Rimanente</span>
                     <span id="posPaymentRemainingVal">{fmtEUR(remainingToPay)}</span>
                   </div>
-                  <div
-                    className={`d-flex justify-content-between small text-success${changeDue > 0 ? "" : " d-none"}`}
-                    id="posPaymentChangeRow"
-                  >
-                    <span>Resto</span>
-                    <span id="posPaymentChangeVal">{fmtEUR(changeDue)}</span>
-                  </div>
 
                   <div className="form-text mt-2" id="posPaymentTypeHelp">
                     {paymentInsufficient
-                      ? "Pagamento insufficiente: la somma dei pagamenti deve coprire il totale."
-                      : "Seleziona come paga il cliente. Puoi suddividere su più metodi."}
+                      ? "Pagamento insufficiente: i pagamenti devono coprire il totale."
+                      : "Seleziona come paga il cliente il residuo dopo eventuali credito/GiftCard."}
                   </div>
                 </div>
 
@@ -1117,14 +1223,14 @@ export function PosContent() {
                   <span id="posFidelityVal">- € 0,00</span>
                 </div>
 
-                <div className="d-flex justify-content-between text-muted small d-none" id="posGiftcardRow">
-                  <span>GiftCard</span>
-                  <span id="posGiftcardVal">- € 0,00</span>
+                <div className={`d-flex justify-content-between text-muted small${giftcardUse > 0 ? "" : " d-none"}`} id="posGiftcardRow">
+                  <span>GiftCard{selectedGiftcard?.code ? ` (${selectedGiftcard.code})` : ""}</span>
+                  <span id="posGiftcardVal">- {fmtEUR(giftcardUse)}</span>
                 </div>
 
-                <div className="d-flex justify-content-between text-muted small d-none" id="posCreditRow">
+                <div className={`d-flex justify-content-between text-muted small${creditUse > 0 ? "" : " d-none"}`} id="posCreditRow">
                   <span>Credito</span>
-                  <span id="posCreditVal">- € 0,00</span>
+                  <span id="posCreditVal">- {fmtEUR(creditUse)}</span>
                 </div>
 
                 <hr />

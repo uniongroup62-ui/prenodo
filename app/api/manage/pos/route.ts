@@ -2,7 +2,7 @@ import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/ap
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelManageSale, checkoutManageSale, getManagePosContext } from "@/lib/manage-pos";
+import { cancelManageSale, checkoutManageSale, getManagePosContext, getManagePosResiduals } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
@@ -22,6 +22,18 @@ export async function GET(request: Request) {
   if (!canAny(session.user.perms, ["pos.manage", "pos.movements"])) return jsonError("Permesso POS mancante.", 403);
 
   const url = new URL(request.url);
+
+  // Residui lookup for the "Residui" panel: the selected client's wallet CREDIT
+  // balance + available GiftCards. Faithful to pos.php?action=pos_residual_credit_data.
+  if (url.searchParams.get("action") === "client_residuals") {
+    const clientId = parseInteger(url.searchParams.get("client_id"), 0);
+    try {
+      return Response.json(await getManagePosResiduals(tenantSlug, clientId));
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore residui POS.");
+    }
+  }
+
   const locationId = await resolveManageLocationId({
     slug: tenantSlug,
     raw: url.searchParams.get("location_id"),
@@ -159,6 +171,7 @@ function paymentsFromBody(body: Record<string, string>): PosPaymentInput[] {
         .map((payment) => ({
           method: normalizePaymentMethod(String(payment.method ?? "")),
           amount: parseNumber(payment.amount, 0),
+          giftcardId: parseInteger(payment.giftcardId ?? payment.giftcard_id, 0),
         }))
         .filter((payment) => payment.amount > 0);
       if (payments.length > 0) return payments;

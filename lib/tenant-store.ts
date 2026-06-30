@@ -69,6 +69,9 @@ export type PosSaleItemInput = {
 export type PosPaymentInput = {
   method: PosPaymentMethod;
   amount: number;
+  // For a "giftcard" tender (POS "Residui"): the giftcards.id to consume from, so the
+  // checkout can decrement the exact card the staff picked. Ignored for other methods.
+  giftcardId?: number;
 };
 
 export type PosSaleItem = {
@@ -87,6 +90,8 @@ export type PosPayment = {
   id: number;
   method: PosPaymentMethod;
   amount: number;
+  // Set for a "giftcard" tender: the giftcards.id the amount is drawn from.
+  giftcardId?: number;
 };
 
 export type PosSale = {
