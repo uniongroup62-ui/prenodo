@@ -406,6 +406,15 @@ export async function checkoutManageSale(
   const paidAmount = roundMoney(payments.reduce((sum, payment) => sum + payment.amount, 0));
   if (paidAmount + 0.00001 < total) throw new Error("Pagamento insufficiente.");
 
+  // FIDELITY points EARNED on this sale (port of Fidelity::calcEarnPointsForAmount ->
+  // addTransaction 'earn','sale'): floor(total / earn_step), whole points, gated on
+  // fidelity_enabled + fidelity_points_enabled + a real client. Persisted on the sale row
+  // and AWARDED after the insert (below), reversed on void. TODO(parity): per-item earn
+  // modes + campaigns (calcEarnPointsForCartWithCampaign) — only the flat earn-step is
+  // ported, like the recharge earn.
+  const earnSettings = await getFidelityEarnSettings(slug);
+  const pointsEarned = earnSettings.enabled && client.id > 0 ? earnFidelityPoints(total, earnSettings.earnStep) : 0;
+
   // Residui: validate the wallet CREDIT + GiftCard tenders against the client's real
   // balances BEFORE writing anything. The base method (cash/card/transfer) covers the
   // remainder. Faithful to pos.php: giftcard_used = min(giftcardBalance, total, req),
@@ -443,6 +452,8 @@ export async function checkoutManageSale(
     // sales.fidelity_discount), so a later void can refund them. Schema-guarded.
     fidelity_points_used: redemption.pointsUsed,
     fidelity_discount: redemption.discount,
+    // Persist the points EARNED so a later void can reverse them (schema-guarded).
+    fidelity_points_earned: pointsEarned,
     // Persist the faithful base payment method. Schema-guarded: a no-op on installs
     // without the column (the notes marker keeps derivePayments correct regardless).
     payment_methods: JSON.stringify({ base: baseMethod }),
@@ -473,6 +484,15 @@ export async function checkoutManageSale(
         source: "sale",
         note: `Sconto Fidelity vendita #${saleId}`,
       },
+      slug,
+    );
+  }
+  // AWARD the EARNED fidelity points: a positive points_earn movement inserts a
+  // transactions row (kind=earn, source_type=sale) + increments clients.points. Reversed
+  // on void via sales.fidelity_points_earned.
+  if (pointsEarned > 0 && client.id > 0) {
+    await addDbWalletMovement(
+      { clientId: client.id, type: "points_earn", points: pointsEarned, source: "sale", note: `Punti vendita #${saleId}` },
       slug,
     );
   }
@@ -1841,6 +1861,7 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   const giftcardId = Math.max(0, Number(saleRow.giftcard_id ?? 0) || 0);
   const clientId = Math.max(0, Number(saleRow.client_id ?? 0) || 0);
   const pointsUsed = normalizePoints(Number(saleRow.fidelity_points_used ?? 0) || 0);
+  const pointsEarned = normalizePoints(Number(saleRow.fidelity_points_earned ?? 0) || 0);
 
   if (giftcardId > 0 && giftcardUsed > 0) {
     await refundDbGiftCard(giftcardId, giftcardUsed, slug, `Storno vendita #${saleId}`).catch(() => undefined);
@@ -1860,6 +1881,14 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
       slug,
     ).catch(() => undefined);
   }
+  // REVERSE the EARNED fidelity points: a negative points_redeem movement removes the
+  // points awarded at checkout, so a cancelled sale doesn't leave its loyalty points.
+  if (pointsEarned > 0 && clientId > 0) {
+    await addDbWalletMovement(
+      { clientId, type: "points_redeem", points: -pointsEarned, source: "sale", note: `Storno punti guadagnati vendita #${saleId}` },
+      slug,
+    ).catch(() => undefined);
+  }
   const salesTableName = (await tenantTable(slug, "sales")).name;
   if ((creditUsed > 0 || giftcardUsed > 0) && (await columnExists(salesTableName, "credit_used"))) {
     await tenantUpdate({ slug, table: "sales", id: saleId, values: { credit_used: 0, giftcard_used: 0 } }).catch(() => 0);
@@ -1868,6 +1897,9 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   // credit_used/giftcard_used reset above).
   if (pointsUsed > 0 && (await columnExists(salesTableName, "fidelity_points_used"))) {
     await tenantUpdate({ slug, table: "sales", id: saleId, values: { fidelity_points_used: 0, fidelity_discount: 0 } }).catch(() => 0);
+  }
+  if (pointsEarned > 0 && (await columnExists(salesTableName, "fidelity_points_earned"))) {
+    await tenantUpdate({ slug, table: "sales", id: saleId, values: { fidelity_points_earned: 0 } }).catch(() => 0);
   }
 }
 
