@@ -1876,6 +1876,35 @@ export function QuickBookingDrawer() {
     [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, discountType, discountValue, couponCode, priceDetails, closeOffcanvas],
   );
 
+  // ---- Delete (#qbDeleteBtn, edit mode only -> action=delete) ----
+  // Faithful to the legacy drawer "Elimina appuntamento": confirm, POST the
+  // tenant-scoped delete (which also restores any consumed redeems), then close +
+  // reload so the calendar/list drop the row. Shown only in edit mode.
+  const deleteBooking = useCallback(async () => {
+    if (!apptId) return;
+    if (typeof window !== "undefined" && !window.confirm("Eliminare definitivamente questa prenotazione? L'azione non è reversibile.")) return;
+    setSubmitting(true);
+    setFormError("");
+    try {
+      const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "delete", id: apptId }),
+      });
+      const data: { ok?: boolean; error?: string } = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false || data.error) {
+        setFormError(String(data.error || "Errore eliminazione."));
+        return;
+      }
+      closeOffcanvas();
+      if (typeof window !== "undefined") window.location.reload();
+    } catch {
+      setFormError("Errore di rete durante l'eliminazione.");
+    } finally {
+      setSubmitting(false);
+    }
+  }, [apptId, slug, closeOffcanvas]);
+
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
 
   return (
@@ -2908,10 +2937,20 @@ export function QuickBookingDrawer() {
             {formError ? <div className="alert alert-danger small mt-3 mb-0">{formError}</div> : null}
 
             <button className="btn btn-primary btn-pill w-100 mt-3" type="submit" id="qbSubmitBtn" disabled={submitting}>
-              <span id="qbSubmitText">{submitting ? "Salvataggio..." : isEditMode ? "Salva modifiche" : "Crea prenotazione"}</span>
+              <span id="qbSubmitText">
+                {submitting
+                  ? "Salvataggio..."
+                  : !isEditMode
+                    ? "Crea prenotazione"
+                    : status === "canceled"
+                      ? "Prenotazione annullata"
+                      : status === "no_show"
+                        ? "Prenotazione No show"
+                        : "Salva modifiche"}
+              </span>
             </button>
 
-            <button className="btn btn-outline-danger btn-pill w-100 mt-2" type="button" id="qbDeleteBtn" style={{ display: "none" }}>
+            <button className="btn btn-outline-danger btn-pill w-100 mt-2" type="button" id="qbDeleteBtn" style={{ display: isEditMode ? "block" : "none" }} onClick={deleteBooking} disabled={submitting}>
               Elimina appuntamento
             </button>
           </form>
