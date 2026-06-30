@@ -737,6 +737,414 @@ export async function cancelManageSale(
   };
 }
 
+// ---------------------------------------------------------------------------
+// POS "Dettaglio vendita" (pos_sale_detail.php) — single sale view + actions.
+// ---------------------------------------------------------------------------
+
+// The CANCEL summary for the detail page: what the void will cancel/restore, and any
+// BLOCKERS that prevent it. Faithful (best-effort) to _pos_sale_cancel_preview: each
+// entry is computed from the SAME linkage cancelManageSale reverses (recharges.sale_id,
+// client_packages.sale_id, client_prepaid_services.sale_id, the giftcard issue marker,
+// the giftbox 'Vendita #saleId' note, sale_installment_plans.sale_id, and the residui
+// columns on the sales row). `blockers` mirror the legacy rules — a fully-redeemed issued
+// GiftBox and a giftcard already spent in ANOTHER (still-active) sale block the void.
+export type PosCancelSummary = {
+  // Product lines whose stock would be restored on a "restore" void (status != ordered).
+  products: Array<{ saleItemId: number; productId: number; name: string; qty: number }>;
+  // Whether the sale has product lines that force the restore/no_restore stock decision.
+  requiresStockDecision: boolean;
+  giftcards: Array<{ id: number; code: string; status: string; balance: number; linkedSaleIds: number[] }>;
+  giftboxes: Array<{ id: number; code: string; status: string; fullyRedeemed: boolean; redeemedItems: string[]; remainingItems: string[] }>;
+  packages: Array<{ id: number; name: string; sessionsTotal: number; sessionsRemaining: number }>;
+  prepaidServices: Array<{ id: number; name: string; purchasedQty: number; remainingQty: number }>;
+  recharges: Array<{ id: number; totalAmount: number; isVoid: boolean }>;
+  installmentPlans: Array<{ id: number; status: string }>;
+  // Residui RESTORED on void (re-credited credit / refunded giftcard / refunded points).
+  creditRestored: number;
+  giftcardResidualRefunded: number;
+  giftcardResidualCode: string;
+  pointsRestored: number;
+  summary: string[];
+  warnings: string[];
+  blockers: string[];
+};
+
+export type PosSaleDetail = {
+  ok: true;
+  source: string;
+  sale: PosSale;
+  operatorName: string;
+  locationName: string;
+  cancelSummary: PosCancelSummary;
+  canCancel: boolean;
+  canMarkCollected: boolean;
+};
+
+// Build the full POS "Dettaglio vendita" payload for one sale: the mapped PosSale (header,
+// grouped-ready items, payments, totals) PLUS the operator/location labels and the cancel
+// summary + blockers. Faithful (best-effort) to pos_sale_detail.php's header + cancel
+// preview. Tenant-scoped via getSaleRow/mapSale; throws "Vendita non trovata." for a
+// missing/foreign id.
+export async function getManageSaleDetail(slug: string, id: number): Promise<PosSaleDetail> {
+  if (id <= 0) throw new Error("Vendita non valida.");
+  const row = await getSaleRow(slug, id);
+  const sale = await mapSale(slug, row);
+  const operatorName = clean(row.operator_name, 120) || (await operatorNameFromUserId(slug, Number(row.created_by ?? 0))) || "—";
+  const locationName = sale.locationId > 0 ? await saleLocationName(slug, sale.locationId) : "";
+  const cancelSummary = await buildCancelSummary(slug, id, row, sale);
+  return {
+    ok: true,
+    source: "app/pages/pos_sale_detail.php",
+    sale,
+    operatorName,
+    locationName,
+    cancelSummary,
+    canCancel: sale.status !== "cancelled" && cancelSummary.blockers.length === 0,
+    canMarkCollected: sale.status !== "cancelled",
+  };
+}
+
+async function operatorNameFromUserId(slug: string, userId: number): Promise<string> {
+  if (userId <= 0) return "";
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "users", columns: "name,email", where: "id=?", params: [userId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  const row = rows[0];
+  if (!row) return "";
+  return clean(row.name, 120) || clean(row.email, 120) || `#${userId}`;
+}
+
+async function saleLocationName(slug: string, locationId: number): Promise<string> {
+  if (locationId <= 0) return "";
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "name", where: "id=?", params: [locationId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  return clean(rows[0]?.name, 190) || `Sede #${locationId}`;
+}
+
+// Compute the cancel summary + blockers from the sale's persisted linkage. Mirrors the
+// legacy _pos_sale_cancel_preview but keyed off the columns/markers cancelManageSale
+// actually reverses (so the preview and the void agree). Every read is best-effort — a
+// missing optional table/column simply omits that section.
+async function buildCancelSummary(slug: string, saleId: number, row: RowDataPacket, sale: PosSale): Promise<PosCancelSummary> {
+  const summary: string[] = [];
+  const warnings: string[] = [];
+  const blockers: string[] = [];
+
+  // Products to restock on a "restore" void (status != ordered), faithful to cancelManageSale.
+  const products = sale.items
+    .filter((item) => item.type === "product" && item.refId > 0 && item.status !== "ordered")
+    .map((item) => ({ saleItemId: item.id, productId: item.refId, name: item.name, qty: Math.max(1, Math.round(item.quantity)) }));
+  const requiresStockDecision = products.length > 0;
+  if (products.length) {
+    summary.push(`Prodotti gia scaricati: ${products.map((p) => `${p.name} x${p.qty}`).join(", ")}. Scelta magazzino richiesta.`);
+  }
+
+  // GiftCard ISSUED by this sale (via the issue ledger marker). A still-active card spent in
+  // ANOTHER active sale blocks the void (the spend would be orphaned); a positive residual
+  // is a warning.
+  const giftcards = await summarizeIssuedGiftcards(slug, saleId, warnings, blockers);
+  if (giftcards.length) summary.push(`GiftCard emesse: ${giftcards.map((g) => g.code).filter(Boolean).join(", ")}`);
+
+  // GiftBox ISSUED by this sale (via the 'Vendita #saleId' note). A FULLY-redeemed box blocks.
+  const giftboxes = await summarizeIssuedGiftboxes(slug, saleId, blockers);
+  if (giftboxes.length) summary.push(`GiftBox emesse: ${giftboxes.map((g) => g.code).filter(Boolean).join(", ")}`);
+
+  // Package issued (client_packages.sale_id).
+  const packages = await summarizeLinkedRows(slug, "client_packages", saleId, (r) => ({
+    id: Number(r.id ?? 0),
+    name: clean(r.name ?? r.package_name, 190) || `Pacchetto #${Number(r.id ?? 0)}`,
+    sessionsTotal: Math.max(0, Number(r.sessions_total ?? 0) || 0),
+    sessionsRemaining: Math.max(0, Number(r.sessions_remaining ?? r.sessions_total ?? 0) || 0),
+  }));
+  if (packages.length) summary.push(`Pacchetti: ${packages.map((p) => `${p.name} (${p.sessionsRemaining}/${p.sessionsTotal})`).join(", ")}`);
+
+  // Prepaid services issued (client_prepaid_services.sale_id).
+  const prepaidServices = await summarizeLinkedRows(slug, "client_prepaid_services", saleId, (r) => ({
+    id: Number(r.id ?? 0),
+    name: clean(r.service_name ?? r.name, 190) || "Servizio prepagato",
+    purchasedQty: Math.max(0, Number(r.purchased_qty ?? r.qty ?? 0) || 0),
+    remainingQty: Math.max(0, Number(r.remaining_qty ?? r.purchased_qty ?? 0) || 0),
+  }));
+  if (prepaidServices.length) summary.push(`Servizi prepagati: ${prepaidServices.map((s) => `${s.name} (${s.remainingQty}/${s.purchasedQty})`).join(", ")}`);
+
+  // Recharge issued (recharges.sale_id). Wallet credit + earned points are reversed on void.
+  const recharges = await summarizeLinkedRows(slug, "recharges", saleId, (r) => ({
+    id: Number(r.id ?? 0),
+    totalAmount: roundMoney(Number(r.total_amount ?? 0) || 0),
+    isVoid: Number(r.is_void ?? 0) === 1,
+  }));
+  if (recharges.some((r) => !r.isVoid)) {
+    summary.push(`Ricariche da stornare: ${recharges.filter((r) => !r.isVoid).map((r) => `€ ${formatMoney(r.totalAmount)}`).join(", ")}`);
+  }
+
+  // Installment plan (sale_installment_plans.sale_id).
+  const installmentPlans = await summarizeLinkedRows(slug, "sale_installment_plans", saleId, (r) => ({
+    id: Number(r.id ?? 0),
+    status: String(r.status ?? "").toLowerCase(),
+  }));
+  if (installmentPlans.length) summary.push("Piano rate collegato: verra annullato.");
+
+  // Residui consumed at checkout → RESTORED on void (faithful to cancelManageSale's restore).
+  const creditRestored = roundMoney(Number(row.credit_used ?? 0) || 0);
+  const giftcardResidualRefunded = roundMoney(Number(row.giftcard_used ?? 0) || 0);
+  const giftcardResidualId = Math.max(0, Number(row.giftcard_id ?? 0) || 0);
+  const pointsRestored = normalizePoints(Number(row.fidelity_points_used ?? 0) || 0);
+  let giftcardResidualCode = "";
+  if (giftcardResidualId > 0 && giftcardResidualRefunded > 0.00001) {
+    const cardRows = await tenantSelect<RowDataPacket>({ slug, table: "giftcards", columns: "code", where: "id=?", params: [giftcardResidualId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    giftcardResidualCode = clean(cardRows[0]?.code, 40);
+  }
+  if (creditRestored > 0.00001) summary.push(`Credito da ri-accreditare: € ${formatMoney(creditRestored)}`);
+  if (giftcardResidualRefunded > 0.00001) summary.push(`GiftCard da rimborsare${giftcardResidualCode ? ` (${giftcardResidualCode})` : ""}: € ${formatMoney(giftcardResidualRefunded)}`);
+  if (pointsRestored > 0) summary.push(`Punti Fidelity da ripristinare: ${pointsRestored} pt`);
+
+  return {
+    products,
+    requiresStockDecision,
+    giftcards,
+    giftboxes,
+    packages,
+    prepaidServices,
+    recharges,
+    installmentPlans,
+    creditRestored,
+    giftcardResidualRefunded,
+    giftcardResidualCode,
+    pointsRestored,
+    summary,
+    warnings,
+    blockers,
+  };
+}
+
+// Generic helper: load the rows of `table` linked to this sale via a sale_id column and map
+// each one. Returns [] when the table or the sale_id column is absent (older installs).
+async function summarizeLinkedRows<T>(slug: string, tableName: string, saleId: number, map: (row: RowDataPacket) => T): Promise<T[]> {
+  const table = await tenantTable(slug, tableName).catch(() => null);
+  if (!table || !(await columnExists(table.name, "sale_id"))) return [];
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: tableName, where: "sale_id=?", params: [saleId] }).catch(() => [] as RowDataPacket[]);
+  return rows.map(map);
+}
+
+// GiftCard(s) ISSUED by this sale: found via the 'issue' giftcard_transactions marker (the
+// same linkage cancelIssuedSaleGiftcards reverses). For each: read status + balance, and
+// check whether the card has been SPENT in another still-active sale (sales.giftcard_id =
+// this card on a non-cancelled sale) — that orphan-spend BLOCKS the void (legacy rule). A
+// positive residual on a live card is a warning.
+async function summarizeIssuedGiftcards(slug: string, saleId: number, warnings: string[], blockers: string[]): Promise<PosCancelSummary["giftcards"]> {
+  const txTable = await tenantTable(slug, "giftcard_transactions").catch(() => null);
+  const giftcardTable = await tenantTable(slug, "giftcards").catch(() => null);
+  if (!txTable || !giftcardTable) return [];
+
+  const marker = `%${GIFTCARD_SALE_MARKER}${saleId}]%`;
+  const metaMatch = `%"sale_id":${saleId}%`;
+  const txRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: txTable.name,
+    columns: "giftcard_id",
+    where: "type = 'issue' AND (meta_json LIKE ? OR note LIKE ?)",
+    params: [metaMatch, marker],
+  }).catch(() => [] as RowDataPacket[]);
+
+  const out: PosCancelSummary["giftcards"] = [];
+  const seen = new Set<number>();
+  for (const tx of txRows) {
+    const giftcardId = Math.max(0, Number(tx.giftcard_id ?? 0) || 0);
+    if (giftcardId <= 0 || seen.has(giftcardId)) continue;
+    seen.add(giftcardId);
+    const cardRows = await tenantSelect<RowDataPacket>({ slug, table: giftcardTable.name, columns: "id, code, status, balance", where: "id=?", params: [giftcardId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    const card = cardRows[0];
+    if (!card) continue;
+    const code = clean(card.code, 40);
+    const status = String(card.status ?? "").toLowerCase();
+    const balance = roundMoney(Math.max(0, Number(card.balance ?? 0) || 0));
+
+    // Linked OTHER active sales that SPENT this card (sales.giftcard_id) → blocker.
+    const linkedSaleIds = await otherSalesSpendingGiftcard(slug, giftcardId, saleId);
+    if (linkedSaleIds.length) {
+      blockers.push(`GiftCard ${code || `#${giftcardId}`}: gia utilizzata ${linkedSaleIds.length === 1 ? "nella vendita" : "nelle vendite"} ${linkedSaleIds.map((s) => `#${s}`).join(", ")}. Annulla prima ${linkedSaleIds.length === 1 ? "quella vendita." : "quelle vendite."}`);
+    } else if (status !== "cancelled" && status !== "canceled" && balance > 0.00001) {
+      warnings.push(`GiftCard ${code || `#${giftcardId}`}: residuo € ${formatMoney(balance)}`);
+    }
+    out.push({ id: giftcardId, code, status, balance, linkedSaleIds });
+  }
+  return out;
+}
+
+// Other NON-cancelled sales (excluding this one) whose giftcard_id = the issued card — i.e.
+// the card was already SPENT as residui elsewhere. Best-effort; [] when the columns are absent.
+async function otherSalesSpendingGiftcard(slug: string, giftcardId: number, excludeSaleId: number): Promise<number[]> {
+  const salesTable = await tenantTable(slug, "sales").catch(() => null);
+  if (!salesTable || !(await columnExists(salesTable.name, "giftcard_id")) || !(await columnExists(salesTable.name, "giftcard_used"))) return [];
+  const scope = await tenantScope(salesTable, ["giftcard_id=?", "id<>?", "COALESCE(giftcard_used,0)>0", "LOWER(COALESCE(status,'')) NOT IN ('cancelled','canceled','annullata','annullato')"], [giftcardId, excludeSaleId]);
+  const rows = await dbQuery<RowDataPacket[]>(`SELECT id FROM ${quoteIdentifier(salesTable.name)}${scope.where} ORDER BY id ASC LIMIT 20`, scope.params).catch(() => [] as RowDataPacket[]);
+  return rows.map((r) => Number(r.id ?? 0)).filter((id) => id > 0);
+}
+
+// GiftBox instance(s) ISSUED by this sale (via the 'Vendita #saleId' note — the same linkage
+// cancelIssuedSaleGiftboxes reverses). A box whose status is 'redeemed', or whose every
+// redeemable item is fully consumed, BLOCKS the void (legacy rule); a partially-redeemed box
+// is allowed. Returns the redeemed/remaining item labels for the modal.
+async function summarizeIssuedGiftboxes(slug: string, saleId: number, blockers: string[]): Promise<PosCancelSummary["giftboxes"]> {
+  const instanceTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
+  if (!instanceTable || !(await columnExists(instanceTable.name, "note"))) return [];
+  const marker = `${GIFTBOX_SALE_MARKER}${saleId}`;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: instanceTable.name, columns: "id, code, status, giftbox_id", where: "note = ?", params: [marker] }).catch(() => [] as RowDataPacket[]);
+
+  const out: PosCancelSummary["giftboxes"] = [];
+  for (const r of rows) {
+    const instanceId = Math.max(0, Number(r.id ?? 0) || 0);
+    if (instanceId <= 0) continue;
+    const code = clean(r.code, 40) || `#${instanceId}`;
+    const status = String(r.status ?? "").toLowerCase();
+    const redemption = await giftboxRedemptionState(slug, instanceId, Number(r.giftbox_id ?? 0));
+    const fullyRedeemed = status === "redeemed" || redemption.fullyRedeemed;
+    if (fullyRedeemed) blockers.push(`GiftBox ${code}: gia riscattata`);
+    out.push({ id: instanceId, code, status, fullyRedeemed, redeemedItems: redemption.redeemedItems, remainingItems: redemption.remainingItems });
+  }
+  return out;
+}
+
+// Best-effort redemption state of a giftbox instance: compare the per-item used qty
+// (giftbox_redemptions + giftbox_redemption_items) against the template item qtys
+// (giftbox_items). fullyRedeemed = at least one redemption exists AND every redeemable item is
+// fully consumed. Returns labelled redeemed/remaining lists for the modal. Degrades to
+// {fullyRedeemed:false} when the optional redemption schema is absent.
+async function giftboxRedemptionState(slug: string, instanceId: number, giftboxId: number): Promise<{ fullyRedeemed: boolean; redeemedItems: string[]; remainingItems: string[] }> {
+  const empty = { fullyRedeemed: false, redeemedItems: [] as string[], remainingItems: [] as string[] };
+  const redTable = await tenantTable(slug, "giftbox_redemptions").catch(() => null);
+  const redItemsTable = await tenantTable(slug, "giftbox_redemption_items").catch(() => null);
+  const itemsTable = await tenantTable(slug, "giftbox_items").catch(() => null);
+  if (!redTable || !redItemsTable || !itemsTable || giftboxId <= 0) return empty;
+
+  const usedRows = await dbQuery<RowDataPacket[]>(
+    `SELECT ri.giftbox_item_id AS item_id, SUM(ri.qty) AS used_qty
+       FROM ${quoteIdentifier(redTable.name)} r
+       JOIN ${quoteIdentifier(redItemsTable.name)} ri ON ri.redemption_id=r.id
+      WHERE r.instance_id=?
+      GROUP BY ri.giftbox_item_id`,
+    [instanceId],
+  ).catch(() => [] as RowDataPacket[]);
+  const usedByItem = new Map<number, number>();
+  for (const u of usedRows) usedByItem.set(Number(u.item_id ?? 0), Math.max(0, Number(u.used_qty ?? 0) || 0));
+  const hasRedemptions = usedByItem.size > 0;
+
+  const templateItems = await tenantSelect<RowDataPacket>({ slug, table: itemsTable.name, columns: "id, item_type, service_id, product_id, qty, custom_label", where: "giftbox_id=?", params: [giftboxId] }).catch(() => [] as RowDataPacket[]);
+  if (!templateItems.length) return { fullyRedeemed: false, redeemedItems: [], remainingItems: [] };
+
+  const redeemedItems: string[] = [];
+  const remainingItems: string[] = [];
+  let allConsumed = true;
+  let considered = 0;
+  for (const it of templateItems) {
+    const itemId = Number(it.id ?? 0);
+    const qty = Math.max(1, Number(it.qty ?? 1) || 1);
+    const used = Math.min(qty, usedByItem.get(itemId) ?? 0);
+    const remaining = Math.max(0, qty - used);
+    const label = clean(it.custom_label, 120) || (String(it.item_type ?? "").toLowerCase() === "product" ? "Prodotto" : String(it.item_type ?? "").toLowerCase() === "service" ? "Servizio" : "Elemento");
+    considered += 1;
+    if (used > 0) redeemedItems.push(used > 1 ? `${label} x${used}` : label);
+    if (remaining > 0) {
+      remainingItems.push(remaining > 1 ? `${label} x${remaining}` : label);
+      allConsumed = false;
+    }
+  }
+  const fullyRedeemed = hasRedemptions && considered > 0 && allConsumed;
+  return { fullyRedeemed, redeemedItems, remainingItems };
+}
+
+// Mark a product sale line as collected ("Ritirato") — a faithful MINIMAL port of the
+// pos_sale_detail.php mark_preorder_collection action. Flips the sale_item to
+// item_status='collected', decrements the location stock by the line qty, and writes a
+// best-effort stock_docs/stock_doc_items 'scarico' movement for the pickup audit trail.
+//
+// TODO (deep stock-document tracking): the legacy action also supports PARTIAL pickup
+// (collect_qty < line qty → split the sale_item into a collected row + a residual ordered
+// row, with proportional line_total split), writes a richer stock_docs row (operator_user_id,
+// cause, document_type, location_id, attachment cols), and has an UNDO ("Storno ritiro") that
+// re-creates an inbound stock_doc. This minimal version handles the common FULL pickup only;
+// partial pickup + undo + the full stock-document schema are left for a later pass.
+export async function markManageSaleItemCollected(
+  slug: string,
+  input: { saleId: number; saleItemId: number; userId: number | null; userName: string },
+): Promise<PosSaleDetail> {
+  if (input.saleId <= 0 || input.saleItemId <= 0) throw new Error("Riga prodotto non valida.");
+  const saleRow = await getSaleRow(slug, input.saleId);
+  if (isCancelledStatus(saleRow.status)) throw new Error("La vendita e annullata: il ritiro non puo essere registrato.");
+  const locationId = Number(saleRow.location_id ?? 0) || 0;
+
+  const itemRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "sale_items",
+    where: "id=? AND sale_id=?",
+    params: [input.saleItemId, input.saleId],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  const item = itemRows[0];
+  if (!item) throw new Error("Riga preordine non trovata.");
+  if (String(item.item_type ?? "").toLowerCase() !== "product") throw new Error("Operazione consentita solo per righe prodotto.");
+  const productId = Math.max(0, Number(item.item_id ?? 0) || 0);
+  if (productId <= 0) throw new Error("Prodotto collegato non valido.");
+  const currentStatus = normalizeItemStatus("product", item.item_status, Number(saleRow.client_id ?? 0) > 0);
+  if (currentStatus !== "ordered") throw new Error("Questo prodotto non e piu in attesa di ritiro.");
+  const qty = Math.max(1, Math.round(Number(item.qty ?? 1) || 1));
+
+  // Decrement the stock for the pickup (a product whose status was 'ordered' was NOT
+  // decremented at checkout, so it is decremented now — faithful to the legacy scarico).
+  const available = await currentProductStock(slug, productId, locationId);
+  if (available + 0.00001 < qty) {
+    throw new Error(`Stock insufficiente per registrare il ritiro${item.item_name ? `: ${String(item.item_name)}` : ""}.`);
+  }
+
+  // Best-effort stock movement document (audit), then the stock decrement, then flip status.
+  await recordPickupStockDoc(slug, {
+    saleId: input.saleId,
+    productId,
+    qty,
+    locationId,
+    note: `Ritiro preordine da Dettaglio vendita • vendita #${input.saleId} • prodotto: ${String(item.item_name ?? "Prodotto")} x${qty}`,
+    operatorName: input.userName,
+    operatorUserId: input.userId,
+  });
+  await adjustProductStock(slug, productId, locationId, -qty);
+  await tenantUpdate({ slug, table: "sale_items", id: input.saleItemId, values: { item_status: "collected" } });
+
+  return getManageSaleDetail(slug, input.saleId);
+}
+
+// Best-effort 'scarico' stock document for a pickup. Inserts a stock_docs header + one
+// stock_doc_items line. A no-op (swallowed) when the optional stock-doc tables are absent.
+async function recordPickupStockDoc(
+  slug: string,
+  input: { saleId: number; productId: number; qty: number; locationId: number; note: string; operatorName: string; operatorUserId: number | null },
+): Promise<void> {
+  try {
+    const docsTable = await tenantTable(slug, "stock_docs").catch(() => null);
+    const docItemsTable = await tenantTable(slug, "stock_doc_items").catch(() => null);
+    if (!docsTable || !docItemsTable) return;
+    const today = todayIso();
+    const docId = await tenantInsert(docsTable, await filterColumns(docsTable.name, {
+      move_date: today,
+      operator_user_id: input.operatorUserId,
+      operator_name: clean(input.operatorName, 120) || "Operatore",
+      cause: "scarico",
+      location_id: input.locationId > 0 ? input.locationId : null,
+      notes: clean(input.note, 500),
+      is_canceled: 0,
+    }));
+    if (docId > 0) {
+      await tenantInsert(docItemsTable, await filterColumns(docItemsTable.name, {
+        stock_doc_id: docId,
+        product_id: input.productId,
+        qty: input.qty,
+        incoming_flag: 0,
+        incoming_qty: 0,
+        incoming_eta: null,
+      }));
+    }
+  } catch {
+    // Optional stock-doc tables can be absent in older installs — the status flip + stock
+    // decrement still happen; only the audit document is skipped.
+  }
+}
+
 async function listPosSales(slug: string, options: { locationId: number; includeCancelled: boolean; query: string }): Promise<PosSale[]> {
   const salesTable = await tenantTable(slug, "sales");
   const clientsTable = await tenantTable(slug, "clients").catch(() => null);

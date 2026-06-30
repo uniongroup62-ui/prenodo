@@ -2,7 +2,7 @@ import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/ap
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelManageSale, checkoutManageSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals } from "@/lib/manage-pos";
+import { cancelManageSale, checkoutManageSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
@@ -45,6 +45,19 @@ export async function GET(request: Request) {
       return Response.json(await getManagePosAppointmentCart(tenantSlug, appointmentId));
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore caricamento appuntamento POS.");
+    }
+  }
+
+  // POS "Dettaglio vendita" (pos_sale_detail.php): the full single sale (header + items +
+  // payments + totals) plus the cancel summary + blockers. Read-gated by the POS permission
+  // already checked above; the cancel/pickup ACTIONS below carry the stronger movements gate.
+  if (url.searchParams.get("action") === "sale_detail") {
+    const saleId = parseInteger(url.searchParams.get("id") ?? url.searchParams.get("sale_id"), 0);
+    if (saleId <= 0) return jsonError("ID vendita mancante.");
+    try {
+      return Response.json(await getManageSaleDetail(tenantSlug, saleId));
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore dettaglio vendita.");
     }
   }
 
@@ -104,6 +117,26 @@ export async function POST(request: Request) {
       return Response.json({
         ...payload,
         source: "app/pages/pos_history.php?action=cancel",
+      });
+    }
+
+    // PICKUP ("Segna ritirato"): mark a product sale line as collected. Faithful (minimal)
+    // port of pos_sale_detail.php?do=mark_preorder_collection — gated by pos.preorders OR
+    // pos.manage (the legacy Auth::canAny(['pos.manage','pos.preorders'])).
+    if (action === "mark_collected") {
+      if (!canAny(session.user.perms, ["pos.manage", "pos.preorders"])) return jsonError("Non hai i permessi per gestire i preordini.", 403);
+      const saleId = parseInteger(body.sale_id ?? body.id);
+      const saleItemId = parseInteger(body.sale_item_id);
+      if (saleId <= 0 || saleItemId <= 0) return jsonError("Riga prodotto non valida.");
+      const payload = await markManageSaleItemCollected(tenantSlug, {
+        saleId,
+        saleItemId,
+        userId: session.user.id,
+        userName: session.user.name,
+      });
+      return Response.json({
+        ...payload,
+        source: "app/pages/pos_sale_detail.php?do=mark_preorder_collection",
       });
     }
 

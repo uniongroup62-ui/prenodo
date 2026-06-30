@@ -27,6 +27,7 @@ import { BookingSettingsContent } from "@/components/modules/booking-content";
 import { ConsentModulesContent } from "@/components/modules/consent_modules-content";
 import { FidelityContent } from "@/components/modules/fidelity-content";
 import { PosHistoryContent } from "@/components/modules/pos_history-content";
+import { PosSaleDetailContent } from "@/components/modules/pos_sale_detail-content";
 import { ReportsContent } from "@/components/modules/reports-content";
 import { StockMovesContent } from "@/components/modules/stock_moves-content";
 import { BusinessProfileContent } from "@/components/modules/business_profile-content";
@@ -97,6 +98,7 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
   reports: ReportsContent,
   stock_moves: StockMovesContent,
   pos_history: PosHistoryContent,
+  pos_sale_detail: PosSaleDetailContent,
   fidelity: FidelityContent,
   booking: BookingSettingsContent,
   business_profile: BusinessProfileContent,
