@@ -2,11 +2,15 @@ import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import type { ManagedClient } from "@/lib/tenant-store";
 import {
   archiveDbClient,
+  blockDbClient,
   createDbClient,
   deleteDbClient,
   getDbClient,
+  getManageClientDeleteSummary,
+  getManageClientDetail,
   listDbClients,
   quickBookClientContext,
+  unblockDbClient,
   updateDbClient,
 } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -70,6 +74,36 @@ export async function GET(request: Request) {
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");
+    }
+  }
+
+  // Faithful client DETAIL (action=view) reader. Port of clients.php action=view:
+  // the full anagrafica + fidelity points/credit + tags + block status + the
+  // appointments/sales history summary + residuals (active packages/prepaids/
+  // giftcards/giftbox/gifts + credit) for the header card and history sections.
+  if (url.searchParams.get("action") === "detail") {
+    const clientId = parseInteger(url.searchParams.get("id"));
+    if (clientId <= 0) return jsonError("ID cliente mancante.");
+    try {
+      const detail = await getManageClientDetail(tenantSlug, clientId);
+      if (!detail) return jsonError("Cliente non trovato.", 404);
+      return Response.json({ ok: true, source: "clients.php action=view", sourceMode: "database", ...detail });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore dettaglio cliente.");
+    }
+  }
+
+  // Delete-cascade SUMMARY (port of clients.php delete-confirm ~1215-1248): the
+  // counts of what WILL be deleted/affected, so the UI confirm can warn before
+  // the actual POST action=delete.
+  if (url.searchParams.get("action") === "delete_summary") {
+    const clientId = parseInteger(url.searchParams.get("id"));
+    if (clientId <= 0) return jsonError("ID cliente mancante.");
+    try {
+      const summary = await getManageClientDeleteSummary(tenantSlug, clientId);
+      return Response.json({ ok: true, source: "clients.php action=delete_confirm", sourceMode: "database", summary });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore riepilogo eliminazione.");
     }
   }
 
@@ -137,8 +171,26 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, source: "clients?action=archive", sourceMode: "database", client, clients: await listDbClients({ slug: tenantSlug }) });
     }
 
+    // Disattiva cliente (port of clients.php _mode=block_client): is_blocked=1 +
+    // blocked_at=now + a REQUIRED internal note. The blocked client drops out of
+    // the default list (listDbClients hides is_blocked=1).
+    if (action === "block") {
+      const note = String(body.blocked_internal_note ?? body.reason ?? "");
+      const client = await blockDbClient(id, tenantSlug, note);
+      return Response.json({ ok: true, source: "clients?action=block", sourceMode: "database", client, clients: await listDbClients({ slug: tenantSlug }) });
+    }
+
+    // Riattiva cliente (port of clients.php _mode=unblock_client): is_blocked=0,
+    // clears blocked_at + note. No associated data is touched.
+    if (action === "unblock") {
+      const client = await unblockDbClient(id, tenantSlug);
+      return Response.json({ ok: true, source: "clients?action=unblock", sourceMode: "database", client, clients: await listDbClients({ slug: tenantSlug }) });
+    }
+
     if (action === "delete") {
-      const result = await deleteDbClient(id, tenantSlug);
+      // delete_reason is accepted for parity with the legacy confirm form (it is
+      // not yet persisted; see deleteDbClient).
+      const result = await deleteDbClient(id, tenantSlug, String(body.delete_reason ?? body.reason ?? ""));
       return Response.json({ ok: true, source: "clients?action=delete", sourceMode: "database", ...result, clients: await listDbClients({ slug: tenantSlug }) });
     }
 

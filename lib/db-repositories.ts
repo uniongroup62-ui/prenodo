@@ -195,10 +195,284 @@ export async function archiveDbClient(id: number, slug: string): Promise<Managed
   return getSingleClient(slug, id);
 }
 
-export async function deleteDbClient(id: number, slug: string): Promise<{ deleted: boolean; client: ManagedClient; reason: string }> {
+export async function deleteDbClient(
+  id: number,
+  slug: string,
+  deleteReason = "",
+): Promise<{ deleted: boolean; client: ManagedClient; reason: string }> {
   const client = await getSingleClient(slug, id);
   const affected = await tenantDelete({ slug, table: "clients", id });
+  // NOTE (cascade scope): this deletes ONLY the `clients` row. The legacy
+  // clients.php delete (client_delete_collect_ids + client_delete_execute,
+  // ~lines 1100-1500) performs a ~40-table cascade (sales, sale_items,
+  // appointments + details, installments/plans, commissions, client_packages,
+  // client_prepaid_services, giftcards/giftbox_instances/gifts + their
+  // transactions, quotes, cards/recharges, customer_documents,
+  // client_consent_records, client_sheet_records, booking_users,
+  // customer_tag_map, transactions/events/point_lots, credit_adjustments, stock
+  // restore, attached files, marketplace links, campaign id-list refs). It is
+  // NOT ported here. The active Postgres schema relies on its own FK rules; rows
+  // in child tables without ON DELETE CASCADE will block or orphan. TODO: port
+  // the full cascade (see getManageClientDeleteSummary for the affected counts).
+  // `deleteReason` is accepted (faithful to the legacy confirm form) but not yet
+  // persisted to an audit log — TODO.
+  void deleteReason;
   return { deleted: affected > 0, client, reason: affected > 0 ? "Cliente eliminato." : "Cliente non eliminato." };
+}
+
+// Block / unblock a client — faithful port of clients.php (~lines 1775-1813,
+// the _mode=block_client / unblock_client POST). Block sets is_blocked=1,
+// blocked_at=NOW(), blocked_internal_note=<reason> (the reason is REQUIRED, like
+// the legacy "Inserisci una nota interna" guard). Unblock sets is_blocked=0 and
+// clears the timestamp + note. Nothing else is deleted (the legacy stresses "Nessun
+// dato associato e stato eliminato"). listDbClients hides is_blocked=1 unless
+// include_archived, so a blocked client drops out of the default list.
+export async function blockDbClient(id: number, slug: string, internalNote: string): Promise<ManagedClient> {
+  const note = String(internalNote ?? "").trim();
+  if (note === "") throw new Error("Inserisci una nota interna con il motivo della disattivazione.");
+  await tenantUpdate({
+    slug,
+    table: "clients",
+    id,
+    values: { is_blocked: 1, blocked_at: new Date(), blocked_internal_note: note },
+  });
+  return getSingleClient(slug, id);
+}
+
+export async function unblockDbClient(id: number, slug: string): Promise<ManagedClient> {
+  await tenantUpdate({
+    slug,
+    table: "clients",
+    id,
+    values: { is_blocked: 0, blocked_at: null, blocked_internal_note: null },
+  });
+  return getSingleClient(slug, id);
+}
+
+// Count rows in a tenant table matching client_id = ? — guarded so a missing
+// table/column degrades to 0 (mirrors the legacy client_delete_count_any +
+// table_exists/column_exists checks). Used by the delete summary.
+async function clientRowCount(slug: string, table: string, column: string, clientId: number): Promise<number> {
+  try {
+    if (!(await tableExists((await tenantTable(slug, table)).name))) return 0;
+    if (!(await columnExists((await tenantTable(slug, table)).name, column))) return 0;
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table,
+      columns: "COUNT(*) AS c",
+      where: `${quoteIdentifier(column)} = ?`,
+      params: [clientId],
+    });
+    return Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+  } catch {
+    return 0;
+  }
+}
+
+export type ManageClientDeleteSummary = {
+  vendite: number;
+  appuntamenti: number;
+  pacchetti: number;
+  prepagati: number;
+  giftcard: number;
+  giftbox: number;
+  documenti: number;
+  consensi: number;
+  schede_cliente: number;
+  movimenti_fidelity: number;
+  rettifiche_credito: number;
+  ricariche: number;
+  credito_cliente: number;
+  punti: number;
+  saldo_giftcard: number;
+};
+
+// Delete-cascade SUMMARY — faithful port of the clients.php delete-confirm summary
+// (~lines 1215-1248): the counts of what WILL be deleted / affected if this client
+// is removed, so the UI can render a "Cosa verra eliminato" confirm panel before
+// the actual POST action=delete. Every count is guarded (missing table -> 0). This
+// is read-only (it never deletes). Tenant-scoped via tenantSelect; tenant + clients
+// permission gated by the route.
+export async function getManageClientDeleteSummary(slug: string, clientId: number): Promise<ManageClientDeleteSummary> {
+  if (clientId <= 0) throw new Error("ID cliente mancante.");
+
+  const [vendite, appuntamenti, pacchetti, prepagati, documenti, consensi, schedeRecords, txCount, eventCount, rettifiche, ricariche] =
+    await Promise.all([
+      clientRowCount(slug, "sales", "client_id", clientId),
+      clientRowCount(slug, "appointments", "client_id", clientId),
+      clientRowCount(slug, "client_packages", "client_id", clientId),
+      clientRowCount(slug, "client_prepaid_services", "client_id", clientId),
+      clientRowCount(slug, "customer_documents", "client_id", clientId),
+      clientRowCount(slug, "client_consent_records", "client_id", clientId),
+      clientRowCount(slug, "client_sheet_records", "client_id", clientId),
+      clientRowCount(slug, "transactions", "client_id", clientId),
+      clientRowCount(slug, "events", "client_id", clientId),
+      clientRowCount(slug, "credit_adjustments", "client_id", clientId),
+      clientRowCount(slug, "recharges", "client_id", clientId),
+    ]);
+
+  // GiftCard / GiftBox counts: count instances where the client is the recipient
+  // (the legacy collects both sent + received via client_delete_collect_ids; the
+  // detail view + this summary use the recipient relation, which is the rows a
+  // delete would remove for the holder). Guarded.
+  let giftcard = 0;
+  let saldoGiftcard = 0;
+  try {
+    const gcTable = await tenantTable(slug, "giftcards");
+    if (await tableExists(gcTable.name)) {
+      const hasRecipient = await columnExists(gcTable.name, "recipient_client_id");
+      const target = hasRecipient ? "recipient_client_id = ?" : "client_id = ?";
+      const rows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftcards",
+        columns: "COUNT(*) AS c, COALESCE(SUM(balance), 0) AS bal",
+        where: target,
+        params: [clientId],
+      });
+      giftcard = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+      saldoGiftcard = roundMoney(Number(rows[0]?.bal ?? 0));
+    }
+  } catch {
+    giftcard = 0;
+    saldoGiftcard = 0;
+  }
+
+  let giftbox = 0;
+  try {
+    const gbTable = await tenantTable(slug, "giftbox_instances");
+    if (await tableExists(gbTable.name)) {
+      const hasRecipient = await columnExists(gbTable.name, "recipient_client_id");
+      const target = hasRecipient ? "recipient_client_id = ?" : "client_id = ?";
+      const rows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instances",
+        columns: "COUNT(*) AS c",
+        where: target,
+        params: [clientId],
+      });
+      giftbox = Math.max(0, Number(rows[0]?.c ?? 0) || 0);
+    }
+  } catch {
+    giftbox = 0;
+  }
+
+  // Credito / punti — the client-row balances that would be wiped.
+  let credito = 0;
+  let punti = 0;
+  try {
+    const bal = await dbWalletBalance(clientId, slug);
+    credito = roundMoney(bal.credit);
+    punti = bal.points;
+  } catch {
+    credito = 0;
+    punti = 0;
+  }
+
+  return {
+    vendite,
+    appuntamenti,
+    pacchetti,
+    prepagati,
+    giftcard,
+    giftbox,
+    documenti,
+    consensi,
+    schede_cliente: schedeRecords,
+    movimenti_fidelity: txCount + eventCount,
+    rettifiche_credito: rettifiche,
+    ricariche,
+    credito_cliente: credito,
+    punti,
+    saldo_giftcard: saldoGiftcard,
+  };
+}
+
+// Client TAGS — port of clients.php client_tags(): the customer_tags joined via
+// customer_tag_map for this client. Guarded so missing tables degrade to []. Used
+// by the detail view header. (The list mapper leaves tags=[] for performance.)
+export async function getDbClientTags(slug: string, clientId: number): Promise<Array<{ id: number; name: string }>> {
+  if (clientId <= 0) return [];
+  try {
+    const mapTable = await tenantTable(slug, "customer_tag_map");
+    const tagTable = await tenantTable(slug, "customer_tags");
+    if (!(await tableExists(mapTable.name)) || !(await tableExists(tagTable.name))) return [];
+    // The tenant filter lives on each table; tenantSelect scopes customer_tag_map,
+    // and we join customer_tags by name lookup per mapped id (avoids a cross-table
+    // raw join that tenantSelect doesn't model). Read the mapped tag ids first.
+    const mapRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "customer_tag_map",
+      columns: "tag_id",
+      where: "client_id = ?",
+      params: [clientId],
+    });
+    const ids = mapRows.map((r) => Number(r.tag_id ?? 0)).filter((n) => n > 0);
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const tagRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "customer_tags",
+      columns: "id, name",
+      where: `id IN (${placeholders})`,
+      params: ids,
+      orderBy: "name ASC",
+    });
+    return tagRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? "") })).filter((t) => t.id > 0);
+  } catch {
+    return [];
+  }
+}
+
+export type ManageClientDetail = {
+  client: ManagedClient;
+  fidelity: { points: number; creditBalance: number };
+  tags: Array<{ id: number; name: string }>;
+  block: { isBlocked: boolean; blockedAt: string | null; blockedInternalNote: string };
+  history: QuickBookClientHistorySummary;
+  residuals: QuickBookClientResidualsSummary;
+};
+
+// Full client DETAIL payload for the faithful "Apri" (action=view) page. Port of
+// clients.php action=view (client_load_accessible + client_profile_defaults + the
+// fidelity/credit cards + tags + the history summary). Bundles:
+//   - client    : the full anagrafica (mapClient)
+//   - fidelity  : points + credit_balance (clients row, via dbWalletBalance)
+//   - tags      : customer_tags joined via customer_tag_map
+//   - block     : is_blocked / blocked_at / blocked_internal_note (the "Disattivato" badge)
+//   - history   : appointments total + last/next visit + sales total
+//                 (quickBookClientHistorySummary)
+//   - residuals : active packages/prepaids/giftcards/giftbox/gifts + credit counts
+//                 (quickBookClientResidualsSummary) for the history-section badges
+// Tenant-scoped + clients-permission gated by the route. Deep per-table history
+// drilldowns (the legacy Storico page's per-status appointment tables, per-package
+// snapshots, per-giftcard/giftbox/quote/sale rows) are NOT included here — the UI
+// links to the existing dedicated pages for those (TODO: a richer history reader).
+export async function getManageClientDetail(slug: string, clientId: number): Promise<ManageClientDetail | null> {
+  if (clientId <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [clientId], limit: 1 });
+  if (!rows[0]) return null;
+  const row = rows[0];
+  const client = mapClient(row);
+
+  const [bal, tags, history, residuals] = await Promise.all([
+    dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 })),
+    getDbClientTags(slug, clientId),
+    quickBookClientHistorySummary(slug, clientId),
+    quickBookClientResidualsSummary(slug, clientId),
+  ]);
+
+  return {
+    client,
+    fidelity: { points: bal.points, creditBalance: bal.credit },
+    tags,
+    block: {
+      isBlocked: Number(row.is_blocked ?? 0) === 1,
+      blockedAt: row.blocked_at ? String(row.blocked_at) : null,
+      blockedInternalNote: String(row.blocked_internal_note ?? ""),
+    },
+    history,
+    residuals,
+  };
 }
 
 export async function listDbServices({

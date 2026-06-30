@@ -4,6 +4,7 @@ import { ManageOnboardingApp } from "@/components/manage-onboarding-app";
 import { ManageShell } from "@/components/manage-shell";
 import { ClientsContent } from "@/components/modules/clients-content";
 import { ClientFormContent } from "@/components/modules/client_form-content";
+import { ClientDetailContent } from "@/components/modules/client_detail-content";
 import { CommissionsContent } from "@/components/modules/commissions-content";
 import { CostsContent } from "@/components/modules/costs-content";
 import { CouponsContent } from "@/components/modules/coupons-content";
@@ -178,12 +179,23 @@ export default async function TenantPage({
 
   // Faithful client NEW / EDIT form. The clients list links to
   // index.php?page=clients&action=new|edit; route those to the faithful form
-  // (instead of the Tailwind ManagementApp fallback). action=view stays on the
-  // fallback for now (next step).
+  // (instead of the Tailwind ManagementApp fallback).
   if (page === "clients" && (query.action === "new" || query.action === "edit")) {
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ClientFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful client DETAIL ("Apri"). The clients list links to
+  // index.php?page=clients&action=view&id=<id>; route it to the faithful detail
+  // page (header card + fidelity/credit + tags + block status + history summary +
+  // delete confirm), instead of the Tailwind ManagementApp fallback.
+  if (page === "clients" && query.action === "view") {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <ClientDetailContent />
       </ManageShell>
     );
   }
