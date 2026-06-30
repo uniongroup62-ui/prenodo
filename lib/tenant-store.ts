@@ -19,6 +19,27 @@ export type ManagedClient = Client & {
   archived: boolean;
   createdAt: string;
   updatedAt: string;
+  // Full anagrafica fields (port of the legacy clients table). All optional so
+  // that list/summary callers that only need name/email/phone stay unaffected.
+  firstName?: string;
+  lastName?: string;
+  companyName?: string;
+  vatNumber?: string;
+  taxCode?: string;
+  sdi?: string;
+  pec?: string;
+  phoneHome?: string;
+  phone2?: string;
+  gender?: string;
+  birthDate?: string;
+  birthPlace?: string;
+  registrationDate?: string;
+  region?: string;
+  province?: string;
+  city?: string;
+  address?: string;
+  cap?: string;
+  jobTitle?: string;
 };
 
 export type ManagedService = Service & {

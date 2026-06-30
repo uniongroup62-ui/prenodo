@@ -100,38 +100,92 @@ export async function listDbClients({
   return rows.map(mapClient);
 }
 
+// Read a single client mapped to the full ManagedClient anagrafica. Used to
+// prefill the edit form (route action=get). Port of clients.php
+// client_load_accessible + client_profile_defaults.
+export async function getDbClient(id: number, slug: string): Promise<ManagedClient | null> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  return mapClient(rows[0]);
+}
+
+// Build the column -> value map for the full anagrafica, faithful to
+// clients.php client_save(). Each extended column is only written when it
+// exists in this install (older databases may lack a column). full_name is
+// kept coherent: if first/last are provided use "first last", else the provided
+// name. registration_date defaults to today (only on create).
+async function clientAnagraficaValues(
+  table: TenantTable,
+  input: Partial<ManagedClient>,
+  { isCreate }: { isCreate: boolean },
+): Promise<Record<string, unknown>> {
+  const first = String(input.firstName ?? "").trim();
+  const last = String(input.lastName ?? "").trim();
+  const composed = `${first} ${last}`.trim();
+  const providedName = String(input.name ?? "").trim();
+  const fullName = composed !== "" ? composed : providedName;
+
+  const values: Record<string, unknown> = {
+    // Base columns (always present on the clients table).
+    full_name: fullName !== "" ? fullName : normalizeName(input.name, "Nuovo cliente"),
+    phone: trimOrNull(input.phone),
+    email: trimOrNull(input.email),
+    notes: trimOrNull(input.note),
+    location_id: input.locationId && input.locationId > 0 ? input.locationId : null,
+  };
+
+  // Extended columns: only written if the column exists in this install.
+  const gender = String(input.gender ?? "").trim().toUpperCase();
+  const extended: Record<string, unknown> = {
+    first_name: first !== "" ? first : null,
+    last_name: last !== "" ? last : null,
+    company_name: trimOrNull(input.companyName),
+    vat_number: trimOrNull(input.vatNumber),
+    tax_code: trimOrNull(input.taxCode),
+    sdi: trimOrNull(input.sdi),
+    pec: trimOrNull(input.pec),
+    phone_home: trimOrNull(input.phoneHome),
+    phone2: trimOrNull(input.phone2),
+    gender: gender === "M" || gender === "F" ? gender : null,
+    birth_date: normalizeClientDate(input.birthDate),
+    birth_place: trimOrNull(input.birthPlace),
+    region: trimOrNull(input.region),
+    province: trimOrNull(input.province),
+    city: trimOrNull(input.city),
+    address: trimOrNull(input.address),
+    cap: trimOrNull(input.cap),
+    job_title: trimOrNull(input.jobTitle),
+  };
+
+  // registration_date: faithful default = today when not a valid date.
+  // On create we always set it; on update we only touch it when a value is sent.
+  const reg = normalizeClientDate(input.registrationDate);
+  if (isCreate) {
+    extended.registration_date = reg ?? todayIso();
+  } else if (input.registrationDate !== undefined) {
+    extended.registration_date = reg ?? todayIso();
+  }
+
+  for (const [col, val] of Object.entries(extended)) {
+    if (await columnExists(table.name, col)) values[col] = val;
+  }
+
+  return values;
+}
+
 export async function createDbClient(input: Partial<ManagedClient>, slug: string): Promise<ManagedClient> {
   const table = await tenantTable(slug, "clients");
-  const name = normalizeName(input.name, "Nuovo cliente");
-  const id = await tenantInsert(table, {
-    full_name: name,
-    first_name: firstName(name),
-    last_name: lastName(name),
-    email: input.email ?? null,
-    phone: input.phone ?? null,
-    location_id: input.locationId && input.locationId > 0 ? input.locationId : null,
-    notes: input.note ?? null,
-    registration_date: todayIso(),
-    points: 0,
-    credit_balance: 0,
-    is_blocked: 0,
-  });
-
+  const values = await clientAnagraficaValues(table, input, { isCreate: true });
+  values.points = 0;
+  values.credit_balance = 0;
+  values.is_blocked = 0;
+  const id = await tenantInsert(table, values);
   return getSingleClient(slug, id);
 }
 
 export async function updateDbClient(id: number, input: Partial<ManagedClient>, slug: string): Promise<ManagedClient> {
-  const values: Record<string, unknown> = {
-    full_name: input.name,
-    email: input.email,
-    phone: input.phone,
-    location_id: input.locationId && input.locationId > 0 ? input.locationId : undefined,
-    notes: input.note,
-  };
-  if (input.name) {
-    values.first_name = firstName(input.name);
-    values.last_name = lastName(input.name);
-  }
+  const table = await tenantTable(slug, "clients");
+  const values = await clientAnagraficaValues(table, input, { isCreate: false });
   await tenantUpdate({ slug, table: "clients", id, values });
   return getSingleClient(slug, id);
 }
@@ -5579,6 +5633,27 @@ function mapClient(row: RowDataPacket): ManagedClient {
     value: `${roundMoney(value)} euro`,
     next: "-",
     note: String(row.notes ?? ""),
+    // Full anagrafica (port of clients.php client_profile_defaults + the columns
+    // edited by the new/edit form). Empty strings keep the edit-form prefill simple.
+    firstName: String(row.first_name ?? ""),
+    lastName: String(row.last_name ?? ""),
+    companyName: String(row.company_name ?? ""),
+    vatNumber: String(row.vat_number ?? ""),
+    taxCode: String(row.tax_code ?? ""),
+    sdi: String(row.sdi ?? ""),
+    pec: String(row.pec ?? ""),
+    phoneHome: String(row.phone_home ?? ""),
+    phone2: String(row.phone2 ?? ""),
+    gender: String(row.gender ?? ""),
+    birthDate: row.birth_date ? String(row.birth_date).slice(0, 10) : "",
+    birthPlace: String(row.birth_place ?? ""),
+    registrationDate: row.registration_date ? String(row.registration_date).slice(0, 10) : "",
+    region: String(row.region ?? ""),
+    province: String(row.province ?? ""),
+    city: String(row.city ?? ""),
+    address: String(row.address ?? ""),
+    cap: String(row.cap ?? ""),
+    jobTitle: String(row.job_title ?? ""),
   };
 }
 
@@ -5698,15 +5773,6 @@ function randomHex(length: number): string {
   return randomBytes(Math.ceil(length / 2)).toString("hex").slice(0, length);
 }
 
-function firstName(name: string): string {
-  return name.trim().split(/\s+/)[0] ?? name;
-}
-
-function lastName(name: string): string {
-  const parts = name.trim().split(/\s+/);
-  return parts.length > 1 ? parts.slice(1).join(" ") : "";
-}
-
 function parseDuration(value: unknown, fallback: number): number {
   const parsed = Number.parseInt(String(value ?? "").replace(/[^0-9]/g, ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -5723,6 +5789,22 @@ function roundMoney(value: number): number {
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Port of clients.php normalize_date(): accepts a strict YYYY-MM-DD string and
+// returns it, otherwise null (invalid/empty -> not persisted).
+function normalizeClientDate(value: unknown): string | null {
+  const s = String(value ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const [y, m, d] = s.split("-").map((part) => Number.parseInt(part, 10));
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== m - 1 || date.getUTCDate() !== d) return null;
+  return s;
+}
+
+function trimOrNull(value: unknown): string | null {
+  const s = String(value ?? "").trim();
+  return s === "" ? null : s;
 }
 
 function addDaysDate(days: number): string {

@@ -4,6 +4,7 @@ import {
   archiveDbClient,
   createDbClient,
   deleteDbClient,
+  getDbClient,
   listDbClients,
   quickBookClientContext,
   updateDbClient,
@@ -69,6 +70,20 @@ export async function GET(request: Request) {
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");
+    }
+  }
+
+  // Edit-form prefill: return the full client anagrafica for one id. Port of
+  // clients.php action=edit (client_load_accessible + client_profile_defaults).
+  if (url.searchParams.get("action") === "get") {
+    const clientId = parseInteger(url.searchParams.get("id"));
+    if (clientId <= 0) return jsonError("ID cliente mancante.");
+    try {
+      const client = await getDbClient(clientId, tenantSlug);
+      if (!client) return jsonError("Cliente non trovato.", 404);
+      return Response.json({ ok: true, source: "clients?action=get", sourceMode: "database", client });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore cliente.");
     }
   }
 
@@ -141,14 +156,34 @@ async function clientInputFromBody(body: Record<string, string>, tenantSlug: str
   });
 
   return {
-    name: body.name ?? body.client_name,
+    name: body.name ?? body.client_name ?? body.full_name,
     email: body.email,
     phone: body.phone,
     locationId,
     lastVisit: body.last_visit,
     value: body.value,
     next: body.next,
-    note: body.note,
+    note: body.note ?? body.notes,
     tags: body.tags ? body.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : undefined,
+    // Full anagrafica (port of clients.php new/edit $_POST fields).
+    firstName: body.first_name,
+    lastName: body.last_name,
+    companyName: body.company_name,
+    vatNumber: body.vat_number,
+    taxCode: body.tax_code,
+    sdi: body.sdi,
+    pec: body.pec,
+    phoneHome: body.phone_home,
+    phone2: body.phone2,
+    gender: body.gender,
+    birthDate: body.birth_date,
+    birthPlace: body.birth_place,
+    registrationDate: body.registration_date,
+    region: body.region,
+    province: body.province,
+    city: body.city,
+    address: body.address,
+    cap: body.cap,
+    jobTitle: body.job_title,
   };
 }
