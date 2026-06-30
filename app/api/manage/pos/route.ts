@@ -206,7 +206,26 @@ function normalizeSaleItemInput(item: Record<string, unknown>): PosSaleItemInput
     startDate: packageMetaString(item.startDate ?? item.start_date ?? item.package_start_date),
     expiresAt: packageMetaString(item.expiresAt ?? item.expires_at ?? item.package_expires_at),
     note: packageMetaString(item.note ?? item.package_note),
+    // GiftCard sale meta (faithful to the legacy issue_giftcard POST fields): the chosen
+    // recipient (client/free-text), optional custom code, expiry, dedica + hide-amount
+    // toggle. Read only for a type:"giftcard" line when issuing the giftcards row.
+    recipientClientId: parseInteger(item.recipientClientId ?? item.recipient_client_id, 0) || undefined,
+    recipientName: packageMetaString(item.recipientName ?? item.recipient_name),
+    recipientEmail: packageMetaString(item.recipientEmail ?? item.recipient_email),
+    code: packageMetaString(item.code ?? item.giftcard_code),
+    eventType: packageMetaString(item.eventType ?? item.event_type),
+    message: packageMetaString(item.message ?? item.gift_message),
+    hideAmount: parseBoolean(item.hideAmount ?? item.hide_amount),
   };
+}
+
+function parseBoolean(value: unknown): boolean | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "boolean") return value;
+  const text = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on", "si"].includes(text)) return true;
+  if (["0", "false", "no", "off"].includes(text)) return false;
+  return undefined;
 }
 
 function packageMetaString(value: unknown): string | undefined {

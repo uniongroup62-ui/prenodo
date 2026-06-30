@@ -113,7 +113,7 @@ type ClientResiduals = {
 
 type CartLine = {
   key: string;
-  type: "service" | "product" | "package" | "prepaid";
+  type: "service" | "product" | "package" | "prepaid" | "giftcard";
   refId: number;
   name: string;
   quantity: number;
@@ -125,6 +125,16 @@ type CartLine = {
   expiresAt?: string;
   note?: string;
   sessions?: number;
+  // GIFTCARD meta (qty locked to 1; the line price is the card amount). Carried to checkout
+  // so issueGiftcardFromSale writes the giftcards row with the chosen recipient/code/expiry/
+  // dedica/hide-amount.
+  recipientClientId?: number;
+  recipientName?: string;
+  recipientEmail?: string;
+  code?: string;
+  eventType?: string;
+  message?: string;
+  hideAmount?: boolean;
 };
 
 // Legacy POS base payment type (the single payment_type radio: cash/card/check/bank).
@@ -255,6 +265,21 @@ export function PosContent() {
   const [packageExpires, setPackageExpires] = useState("");
   const [packageExpiresTouched, setPackageExpiresTouched] = useState(false);
   const [packageNote, setPackageNote] = useState("");
+
+  // GIFTCARD sale modal (wired): the configured card. Amount + recipient are required; the
+  // recipient defaults to the selected sale client (so the card lands in their residui), or
+  // a free-text name. Optional custom code (else auto), expiry (editable), dedica message,
+  // and the hide-amount voucher toggle. "Aggiungi" pushes a {type:"giftcard"} cart line.
+  const [gcAmount, setGcAmount] = useState("");
+  const [gcEventType, setGcEventType] = useState("giftcard");
+  const [gcValidFrom, setGcValidFrom] = useState("");
+  const [gcExpiresAt, setGcExpiresAt] = useState("");
+  const [gcRecipientName, setGcRecipientName] = useState("");
+  const [gcRecipientEmail, setGcRecipientEmail] = useState("");
+  const [gcRecipientClientId, setGcRecipientClientId] = useState(0);
+  const [gcCode, setGcCode] = useState("");
+  const [gcMessage, setGcMessage] = useState("");
+  const [gcHideAmount, setGcHideAmount] = useState(false);
 
   // Checkout state.
   const [submitting, setSubmitting] = useState(false);
@@ -624,6 +649,90 @@ export function PosContent() {
     setCart((prev) => prev.filter((l) => l.key !== key));
   }
 
+  // Hide a Bootstrap modal by id (its data-bs handlers may not run for this dynamic markup).
+  function closePosModal(id: string) {
+    if (typeof document === "undefined") return;
+    const modalEl = document.getElementById(id);
+    const w = window as unknown as { bootstrap?: { Modal?: { getOrCreateInstance?: (el: Element) => { hide?: () => void } } } };
+    try {
+      w.bootstrap?.Modal?.getOrCreateInstance?.(modalEl as Element)?.hide?.();
+    } catch {
+      if (modalEl) {
+        modalEl.classList.remove("show");
+        (modalEl as HTMLElement).style.display = "none";
+      }
+    }
+  }
+
+  // ---- GIFTCARD sale (wired) ----
+  function resetGiftcardModal() {
+    setGcAmount("");
+    setGcEventType("giftcard");
+    setGcValidFrom("");
+    setGcExpiresAt("");
+    setGcRecipientName("");
+    setGcRecipientEmail("");
+    setGcRecipientClientId(0);
+    setGcCode("");
+    setGcMessage("");
+    setGcHideAmount(false);
+  }
+
+  // "Aggiungi alla lista": validate the amount + recipient and push a {type:"giftcard"} cart
+  // line — qty 1 at the card amount, carrying the recipient/code/expiry/dedica/hide-amount.
+  // Faithful to the legacy issue_giftcard validation (positive amount, recipient required,
+  // "Valida al" must be after the issue date). The card is issued server-side at checkout.
+  function addGiftcardToCart() {
+    setErrorMsg("");
+    const amount = roundMoney(Math.max(0, Number.parseFloat(gcAmount.replace(",", ".")) || 0));
+    if (amount <= 0) {
+      setErrorMsg("Inserisci un importo GiftCard valido.");
+      return;
+    }
+    // Recipient: an existing client (so the card lands in their residui) OR a free-text name,
+    // defaulting to the selected sale client when neither is set.
+    const recipientClientId = gcRecipientClientId > 0 ? gcRecipientClientId : (clientId ?? 0) > 0 ? (clientId as number) : 0;
+    const recipientName = gcRecipientName.trim() || (recipientClientId > 0 ? clientName.trim() : "");
+    if (recipientClientId <= 0 && !recipientName) {
+      setErrorMsg("Inserisci un destinatario per la GiftCard.");
+      return;
+    }
+    const validFrom = gcValidFrom || today;
+    const expiresAt = gcExpiresAt.trim();
+    if (expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(expiresAt)) {
+      setErrorMsg('Data "Valida al" non valida.');
+      return;
+    }
+    if (expiresAt && validFrom >= expiresAt) {
+      setErrorMsg('La data "Valida al" deve essere successiva a "Valida dal".');
+      return;
+    }
+    const code = gcCode.trim().toUpperCase();
+    const labelName = recipientName || (code ? code : "Destinatario");
+    setCart((prev) => [
+      {
+        key: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        type: "giftcard",
+        refId: 0,
+        name: `GiftCard ${labelName}`,
+        quantity: 1,
+        unitPrice: amount,
+        status: "prepaid",
+        expiresAt: expiresAt || undefined,
+        recipientClientId: recipientClientId > 0 ? recipientClientId : undefined,
+        recipientName: recipientName || undefined,
+        recipientEmail: gcRecipientEmail.trim() || undefined,
+        code: code || undefined,
+        eventType: gcEventType || "giftcard",
+        message: gcMessage.trim() || undefined,
+        hideAmount: gcHideAmount,
+      },
+      ...prev,
+    ]);
+    resetGiftcardModal();
+    closePosModal("posModalGiftcard");
+  }
+
   // ---- Coupon preview (wired) ----
   // Reset the applied coupon (invalidates any in-flight preview via the req-id).
   const clearCouponState = useCallback(() => {
@@ -761,6 +870,20 @@ export function PosContent() {
         // client_packages row with the right validity window + note.
         ...(line.type === "package"
           ? { startDate: line.startDate ?? "", expiresAt: line.expiresAt ?? "", note: line.note ?? "" }
+          : {}),
+        // GiftCard meta (only set on giftcard lines): the backend reads these to issue the
+        // giftcards row with the chosen recipient/code/expiry/dedica/hide-amount.
+        ...(line.type === "giftcard"
+          ? {
+              recipientClientId: line.recipientClientId ?? 0,
+              recipientName: line.recipientName ?? "",
+              recipientEmail: line.recipientEmail ?? "",
+              code: line.code ?? "",
+              eventType: line.eventType ?? "",
+              expiresAt: line.expiresAt ?? "",
+              message: line.message ?? "",
+              hideAmount: line.hideAmount ? 1 : 0,
+            }
           : {}),
       })),
     );
@@ -946,7 +1069,10 @@ export function PosContent() {
                       // A package line is a fixed single unit (qty locked, like the legacy
                       // disabled qty input); the validity window/note + session count show
                       // under the name. A prepaid line is a per-session service (qty = sessions).
+                      // A giftcard line is also a fixed single unit (the card amount); the
+                      // recipient/expiry show under the name.
                       const isPackage = line.type === "package";
+                      const isGiftcard = line.type === "giftcard";
                       const label = isPackage
                         ? `Pacchetto • ${line.name}`
                         : line.type === "prepaid"
@@ -963,7 +1089,15 @@ export function PosContent() {
                             .join(" • ")
                         : line.type === "prepaid"
                           ? `${line.quantity} sedute prepagate`
-                          : "";
+                          : isGiftcard
+                            ? [
+                                line.recipientName ? `Destinatario: ${line.recipientName}` : "",
+                                line.code ? `Codice: ${line.code}` : "Codice: auto",
+                                line.expiresAt ? `Valida al: ${line.expiresAt}` : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" • ")
+                            : "";
                       return (
                       <tr data-item-row="1" data-type={line.type} data-id={line.refId} key={line.key}>
                         <td className="text-uppercase small">{line.type}</td>
@@ -978,7 +1112,7 @@ export function PosContent() {
                             min={1}
                             step={1}
                             value={line.quantity}
-                            disabled={isPackage}
+                            disabled={isPackage || isGiftcard}
                             onChange={(e) => setQty(line.key, Number.parseInt(e.target.value, 10))}
                           />
                         </td>
@@ -2239,20 +2373,36 @@ export function PosContent() {
 
             <div className="modal-body">
               <div className="small text-muted mb-2">
-                Mittente: <strong id="posGiftcardClientLabel">—</strong>
+                Mittente: <strong id="posGiftcardClientLabel">{clientId ? clientName : "Cliente banco"}</strong>
               </div>
 
               <div className="row g-2">
                 <div className="col-12">
                   <label className="form-label">Importo (€)</label>
-                  <input className="form-control" type="number" step="0.01" min="0" id="posGcAmount" placeholder="Es. 20" required />
+                  <input
+                    className="form-control"
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    id="posGcAmount"
+                    placeholder="Es. 20"
+                    required
+                    value={gcAmount}
+                    onChange={(e) => setGcAmount(e.target.value)}
+                  />
                 </div>
               </div>
 
               <div className="row g-2 mt-3">
                 <div className="col-12">
                   <label className="form-label">Evento</label>
-                  <select className="form-select" id="posGcEventType" required defaultValue="giftcard">
+                  <select
+                    className="form-select"
+                    id="posGcEventType"
+                    required
+                    value={gcEventType}
+                    onChange={(e) => setGcEventType(e.target.value)}
+                  >
                     <option value="giftcard">GiftCard (generica)</option>
                     <option value="compleanno">Compleanno</option>
                     <option value="anniversario">Anniversario</option>
@@ -2272,89 +2422,111 @@ export function PosContent() {
               <div className="row g-2 mt-3">
                 <div className="col-6">
                   <label className="form-label small text-muted mb-1">Valida dal</label>
-                  <input className="form-control" type="date" id="posGcValidFrom" min={today} required />
+                  <input
+                    className="form-control"
+                    type="date"
+                    id="posGcValidFrom"
+                    min={today}
+                    required
+                    value={gcValidFrom || today}
+                    onChange={(e) => setGcValidFrom(e.target.value)}
+                  />
                 </div>
                 <div className="col-6">
                   <label className="form-label small text-muted mb-1">Valida al</label>
-                  <input className="form-control" type="date" id="posGcExpiresAt" />
+                  <input
+                    className="form-control"
+                    type="date"
+                    id="posGcExpiresAt"
+                    value={gcExpiresAt}
+                    onChange={(e) => setGcExpiresAt(e.target.value)}
+                  />
+                  <div className="form-text">Vuoto = scadenza predefinita GiftCard (default 12 mesi).</div>
                 </div>
               </div>
 
+              {/* Destinatario: un cliente esistente (la GiftCard finisce nei suoi residui) o
+                  un nome libero. Il select default sul cliente della vendita. */}
               <div className="row g-2 mt-3">
+                <div className="col-12">
+                  <label className="form-label small text-muted mb-1">Destinatario (cliente)</label>
+                  <select
+                    className="form-select"
+                    id="posGiftcardRecipientClientId"
+                    value={gcRecipientClientId || (clientId ?? 0)}
+                    onChange={(e) => {
+                      const id = Number.parseInt(e.target.value, 10) || 0;
+                      setGcRecipientClientId(id);
+                      const picked = clients.find((c) => c.id === id);
+                      if (picked) {
+                        setGcRecipientName(picked.name);
+                        if (picked.email) setGcRecipientEmail(picked.email);
+                      }
+                    }}
+                  >
+                    <option value={0}>Nessuno (usa nome libero)</option>
+                    {clients.map((c) => (
+                      <option value={c.id} key={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="row g-2 mt-2">
                 <div className="col-6">
-                  <label className="form-label small text-muted mb-1">Destinatario</label>
-                  <input className="form-control" type="text" id="posGcRecipientName" placeholder="Nome" required />
+                  <label className="form-label small text-muted mb-1">Destinatario (nome)</label>
+                  <input
+                    className="form-control"
+                    type="text"
+                    id="posGcRecipientName"
+                    placeholder="Nome"
+                    required
+                    value={gcRecipientName}
+                    onChange={(e) => setGcRecipientName(e.target.value)}
+                  />
                 </div>
                 <div className="col-6">
                   <label className="form-label small text-muted mb-1">Email destinatario</label>
-                  <input className="form-control" type="email" id="posGcRecipientEmail" placeholder="Email (opzionale)" />
+                  <input
+                    className="form-control"
+                    type="email"
+                    id="posGcRecipientEmail"
+                    placeholder="Email (opzionale)"
+                    value={gcRecipientEmail}
+                    onChange={(e) => setGcRecipientEmail(e.target.value)}
+                  />
                 </div>
               </div>
 
               <div className="row g-2 mt-2">
                 <div className="col-12">
-                  <div className="form-check">
-                    <input className="form-check-input" type="checkbox" id="posGcRecipientExistingToggle" value="1" />
-                    <label className="form-check-label" htmlFor="posGcRecipientExistingToggle">
-                      Destinatario già cliente
-                    </label>
-                  </div>
+                  <label className="form-label small text-muted mb-1">Codice (opzionale)</label>
+                  <input
+                    className="form-control text-uppercase"
+                    type="text"
+                    id="posGcCode"
+                    placeholder="Auto se vuoto (GC-XXXX-XXXX-XXXX)"
+                    maxLength={24}
+                    value={gcCode}
+                    onChange={(e) => setGcCode(e.target.value.toUpperCase())}
+                  />
                 </div>
               </div>
-
-              <div className="mt-2 d-none" id="posGcRecipientExistingBox">
-                <div className="border rounded p-3 mb-2 d-none" id="posGcRecipientSelectedBox">
-                  <div className="d-flex justify-content-between align-items-start">
-                    <div>
-                      <div className="fw-semibold" id="posGcRecipientSelectedName"></div>
-                      <div className="text-muted small" id="posGcRecipientSelectedMeta"></div>
-                    </div>
-                    <button type="button" className="btn btn-sm btn-outline-danger" id="posGcRecipientRemoveBtn" title="Rimuovi destinatario">
-                      <i className="bi bi-x-lg"></i>
-                    </button>
-                  </div>
-                  <div className="alert mt-2 mb-0 py-2 px-3 small d-none" id="posGcRecipientFidelityAlert"></div>
-                </div>
-
-                <div id="posGcRecipientSearchWrap">
-                  <div className="input-group input-group-sm mb-2">
-                    <span className="input-group-text">
-                      <i className="bi bi-search"></i>
-                    </span>
-                    <input className="form-control" type="text" id="posGcRecipientClientSearch" placeholder="Cerca destinatario..." />
-                  </div>
-
-                  <div className="border rounded pos-scroll-160" id="posGcRecipientClientList">
-                    {clients.map((c) => (
-                      <button
-                        type="button"
-                        className="pos-client-row pos-client-row-compact"
-                        data-client-id={c.id}
-                        data-name={c.name}
-                        data-email={c.email ?? ""}
-                        data-phone={c.phone ?? ""}
-                        key={c.id}
-                      >
-                        <div className="d-flex justify-content-between align-items-start">
-                          <div>
-                            <div className="fw-semibold">{c.name}</div>
-                            {c.phone ? <div className="small text-muted">{c.phone}</div> : null}
-                          </div>
-                          <div className="small text-muted">ID {c.id}</div>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              <input type="hidden" id="posGiftcardRecipientClientId" value="" readOnly />
 
               <div className="row g-2 mt-2">
                 <div className="col-12">
                   <label className="form-label">Voucher (destinatario)</label>
                   <div className="form-check mt-1">
-                    <input className="form-check-input" type="checkbox" id="posGcVoucherHideAmount" value="1" />
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="posGcVoucherHideAmount"
+                      value="1"
+                      checked={gcHideAmount}
+                      onChange={(e) => setGcHideAmount(e.target.checked)}
+                    />
                     <label className="form-check-label" htmlFor="posGcVoucherHideAmount">
                       Nascondi importo nel voucher pubblico (QR)
                     </label>
@@ -2366,7 +2538,14 @@ export function PosContent() {
               </div>
 
               <label className="form-label mt-3">Messaggio di dedica</label>
-              <textarea className="form-control" id="posGcMessage" rows={3} placeholder="(opzionale)"></textarea>
+              <textarea
+                className="form-control"
+                id="posGcMessage"
+                rows={3}
+                placeholder="(opzionale)"
+                value={gcMessage}
+                onChange={(e) => setGcMessage(e.target.value)}
+              ></textarea>
 
               <label className="form-label mt-3">Nota per il cliente</label>
               <textarea className="form-control" id="posGcNote" rows={2} placeholder="(opzionale)"></textarea>
@@ -2420,7 +2599,7 @@ export function PosContent() {
               <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">
                 Annulla
               </button>
-              <button type="button" className="btn btn-primary" id="posGiftcardCreateBtn">
+              <button type="button" className="btn btn-primary" id="posGiftcardCreateBtn" onClick={addGiftcardToCart}>
                 Aggiungi alla lista
               </button>
             </div>

@@ -1,5 +1,6 @@
 import "server-only";
 
+import { randomBytes } from "node:crypto";
 import type { RowDataPacket } from "mysql2/promise";
 import type {
   ManagedClient,
@@ -294,6 +295,11 @@ export async function checkoutManageSale(
     }
     if (item.type === "prepaid" && client.id > 0) await issuePrepaidFromSale(slug, saleId, saleItemId, client.id, item);
     if (item.type === "package" && client.id > 0) await issuePackageFromSale(slug, saleId, client.id, item);
+    // SELL a GiftCard: issue a real giftcards row owned by the chosen recipient (so it
+    // appears in their residui/voucher). The card amount is the line price (qty 1). A
+    // bench sale (no buyer + no recipient picked) cannot own a card, so it is gated on a
+    // resolvable recipient inside issueGiftcardFromSale.
+    if (item.type === "giftcard") await issueGiftcardFromSale(slug, saleId, client.id, item, locationId);
   }
 
   if (input.appointmentId && input.appointmentId > 0) {
@@ -666,8 +672,13 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
     // the line meta and the issued sessions are read from the package template, NOT the
     // line qty. For a PREPAID line the qty IS the purchased session count (per-session
     // unitPrice), so it flows straight into client_prepaid_services.purchased_qty.
+    // A GIFTCARD line is also a single unit at the card amount (faithful to the legacy
+    // issue_giftcard sale_items row: qty 1, unit_price = line_total = amount), so the sale
+    // TOTAL equals the giftcard amount. The recipient/code/expiry/dedica/hide-amount ride
+    // on the line meta and are read by issueGiftcardFromSale at checkout.
     const isPackage = input.type === "package";
-    const lineQty = isPackage ? 1 : quantity;
+    const isGiftcard = input.type === "giftcard";
+    const lineQty = isPackage || isGiftcard ? 1 : quantity;
     const unitPrice = roundMoney(input.unitPrice ?? 0);
     items.push({
       id: index + 1,
@@ -681,6 +692,13 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
       startDate: clean(input.startDate, 10) || undefined,
       expiresAt: clean(input.expiresAt, 10) || undefined,
       note: clean(input.note, 255) || undefined,
+      recipientClientId: isGiftcard ? Math.max(0, Number(input.recipientClientId ?? 0) || 0) || undefined : undefined,
+      recipientName: isGiftcard ? clean(input.recipientName, 120) || undefined : undefined,
+      recipientEmail: isGiftcard ? clean(input.recipientEmail, 190) || undefined : undefined,
+      code: isGiftcard ? clean(input.code, 24).toUpperCase() || undefined : undefined,
+      eventType: isGiftcard ? clean(input.eventType, 32) || undefined : undefined,
+      message: isGiftcard ? clean(input.message, 2000) || undefined : undefined,
+      hideAmount: isGiftcard ? input.hideAmount === true : undefined,
     });
   }
   return items.filter((item) => item.quantity > 0);
@@ -859,6 +877,12 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   await updateBySaleId(slug, "sale_installment_plans", saleId, { status: "cancelled", cancelled_at: new Date(), cancelled_reason: reason });
   await updateBySaleId(slug, "sale_installments", saleId, { status: "cancelled", note: reason });
 
+  // CANCEL the GiftCard this sale ISSUED (the SELL path): flip the card to 'cancelled' +
+  // write a reversal ledger row. Found by the issue transaction's sale marker, NOT by
+  // sales.giftcard_id (that column is the RESIDUI card the sale SPENT — a different card,
+  // restored below). Keyed off the sale linkage so the two never collide.
+  await cancelIssuedSaleGiftcards(slug, saleId, reason);
+
   // Restore the residui consumed at checkout: refund the GiftCard balance (re-activating
   // a card the redeem flipped to 'redeemed') and credit the wallet back. Both are linked
   // by the sale row's credit_used / giftcard_id / giftcard_used columns. Best-effort and
@@ -903,6 +927,72 @@ async function updateBySaleId(slug: string, tableName: string, saleId: number, v
   const rows = await tenantSelect<RowDataPacket>({ slug, table: tableName, columns: "id", where: "sale_id=?", params: [saleId] }).catch(() => []);
   for (const row of rows) {
     await tenantUpdate({ slug, table: tableName, id: Number(row.id ?? 0), values }).catch(() => 0);
+  }
+}
+
+// Cancel any GiftCard(s) this sale ISSUED (the SELL path), found via the 'issue'
+// giftcard_transactions row tagged with the sale marker (meta_json or note). Flips each
+// still-active card to status='cancelled' (+ cancelled_at / cancelled_reason) and writes a
+// 'cancel' reversal ledger row so the issued credit is voided. Best-effort + idempotent:
+// only an 'active'/'redeemed' card is touched (a card already cancelled / used elsewhere is
+// left as-is), so a re-void is a no-op. This is distinct from the residui restore which
+// reverses a card the sale SPENT (keyed off sales.giftcard_id) — keyed off sale linkage so
+// the two giftcards (sold vs spent) never collide.
+async function cancelIssuedSaleGiftcards(slug: string, saleId: number, reason: string): Promise<void> {
+  const txTable = await tenantTable(slug, "giftcard_transactions").catch(() => null);
+  const giftcardTable = await tenantTable(slug, "giftcards").catch(() => null);
+  if (!txTable || !giftcardTable) return;
+
+  // Find the issue rows for this sale. Match the meta_json sale_id (preferred) or the note
+  // marker — both written by issueGiftcardFromSale. Scoped to type='issue' so only the SELL
+  // ledger row matches (a redeem/cancel row for the same card is ignored).
+  const marker = `%${GIFTCARD_SALE_MARKER}${saleId}]%`;
+  const metaMatch = `%"sale_id":${saleId}%`;
+  const txRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: txTable.name,
+    columns: "giftcard_id",
+    where: "type = 'issue' AND (meta_json LIKE ? OR note LIKE ?)",
+    params: [metaMatch, marker],
+  }).catch(() => [] as RowDataPacket[]);
+
+  const seen = new Set<number>();
+  for (const tx of txRows) {
+    const giftcardId = Math.max(0, Number(tx.giftcard_id ?? 0) || 0);
+    if (giftcardId <= 0 || seen.has(giftcardId)) continue;
+    seen.add(giftcardId);
+
+    const cardRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: giftcardTable.name,
+      columns: "id, balance, status",
+      where: "id = ?",
+      params: [giftcardId],
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    const card = cardRows[0];
+    if (!card) continue;
+    const status = String(card.status ?? "").toLowerCase();
+    // Idempotent: skip a card already cancelled/expired (a re-void must not re-cancel).
+    if (status === "cancelled" || status === "canceled" || status === "expired") continue;
+    const balance = roundMoney(Math.max(0, Number(card.balance ?? 0) || 0));
+
+    await tenantUpdate({
+      slug,
+      table: giftcardTable.name,
+      id: giftcardId,
+      values: { status: "cancelled", cancelled_at: new Date(), cancelled_reason: clean(reason, 255) || `Storno vendita #${saleId}` },
+    }).catch(() => 0);
+
+    await tenantInsert(txTable, await filterColumns(txTable.name, {
+      giftcard_id: giftcardId,
+      type: "cancel",
+      // Reverse the still-available balance (negative), mirroring the legacy cancel ledger.
+      amount: -balance,
+      note: `Annullamento GiftCard (storno vendita #${saleId})`,
+      meta_json: JSON.stringify({ source: "sale_cancel", sale_id: saleId }),
+      created_at: new Date(),
+    })).catch(() => undefined);
   }
 }
 
@@ -961,6 +1051,179 @@ async function issuePackageFromSale(slug: string, saleId: number, clientId: numb
 async function packageRowById(slug: string, id: number): Promise<RowDataPacket | null> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "packages", where: "id=?", params: [id], limit: 1 }).catch(() => []);
   return rows[0] ?? null;
+}
+
+// Marker stored on the issue giftcard_transactions row (note + meta_json) so a later sale
+// VOID can find the giftcard this sale ISSUED — the giftcards table has no sale_id column,
+// so the sale linkage rides on the issue ledger entry. cancelLinkedSaleResidues parses it
+// back to flip the issued card to 'cancelled' (kept distinct from a RESIDUI giftcard that
+// was merely spent on the sale — that is a different card, keyed off sales.giftcard_id).
+const GIFTCARD_SALE_MARKER = "[possale:";
+
+// SELL a GiftCard at checkout — faithful port of GiftCard::issueGiftCard (app/lib/GiftCard.php
+// ~1465) + the pos.php issue_giftcard action (~2781). Inserts a `giftcards` row owned by the
+// recipient (recipient_client_id, so it surfaces in their residui/voucher) with a unique
+// uppercase CODE, initial_amount + balance = the line amount, status='active', issued_at,
+// expires_at (from the giftcard validity setting, default +12 months / +365d), location_id,
+// and the voucher fields (voucher_public_token + voucher_hide_amount / email_show_amount).
+// Also writes the 'issue' giftcard_transactions ledger row tagged with the sale id (note +
+// meta_json) for the void reversal. Returns the new giftcards id (0 when not issued).
+// Optional issue email is OUT OF SCOPE (the giftcard-send cron delivers it) — see TODO below.
+async function issueGiftcardFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<number> {
+  const giftcardTable = await tenantTable(slug, "giftcards").catch(() => null);
+  if (!giftcardTable) return 0;
+
+  // Amount = the line price (qty is forced to 1, so total === unitPrice). Faithful to the
+  // legacy sale_items row: 1 @ amount. Skip silently when the amount is not positive.
+  const amount = roundMoney(Math.max(0, item.total > 0 ? item.total : item.unitPrice));
+  if (amount <= 0) return 0;
+
+  // Owner = the recipient client the staff picked (defaults to the sale buyer). A card with
+  // no owner cannot show in any residui, so a bench sale with no recipient is skipped.
+  const recipientClientId = Math.max(0, Number(item.recipientClientId ?? 0) || 0) || (clientId > 0 ? clientId : 0);
+  const hasRecipientColumn = await columnExists(giftcardTable.name, "recipient_client_id");
+  if (recipientClientId <= 0 && (!item.recipientName || !item.recipientName.trim())) return 0;
+
+  const recipientName = clean(item.recipientName, 120)
+    || (recipientClientId > 0 ? await clientName(slug, recipientClientId) : "")
+    || "Destinatario";
+  const recipientEmail = clean(item.recipientEmail, 190) || null;
+
+  // CODE: honour a custom uppercase code (must be unique), else generate a unique one in the
+  // legacy GC-XXXX-XXXX-XXXX format (unambiguous alphabet, no O/0 or I/1).
+  const code = await resolveUniqueGiftcardCode(slug, giftcardTable.name, item.code);
+
+  // EXPIRY: the custom "Valida al" the staff set, else the giftcard validity default from
+  // the businesses settings (value + unit), else +365d (task fallback ~12 months).
+  const issuedAtYmd = todayIso();
+  let expiresAt: string | null = item.expiresAt && /^\d{4}-\d{2}-\d{2}$/.test(item.expiresAt) ? item.expiresAt : null;
+  if (!expiresAt) expiresAt = await defaultGiftcardExpiry(slug, issuedAtYmd);
+
+  const hideAmount = item.hideAmount === true ? 1 : 0;
+  const hasTokenColumn = await columnExists(giftcardTable.name, "voucher_public_token");
+
+  const giftcardId = await tenantInsert(giftcardTable, await filterColumns(giftcardTable.name, {
+    voucher_public_token: hasTokenColumn ? randomHex(64) : undefined,
+    code,
+    client_id: clientId > 0 ? clientId : null,
+    recipient_client_id: hasRecipientColumn ? (recipientClientId > 0 ? recipientClientId : null) : undefined,
+    recipient_name: recipientName,
+    recipient_email: recipientEmail,
+    event_type: clean(item.eventType, 32) || "giftcard",
+    voucher_hide_amount: hideAmount,
+    // email_show_amount mirrors the modal hide-amount toggle (legacy default 1 = show).
+    email_show_amount: hideAmount ? 0 : 1,
+    initial_amount: amount,
+    balance: amount,
+    currency: "EUR",
+    status: "active",
+    issued_at: new Date(),
+    expires_at: expiresAt,
+    gift_message: clean(item.message, 2000) || null,
+    note: `Emessa da vendita #${saleId}`,
+    location_id: locationId > 0 ? locationId : null,
+  })).catch(() => 0);
+  if (!giftcardId) return 0;
+
+  // 'issue' ledger row, tagged with the sale id (note marker + meta_json) so the void
+  // reversal can find this exact card. Best-effort: a missing transactions table is a no-op.
+  const txTable = await tenantTable(slug, "giftcard_transactions").catch(() => null);
+  if (txTable) {
+    await tenantInsert(txTable, await filterColumns(txTable.name, {
+      giftcard_id: giftcardId,
+      type: "issue",
+      amount,
+      note: `Emissione GiftCard ${GIFTCARD_SALE_MARKER}${saleId}]`,
+      meta_json: JSON.stringify({ source: "sale", sale_id: saleId }),
+      created_at: new Date(),
+      location_id: locationId > 0 ? locationId : null,
+    })).catch(() => undefined);
+  }
+
+  // TODO: optional issue email (recipient_email / scheduled_send_on). Out of scope here —
+  // the giftcard-send cron (GiftCard::sendDueScheduledGiftCards) handles delivery.
+  return giftcardId;
+}
+
+// Unique uppercase giftcard CODE — port of GiftCard::generateCode (GC-XXXX-XXXX-XXXX,
+// unambiguous alphabet) + the issueGiftCard 20-try uniqueness loop, mirroring the
+// generateUniqueAppointmentPublicCode pattern. A staff-supplied custom code is honoured
+// when free (uppercased, <= 24 chars); otherwise codes are generated until one is unused.
+async function resolveUniqueGiftcardCode(slug: string, tableName: string, customCode?: string): Promise<string> {
+  const custom = clean(customCode, 24).toUpperCase();
+  if (custom && !(await giftcardCodeExists(slug, tableName, custom))) return custom;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const code = generateGiftcardCode();
+    if (!(await giftcardCodeExists(slug, tableName, code))) return code;
+  }
+  // Extremely unlikely fallthrough: append a timestamp suffix to force uniqueness.
+  return generateGiftcardCode().slice(0, 16) + Date.now().toString(36).toUpperCase().slice(-4);
+}
+
+async function giftcardCodeExists(slug: string, tableName: string, code: string): Promise<boolean> {
+  if (!code) return false;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: tableName,
+    columns: "id",
+    where: "code = ?",
+    params: [code],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  return rows.length > 0;
+}
+
+// GC-XXXX-XXXX-XXXX with the legacy unambiguous alphabet (no O/0, I/1) — GiftCard::generateCode.
+function generateGiftcardCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const pick = (n: number): string => {
+    let out = "";
+    for (let i = 0; i < n; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+    return out;
+  };
+  return `GC-${pick(4)}-${pick(4)}-${pick(4)}`;
+}
+
+// Default giftcard expiry when the staff leaves "Valida al" blank — port of the legacy
+// issueGiftCard auto-expiry: read businesses.giftcard_default_validity_value/_unit
+// (days/months/years) and add it to the issue date. Falls back to +365d (~12 months, the
+// task default) when the setting is unset/zero or the column is missing. Returns YYYY-MM-DD.
+async function defaultGiftcardExpiry(slug: string, issuedAtYmd: string): Promise<string> {
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "giftcard_default_validity_value, giftcard_default_validity_unit",
+      orderBy: "id ASC",
+      limit: 1,
+    });
+    const row = rows[0];
+    const value = Math.max(0, Math.floor(Number(row?.giftcard_default_validity_value ?? 0) || 0));
+    const unit = String(row?.giftcard_default_validity_unit ?? "days").toLowerCase();
+    if (value > 0) {
+      if (unit === "months") return addMonthsIso(issuedAtYmd, value);
+      if (unit === "years") return addMonthsIso(issuedAtYmd, value * 12);
+      return addDaysIso(issuedAtYmd, value);
+    }
+  } catch {
+    // missing column / table -> fall through to the +365d default
+  }
+  return addDaysIso(issuedAtYmd, 365);
+}
+
+// start-date + N months as YYYY-MM-DD with day clamping (port of GiftCard::addMonthsClamped).
+function addMonthsIso(startYmd: string, months: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(startYmd);
+  if (!m) return addDaysIso(startYmd, Math.max(0, months) * 30);
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const total = year * 12 + (month - 1) + Math.max(0, Math.floor(months));
+  const ny = Math.floor(total / 12);
+  const nmo = (total % 12) + 1;
+  const dim = new Date(ny, nmo, 0).getDate();
+  const nd = Math.min(day, dim);
+  return `${ny}-${String(nmo).padStart(2, "0")}-${String(nd).padStart(2, "0")}`;
 }
 
 // today/start-date + N days as YYYY-MM-DD (pkAddDurationYmd 'days' base case).
@@ -1302,6 +1565,13 @@ function normalizePoints(value: number): number {
 
 function roundQuantity(value: number): number {
   return Math.round((value + Number.EPSILON) * 10000) / 10000;
+}
+
+// Lowercase hex token of `length` chars — used for the giftcard voucher_public_token (a
+// 64-char public link/QR token kept separate from the operational code; port of
+// GiftCard::generatePublicToken).
+function randomHex(length: number): string {
+  return randomBytes(Math.ceil(length / 2)).toString("hex").slice(0, length);
 }
 
 function formatMoney(value: number): string {

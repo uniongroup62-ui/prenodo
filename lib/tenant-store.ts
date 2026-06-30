@@ -71,6 +71,18 @@ export type PosSaleItemInput = {
   startDate?: string;
   expiresAt?: string;
   note?: string;
+  // GiftCard sale meta (faithful to pos.php issue_giftcard + GiftCard::issueGiftCard):
+  // the giftcard configured in the "Emetti GiftCard" modal. Read only for a
+  // type:"giftcard" line at checkout; flows through to the issued giftcards row
+  // (recipient_client_id / recipient_name / code / expires_at / gift_message /
+  // voucher_hide_amount). The card amount is the line unitPrice. Ignored for other types.
+  recipientClientId?: number;
+  recipientName?: string;
+  recipientEmail?: string;
+  code?: string;
+  eventType?: string;
+  message?: string;
+  hideAmount?: boolean;
 };
 
 export type PosPaymentInput = {
@@ -95,6 +107,15 @@ export type PosSaleItem = {
   startDate?: string;
   expiresAt?: string;
   note?: string;
+  // GiftCard sale meta carried from the cart to issueGiftcardFromSale (recipient/code/
+  // expiry/dedica/hide-amount). Only set on a type:"giftcard" line.
+  recipientClientId?: number;
+  recipientName?: string;
+  recipientEmail?: string;
+  code?: string;
+  eventType?: string;
+  message?: string;
+  hideAmount?: boolean;
 };
 
 export type PosPayment = {
