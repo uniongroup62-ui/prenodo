@@ -68,7 +68,7 @@ export function PackagesContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`${suffix}`.replace("&", "?")}`;
   }
 
   const isEmpty = clientPackages.length === 0;

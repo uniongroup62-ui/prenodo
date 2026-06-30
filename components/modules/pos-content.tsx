@@ -1665,7 +1665,7 @@ export function PosContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2 flex-wrap">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=pos_settings`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/pos_settings`}>
               <i className="bi bi-gear me-1"></i>Impostazioni
             </a>
           </div>
@@ -1695,7 +1695,7 @@ export function PosContent() {
                 <div className="fw-semibold">Clienti</div>
                 <a
                   className="btn btn-sm btn-outline-primary"
-                  href={`/${encodeURIComponent(slug)}/index.php?page=clients`}
+                  href={`/${encodeURIComponent(slug)}/clients`}
                   title="Apri rubrica clienti"
                 >
                   <i className="bi bi-people"></i>

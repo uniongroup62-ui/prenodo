@@ -144,7 +144,7 @@ function voucherUrlFromToken(token: string, slug: string): string {
   if (!/^[a-f0-9]{64}$/.test(t)) return "";
   const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
   if (base === "" || !slug) return "";
-  return `${base}/${slug}/index.php?page=giftcard_voucher&public=1&embed=1&token=${encodeURIComponent(t)}`;
+  return `${base}/${slug}/giftcard_voucher?public=1&embed=1&token=${encodeURIComponent(t)}`;
 }
 
 // Per-tenant business branding/settings — legacy used setting_get('name'),

@@ -203,7 +203,7 @@ export function GiftFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=gifts&action=campaigns`;
+    window.location.href = `/${encodeURIComponent(slug)}/gifts?action=campaigns`;
   }
 
   const minValidFrom = useMemo(() => (action === "new" ? new Date().toISOString().slice(0, 10) : ""), [action]);
@@ -297,7 +297,7 @@ export function GiftFormContent() {
           <div className="bs-page-subtitle">Gestisci campagne, premi, sedi e stati.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=gifts&action=campaigns`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/gifts?action=campaigns`}>
             <i className="bi bi-arrow-left me-1" />
             Campagne gift
           </a>
@@ -620,7 +620,7 @@ export function GiftFormContent() {
                 <i className="bi bi-check2-circle me-1" />
                 {saving ? "Salvataggio…" : action === "edit" ? "Salva modifiche" : "Salva"}
               </button>
-              <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=gifts`}>
+              <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/gifts`}>
                 Annulla
               </a>
             </div>

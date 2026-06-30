@@ -222,7 +222,7 @@ export function StockMovesContent() {
   }
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=stock_moves${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`stock_moves${suffix}`.replace("&", "?")}`;
   }
 
   const locParam = activeLocationId ? `&location_id=${activeLocationId}` : "";
@@ -238,7 +238,7 @@ export function StockMovesContent() {
           </div>
           <div className="bs-page-actions">
             <div className="d-flex gap-2">
-              <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=products`}>
+              <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/products`}>
                 Torna al magazzino
               </a>
               <a className="btn btn-primary" href={href(`&action=new${locParam}`)}>

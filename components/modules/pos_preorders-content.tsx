@@ -137,7 +137,7 @@ export function PosPreordersContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2 flex-wrap">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=pos_settings`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/pos_settings`}>
               <i className="bi bi-gear me-1" />
               Impostazioni
             </a>
@@ -189,7 +189,7 @@ export function PosPreordersContent() {
               </div>
               <a
                 className="btn btn-sm btn-outline-secondary"
-                href={`/${encodeURIComponent(slug)}/index.php?page=pos_preorders`}
+                href={`/${encodeURIComponent(slug)}/pos_preorders`}
                 title="Azzera filtri"
                 onClick={(e) => {
                   e.preventDefault();
@@ -390,7 +390,7 @@ export function PosPreordersContent() {
                       <tr key={p.id}>
                         <td className="pos-preorders-col-purchase">{fmtDate(p.createdAt)}</td>
                         <td className="pos-preorders-col-sale">
-                          <a href={`/${encodeURIComponent(slug)}/index.php?page=pos_sales&action=view&id=${p.id}`}>
+                          <a href={`/${encodeURIComponent(slug)}/pos_sales?action=view&id=${p.id}`}>
                             #{p.id}
                           </a>
                         </td>
@@ -409,7 +409,7 @@ export function PosPreordersContent() {
                         <td className="text-end pos-preorders-col-actions">
                           <a
                             className="btn btn-sm btn-outline-secondary"
-                            href={`/${encodeURIComponent(slug)}/index.php?page=pos_sales&action=view&id=${p.id}`}
+                            href={`/${encodeURIComponent(slug)}/pos_sales?action=view&id=${p.id}`}
                           >
                             Dettaglio
                           </a>

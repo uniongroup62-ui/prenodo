@@ -61,11 +61,11 @@ export function FidelityMembershipContent() {
   }, [slug]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=fidelity_membership${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`fidelity_membership${suffix}`.replace("&", "?")}`;
   }
 
   function pageHref(page: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
+    return `/${encodeURIComponent(slug)}/${`${page}`.replace("&", "?")}`;
   }
 
   // Client search results inside the "Nuova tessera" modal (matches the PHP JS:

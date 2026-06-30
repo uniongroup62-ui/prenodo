@@ -72,7 +72,7 @@ export function ConsentModulesContent() {
   }, [slug]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=consent_modules${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`consent_modules${suffix}`.replace("&", "?")}`;
   }
 
   const count = records.length;

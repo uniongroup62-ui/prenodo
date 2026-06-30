@@ -72,7 +72,7 @@ export function PromotionsContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=promotions${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`promotions${suffix}`.replace("&", "?")}`;
   }
 
   return (

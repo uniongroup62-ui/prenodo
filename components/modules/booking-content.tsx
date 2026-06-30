@@ -70,11 +70,11 @@ export function BookingSettingsContent() {
   const publicHref =
     bookingUrl ||
     (typeof window !== "undefined"
-      ? `${window.location.origin}/${encodeURIComponent(slug)}/index.php?page=booking&public=1`
-      : `/${encodeURIComponent(slug)}/index.php?page=booking&public=1`);
+      ? `${window.location.origin}/${encodeURIComponent(slug)}/booking?public=1`
+      : `/${encodeURIComponent(slug)}/booking?public=1`);
 
   function cancelHref(): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=booking`;
+    return `/${encodeURIComponent(slug)}/booking`;
   }
 
   return (

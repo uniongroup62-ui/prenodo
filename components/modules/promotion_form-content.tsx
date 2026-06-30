@@ -150,7 +150,7 @@ export function PromotionFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=promotions`;
+    window.location.href = `/${encodeURIComponent(slug)}/promotions`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -244,7 +244,7 @@ export function PromotionFormContent() {
           <div className="bs-page-subtitle">Gestisci promozioni, regole e visibilita per sedi e canali.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=promotions`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/promotions`}>
             <i className="bi bi-arrow-left me-1" />
             Torna alle promozioni
           </a>

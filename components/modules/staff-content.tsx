@@ -91,7 +91,7 @@ export function StaffContent() {
   }, [staff, applied]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=staff${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`staff${suffix}`.replace("&", "?")}`;
   }
 
   return (

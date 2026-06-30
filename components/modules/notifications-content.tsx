@@ -48,7 +48,7 @@ export function NotificationsContent() {
   }, [slug]);
 
   function href(page: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
+    return `/${encodeURIComponent(slug)}/${`${page}`.replace("&", "?")}`;
   }
 
   return (

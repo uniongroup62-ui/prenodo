@@ -84,7 +84,7 @@ export function ServiceCategoriesContent() {
   }, [load]);
 
   function tabHref(tab: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=services&tab=${tab}`;
+    return `/${encodeURIComponent(slug)}/services?tab=${tab}`;
   }
 
   // POST a category action to the services API; on success refresh the list with

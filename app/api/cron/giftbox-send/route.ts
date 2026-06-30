@@ -464,7 +464,7 @@ export async function GET(request: Request) {
           const token = String(row.voucher_public_token ?? "").trim();
           const voucherUrl =
             publicBase !== "" && /^[0-9a-fA-F]{64}$/.test(token)
-              ? `${publicBase}/${slug}/index.php?page=giftbox_voucher&public=1&embed=1&token=${encodeURIComponent(token)}`
+              ? `${publicBase}/${slug}/giftbox_voucher?public=1&embed=1&token=${encodeURIComponent(token)}`
               : "";
 
           const { subject, content } = buildGiftBoxEmail({

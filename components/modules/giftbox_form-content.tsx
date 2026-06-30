@@ -163,7 +163,7 @@ export function GiftBoxFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=giftbox`;
+    window.location.href = `/${encodeURIComponent(slug)}/giftbox`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -241,7 +241,7 @@ export function GiftBoxFormContent() {
           <div className="bs-page-subtitle">Configura il template GiftBox e i suoi contenuti.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=giftbox`}>
+          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/giftbox`}>
             <i className="bi bi-arrow-left me-1" />
             GiftBox
           </a>
@@ -448,7 +448,7 @@ export function GiftBoxFormContent() {
                 <i className="bi bi-check2-circle me-1" />
                 {saving ? "Salvataggio…" : "Salva GiftBox"}
               </button>
-              <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=giftbox`}>
+              <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/giftbox`}>
                 Annulla
               </a>
             </div>

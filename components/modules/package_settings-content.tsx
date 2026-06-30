@@ -101,7 +101,7 @@ export function PackageSettingsContent() {
           <div className="bs-page-subtitle">Configura validita e impostazioni predefinite dei pacchetti.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=packages`}>
+          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/packages`}>
             <i className="bi bi-arrow-left me-1" />
             Pacchetti
           </a>

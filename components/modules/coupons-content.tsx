@@ -67,7 +67,7 @@ export function CouponsContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=coupons${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`coupons${suffix}`.replace("&", "?")}`;
   }
 
   const hasAnyCoupons = coupons.length > 0;

@@ -74,7 +74,7 @@ export function ClientSheetTemplatesContent() {
 
   const href = useCallback(
     (suffix: string): string =>
-      `/${encodeURIComponent(slug)}/index.php?page=client_sheet_templates${suffix}`,
+      `/${encodeURIComponent(slug)}/${`client_sheet_templates${suffix}`.replace("&", "?")}`,
     [slug],
   );
 
@@ -107,7 +107,7 @@ export function ClientSheetTemplatesContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2 flex-wrap justify-content-end align-items-center">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=clients`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/clients`}>
               <i className="bi bi-arrow-left me-1" />
               Clienti
             </a>

@@ -82,7 +82,7 @@ export function ServicesContent() {
   }, [load]);
 
   function listHref(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=services${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`services${suffix}`.replace("&", "?")}`;
   }
 
   const services = useMemo(() => data.services ?? [], [data.services]);

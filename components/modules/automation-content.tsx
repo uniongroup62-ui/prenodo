@@ -79,7 +79,7 @@ export function AutomationContent() {
             <div className="fw-bold mb-2"><i className="bi bi-envelope me-1" />Promemoria email appuntamento</div>
             <div className="text-muted small">Invia una email prima dell&apos;appuntamento al cliente con indirizzo email valido. Il promemoria parte solo per appuntamenti in stato <strong>Prenotato</strong>.</div>
 
-            <form method="post" className="mt-3" action={`/${encodeURIComponent(slug)}/index.php?page=automation`}>
+            <form method="post" className="mt-3" action={`/${encodeURIComponent(slug)}/automation`}>
               <div className="row g-3">
                 <div className="col-12">
                   <div className="form-check form-switch">
@@ -273,7 +273,7 @@ export function AutomationContent() {
 
               <div className="mt-4 d-flex gap-2">
                 <button className="btn btn-primary" type="submit"><i className="bi bi-check2-circle me-1" />Salva</button>
-                <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=dashboard`}>Indietro</a>
+                <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/dashboard`}>Indietro</a>
               </div>
             </form>
           </div>

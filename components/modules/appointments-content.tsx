@@ -233,7 +233,7 @@ export function AppointmentsContent() {
   );
 
   function pageHref(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=appointments${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`appointments${suffix}`.replace("&", "?")}`;
   }
 
   const resetHref = pageHref("");
@@ -249,7 +249,7 @@ export function AppointmentsContent() {
           <div className="bs-page-subtitle">Gestisci prenotazioni, stati e passaggio rapido al calendario.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=calendar`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/calendar`}>
             <i className="bi bi-calendar3 me-1"></i>Calendario
           </a>
         </div>

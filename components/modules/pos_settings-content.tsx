@@ -104,7 +104,7 @@ export function PosSettingsContent() {
     });
   }
 
-  const posHref = `/${encodeURIComponent(slug)}/index.php?page=pos`;
+  const posHref = `/${encodeURIComponent(slug)}/pos`;
 
   // Mirrors PHP: the "apply to existing" buttons are enabled only when the
   // expiry is currently enabled AND a positive value is saved (the count is

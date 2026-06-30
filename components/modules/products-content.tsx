@@ -83,7 +83,7 @@ export function ProductsContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=products${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`products${suffix}`.replace("&", "?")}`;
   }
 
   // Client-side filtering mirrors the PHP list filter (the API exposes no

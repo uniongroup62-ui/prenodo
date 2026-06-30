@@ -50,7 +50,7 @@ export function ServiceRecommendationsContent() {
   }, [load]);
 
   function tabHref(tab: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=services&tab=${tab}`;
+    return `/${encodeURIComponent(slug)}/services?tab=${tab}`;
   }
 
   // Top-of-page service combobox filter data (the PHP page emits these as JSON
@@ -238,7 +238,7 @@ export function ServiceRecommendationsContent() {
               <div className="modal-content">
                 <form
                   method="post"
-                  action={`/${encodeURIComponent(slug)}/index.php?page=services&tab=recommended&action=edit&id=${service.id}`}
+                  action={`/${encodeURIComponent(slug)}/services?tab=recommended&action=edit&id=${service.id}`}
                 >
                   <div className="modal-header">
                     <div>

@@ -76,7 +76,7 @@ export function CommissionsContent() {
   }, [slug]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=commissions${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`commissions${suffix}`.replace("&", "?")}`;
   }
 
   const hasRows = commissions.length > 0;

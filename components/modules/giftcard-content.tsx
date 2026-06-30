@@ -79,7 +79,7 @@ export function GiftcardContent() {
   }, [slug]);
 
   function href(page: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
+    return `/${encodeURIComponent(slug)}/${`${page}`.replace("&", "?")}`;
   }
 
   const isEmpty = !loading && giftCards.length === 0;

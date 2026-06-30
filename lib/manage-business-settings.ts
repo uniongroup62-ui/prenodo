@@ -427,7 +427,7 @@ async function listBusinessLocations(slug: string, publicOrigin = "") {
   const mappings = await listLocationActivityMappings(slug);
   return rows.map((row) => {
     const id = Number(row.id ?? 0);
-    const bookingUrl = `${publicOrigin || ""}/${encodeURIComponent(slug)}/index.php?page=booking&public=1&location_id=${id}`;
+    const bookingUrl = `${publicOrigin || ""}/${encodeURIComponent(slug)}/booking?public=1&location_id=${id}`;
     return {
       id,
       name: String(row.name ?? ""),
@@ -592,7 +592,7 @@ async function syncMarketplaceProfile(slug: string, publicOrigin = "") {
   const categoryText = await currentTenantMarketplaceCategoryText(slug);
   const isVisible = visible ? 1 : 0;
   const status = visible ? "published" : "hidden";
-  const bookingUrl = `${publicOrigin || ""}/${encodeURIComponent(slug)}/index.php?page=booking&public=1`;
+  const bookingUrl = `${publicOrigin || ""}/${encodeURIComponent(slug)}/booking?public=1`;
   const values = {
     tenant_id: tenant.id,
     tenant_slug: tenant.slug,
@@ -722,7 +722,7 @@ async function syncDirectoryLocations(slug: string, profile: Record<string, unkn
     const primaryCategoryName = clean(String(primaryActivity.marketplace_category_name ?? ""), 190);
     const categoryText = activityCategoryText(activityRows);
     const locationSlug = locationSlugFor(row);
-    const bookingUrl = `${publicOrigin || ""}/${encodeURIComponent(slug)}/index.php?page=booking&public=1&location_id=${locationId}`;
+    const bookingUrl = `${publicOrigin || ""}/${encodeURIComponent(slug)}/booking?public=1&location_id=${locationId}`;
     const locationValues = [
       tenant.id,
       tenant.slug,

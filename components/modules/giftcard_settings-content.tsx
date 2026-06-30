@@ -105,7 +105,7 @@ export function GiftcardSettingsContent() {
     }
   }
 
-  const page = (p: string) => `/${encodeURIComponent(slug)}/index.php?page=${p}`;
+  const page = (p: string) => `/${encodeURIComponent(slug)}/${`${p}`.replace("&", "?")}`;
 
   return (
     <div className="container-fluid">

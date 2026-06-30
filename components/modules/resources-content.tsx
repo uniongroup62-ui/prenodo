@@ -50,7 +50,7 @@ export function ResourcesContent() {
               Le risorse servono per macchinari, dispositivi o dotazioni condivise con disponibilità
               limitata. Creane una solo se un servizio deve bloccare una risorsa.
             </p>
-            <a className="btn btn-primary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=resources&action=new`}>
+            <a className="btn btn-primary btn-pill" href={`/${encodeURIComponent(slug)}/resources?action=new`}>
               <i className="bi bi-plus-lg me-1" />
               Nuova risorsa
             </a>
@@ -77,7 +77,7 @@ export function ResourcesContent() {
                     <td className="text-end">
                       <a
                         className="btn btn-sm btn-outline-secondary"
-                        href={`/${encodeURIComponent(slug)}/index.php?page=resources&action=edit&id=${String(r.id ?? "")}`}
+                        href={`/${encodeURIComponent(slug)}/resources?action=edit&id=${String(r.id ?? "")}`}
                       >
                         Modifica
                       </a>

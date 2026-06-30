@@ -231,7 +231,7 @@ export function ClientDetailContent() {
   }, [slug]);
 
   function page(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`${suffix}`.replace("&", "?")}`;
   }
 
   async function doBlock() {

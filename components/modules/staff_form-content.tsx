@@ -147,7 +147,7 @@ export function StaffFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=staff`;
+    window.location.href = `/${encodeURIComponent(slug)}/staff`;
   }
 
   const locations = useMemo(() => ctx.locations ?? [], [ctx.locations]);
@@ -218,7 +218,7 @@ export function StaffFormContent() {
           <div className="bs-page-subtitle">Gestisci operatori, ruoli e sedi abilitate.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=staff`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/staff`}>
             <i className="bi bi-arrow-left me-1" />
             Torna allo staff
           </a>

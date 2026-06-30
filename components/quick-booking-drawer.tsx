@@ -1644,7 +1644,7 @@ export function QuickBookingDrawer() {
   // client card). Residuals "Apri scheda" is a no-op (#) for now, matching the
   // SCOPE note (the residuals-detail popup is not yet ported).
   const historyOpenHref = clientId
-    ? `/${encodeURIComponent(slug)}/index.php?page=clients&action=view&id=${encodeURIComponent(clientId)}`
+    ? `/${encodeURIComponent(slug)}/clients?action=view&id=${encodeURIComponent(clientId)}`
     : "#";
 
   // Derived display state for the two boxes (no extra render-state).

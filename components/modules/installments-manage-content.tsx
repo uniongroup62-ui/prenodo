@@ -36,7 +36,7 @@ export function InstallmentsManageContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=pos_history`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/pos_history`}>
               <i className="bi bi-clock-history me-1" />
               Movimenti
             </a>
@@ -53,7 +53,7 @@ export function InstallmentsManageContent() {
             <h2>Nessun piano rateale presente</h2>
             <p>La gestione rate e ancora vuota. Crea una vendita con pagamento rateizzato per iniziare.</p>
             <div className="d-flex justify-content-center gap-2 flex-wrap">
-              <a className="btn btn-primary" href={`/${encodeURIComponent(slug)}/index.php?page=pos`}>
+              <a className="btn btn-primary" href={`/${encodeURIComponent(slug)}/pos`}>
                 <i className="bi bi-credit-card me-1" />
                 Nuova vendita
               </a>
@@ -81,7 +81,7 @@ export function InstallmentsManageContent() {
                     <td className="text-end">
                       <a
                         className="btn btn-sm btn-outline-secondary"
-                        href={`/${encodeURIComponent(slug)}/index.php?page=installments_manage&action=view&id=${String(p.id ?? "")}`}
+                        href={`/${encodeURIComponent(slug)}/installments_manage?action=view&id=${String(p.id ?? "")}`}
                       >
                         Apri
                       </a>

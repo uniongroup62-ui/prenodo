@@ -225,8 +225,9 @@ export function StaffAvailabilityContent() {
   }
 
   function buildHref(params: Record<string, string>): string {
-    const base = new URLSearchParams({ page: "staff_availability", ...params });
-    return `/${encodeURIComponent(slug)}/index.php?${base.toString()}`;
+    const base = new URLSearchParams(params);
+    const qs = base.toString();
+    return `/${encodeURIComponent(slug)}/staff_availability${qs ? `?${qs}` : ""}`;
   }
 
   const staffIdParam = "0";

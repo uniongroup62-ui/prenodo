@@ -44,8 +44,8 @@ export function GiftboxContent() {
       .catch(() => {});
   }, [slug, tab]);
 
-  const settingsHref = `/${encodeURIComponent(slug)}/index.php?page=giftbox_settings`;
-  const boxesHref = `/${encodeURIComponent(slug)}/index.php?page=giftbox&tab=boxes`;
+  const settingsHref = `/${encodeURIComponent(slug)}/giftbox_settings`;
+  const boxesHref = `/${encodeURIComponent(slug)}/giftbox?tab=boxes`;
 
   // Template grid (giftbox.php tab=boxes): the box catalog + the editor entry
   // points (Nuova GiftBox / Modifica), wired to the faithful template editor.
@@ -62,11 +62,11 @@ export function GiftboxContent() {
           </div>
           <div className="bs-page-actions">
             <div className="d-flex gap-2">
-              <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=giftbox`}>
+              <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/giftbox`}>
                 <i className="bi bi-arrow-left me-1" />
                 GiftBox emesse
               </a>
-              <a className="btn btn-primary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=giftbox&action=new`}>
+              <a className="btn btn-primary btn-pill" href={`/${encodeURIComponent(slug)}/giftbox?action=new`}>
                 <i className="bi bi-plus-circle me-1" />
                 Nuova GiftBox
               </a>
@@ -107,7 +107,7 @@ export function GiftboxContent() {
                       <td className="text-end">
                         <a
                           className="btn btn-sm btn-outline-primary"
-                          href={`/${encodeURIComponent(slug)}/index.php?page=giftbox&action=edit&id=${t.id}`}
+                          href={`/${encodeURIComponent(slug)}/giftbox?action=edit&id=${t.id}`}
                         >
                           Modifica
                         </a>
@@ -135,7 +135,7 @@ export function GiftboxContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2">
-            <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=fidelity`}>
+            <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/fidelity`}>
               <i className="bi bi-arrow-left me-1" />
               Fidelity
             </a>
@@ -163,7 +163,7 @@ export function GiftboxContent() {
               scadenze, riscatti e sede di emissione.
             </p>
             <div className="d-flex justify-content-center gap-2 flex-wrap">
-              <a className="btn btn-primary" href={`/${encodeURIComponent(slug)}/index.php?page=pos`}>
+              <a className="btn btn-primary" href={`/${encodeURIComponent(slug)}/pos`}>
                 <i className="bi bi-plus-lg me-1" />
                 Crea GiftBox
               </a>
@@ -197,7 +197,7 @@ export function GiftboxContent() {
                     <td className="text-end">
                       <a
                         className="btn btn-sm btn-outline-secondary"
-                        href={`/${encodeURIComponent(slug)}/index.php?page=giftbox&action=view&id=${String(r.id ?? "")}`}
+                        href={`/${encodeURIComponent(slug)}/giftbox?action=view&id=${String(r.id ?? "")}`}
                       >
                         Apri
                       </a>

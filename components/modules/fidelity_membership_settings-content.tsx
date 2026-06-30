@@ -130,10 +130,10 @@ export function FidelityMembershipSettingsContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2">
-            <a className="btn btn-light" href={`/${encodeURIComponent(slug)}/index.php?page=fidelity_membership`}>
+            <a className="btn btn-light" href={`/${encodeURIComponent(slug)}/fidelity_membership`}>
               <i className="bi bi-arrow-left" /> Adesione
             </a>
-            <a className="btn btn-light" href={`/${encodeURIComponent(slug)}/index.php?page=fidelity_points#livelli-card`}>
+            <a className="btn btn-light" href={`/${encodeURIComponent(slug)}/fidelity_points#livelli-card`}>
               <i className="bi bi-stars" /> Livelli Card
             </a>
           </div>

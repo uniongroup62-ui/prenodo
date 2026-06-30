@@ -154,7 +154,7 @@ export function CabinsContent() {
   }
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=cabins${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`cabins${suffix}`.replace("&", "?")}`;
   }
 
   // Delete link target for an existing cabin (legacy fallback action).

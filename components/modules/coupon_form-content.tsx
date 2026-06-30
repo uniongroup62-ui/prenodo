@@ -108,7 +108,7 @@ export function CouponFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=coupons`;
+    window.location.href = `/${encodeURIComponent(slug)}/coupons`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -184,7 +184,7 @@ export function CouponFormContent() {
           <div className="bs-page-subtitle">Crea e gestisci codici sconto e campagne coupon.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=coupons`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/coupons`}>
             <i className="bi bi-arrow-left me-1" />
             Torna ai coupon
           </a>

@@ -100,7 +100,7 @@ export function GiftsContent() {
   }, [gifts, applied]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=gifts${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`gifts${suffix}`.replace("&", "?")}`;
   }
 
   return (

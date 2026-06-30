@@ -49,10 +49,10 @@ export function LocationsContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=locations${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`locations${suffix}`.replace("&", "?")}`;
   }
   function pageHref(page: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
+    return `/${encodeURIComponent(slug)}/${`${page}`.replace("&", "?")}`;
   }
 
   return (

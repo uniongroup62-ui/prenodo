@@ -162,7 +162,7 @@ export function ClientFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=clients`;
+    window.location.href = `/${encodeURIComponent(slug)}/clients`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -242,7 +242,7 @@ export function ClientFormContent() {
           <div className="bs-page-subtitle">Compila dati principali, contatti e preferenze cliente.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=clients`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/clients`}>
             <i className="bi bi-arrow-left me-1" />
             Torna alla lista
           </a>

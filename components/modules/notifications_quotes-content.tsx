@@ -90,7 +90,7 @@ export function NotificationsQuotesContent() {
   const subtitleLocation = locationName ? ` Sede: ${locationName}.` : "";
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=notifications_quotes${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`notifications_quotes${suffix}`.replace("&", "?")}`;
   }
 
   return (
@@ -146,7 +146,7 @@ export function NotificationsQuotesContent() {
                 <div className="notification-action p-3 d-flex align-items-center">
                   <a
                     className="btn btn-sm btn-outline-secondary"
-                    href={`/${encodeURIComponent(slug)}/index.php?page=quotes&action=view&id=${r.id}`}
+                    href={`/${encodeURIComponent(slug)}/quotes?action=view&id=${r.id}`}
                   >
                     Apri preventivo
                   </a>

@@ -120,7 +120,7 @@ export function ConsentModuleFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=consent_modules`;
+    window.location.href = `/${encodeURIComponent(slug)}/consent_modules`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -207,7 +207,7 @@ export function ConsentModuleFormContent() {
           <div className="bs-page-subtitle">{moduleSubtitle}</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=consent_modules`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/consent_modules`}>
             <i className="bi bi-arrow-left me-1" />
             Lista moduli
           </a>

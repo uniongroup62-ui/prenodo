@@ -61,7 +61,7 @@ export function SuppliersContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=suppliers${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`suppliers${suffix}`.replace("&", "?")}`;
   }
 
   const locationNames = useMemo(() => {

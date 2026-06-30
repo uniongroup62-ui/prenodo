@@ -116,7 +116,7 @@ export function QuoteFormContent() {
   const total = useMemo(() => roundMoney(Math.max(0, subtotal - discountValue)), [subtotal, discountValue]);
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=quotes`;
+    window.location.href = `/${encodeURIComponent(slug)}/quotes`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -171,7 +171,7 @@ export function QuoteFormContent() {
           <div className="bs-page-subtitle">Crea e gestisci preventivi per i tuoi clienti.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=quotes`}>
+          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/quotes`}>
             <i className="bi bi-arrow-left me-1" />
             Torna ai preventivi
           </a>

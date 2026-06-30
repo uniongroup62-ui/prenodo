@@ -253,7 +253,7 @@ export function RolesContent() {
   }
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=roles${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`roles${suffix}`.replace("&", "?")}`;
   }
 
   const roleLabel = data?.manageableRoles?.[activeRole] ?? (activeRole === "altro" ? "Altro" : "Staff");

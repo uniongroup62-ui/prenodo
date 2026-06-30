@@ -177,7 +177,7 @@ export function ProductFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=products`;
+    window.location.href = `/${encodeURIComponent(slug)}/products`;
   }
 
   const categories = useMemo(() => ctx.categories ?? [], [ctx.categories]);
@@ -269,7 +269,7 @@ export function ProductFormContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=products`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/products`}>
               Torna al magazzino
             </a>
           </div>
@@ -437,7 +437,7 @@ export function ProductFormContent() {
                 <input className="form-control" type="number" value={form.stock} disabled />
                 <div className="form-text">
                   Aggiornata da{" "}
-                  <a href={`/${encodeURIComponent(slug)}/index.php?page=stock_moves`}>Carico / Scarico</a>.
+                  <a href={`/${encodeURIComponent(slug)}/stock_moves`}>Carico / Scarico</a>.
                 </div>
               </div>
 
@@ -490,7 +490,7 @@ export function ProductFormContent() {
                   ) : null}
                 </select>
                 <div className="form-text">
-                  <a href={`/${encodeURIComponent(slug)}/index.php?page=suppliers`}>Gestisci fornitori</a>
+                  <a href={`/${encodeURIComponent(slug)}/suppliers`}>Gestisci fornitori</a>
                   {suppliers.length === 0 ? " • Nessun fornitore: aggiungilo da “Fornitori”." : null}
                 </div>
               </div>

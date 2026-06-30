@@ -87,7 +87,7 @@ export function AccessibilityContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=accessibility${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`accessibility${suffix}`.replace("&", "?")}`;
   }
 
   async function postAction(payload: Record<string, unknown>): Promise<void> {
@@ -359,7 +359,7 @@ export function AccessibilityContent() {
                     <i className="bi bi-key me-1" />
                     Aggiorna password
                   </button>
-                  <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=dashboard`}>
+                  <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/dashboard`}>
                     Indietro
                   </a>
                 </div>

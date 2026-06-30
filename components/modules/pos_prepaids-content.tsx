@@ -195,7 +195,7 @@ export function PosPrepaidsContent() {
   }
 
   function resetHref(): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=pos_prepaids`;
+    return `/${encodeURIComponent(slug)}/pos_prepaids`;
   }
 
   const activeFilters: string[] = [];
@@ -229,7 +229,7 @@ export function PosPrepaidsContent() {
           <div className="d-flex gap-2 flex-wrap">
             <a
               className="btn btn-outline-secondary"
-              href={`/${encodeURIComponent(slug)}/index.php?page=pos_settings`}
+              href={`/${encodeURIComponent(slug)}/pos_settings`}
             >
               <i className="bi bi-gear me-1" />
               Impostazioni
@@ -538,7 +538,7 @@ export function PosPrepaidsContent() {
                         <td className="pos-prepaids-col-sale">
                           {p.sourceSaleId ? (
                             <a
-                              href={`/${encodeURIComponent(slug)}/index.php?page=pos_sale&id=${p.sourceSaleId}`}
+                              href={`/${encodeURIComponent(slug)}/pos_sale?id=${p.sourceSaleId}`}
                             >
                               #{p.sourceSaleId}
                             </a>
@@ -561,7 +561,7 @@ export function PosPrepaidsContent() {
                         <td className="text-end pos-prepaids-col-actions">
                           <a
                             className="btn btn-sm btn-outline-secondary"
-                            href={`/${encodeURIComponent(slug)}/index.php?page=pos_prepaids&action=view&id=${p.id}`}
+                            href={`/${encodeURIComponent(slug)}/pos_prepaids?action=view&id=${p.id}`}
                           >
                             Apri
                           </a>

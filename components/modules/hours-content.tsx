@@ -136,7 +136,7 @@ export function HoursContent() {
   );
 
   function pageHref(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=hours${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`hours${suffix}`.replace("&", "?")}`;
   }
 
   function tabHref(target: "hours" | "closures" | "exceptions"): string {
@@ -154,7 +154,7 @@ export function HoursContent() {
           <div className="bs-page-subtitle">Gestisci orari, chiusure e straordinari.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-primary" href={`/${encodeURIComponent(slug)}/index.php?page=settings`}>
+          <a className="btn btn-outline-primary" href={`/${encodeURIComponent(slug)}/settings`}>
             <i className="bi bi-building me-1" />
             Attivita
           </a>

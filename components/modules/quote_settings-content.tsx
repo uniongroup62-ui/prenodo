@@ -164,7 +164,7 @@ export function QuoteSettingsContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`${suffix}`.replace("&", "?")}`;
   }
 
   function updatePm(idx: number, patch: Partial<PaymentMethodRow>): void {

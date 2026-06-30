@@ -66,7 +66,7 @@ export function ClientConsentsContent() {
 
   // Legacy-style relative action links (the PHP page uses index.php?page=...).
   function pageHref(path: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${path}`;
+    return `/${encodeURIComponent(slug)}/${`${path}`.replace("&", "?")}`;
   }
 
   return (

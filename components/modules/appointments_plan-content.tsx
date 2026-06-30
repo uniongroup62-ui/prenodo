@@ -229,11 +229,11 @@ export function AppointmentsPlanContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=appointments`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/appointments`}>
               <i className="bi bi-list-task me-1" />
               Lista
             </a>
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=calendar`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/calendar`}>
               <i className="bi bi-calendar-week me-1" />
               Calendario
             </a>

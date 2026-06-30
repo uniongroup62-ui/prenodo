@@ -184,7 +184,7 @@ export function ServiceFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=services`;
+    window.location.href = `/${encodeURIComponent(slug)}/services`;
   }
 
   const categories = useMemo(() => ctx.categories ?? [], [ctx.categories]);
@@ -268,7 +268,7 @@ export function ServiceFormContent() {
             <div className="bs-page-subtitle">Configura disponibilita, sedi e risorse operative del servizio.</div>
           </div>
           <div className="bs-page-actions">
-            <a className="btn btn-outline-secondary services-back-btn" href={`/${encodeURIComponent(slug)}/index.php?page=services`}>
+            <a className="btn btn-outline-secondary services-back-btn" href={`/${encodeURIComponent(slug)}/services`}>
               <i className="bi bi-arrow-left me-1" />
               Torna ai servizi
             </a>
@@ -322,7 +322,7 @@ export function ServiceFormContent() {
                           </select>
                           <div className="form-text">
                             Gestisci le categorie da{" "}
-                            <a href={`/${encodeURIComponent(slug)}/index.php?page=services&tab=categories`}>Categorie</a>.
+                            <a href={`/${encodeURIComponent(slug)}/services?tab=categories`}>Categorie</a>.
                           </div>
                         </div>
 
@@ -462,7 +462,7 @@ export function ServiceFormContent() {
                         {cabins.length === 0 ? (
                           <div className="text-muted">
                             Nessuna cabina configurata. Vai su{" "}
-                            <a href={`/${encodeURIComponent(slug)}/index.php?page=cabins`}>Risorse &rarr; Cabine</a>.
+                            <a href={`/${encodeURIComponent(slug)}/cabins`}>Risorse &rarr; Cabine</a>.
                           </div>
                         ) : null}
                       </div>
@@ -547,7 +547,7 @@ export function ServiceFormContent() {
                         {staff.length === 0 ? (
                           <div className="text-muted">
                             Nessun operatore. Creali in{" "}
-                            <a href={`/${encodeURIComponent(slug)}/index.php?page=staff`}>Staff</a>.
+                            <a href={`/${encodeURIComponent(slug)}/staff`}>Staff</a>.
                           </div>
                         ) : null}
                       </div>
@@ -566,7 +566,7 @@ export function ServiceFormContent() {
                       {resources.length === 0 ? (
                         <div className="text-muted">
                           Nessuna risorsa configurata. Vai su{" "}
-                          <a href={`/${encodeURIComponent(slug)}/index.php?page=resources`}>Risorse</a> per crearle.
+                          <a href={`/${encodeURIComponent(slug)}/resources`}>Risorse</a> per crearle.
                         </div>
                       ) : (
                         <>

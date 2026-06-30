@@ -120,7 +120,7 @@ export function ClientSheetsContent() {
   }, [slug, clientId]);
 
   function href(page: string, extra: string = ""): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}${extra}`;
+    return `/${encodeURIComponent(slug)}/${`${page}${extra}`.replace("&", "?")}`;
   }
 
   const templateConfigUrl = href("client_sheet_templates", `&return_client_id=${clientId}`);

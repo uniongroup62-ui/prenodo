@@ -188,7 +188,7 @@ export function CostFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=costs&tab=scadenziario`;
+    window.location.href = `/${encodeURIComponent(slug)}/costs?tab=scadenziario`;
   }
 
   const showLocation = locations.length > 1;
@@ -272,7 +272,7 @@ export function CostFormContent() {
           <div className="bs-page-subtitle">Gestisci scadenze, costi e categorie operative.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=costs&tab=scadenziario`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/costs?tab=scadenziario`}>
             <i className="bi bi-arrow-left me-1" />
             Scadenziario
           </a>

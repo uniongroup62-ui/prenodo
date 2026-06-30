@@ -804,7 +804,7 @@ export function CalendarContent() {
   }, [loadContext, date, visibleRange]);
 
   function href(page: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}`;
+    return `/${encodeURIComponent(slug)}/${`${page}`.replace("&", "?")}`;
   }
 
   // Open/close window (minutes) for a single day-of-week from business hours

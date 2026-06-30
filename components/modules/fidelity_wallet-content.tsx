@@ -123,7 +123,7 @@ export function FidelityWalletContent() {
   }
 
   function pageHref(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=fidelity_wallet${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`fidelity_wallet${suffix}`.replace("&", "?")}`;
   }
 
   return (

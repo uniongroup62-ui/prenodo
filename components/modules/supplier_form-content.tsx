@@ -169,7 +169,7 @@ export function SupplierFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=suppliers`;
+    window.location.href = `/${encodeURIComponent(slug)}/suppliers`;
   }
 
   const activeLocations = useMemo(() => locations.filter((l) => l.isActive !== false), [locations]);
@@ -243,7 +243,7 @@ export function SupplierFormContent() {
           <div className="bs-page-subtitle">Gestisci fornitori collegati a prodotti, magazzino e scadenze.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=suppliers`}>
+          <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/suppliers`}>
             <i className="bi bi-arrow-left me-1" />
             Torna ai fornitori
           </a>

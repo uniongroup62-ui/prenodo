@@ -78,7 +78,7 @@ export function FidelityLevelsContent() {
   }, [slug]);
 
   function pageHref(page: string, suffix = ""): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`${page}${suffix}`.replace("&", "?")}`;
   }
 
   const action = useMemo(() => pageHref("fidelity_levels"), [slug]); // eslint-disable-line react-hooks/exhaustive-deps

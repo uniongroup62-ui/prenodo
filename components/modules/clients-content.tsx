@@ -62,7 +62,7 @@ export function ClientsContent() {
   }, [load, slug]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=clients${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`clients${suffix}`.replace("&", "?")}`;
   }
 
   return (
@@ -76,7 +76,7 @@ export function ClientsContent() {
           <div className="bs-page-subtitle">Anagrafiche clienti, contatti, schede e storico.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-primary" href={`/${encodeURIComponent(slug)}/index.php?page=client_sheet_templates`}>
+          <a className="btn btn-outline-primary" href={`/${encodeURIComponent(slug)}/client_sheet_templates`}>
             <i className="bi bi-sliders me-1" />
             Configura schede
           </a>

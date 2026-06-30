@@ -123,7 +123,7 @@ export function LocationFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=locations`;
+    window.location.href = `/${encodeURIComponent(slug)}/locations`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -193,7 +193,7 @@ export function LocationFormContent() {
           <div className="bs-page-subtitle">Aggiungi i dati della tua sede e imposta la visibilita.</div>
         </div>
         <div className="bs-page-actions">
-          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=locations`}>
+          <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/locations`}>
             <i className="bi bi-arrow-left me-1" />
             Torna alle sedi
           </a>

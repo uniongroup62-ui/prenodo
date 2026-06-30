@@ -61,7 +61,7 @@ export function NotificationsBirthdaysContent() {
     .sort((a, b) => a.days - b.days);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=notifications_birthdays${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`notifications_birthdays${suffix}`.replace("&", "?")}`;
   }
 
   return (
@@ -85,7 +85,7 @@ export function NotificationsBirthdaysContent() {
               <i className="bi bi-gear me-1" />
               Impostazioni
             </button>
-            <a className="btn btn-outline-primary btn-sm" href={`/${encodeURIComponent(slug)}/index.php?page=clients&location_id=all`}>
+            <a className="btn btn-outline-primary btn-sm" href={`/${encodeURIComponent(slug)}/clients?location_id=all`}>
               <i className="bi bi-people me-1" />
               Apri Clienti
             </a>

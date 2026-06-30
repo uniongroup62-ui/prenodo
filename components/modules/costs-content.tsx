@@ -146,7 +146,7 @@ export function CostsContent() {
   }, [load]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=costs${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`costs${suffix}`.replace("&", "?")}`;
   }
 
   const showLocationCol = locations.length > 1;

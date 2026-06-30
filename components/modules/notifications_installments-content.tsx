@@ -117,7 +117,7 @@ export function NotificationsInstallmentsContent() {
   }, [plans, alertDays]);
 
   function manageHref(): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=installments_manage`;
+    return `/${encodeURIComponent(slug)}/installments_manage`;
   }
 
   return (

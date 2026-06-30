@@ -124,7 +124,7 @@ export function QuotesContent() {
   }, [quotes, applied]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=quotes${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`quotes${suffix}`.replace("&", "?")}`;
   }
 
   return (
@@ -139,7 +139,7 @@ export function QuotesContent() {
         </div>
         <div className="bs-page-actions">
           <div className="d-flex gap-2">
-            <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/index.php?page=quote_settings`}>
+            <a className="btn btn-outline-secondary btn-pill" href={`/${encodeURIComponent(slug)}/quote_settings`}>
               <i className="bi bi-gear me-1" />
               Impostazioni
             </a>

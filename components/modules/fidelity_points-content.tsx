@@ -60,11 +60,11 @@ export function FidelityPointsContent() {
   }, [slug]);
 
   function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=fidelity_points${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`fidelity_points${suffix}`.replace("&", "?")}`;
   }
 
   function pageHref(page: string, suffix = ""): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=${page}${suffix}`;
+    return `/${encodeURIComponent(slug)}/${`${page}${suffix}`.replace("&", "?")}`;
   }
 
   // Derived live stats from clients/wallet.points.

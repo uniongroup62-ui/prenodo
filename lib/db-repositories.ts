@@ -2706,12 +2706,12 @@ function resolveQuoteLogoUrl(logoPath: string): string {
 function quotePublicUrl(slug: string, token: string): string {
   const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
   if (!base || !token) return "";
-  return `${base}/${encodeURIComponent(slug)}/index.php?page=quote_public&token=${encodeURIComponent(token)}&embed=1`;
+  return `${base}/${encodeURIComponent(slug)}/quote_public?token=${encodeURIComponent(token)}&embed=1`;
 }
 function quotePublicPdfUrl(slug: string, token: string): string {
   const base = String(process.env.PRENODO_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
   if (!base || !token) return "";
-  return `${base}/${encodeURIComponent(slug)}/index.php?page=quote_public&token=${encodeURIComponent(token)}&format=pdf`;
+  return `${base}/${encodeURIComponent(slug)}/quote_public?token=${encodeURIComponent(token)}&format=pdf`;
 }
 
 function escapeQuoteHtml(value: string): string {

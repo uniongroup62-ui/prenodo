@@ -41,7 +41,7 @@ export function FidelityContent() {
       .catch(() => {});
   }, [slug]);
 
-  const pageHref = `/${encodeURIComponent(slug)}/index.php?page=fidelity`;
+  const pageHref = `/${encodeURIComponent(slug)}/fidelity`;
 
   return (
     <div className="container-fluid">

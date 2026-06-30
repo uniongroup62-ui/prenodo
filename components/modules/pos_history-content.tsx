@@ -137,7 +137,7 @@ export function PosHistoryContent() {
           </div>
           <div className="bs-page-actions">
             <div className="d-flex gap-2">
-              <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=pos`}>
+              <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/pos`}>
                 <i className="bi bi-arrow-left"></i> Torna a Pagamenti
               </a>
             </div>
@@ -159,7 +159,7 @@ export function PosHistoryContent() {
               </div>
               <a
                 className="btn btn-sm btn-outline-secondary"
-                href={`/${encodeURIComponent(slug)}/index.php?page=pos_history`}
+                href={`/${encodeURIComponent(slug)}/pos_history`}
                 title="Azzera filtri"
               >
                 <i className="bi bi-arrow-counterclockwise"></i>
@@ -458,7 +458,7 @@ export function PosHistoryContent() {
                   <button className="btn btn-primary w-100" type="submit">
                     <i className="bi bi-search"></i> Filtra
                   </button>
-                  <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=pos_history`}>
+                  <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/pos_history`}>
                     <i className="bi bi-arrow-counterclockwise"></i>
                   </a>
                 </div>
@@ -506,7 +506,7 @@ export function PosHistoryContent() {
                           <td className="text-end pos-cronologia-actions-col">
                             <a
                               className="btn btn-sm btn-outline-secondary"
-                              href={`/${encodeURIComponent(slug)}/index.php?page=pos_sale_detail&id=${sale.id}`}
+                              href={`/${encodeURIComponent(slug)}/pos_sale_detail?id=${sale.id}`}
                             >
                               Dettaglio
                             </a>

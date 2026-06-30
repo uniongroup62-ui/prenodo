@@ -153,7 +153,7 @@ export function StockMoveFormContent() {
   }
 
   function backToList() {
-    window.location.href = `/${encodeURIComponent(slug)}/index.php?page=stock_moves`;
+    window.location.href = `/${encodeURIComponent(slug)}/stock_moves`;
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -231,7 +231,7 @@ export function StockMoveFormContent() {
             <div className="bs-page-subtitle">Registra movimenti di magazzino e rettifiche prodotto.</div>
           </div>
           <div className="bs-page-actions">
-            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=stock_moves`}>
+            <a className="btn btn-outline-secondary" href={`/${encodeURIComponent(slug)}/stock_moves`}>
               Torna alla lista
             </a>
           </div>
@@ -245,7 +245,7 @@ export function StockMoveFormContent() {
           <div className="card p-3 mb-3">
             <div className="d-flex justify-content-between align-items-center">
               <div className="h6 fw-semibold m-0">Nuovo carico / scarico</div>
-              <a className="btn btn-sm btn-outline-secondary" href={`/${encodeURIComponent(slug)}/index.php?page=stock_moves`}>
+              <a className="btn btn-sm btn-outline-secondary" href={`/${encodeURIComponent(slug)}/stock_moves`}>
                 Torna alla lista
               </a>
             </div>
