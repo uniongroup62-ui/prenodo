@@ -79,26 +79,10 @@ export async function loginManageUser({
     const session: ManageSession = { tenantSlug, user, issuedAt: Date.now() };
     return { ok: true, session, redirectTo: `/${encodeURIComponent(tenantSlug)}/dashboard`, source: "database" };
   } catch {
-    if (tenantSlug === "centroesteticoelite" && normalizedEmail === "info@artebrand.it" && password === "iosono98") {
-      const session: ManageSession = {
-        tenantSlug,
-        user: {
-          id: 1,
-          email: normalizedEmail,
-          name: "Centro Estetico Elite",
-          role: "admin",
-          perms: allAssignablePermissions(),
-          needsEmailVerification: false,
-          currentLocationId: 0,
-          needsLocationSelection: false,
-          locationIds: [],
-        },
-        issuedAt: Date.now(),
-      };
-      return { ok: true, session, redirectTo: `/${encodeURIComponent(tenantSlug)}/dashboard`, source: "demo" };
-    }
-
-    return { ok: false, error: "Database gestionale non disponibile o credenziali non valide." };
+    // SECURITY: no hardcoded/demo credential fallback. Auth is DB-only — a DB
+    // failure is an error, never an admin grant for a specific tenant.
+    await recordLoginAttempt(tenantSlug, normalizedEmail, ip, false).catch(() => undefined);
+    return { ok: false, error: "Servizio di autenticazione non disponibile. Riprova tra poco." };
   }
 }
 
