@@ -8,15 +8,31 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // WIRED (core sale flow): load clients + service/product catalog from
 // GET /api/manage/pos; select a client; click a catalog tile to add a cart line;
 // qty +/- and remove per line; subtotal/discount/total in Italian "€ X,XX" format;
-// manual discount (none/percent/fixed); a single payment method + amount; the
-// "Concludi" button POSTs action=checkout with items_json/payments_json and resets
-// the cart on success (showing a success banner).
+// manual discount (none/percent/fixed); the "Concludi" button POSTs action=checkout
+// with items_json/payments_json and resets the cart on success (showing a success
+// banner).
+//
+// WIRED (coupon preview): the coupon Apply/Remove buttons (couponApplyBtn /
+// couponRemoveBtn) validate the typed code against POST /api/manage/coupons
+// action=preview (the same endpoint the quick-booking drawer uses) with the current
+// subtotal. On a valid coupon the discount is stored, the "Coupon (CODE) − € X,XX"
+// row (posCodeDiscountRow) is revealed and SUBTRACTED from the total; the reason is
+// shown on invalid. coupon_code is still sent on checkout (the backend re-validates,
+// so the shown discount always equals the charged discount).
+//
+// WIRED (split payment): a multi-row payment editor replaces the single payment
+// (port of the legacy single payment_type radio, extended to a faithful split). A
+// list of {method, amount} rows, "+ Aggiungi pagamento" adds a row, methods =
+// Contanti/Carta/Bonifico/Assegno (mapped to the API cash/card/transfer). The bar
+// shows the running total paid, the remaining-to-pay and the change/resto when
+// overpaid in cash; checkout is blocked client-side when paid < total (mirrors the
+// backend "Pagamento insufficiente"). All rows are sent as payments_json.
 //
 // LEFT STATIC / NON-WIRED (rendered faithfully for visual fidelity only): the
 // advanced line types and their modals — Pacchetti, Ricariche, GiftBox, GiftCard,
-// Residui (credit/giftcard), the installment (rate) plan, coupon apply, and
-// fidelity points. These dialogs are reproduced verbatim but their buttons do not
-// mutate state yet. The checkout only sends service/product lines.
+// Residui (credit/giftcard), the installment (rate) plan, and fidelity points.
+// These dialogs are reproduced verbatim but their buttons do not mutate state yet.
+// The checkout only sends service/product lines.
 
 type CatalogService = {
   id: number;
@@ -60,6 +76,32 @@ type CartLine = {
   unitPrice: number;
   status: "executed" | "collected";
 };
+
+// Legacy POS payment types (the single payment_type radio: cash/card/check/bank).
+// The Next API maps check -> card and bank -> transfer (see app/api/manage/pos route).
+type PaymentMethod = "cash" | "card" | "check" | "bank";
+
+// One row of the split-payment editor: a method + the raw amount text the staff types.
+type PaymentRow = { key: string; method: PaymentMethod; amount: string };
+
+const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
+  cash: "Contanti",
+  card: "Carta",
+  check: "Assegno",
+  bank: "Bonifico",
+};
+
+// PHP payment radios use cash/card/check/bank; the Next API maps check->card and
+// bank->transfer (port of normalizePaymentMethod in app/api/manage/pos/route.ts).
+function apiPaymentMethod(method: PaymentMethod): string {
+  if (method === "cash") return "cash";
+  if (method === "bank") return "transfer";
+  return "card"; // card + check
+}
+
+function paymentRowKey(): string {
+  return `pay-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+}
 
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
@@ -116,12 +158,25 @@ export function PosContent() {
   const [discountType, setDiscountType] = useState<"none" | "percent" | "fixed">("none");
   const [discountValue, setDiscountValue] = useState<string>("0");
 
-  // Coupon (rendered; not wired into totals server-side from here).
+  // Coupon (wired): the box toggle + the typed code, plus the APPLIED coupon
+  // (couponCode/couponDiscount mirror what the preview validated) and the
+  // couponHelp feedback ({text, ok}). couponApplying disables the buttons during
+  // the preview fetch; a monotonic req-id discards stale responses (legacy pattern).
   const [couponOpen, setCouponOpen] = useState(false);
+  const [couponInput, setCouponInput] = useState("");
   const [couponCode, setCouponCode] = useState("");
+  const [couponDiscount, setCouponDiscount] = useState(0);
+  const [couponMsg, setCouponMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [couponApplying, setCouponApplying] = useState(false);
+  const couponReqRef = useRef(0);
 
-  // Payment.
-  const [paymentType, setPaymentType] = useState<"cash" | "card" | "check" | "bank">("cash");
+  // Payment (split): one cash row pre-filled with the total by default, so a simple
+  // sale is unchanged. "+ Aggiungi pagamento" adds rows; checkout sends them all.
+  const [payments, setPayments] = useState<PaymentRow[]>([{ key: "pay-initial", method: "cash", amount: "" }]);
+  // True until the staff edits any payment amount: while true, the single cash row's
+  // amount auto-tracks the total (so the default "one cash row = total" keeps working
+  // as the cart/discount change). Any manual amount edit switches it off.
+  const [paymentsAuto, setPaymentsAuto] = useState(true);
   const [notes, setNotes] = useState("");
 
   // Checkout state.
@@ -184,7 +239,50 @@ export function PosContent() {
     return 0;
   }, [discountType, discountValue, subtotal]);
 
-  const total = useMemo(() => roundMoney(Math.max(0, subtotal - manualDiscount)), [subtotal, manualDiscount]);
+  // The coupon discount shown is the previewed value, but it is composed with the
+  // manual discount exactly like the backend (discount = min(subtotal, manual +
+  // coupon)), so it never drives the total negative and the shown total equals the
+  // server's. Only the part of the coupon that fits after the manual discount counts.
+  const codeDiscount = useMemo(
+    () => roundMoney(Math.min(Math.max(0, couponDiscount), Math.max(0, subtotal - manualDiscount))),
+    [couponDiscount, subtotal, manualDiscount],
+  );
+
+  const total = useMemo(
+    () => roundMoney(Math.max(0, subtotal - manualDiscount - codeDiscount)),
+    [subtotal, manualDiscount, codeDiscount],
+  );
+
+  // ---- split-payment math ----
+  // Sum of the typed amounts. The single default cash row auto-tracks the total
+  // (paymentsAuto), so when paymentsAuto is on the first row's effective amount is
+  // the total even before the staff types anything.
+  const paymentRows = useMemo<Array<{ key: string; method: PaymentMethod; amount: number }>>(
+    () =>
+      payments.map((row, index) => {
+        const typed = Math.max(0, Number.parseFloat(String(row.amount).replace(",", ".")) || 0);
+        const amount = paymentsAuto && index === 0 && payments.length === 1 && !row.amount ? total : typed;
+        return { key: row.key, method: row.method, amount: roundMoney(amount) };
+      }),
+    [payments, paymentsAuto, total],
+  );
+
+  const paidTotal = useMemo(
+    () => roundMoney(paymentRows.reduce((sum, row) => sum + row.amount, 0)),
+    [paymentRows],
+  );
+  const remainingToPay = useMemo(() => roundMoney(Math.max(0, total - paidTotal)), [total, paidTotal]);
+  // Change (resto) is only meaningful when overpaid in CASH (mirrors the backend's
+  // changeDue but gated on cash, like a real till).
+  const cashPaid = useMemo(
+    () => roundMoney(paymentRows.filter((row) => row.method === "cash").reduce((sum, row) => sum + row.amount, 0)),
+    [paymentRows],
+  );
+  const changeDue = useMemo(
+    () => (cashPaid > 0 ? roundMoney(Math.max(0, paidTotal - total)) : 0),
+    [cashPaid, paidTotal, total],
+  );
+  const paymentInsufficient = useMemo(() => total > 0 && paidTotal + 0.00001 < total, [total, paidTotal]);
 
   function selectClient(id: number, name: string) {
     setClientId(id);
@@ -226,11 +324,103 @@ export function PosContent() {
     setCart((prev) => prev.filter((l) => l.key !== key));
   }
 
-  // PHP payment radios use cash/card/check/bank; the Next API maps check->card and bank->transfer.
-  function apiPaymentMethod(): string {
-    if (paymentType === "cash") return "cash";
-    if (paymentType === "bank") return "transfer";
-    return "card"; // card + check
+  // ---- Coupon preview (wired) ----
+  // Reset the applied coupon (invalidates any in-flight preview via the req-id).
+  const clearCouponState = useCallback(() => {
+    couponReqRef.current += 1;
+    setCouponCode("");
+    setCouponDiscount(0);
+  }, []);
+
+  // Apply: validate the typed code against the DB coupons preview endpoint
+  // (POST /api/manage/coupons action=preview -> {ok, preview:{valid, discount, reason}},
+  // the same endpoint the quick-booking drawer uses). On valid, store the code +
+  // discount (revealing the coupon row and subtracting it from the total); on invalid
+  // show the reason. The subtotal sent is the cart subtotal (coupon minimums are
+  // subtotal-aware; the backend re-validates on checkout so the charged discount agrees).
+  const applyCoupon = useCallback(async () => {
+    const code = couponInput.trim().toUpperCase();
+    setCouponOpen(true);
+    if (!code) {
+      clearCouponState();
+      setCouponInput("");
+      setCouponMsg({ text: "Inserisci un codice coupon.", ok: false });
+      return;
+    }
+    if (subtotal <= 0) {
+      setCouponMsg({ text: "Aggiungi almeno un elemento al carrello.", ok: false });
+      return;
+    }
+    const myReq = ++couponReqRef.current;
+    setCouponApplying(true);
+    try {
+      const res = await fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "preview", code, subtotal }),
+      });
+      const data: { ok?: boolean; error?: string; preview?: { valid?: boolean; discount?: number; reason?: string } } =
+        await res.json().catch(() => ({}));
+      if (myReq !== couponReqRef.current) return; // stale
+      const preview = data?.preview;
+      if (res.ok && data?.ok !== false && preview?.valid) {
+        const disc = roundMoney(Math.max(0, Number(preview.discount ?? 0)));
+        setCouponCode(code);
+        setCouponDiscount(disc);
+        setCouponInput(code);
+        setCouponMsg({ text: "Coupon applicato.", ok: true });
+      } else {
+        clearCouponState();
+        setCouponInput(code);
+        setCouponMsg({ text: String(preview?.reason || data?.error || "Coupon non applicabile."), ok: false });
+      }
+    } catch {
+      if (myReq !== couponReqRef.current) return;
+      clearCouponState();
+      setCouponInput(code);
+      setCouponMsg({ text: "Errore durante la verifica del coupon.", ok: false });
+    } finally {
+      if (myReq === couponReqRef.current) setCouponApplying(false);
+    }
+  }, [couponInput, subtotal, slug, clearCouponState]);
+
+  // Remove: clear the applied coupon + the typed code + the feedback.
+  const removeCoupon = useCallback(() => {
+    clearCouponState();
+    setCouponInput("");
+    setCouponMsg(null);
+  }, [clearCouponState]);
+
+  // ---- Split-payment row mutators ----
+  // Editing any amount switches off the auto-track default (the staff is now in control).
+  function setPaymentAmount(key: string, amount: string) {
+    setPaymentsAuto(false);
+    setPayments((prev) => prev.map((row) => (row.key === key ? { ...row, amount } : row)));
+  }
+  function setPaymentMethod(key: string, method: PaymentMethod) {
+    setPayments((prev) => prev.map((row) => (row.key === key ? { ...row, method } : row)));
+  }
+  // Add a new row pre-filled with what is still owed (so the running remaining hits 0).
+  function addPaymentRow() {
+    setPaymentsAuto(false);
+    setPayments((prev) => {
+      const owed = remainingToPay;
+      const amount = owed > 0 ? owed.toFixed(2) : "";
+      // If the single default row is still empty, materialize its auto amount first so
+      // the new row's prefill is correct.
+      const base =
+        prev.length === 1 && !prev[0].amount
+          ? [{ ...prev[0], amount: roundMoney(Math.max(0, total - owed)).toFixed(2) }]
+          : prev;
+      return [...base, { key: paymentRowKey(), method: "card", amount }];
+    });
+  }
+  function removePaymentRow(key: string) {
+    setPaymentsAuto(false);
+    setPayments((prev) => {
+      if (prev.length <= 1) return prev; // always keep at least one row
+      return prev.filter((row) => row.key !== key);
+    });
   }
 
   async function handleCheckout(event: React.FormEvent) {
@@ -239,6 +429,11 @@ export function PosContent() {
     setSuccessMsg("");
     if (cart.length === 0) {
       setErrorMsg("Aggiungi almeno un elemento prima di concludere la vendita.");
+      return;
+    }
+    // Mirror the backend's "Pagamento insufficiente" client-side.
+    if (paymentInsufficient) {
+      setErrorMsg("Pagamento insufficiente.");
       return;
     }
 
@@ -254,7 +449,13 @@ export function PosContent() {
         status: line.status,
       })),
     );
-    const paymentsJson = JSON.stringify([{ method: apiPaymentMethod(), amount: total }]);
+    // Send ALL payment rows (method mapped to the API set, amount > 0). The backend
+    // re-validates the sum >= total.
+    const paymentsJson = JSON.stringify(
+      paymentRows
+        .filter((row) => row.amount > 0)
+        .map((row) => ({ method: apiPaymentMethod(row.method), amount: row.amount })),
+    );
 
     const body = {
       action: "checkout",
@@ -285,8 +486,12 @@ export function PosContent() {
       setCart([]);
       setDiscountType("none");
       setDiscountValue("0");
-      setCouponCode("");
+      clearCouponState();
+      setCouponInput("");
+      setCouponMsg(null);
       setCouponOpen(false);
+      setPayments([{ key: "pay-initial", method: "cash", amount: "" }]);
+      setPaymentsAuto(true);
       setNotes("");
       clearClient();
       setSuccessMsg(`Vendita conclusa${saleCode}.`);
@@ -299,7 +504,6 @@ export function PosContent() {
     }
   }
 
-  const codeDiscount = 0; // coupon discount not computed client-side
   const today = "2026-06-29";
 
   return (
@@ -649,22 +853,40 @@ export function PosContent() {
                       name="coupon_code"
                       id="coupon_code"
                       placeholder="ES. WELCOME10"
-                      value={couponCode}
-                      onChange={(e) => setCouponCode(e.target.value)}
+                      value={couponInput}
+                      onChange={(e) => setCouponInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void applyCoupon();
+                        }
+                      }}
                     />
-                    <button className="btn btn-outline-success" type="button" id="couponApplyBtn">
+                    <button
+                      className="btn btn-outline-success"
+                      type="button"
+                      id="couponApplyBtn"
+                      disabled={couponApplying}
+                      onClick={() => void applyCoupon()}
+                    >
                       Applica
                     </button>
                     <button
                       className="btn btn-outline-secondary"
                       type="button"
                       id="couponRemoveBtn"
-                      onClick={() => setCouponCode("")}
+                      disabled={couponApplying}
+                      onClick={removeCoupon}
                     >
                       Rimuovi
                     </button>
                   </div>
-                  <div className="form-text" id="couponHelp"></div>
+                  <div
+                    className={`form-text${couponMsg ? (couponMsg.ok ? " text-success" : " text-danger") : ""}`}
+                    id="couponHelp"
+                  >
+                    {couponMsg?.text ?? ""}
+                  </div>
                 </div>
               </div>
 
@@ -733,72 +955,85 @@ export function PosContent() {
               </div>
 
               <div className="card p-3" id="posPriceDetails">
+                {/* SPLIT PAYMENT — a faithful multi-row payment editor. Each row is a
+                    method (Contanti/Carta/Assegno/Bonifico) + an amount; "+ Aggiungi
+                    pagamento" adds a row; the bar shows the running paid / remaining /
+                    change. Defaults to one cash row that auto-tracks the total, so a
+                    simple sale is unchanged. */}
                 <div className="mb-3 pos-payment-type-card" id="posPaymentTypeBox">
-                  <div className="small text-muted mb-2">Tipo pagamento</div>
-                  <div className="pos-payment-type-grid">
-                    <div className="pos-payment-type-option">
-                      <input
-                        className="btn-check"
-                        type="radio"
-                        name="payment_type"
-                        id="posPaymentTypeCash"
-                        value="cash"
-                        autoComplete="off"
-                        checked={paymentType === "cash"}
-                        onChange={() => setPaymentType("cash")}
-                      />
-                      <label className="pos-payment-type-label" htmlFor="posPaymentTypeCash">
-                        Contanti
-                      </label>
-                    </div>
-                    <div className="pos-payment-type-option">
-                      <input
-                        className="btn-check"
-                        type="radio"
-                        name="payment_type"
-                        id="posPaymentTypeCard"
-                        value="card"
-                        autoComplete="off"
-                        checked={paymentType === "card"}
-                        onChange={() => setPaymentType("card")}
-                      />
-                      <label className="pos-payment-type-label" htmlFor="posPaymentTypeCard" title="Carta di Credito">
-                        Carta
-                      </label>
-                    </div>
-                    <div className="pos-payment-type-option">
-                      <input
-                        className="btn-check"
-                        type="radio"
-                        name="payment_type"
-                        id="posPaymentTypeCheck"
-                        value="check"
-                        autoComplete="off"
-                        checked={paymentType === "check"}
-                        onChange={() => setPaymentType("check")}
-                      />
-                      <label className="pos-payment-type-label" htmlFor="posPaymentTypeCheck">
-                        Assegno
-                      </label>
-                    </div>
-                    <div className="pos-payment-type-option">
-                      <input
-                        className="btn-check"
-                        type="radio"
-                        name="payment_type"
-                        id="posPaymentTypeBank"
-                        value="bank"
-                        autoComplete="off"
-                        checked={paymentType === "bank"}
-                        onChange={() => setPaymentType("bank")}
-                      />
-                      <label className="pos-payment-type-label" htmlFor="posPaymentTypeBank" title="Bonifico">
-                        Bonifico
-                      </label>
-                    </div>
+                  <div className="d-flex justify-content-between align-items-center mb-2">
+                    <div className="small text-muted">Pagamento</div>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-outline-primary"
+                      id="posPaymentAddBtn"
+                      onClick={addPaymentRow}
+                    >
+                      <i className="bi bi-plus-lg me-1"></i>Aggiungi pagamento
+                    </button>
                   </div>
+
+                  <div className="pos-payment-rows" id="posPaymentRows">
+                    {payments.map((row, index) => (
+                      <div className="input-group input-group-sm mb-2 pos-payment-row" key={row.key}>
+                        <select
+                          className="form-select pos-payment-row-method"
+                          aria-label="Metodo di pagamento"
+                          value={row.method}
+                          onChange={(e) => setPaymentMethod(row.key, e.target.value as PaymentMethod)}
+                        >
+                          <option value="cash">{PAYMENT_METHOD_LABELS.cash}</option>
+                          <option value="card">{PAYMENT_METHOD_LABELS.card}</option>
+                          <option value="check">{PAYMENT_METHOD_LABELS.check}</option>
+                          <option value="bank">{PAYMENT_METHOD_LABELS.bank}</option>
+                        </select>
+                        <span className="input-group-text">€</span>
+                        <input
+                          className="form-control text-end pos-payment-row-amount"
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          inputMode="decimal"
+                          placeholder={index === 0 ? total.toFixed(2) : "0.00"}
+                          value={row.amount}
+                          onChange={(e) => setPaymentAmount(row.key, e.target.value)}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger"
+                          title="Rimuovi pagamento"
+                          disabled={payments.length <= 1}
+                          onClick={() => removePaymentRow(row.key)}
+                        >
+                          <i className="bi bi-x-lg"></i>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="d-flex justify-content-between small" id="posPaymentPaidRow">
+                    <span className="text-muted">Pagato</span>
+                    <span id="posPaymentPaidVal">{fmtEUR(paidTotal)}</span>
+                  </div>
+                  <div
+                    className={`d-flex justify-content-between small${remainingToPay > 0 ? " text-danger fw-semibold" : " text-muted"}`}
+                    id="posPaymentRemainingRow"
+                  >
+                    <span>Rimanente</span>
+                    <span id="posPaymentRemainingVal">{fmtEUR(remainingToPay)}</span>
+                  </div>
+                  <div
+                    className={`d-flex justify-content-between small text-success${changeDue > 0 ? "" : " d-none"}`}
+                    id="posPaymentChangeRow"
+                  >
+                    <span>Resto</span>
+                    <span id="posPaymentChangeVal">{fmtEUR(changeDue)}</span>
+                  </div>
+
                   <div className="form-text mt-2" id="posPaymentTypeHelp">
-                    Seleziona come paga il cliente.
+                    {paymentInsufficient
+                      ? "Pagamento insufficiente: la somma dei pagamenti deve coprire il totale."
+                      : "Seleziona come paga il cliente. Puoi suddividere su più metodi."}
                   </div>
                 </div>
 
@@ -865,7 +1100,7 @@ export function PosContent() {
                   className={`d-flex justify-content-between text-muted small${codeDiscount > 0 ? "" : " d-none"}`}
                   id="posCodeDiscountRow"
                 >
-                  <span id="posCodeDiscountLabel">Coupon</span>
+                  <span id="posCodeDiscountLabel">{couponCode ? `Coupon (${couponCode})` : "Coupon"}</span>
                   <span id="posCodeDiscountVal">- {fmtEUR(codeDiscount)}</span>
                 </div>
 
@@ -911,7 +1146,12 @@ export function PosContent() {
                 onChange={(e) => setNotes(e.target.value)}
               ></textarea>
 
-              <button className="btn btn-success w-100 mt-3" type="submit" id="posConcludeBtn" disabled={submitting}>
+              <button
+                className="btn btn-success w-100 mt-3"
+                type="submit"
+                id="posConcludeBtn"
+                disabled={submitting || paymentInsufficient || cart.length === 0}
+              >
                 <i className="bi bi-check2-circle me-1"></i>
                 {submitting ? "Conclusione…" : "Concludi"}
               </button>
