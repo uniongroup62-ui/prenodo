@@ -51,6 +51,12 @@ type CalendarBusinessHour = {
   locationId: number | null;
   openTime: string;
   closeTime: string;
+  // Second (afternoon) interval of a split schedule, e.g. 09:00-13:00 + 15:00-19:00.
+  // The lunch BREAK is the gap between closeTime (13:00) and openTime2 (15:00).
+  // Empty strings when the day has no second interval. Faithful to the legacy
+  // business_hours.opens2/closes2 columns (getStoreScheduleForDow).
+  openTime2: string;
+  closeTime2: string;
   isClosed: boolean;
 };
 
@@ -67,6 +73,10 @@ type CalendarBusinessHourException = {
   locationId: number | null;
   openTime: string;
   closeTime: string;
+  // Second interval for a split special-open day (legacy specialOpenRowForDateKey
+  // reads opens2/closes2 too). Empty when single-interval.
+  openTime2: string;
+  closeTime2: string;
   isClosed: boolean;
 };
 
@@ -405,6 +415,11 @@ async function listBusinessHours(slug: string): Promise<CalendarBusinessHour[]> 
     locationId: nullableNumber(row.location_id),
     openTime: timeString(row.opens ?? row.open_time ?? row.opens_at ?? row.start_time),
     closeTime: timeString(row.closes ?? row.close_time ?? row.closes_at ?? row.end_time),
+    // Second interval (split schedule). Same fallback style as opens/closes; the
+    // gap between closeTime and openTime2 is the store BREAK (lunch). Empty when
+    // the row has no second interval, so callers can detect a single-interval day.
+    openTime2: timeString(row.opens2 ?? row.open_time2 ?? row.opens2_at ?? row.start_time2),
+    closeTime2: timeString(row.closes2 ?? row.close_time2 ?? row.closes2_at ?? row.end_time2),
     isClosed: Number(row.is_closed ?? 0) === 1,
   }));
 }
@@ -441,6 +456,8 @@ async function listBusinessHourExceptions({ slug, start, end }: { slug: string; 
     locationId: nullableNumber(row.location_id),
     openTime: timeString(row.opens ?? row.open_time ?? row.opens_at ?? row.start_time),
     closeTime: timeString(row.closes ?? row.close_time ?? row.closes_at ?? row.end_time),
+    openTime2: timeString(row.opens2 ?? row.open_time2 ?? row.opens2_at ?? row.start_time2),
+    closeTime2: timeString(row.closes2 ?? row.close_time2 ?? row.closes2_at ?? row.end_time2),
     isClosed: Number(row.is_closed ?? 0) === 1,
   }));
 }

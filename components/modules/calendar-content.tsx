@@ -66,6 +66,32 @@ type CalendarBusinessHour = {
   locationId: number | null;
   openTime: string;
   closeTime: string;
+  // Second (afternoon) interval of a split schedule, e.g. 09:00-13:00 + 15:00-19:00.
+  // The lunch BREAK is the gap between closeTime and openTime2. Empty when the day
+  // is a single interval. (Faithful port of business_hours.opens2/closes2.)
+  openTime2?: string;
+  closeTime2?: string;
+  isClosed: boolean;
+};
+
+// A date the store is fully CLOSED (Impostazioni → Chiusure). Faithful to the
+// closures table (calendar.php) — drives the whole-column "Chiuso" shading.
+type CalendarClosure = {
+  date: string;
+  locationId: number | null;
+};
+
+// A per-date business-hours override (Impostazioni → Straordinari). When present it
+// REPLACES the day-of-week hours for that date and wins even over closures
+// (specialOpenRowForDateKey in calendar.js): a normally-closed date can be opened,
+// or a date given custom (possibly split) hours.
+type CalendarBusinessHourException = {
+  date: string;
+  locationId: number | null;
+  openTime: string;
+  closeTime: string;
+  openTime2?: string;
+  closeTime2?: string;
   isClosed: boolean;
 };
 
@@ -82,6 +108,8 @@ type CalendarContextResponse = {
   notes?: CalendarNote[];
   countByDate?: Record<string, number>;
   businessHours?: CalendarBusinessHour[];
+  closures?: CalendarClosure[];
+  exceptions?: CalendarBusinessHourException[];
 };
 
 type Appointment = {
@@ -476,6 +504,84 @@ function nowMinutesOfDay(): number {
   return d.getHours() * 60 + d.getMinutes();
 }
 
+// === STORE-BACKGROUND BANDS (port of buildStoreBreakEventsForView + the FullCalendar
+// non-business / closed-day shading) ===
+// A single absolutely-positioned background band inside a column body. `top`/`height`
+// are px (mapped like an appointment block: minutes-from-window-start * PX_PER_MIN).
+// `kind` selects the legacy CSS class: a lunch BREAK gap (store-break-time), the
+// before-open / after-close non-business region (fc-non-business — transparent in this
+// theme, faithful to the legacy), or a fully-closed day (store-closed-day).
+type StoreBand = { key: string; kind: "break" | "nonbusiness" | "closed"; top: number; height: number };
+
+// Compute the background bands for one column-date given its effective schedule
+// (closed flag + open intervals, minutes-of-day) and the visible window [winMin,
+// winMax] (minutes). Mirrors storeBreakRangesForDate (gaps between consecutive open
+// intervals) plus the FullCalendar non-business shading before the first open / after
+// the last close, and the whole-column closed shading when the day has no intervals.
+function storeBandsForColumn(
+  schedule: { closed: boolean; intervals: { start: number; end: number }[] },
+  winMin: number,
+  winMax: number,
+): StoreBand[] {
+  const out: StoreBand[] = [];
+  const toPx = (min: number) => (min - winMin) * PX_PER_MIN;
+  // Clamp a [start,end] range to the visible window and emit a band if it has height.
+  const emit = (kind: StoreBand["kind"], start: number, end: number, key: string) => {
+    const s = Math.max(start, winMin);
+    const e = Math.min(end, winMax);
+    if (e <= s) return;
+    out.push({ key, kind, top: toPx(s), height: (e - s) * PX_PER_MIN });
+  };
+
+  // Fully closed (is_closed / in closures / special-open with no intervals): shade the
+  // whole visible window as closed.
+  if (schedule.closed || schedule.intervals.length === 0) {
+    emit("closed", winMin, winMax, "closed");
+    return out;
+  }
+
+  const intervals = schedule.intervals;
+  const firstOpen = intervals[0].start;
+  const lastClose = intervals[intervals.length - 1].end;
+
+  // Non-business BEFORE the first open and AFTER the last close, within the window.
+  emit("nonbusiness", winMin, firstOpen, "pre");
+  emit("nonbusiness", lastClose, winMax, "post");
+
+  // BREAK gaps between consecutive open intervals (closes -> next opens).
+  for (let i = 0; i < intervals.length - 1; i++) {
+    const gapStart = intervals[i].end;
+    const gapEnd = intervals[i + 1].start;
+    if (gapEnd > gapStart) emit("break", gapStart, gapEnd, `break-${i}`);
+  }
+
+  return out;
+}
+
+// Map a band to its legacy CSS classes. In the Day view the break/closed bands carry
+// the per-staff-column suffix (-staffday / -master on the first column) like
+// buildStoreBreakEventsForView, so calendar/app.css styles them identically. The
+// non-business band reuses .fc-non-business (transparent via --fc-non-business-color,
+// faithful to the legacy, which does NOT visibly shade out-of-hours time).
+function storeBandClass(kind: StoreBand["kind"], dayView: boolean, firstCol: boolean): string {
+  if (kind === "nonbusiness") return "fc-non-business";
+  if (kind === "break") {
+    const cls = ["store-break-time"];
+    if (dayView) {
+      cls.push("store-break-time-staffday");
+      if (firstCol) cls.push("store-break-time-master");
+    }
+    return cls.join(" ");
+  }
+  // closed
+  const cls = ["store-closed-day"];
+  if (dayView) {
+    cls.push("store-closed-day-staffday");
+    if (firstCol) cls.push("store-closed-day-master");
+  }
+  return cls.join(" ");
+}
+
 // Drag payload moved between an appointment block and a staff/grid drop target.
 type CalendarDrag = {
   id: number;
@@ -504,6 +610,12 @@ export function CalendarContent() {
   const [notes, setNotes] = useState<CalendarNote[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [businessHours, setBusinessHours] = useState<CalendarBusinessHour[]>([]);
+  // Date-level overrides used to shade the grid: closures (fully closed dates) and
+  // business_hours_exceptions / special-open (per-date custom or extra opening). Both
+  // are already returned by /api/manage/calendar (calendarContext) for the visible
+  // range; they feed the per-column open-interval computation below.
+  const [closures, setClosures] = useState<CalendarClosure[]>([]);
+  const [exceptions, setExceptions] = useState<CalendarBusinessHourException[]>([]);
   // Staff-column ordering (Day view). currentStaffId is the logged-in operator's
   // own column (always pinned first); savedStaffOrder is the persisted order of the
   // OTHER operators (port of CURRENT_STAFF_ID + SAVED_DAY_STAFF_ORDER).
@@ -589,6 +701,8 @@ export function CalendarContent() {
           setServices(Array.isArray(j.services) ? j.services : []);
           setNotes(Array.isArray(j.notes) ? j.notes : []);
           setBusinessHours(Array.isArray(j.businessHours) ? j.businessHours : []);
+          setClosures(Array.isArray(j.closures) ? j.closures : []);
+          setExceptions(Array.isArray(j.exceptions) ? j.exceptions : []);
           setCountByDate(j.countByDate && typeof j.countByDate === "object" ? j.countByDate : {});
           setCurrentStaffId(Number(j.currentStaffId ?? 0) || 0);
           setSavedStaffOrder(normalizeStaffOrder(j.staffOrder));
@@ -598,6 +712,8 @@ export function CalendarContent() {
           setServices([]);
           setNotes([]);
           setBusinessHours([]);
+          setClosures([]);
+          setExceptions([]);
           setCountByDate({});
           setCurrentStaffId(0);
           setSavedStaffOrder([]);
@@ -645,6 +761,93 @@ export function CalendarContent() {
       return { open, close };
     },
     [businessHours],
+  );
+
+  // === STORE SCHEDULE PER DATE (port of getStoreScheduleForDate) ===
+  // The effective open INTERVALS (in minutes-of-day) for a specific column-date,
+  // applying the same priority as the legacy:
+  //   0) special-open / business_hours_exceptions for that date wins over everything
+  //      (a normally-closed date can open, or get custom — possibly split — hours);
+  //   1) a closure for that date => fully closed (no intervals);
+  //   2) otherwise the standard day-of-week business hours, incl. the second
+  //      (opens2/closes2) interval. is_closed / missing opens => closed.
+  // Intervals are sorted by start; the gaps between consecutive intervals are the
+  // store BREAK(s). Returns { closed, intervals: [{start,end}] }.
+  const scheduleForDate = useCallback(
+    (iso: string): { closed: boolean; intervals: { start: number; end: number }[] } => {
+      const pushInterval = (
+        list: { start: number; end: number }[],
+        open: string | undefined,
+        close: string | undefined,
+      ) => {
+        const s = timeToMin(open ?? "");
+        const e = timeToMin(close ?? "");
+        if (s !== null && e !== null && e > s) list.push({ start: s, end: e });
+      };
+      const sortIntervals = (list: { start: number; end: number }[]) =>
+        list.sort((a, b) => a.start - b.start);
+
+      // 0) Special-open / exception override for this exact date.
+      const sp = exceptions.find((x) => x.date === iso);
+      if (sp) {
+        if (sp.isClosed) return { closed: true, intervals: [] };
+        const intervals: { start: number; end: number }[] = [];
+        pushInterval(intervals, sp.openTime, sp.closeTime);
+        pushInterval(intervals, sp.openTime2, sp.closeTime2);
+        return { closed: intervals.length === 0, intervals: sortIntervals(intervals) };
+      }
+
+      // 1) Closure for this date => fully closed.
+      if (closures.some((c) => c.date === iso)) return { closed: true, intervals: [] };
+
+      // 2) Standard day-of-week business hours (with the second interval).
+      const dow = new Date(`${iso}T12:00:00`).getDay();
+      const todays = businessHours.filter((b) => b.dow === dow);
+      const intervals: { start: number; end: number }[] = [];
+      for (const b of todays) {
+        if (b.isClosed) continue;
+        pushInterval(intervals, b.openTime, b.closeTime);
+        pushInterval(intervals, b.openTime2, b.closeTime2);
+      }
+      return { closed: intervals.length === 0, intervals: sortIntervals(intervals) };
+    },
+    [businessHours, closures, exceptions],
+  );
+
+  // Render the store-background bands for one column body: the unavailable / break /
+  // closed shading for `iso` within the visible window [winMin, winMax]. Each band is
+  // an absolutely-positioned, pointer-events:none div at a LOW z-index (0) so it sits
+  // BEHIND the slot lines' content, appointment blocks (z auto/positioned), the
+  // now-indicator (z 6-7) and quick-book/drag/resize stay fully interactive on top.
+  // `dayView` toggles the Day-view per-staff-column class suffixes; `firstCol` marks
+  // the first staff column (the -master that carries the single centered label).
+  const renderStoreBands = useCallback(
+    (iso: string, winMin: number, winMax: number, dayView: boolean, firstCol: boolean) => {
+      const schedule = scheduleForDate(iso);
+      const bands = storeBandsForColumn(schedule, winMin, winMax);
+      if (!bands.length) return null;
+      return (
+        <>
+          {bands.map((b) => (
+            <div
+              key={b.key}
+              className={storeBandClass(b.kind, dayView, firstCol)}
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: b.top,
+                height: b.height,
+                zIndex: 0,
+                pointerEvents: "none",
+              }}
+            />
+          ))}
+        </>
+      );
+    },
+    [scheduleForDate],
   );
 
   // Visible time window from business hours for the focused day-of-week (Day view),
@@ -1445,6 +1648,11 @@ export function CalendarContent() {
 
                 {/* Slot rows (background) + positioned appointment blocks */}
                 <div className="cal-col-body" style={{ position: "relative", height: weekGridHeight }}>
+                  {/* Store-background shading per DAY column (unavailable / lunch break /
+                      closed), computed from THIS column's date over the shared week
+                      window. Behind the slot lines + blocks + now-indicator and
+                      non-interactive (pointer-events:none). */}
+                  {renderStoreBands(iso, weekMinMin, weekMaxMin, false, false)}
                   {weekRows.map((m) => (
                     <div
                       key={m}
@@ -1489,6 +1697,9 @@ export function CalendarContent() {
                           background: "#f4f8ff",
                           color: "#14326f",
                           boxSizing: "border-box",
+                          // Above the store-background bands (z 0) so blocks stay
+                          // visible/clickable over the shading.
+                          zIndex: 3,
                         }}
                       >
                         <div className="fc-event-main">
@@ -1938,7 +2149,11 @@ export function CalendarContent() {
                       ? "fc-view fc-daygrid fc-dayGridMonth-view"
                       : view === "timeGridWeek"
                         ? "fc-view fc-timegrid fc-timeGridWeek-view"
-                        : "fc-view fc-timegrid"
+                        : // The Day view carries fc-staffTimeGridDay-view so the legacy
+                          // store-break-time-staffday / -master (single centered label)
+                          // and closed-day master-label rules in app.css apply, like the
+                          // real FullCalendar staffTimeGridDay view.
+                          "fc-view fc-timegrid fc-staffTimeGridDay-view"
                   }
                 >
                   {view === "dayGridMonth" ? (
@@ -2035,7 +2250,7 @@ export function CalendarContent() {
                         {staffCols.length === 0 ? (
                           <div className="text-muted small p-4">{loading ? "Caricamento prenotazioni..." : "Nessun operatore attivo."}</div>
                         ) : (
-                          staffCols.map((s) => {
+                          staffCols.map((s, colIndex) => {
                             const first = (Array.from(s.name.trim())[0] || "O").toUpperCase();
                             const colAppts = apptsForStaff(s.name);
                             const colCount = colAppts.length;
@@ -2103,6 +2318,12 @@ export function CalendarContent() {
                                     openGlobalQuickBook(timeFromY(e.clientY - rect.top), s.id);
                                   }}
                                 >
+                                  {/* Store-background shading (unavailable / lunch break /
+                                      closed) for the focused date, applied to every staff
+                                      column like the legacy. Behind the slot lines + blocks
+                                      + now-indicator, pointer-events:none so quick-book /
+                                      drag / resize still work on top. */}
+                                  {renderStoreBands(date, minMin, maxMin, true, colIndex === 0)}
                                   {rows.map((m) => (
                                     <div
                                       key={m}
@@ -2176,6 +2397,10 @@ export function CalendarContent() {
                                           background: "#f4f8ff",
                                           color: "#14326f",
                                           boxSizing: "border-box",
+                                          // Above the store-background bands (z 0, and the
+                                          // -master break band at z 2) so blocks stay
+                                          // visible/clickable over the shading.
+                                          zIndex: 3,
                                         }}
                                       >
                                         <div className="fc-event-main">
