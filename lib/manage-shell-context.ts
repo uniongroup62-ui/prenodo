@@ -86,8 +86,25 @@ export async function automationAlertDays(slug: string, column: string): Promise
   }
 }
 
+// Tenant scoping fragment for a RAW dbQuery on a shared-tenant table. Returns the SQL
+// to AND into the WHERE plus its param, or empty when the table is single-tenant / has
+// no tenant_id column. Without this a raw COUNT(*) aggregates ACROSS every tenant in
+// the shared-schema DB (cross-tenant leak); tenantSelect already scopes automatically.
+async function tenantScope(slug: string, table: string, alias?: string): Promise<{ sql: string; params: number[] }> {
+  try {
+    const target = await tenantTable(slug, table);
+    if (target.mode === "shared" && target.tenantId && (await columnExists(target.name, "tenant_id"))) {
+      return { sql: ` AND ${alias ? `${alias}.` : ""}tenant_id = ?`, params: [target.tenantId] };
+    }
+  } catch {
+    // best effort like the rest of this file — fall back to unscoped
+  }
+  return { sql: "", params: [] };
+}
+
 export async function countPendingAppointments(slug: string, currentLocationId: number): Promise<number> {
   try {
+    const scope = await tenantScope(slug, "appointments", "a");
     if (currentLocationId > 0) {
       const hasApptLocation = await tenantColumnExists(slug, "appointments", "location_id");
       const hasBridge =
@@ -100,15 +117,15 @@ export async function countPendingAppointments(slug: string, currentLocationId: 
           `SELECT COUNT(*) c
              FROM appointments a
             WHERE a.status='pending'
-              AND (a.location_id=? OR (a.location_id IS NULL AND (EXISTS (SELECT 1 FROM appointment_locations al WHERE al.appointment_id=a.id AND al.location_id=?) OR NOT EXISTS (SELECT 1 FROM appointment_locations al2 WHERE al2.appointment_id=a.id))))`,
-          [currentLocationId, currentLocationId],
+              AND (a.location_id=? OR (a.location_id IS NULL AND (EXISTS (SELECT 1 FROM appointment_locations al WHERE al.appointment_id=a.id AND al.location_id=?) OR NOT EXISTS (SELECT 1 FROM appointment_locations al2 WHERE al2.appointment_id=a.id))))${scope.sql}`,
+          [currentLocationId, currentLocationId, ...scope.params],
         );
         return Number(rows[0]?.c ?? 0);
       }
       if (hasApptLocation) {
         const rows = await dbQuery<RowDataPacket[]>(
-          "SELECT COUNT(*) c FROM appointments a WHERE a.status='pending' AND (a.location_id=? OR a.location_id IS NULL)",
-          [currentLocationId],
+          `SELECT COUNT(*) c FROM appointments a WHERE a.status='pending' AND (a.location_id=? OR a.location_id IS NULL)${scope.sql}`,
+          [currentLocationId, ...scope.params],
         );
         return Number(rows[0]?.c ?? 0);
       }
@@ -117,13 +134,13 @@ export async function countPendingAppointments(slug: string, currentLocationId: 
           `SELECT COUNT(*) c
              FROM appointments a
             WHERE a.status='pending'
-              AND (EXISTS (SELECT 1 FROM appointment_locations al WHERE al.appointment_id=a.id AND al.location_id=?) OR NOT EXISTS (SELECT 1 FROM appointment_locations al2 WHERE al2.appointment_id=a.id))`,
-          [currentLocationId],
+              AND (EXISTS (SELECT 1 FROM appointment_locations al WHERE al.appointment_id=a.id AND al.location_id=?) OR NOT EXISTS (SELECT 1 FROM appointment_locations al2 WHERE al2.appointment_id=a.id))${scope.sql}`,
+          [currentLocationId, ...scope.params],
         );
         return Number(rows[0]?.c ?? 0);
       }
     }
-    const rows = await dbQuery<RowDataPacket[]>("SELECT COUNT(*) c FROM appointments WHERE status='pending'");
+    const rows = await dbQuery<RowDataPacket[]>(`SELECT COUNT(*) c FROM appointments a WHERE a.status='pending'${scope.sql}`, scope.params);
     return Number(rows[0]?.c ?? 0);
   } catch {
     return 0;
@@ -134,14 +151,15 @@ export async function countUnseenQuoteDecisions(slug: string, currentLocationId:
   try {
     const useLocation = currentLocationId > 0 && (await tenantColumnExists(slug, "quotes", "location_id"));
     const locationSql = useLocation ? " AND location_id=?" : "";
-    const params = useLocation ? [currentLocationId] : [];
+    const scope = await tenantScope(slug, "quotes");
+    const params: number[] = useLocation ? [currentLocationId, ...scope.params] : [...scope.params];
     const rows = await dbQuery<RowDataPacket[]>(
       `SELECT COUNT(*) c
          FROM quotes
         WHERE status IN ('accepted','rejected')
           AND customer_decision_at IS NOT NULL
           AND customer_decision_seen_at IS NULL
-          ${locationSql}`,
+          ${locationSql}${scope.sql}`,
       params,
     );
     return Number(rows[0]?.c ?? 0);
@@ -172,6 +190,9 @@ async function countInstallmentDueAlertGroups(slug: string, currentLocationId: n
       sql += " AND s.location_id=?";
       params.push(currentLocationId);
     }
+    const scope = await tenantScope(slug, "sale_installments", "i");
+    sql += scope.sql;
+    params.push(...scope.params);
     const rows = await dbQuery<RowDataPacket[]>(sql, params);
     return Number(rows[0]?.c ?? 0);
   } catch {
@@ -297,13 +318,15 @@ export async function getClosureRange(slug: string, currentLocationId: number): 
     if (!(await tenantTableExists(slug, "closures"))) return null;
 
     const hasClosureLocation = currentLocationId > 0 && (await tenantColumnExists(slug, "closures", "location_id"));
+    const closureScope = await tenantScope(slug, "closures");
     const closureRows = hasClosureLocation
       ? await dbQuery<RowDataPacket[]>(
-          "SELECT date FROM closures WHERE (location_id IS NULL OR location_id=?) AND date >= CURRENT_DATE ORDER BY date ASC",
-          [currentLocationId],
+          `SELECT date FROM closures WHERE (location_id IS NULL OR location_id=?) AND date >= CURRENT_DATE${closureScope.sql} ORDER BY date ASC`,
+          [currentLocationId, ...closureScope.params],
         )
       : await dbQuery<RowDataPacket[]>(
-          "SELECT date FROM closures WHERE location_id IS NULL AND date >= CURRENT_DATE ORDER BY date ASC",
+          `SELECT date FROM closures WHERE location_id IS NULL AND date >= CURRENT_DATE${closureScope.sql} ORDER BY date ASC`,
+          closureScope.params,
         );
 
     let dates = closureRows
@@ -317,13 +340,15 @@ export async function getClosureRange(slug: string, currentLocationId: number): 
       if (await tenantTableExists(slug, "business_hours_exceptions")) {
         const hasExcLocation =
           currentLocationId > 0 && (await tenantColumnExists(slug, "business_hours_exceptions", "location_id"));
+        const excScope = await tenantScope(slug, "business_hours_exceptions");
         const excRows = hasExcLocation
           ? await dbQuery<RowDataPacket[]>(
-              "SELECT date FROM business_hours_exceptions WHERE (location_id IS NULL OR location_id=?) AND is_closed=0 AND date >= CURRENT_DATE",
-              [currentLocationId],
+              `SELECT date FROM business_hours_exceptions WHERE (location_id IS NULL OR location_id=?) AND is_closed=0 AND date >= CURRENT_DATE${excScope.sql}`,
+              [currentLocationId, ...excScope.params],
             )
           : await dbQuery<RowDataPacket[]>(
-              "SELECT date FROM business_hours_exceptions WHERE location_id IS NULL AND is_closed=0 AND date >= CURRENT_DATE",
+              `SELECT date FROM business_hours_exceptions WHERE location_id IS NULL AND is_closed=0 AND date >= CURRENT_DATE${excScope.sql}`,
+              excScope.params,
             );
         for (const row of excRows) {
           const d = String(row.date ?? "").slice(0, 10);
