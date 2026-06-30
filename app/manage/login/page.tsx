@@ -11,5 +11,7 @@ export default async function ManageLoginPage({
   searchParams: Promise<{ slug?: string }>;
 }) {
   const { slug } = await searchParams;
-  return <ManageLoginFaithful initialSlug={slug || "centroesteticoelite"} />;
+  // Multi-tenant-clean: prefill the slug from the URL only. No default to a
+  // specific tenant — the field stays empty (its placeholder shows an example).
+  return <ManageLoginFaithful initialSlug={slug || ""} />;
 }

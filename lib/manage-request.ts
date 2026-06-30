@@ -1,8 +1,10 @@
 import "server-only";
 
-import { tenantSlug as defaultTenantSlug } from "@/lib/tenant-runtime";
-
 export function manageTenantSlugFromRequest(request: Request): string {
+  // Multi-tenant-clean: derive the slug from the request (query / x-tenant-slug
+  // header / referer path) only. No default to a specific tenant — when the slug
+  // cannot be resolved we return "" so the session lookup fails closed (401)
+  // instead of silently operating on another center's data.
   const url = new URL(request.url);
   const explicit = normalizeSlug(url.searchParams.get("slug") || request.headers.get("x-tenant-slug") || "");
   if (explicit) return explicit;
@@ -11,7 +13,7 @@ export function manageTenantSlugFromRequest(request: Request): string {
   const fromReferer = slugFromUrl(referer);
   if (fromReferer) return fromReferer;
 
-  return defaultTenantSlug;
+  return "";
 }
 
 function slugFromUrl(value: string): string {

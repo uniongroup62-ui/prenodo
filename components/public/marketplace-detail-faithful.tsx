@@ -209,14 +209,15 @@ function initialOf(value: string): string {
 }
 
 function readSlugFromPath(): string {
-  if (typeof window === "undefined") return "centroesteticoelite";
+  if (typeof window === "undefined") return "";
   const parts = window.location.pathname.split("/");
-  // route is /attivita/[slug] -> parts[2]
-  return (parts[2] || "centroesteticoelite").trim() || "centroesteticoelite";
+  // route is /attivita/[slug] -> parts[2]. Resolve the tenant from the URL only —
+  // never default to a specific center.
+  return (parts[2] || "").trim();
 }
 
 export function MarketplaceDetailFaithful({ slug: slugProp }: { slug?: string } = {}) {
-  const [slug, setSlug] = useState<string>(slugProp ?? "centroesteticoelite");
+  const [slug, setSlug] = useState<string>(slugProp ?? "");
   const [context, setContext] = useState<BookingContext | null>(null);
   const [profile, setProfile] = useState<MarketplaceProfile | null>(null);
 

@@ -31,7 +31,7 @@ const modeCopy: Record<ManageMode, { title: string; lead: string }> = {
 
 export function ManageAccountPage({
   initialMode = "login",
-  initialSlug = "centroesteticoelite",
+  initialSlug = "",
   initialToken = "",
   initialEmail = "",
   initialSignupId = 0,

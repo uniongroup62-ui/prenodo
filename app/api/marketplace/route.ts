@@ -1,6 +1,4 @@
 import type { RowDataPacket } from "@/lib/tenant-db";
-import { dbFirstValue } from "@/lib/db-first";
-import { centers, locations, marketplaceCategories } from "@/lib/demo-data";
 import { dbQuery } from "@/lib/tenant-db";
 
 type MarketplaceProfile = {
@@ -23,17 +21,28 @@ type MarketplaceProfile = {
   }>;
 };
 
-export async function GET() {
-  const { value, sourceMode } = await dbFirstValue(
-    () => marketplaceProfiles(),
-    () => ({ profiles: demoProfiles(), categories: marketplaceCategories }),
-  );
+// Neutral marketplace-card defaults used when the DB row has no value for a
+// purely-visual field (rating / reviews / hero image / next slot). These are
+// generic, tenant-agnostic placeholders — never another tenant's demo data.
+const DEFAULT_RATING = "5.0";
+const DEFAULT_REVIEWS = 0;
+const DEFAULT_NEXT_SLOT = "Disponibilita su richiesta";
+const DEFAULT_PRICE_FROM = "Da definire";
+const DEFAULT_IMAGE =
+  "https://images.unsplash.com/photo-1560066984-138dadb4c035?auto=format&fit=crop&w=900&q=80";
+const DEFAULT_CATEGORY = "Centro benessere";
+const DEFAULT_SERVICES = ["Viso", "Corpo", "Benessere"];
 
-  return Response.json({
-    ok: true,
-    sourceMode,
-    ...value,
-  });
+export async function GET() {
+  try {
+    const value = await marketplaceProfiles();
+    return Response.json({ ok: true, sourceMode: "database", ...value });
+  } catch (error) {
+    return Response.json(
+      { ok: false, error: error instanceof Error ? error.message : "Marketplace non disponibile." },
+      { status: 503 },
+    );
+  }
 }
 
 async function marketplaceProfiles(): Promise<{ profiles: MarketplaceProfile[]; categories: string[] }> {
@@ -66,11 +75,11 @@ async function marketplaceProfiles(): Promise<{ profiles: MarketplaceProfile[]; 
   `);
 
   const categories = await marketplaceDbCategories(rows);
-  const profiles = await Promise.all(rows.map((row, index) => profileFromRow(row, index)));
+  const profiles = await Promise.all(rows.map((row) => profileFromRow(row)));
   return { profiles, categories };
 }
 
-async function profileFromRow(row: RowDataPacket, index: number): Promise<MarketplaceProfile> {
+async function profileFromRow(row: RowDataPacket): Promise<MarketplaceProfile> {
   const tenantId = Number(row.tenant_id ?? 0);
   const slug = String(row.slug ?? "");
   const locationRows = tenantId > 0
@@ -83,22 +92,21 @@ async function profileFromRow(row: RowDataPacket, index: number): Promise<Market
     `, [tenantId]).catch(() => [] as RowDataPacket[])
     : [];
   const services = splitLabels(row.service_labels).slice(0, 4);
-  const fallback = centers.find((center) => center.slug === slug) ?? centers[index % centers.length] ?? centers[0];
   const city = String(row.city ?? "").trim();
-  const area = String(row.area ?? "").trim() || city || fallback.area;
+  const area = String(row.area ?? "").trim() || city || "";
   const price = Number(row.price_from ?? 0);
 
   return {
     slug,
-    name: String(row.business_name ?? fallback.name),
-    category: services[0] ?? fallback.category,
+    name: String(row.business_name ?? slug),
+    category: services[0] ?? DEFAULT_CATEGORY,
     area,
-    rating: fallback.rating,
-    reviews: fallback.reviews,
-    nextSlot: fallback.nextSlot,
-    priceFrom: price > 0 ? `Da ${roundMoney(price)} euro` : fallback.priceFrom,
-    image: fallback.image,
-    services: services.length ? services : fallback.services,
+    rating: DEFAULT_RATING,
+    reviews: DEFAULT_REVIEWS,
+    nextSlot: DEFAULT_NEXT_SLOT,
+    priceFrom: price > 0 ? `Da ${roundMoney(price)} euro` : DEFAULT_PRICE_FROM,
+    image: DEFAULT_IMAGE,
+    services: services.length ? services : DEFAULT_SERVICES,
     locations: (locationRows.length ? locationRows : [row]).map((location) => ({
       id: Number(location.id ?? row.first_location_id ?? 0),
       name: String(location.name ?? row.first_location_name ?? "Sede principale"),
@@ -119,22 +127,7 @@ async function marketplaceDbCategories(rows: RowDataPacket[]): Promise<string[]>
   const fromTable = categoryRows.map((row) => String(row.name ?? "").trim()).filter(Boolean);
   if (fromTable.length) return fromTable;
   const fromServices = rows.flatMap((row) => splitLabels(row.service_labels));
-  return Array.from(new Set(fromServices.length ? fromServices : marketplaceCategories));
-}
-
-function demoProfiles(): MarketplaceProfile[] {
-  return centers.map((center) => ({
-    ...center,
-    locations: locations
-      .filter((location) => location.tenantSlug === center.slug)
-      .map((location) => ({
-        id: location.id,
-        name: location.name,
-        city: location.city,
-        area: location.area,
-        address: location.address,
-      })),
-  }));
+  return Array.from(new Set(fromServices));
 }
 
 function splitLabels(value: unknown): string[] {

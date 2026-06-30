@@ -2,8 +2,8 @@ import "server-only";
 
 import { randomBytes } from "crypto";
 import type { RowDataPacket } from "@/lib/tenant-db";
-import type { AppointmentStatus, Location } from "@/lib/demo-data";
-import type { AppointmentWithMeta } from "@/lib/appointment-engine";
+import type { Location } from "@/lib/demo-data";
+import type { AppointmentStatus, AppointmentWithMeta } from "@/lib/appointment-engine";
 import type {
   AutomationRule,
   ClientPackage,

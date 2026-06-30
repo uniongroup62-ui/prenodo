@@ -53,7 +53,7 @@ function connectionString(): string | null {
   return process.env.PRENODO_DATABASE_URL || process.env.SUPA_URL || process.env.DATABASE_URL || null;
 }
 
-export async function databaseStatus(slug = "centroesteticoelite"): Promise<DatabaseStatus> {
+export async function databaseStatus(slug = ""): Promise<DatabaseStatus> {
   if (!connectionString()) return { available: false, configured: false, error: "Database non configurato." };
   try {
     const table = await tenantTable(slug, "users");

@@ -15,12 +15,6 @@ import {
   Star,
   Store,
 } from "lucide-react";
-import {
-  centers,
-  locations,
-  marketplaceCategories,
-} from "@/lib/demo-data";
-
 type MarketplaceProfile = {
   slug: string;
   name: string;
@@ -42,9 +36,10 @@ type MarketplaceProfile = {
 };
 
 export function PublicMarketplace({ resultsOnly = false }: { resultsOnly?: boolean }) {
-  const fallbackProfiles = useMemo(() => demoProfiles(), []);
-  const [profiles, setProfiles] = useState<MarketplaceProfile[]>(fallbackProfiles);
-  const [categories, setCategories] = useState<string[]>(marketplaceCategories);
+  // Purely DB-backed: profiles/categories come from /api/marketplace. No demo
+  // seed data — start empty and render the real published tenants once loaded.
+  const [profiles, setProfiles] = useState<MarketplaceProfile[]>([]);
+  const [categories, setCategories] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [city, setCity] = useState("");
   const [category, setCategory] = useState("");
@@ -60,12 +55,12 @@ export function PublicMarketplace({ resultsOnly = false }: { resultsOnly?: boole
         const data = await response.json();
         if (!active) return;
         if (!data.ok) throw new Error("Marketplace non disponibile.");
-        setProfiles(data.profiles?.length ? data.profiles : fallbackProfiles);
-        setCategories(data.categories?.length ? data.categories : marketplaceCategories);
+        setProfiles(Array.isArray(data.profiles) ? data.profiles : []);
+        setCategories(Array.isArray(data.categories) ? data.categories : []);
       } catch {
         if (active) {
-          setProfiles(fallbackProfiles);
-          setCategories(marketplaceCategories);
+          setProfiles([]);
+          setCategories([]);
         }
       }
     }
@@ -74,7 +69,7 @@ export function PublicMarketplace({ resultsOnly = false }: { resultsOnly?: boole
     return () => {
       active = false;
     };
-  }, [fallbackProfiles]);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -313,7 +308,7 @@ function MarketplaceTopbar() {
           <Link className="hidden h-10 items-center rounded-md px-3 text-sm font-semibold text-zinc-600 transition hover:text-zinc-950 sm:inline-flex" href="/account/activities">
             Account
           </Link>
-          <Link className="inline-flex h-10 items-center rounded-md bg-[#191816] px-3 text-sm font-semibold text-white" href="/manage/login?slug=centroesteticoelite">
+          <Link className="inline-flex h-10 items-center rounded-md bg-[#191816] px-3 text-sm font-semibold text-white" href="/manage/login">
             Gestionale
           </Link>
         </nav>
@@ -463,30 +458,6 @@ function MarketplaceCard({
       </div>
     </article>
   );
-}
-
-function demoProfiles(): MarketplaceProfile[] {
-  return centers.map((center) => ({
-    slug: center.slug,
-    name: center.name,
-    category: center.category,
-    area: center.area,
-    rating: center.rating,
-    reviews: center.reviews,
-    nextSlot: center.nextSlot,
-    priceFrom: center.priceFrom,
-    image: center.image,
-    services: center.services,
-    locations: locations
-      .filter((location) => location.tenantSlug === center.slug)
-      .map((location) => ({
-        id: location.id,
-        name: location.name,
-        city: location.city,
-        area: location.area,
-        address: location.address,
-      })),
-  }));
 }
 
 function favoriteKeyFor(tenantSlug: string, locationId: number): string {

@@ -161,9 +161,11 @@ const MONTHS_IT = [
 export function BookingFaithful({ slug: slugProp }: { slug?: string } = {}) {
   const slug = useMemo(() => {
     if (slugProp) return slugProp;
-    if (typeof window === "undefined") return "centroesteticoelite";
-    // This component renders under /{slug}/booking.
-    return window.location.pathname.split("/").filter(Boolean)[0] || "centroesteticoelite";
+    if (typeof window === "undefined") return "";
+    // This component renders under /{slug}/booking. Resolve the tenant from the
+    // URL path only — never default to a specific center. An empty slug makes the
+    // context fetch surface a clear "attivita non specificata" error.
+    return window.location.pathname.split("/").filter(Boolean)[0] || "";
   }, [slugProp]);
 
   const [context, setContext] = useState<BookingContext | null>(null);

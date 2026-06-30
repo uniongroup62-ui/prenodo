@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { MarketplaceDetailFaithful } from "@/components/public/marketplace-detail-faithful";
-import { centerBySlug } from "@/lib/demo-data";
 
 export async function generateMetadata({
   params,
@@ -8,13 +7,12 @@ export async function generateMetadata({
   params: Promise<{ slug: string }>;
 }): Promise<Metadata> {
   const { slug } = await params;
-  const center = centerBySlug(slug);
-
+  // The real business name is loaded client-side by the faithful component from
+  // /api/booking?action=context. Metadata stays tenant-agnostic (slug-based) so
+  // we never depend on demo data nor default to a specific center here.
   return {
-    title: center ? `${center.name} | Prenodo` : "Attivita | Prenodo",
-    description: center
-      ? `Scheda marketplace e prenotazione online per ${center.name}.`
-      : "Scheda marketplace Prenodo.",
+    title: slug ? `${slug} | Prenodo` : "Attivita | Prenodo",
+    description: "Scheda marketplace e prenotazione online su Prenodo.",
   };
 }
 

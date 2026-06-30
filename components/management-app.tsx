@@ -84,10 +84,7 @@ import type {
   Quote,
   WalletMovement,
 } from "@/lib/tenant-store";
-import {
-  tenantSessionSuffix,
-  tenantSlug as defaultTenantSlug,
-} from "@/lib/tenant-runtime";
+import { tenantSessionSuffix } from "@/lib/tenant-runtime";
 
 type FeatureState = "Replica navigabile" | "Analizzato" | "Da collegare al DB";
 type AppointmentStatus = "Confermato" | "In attesa" | "Completato";
@@ -1059,7 +1056,7 @@ const emptyManageUser: ManagementUser = {
 export function ManagementApp({
   initialSection = defaultFeatureId,
   currentUser = emptyManageUser,
-  tenantSlug = defaultTenantSlug,
+  tenantSlug = "",
 }: {
   initialSection?: string;
   currentUser?: ManagementUser;
@@ -1306,13 +1303,13 @@ export function ManagementApp({
       <div className="grid min-h-screen lg:grid-cols-[240px_minmax(0,1fr)]">
         <aside className="border-b border-[#242742] bg-[#191b32] text-white lg:border-b-0 lg:border-r">
           <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-4">
-            <Link className="flex min-w-0 items-center gap-3" href="/manage/login?slug=centroesteticoelite">
+            <Link className="flex min-w-0 items-center gap-3" href={tenantSlug ? `/${encodeURIComponent(tenantSlug)}/dashboard` : "/manage/login"}>
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[#5b62d6] text-sm font-bold text-white">
                 B
               </span>
               <span className="min-w-0">
                 <span className="block truncate text-sm font-semibold">BeautySuite</span>
-                <span className="block truncate text-xs text-slate-200">Centro Estetico Elite</span>
+                <span className="block truncate text-xs text-slate-200">{tenantSlug || "Gestionale"}</span>
               </span>
             </Link>
             <button
@@ -1434,7 +1431,7 @@ export function ManagementApp({
                 </button>
                 <Link
                   className="inline-flex h-10 items-center gap-2 rounded-md border border-zinc-300 bg-white px-3 text-sm font-semibold transition hover:border-zinc-800"
-                  href="/attivita/centroesteticoelite"
+                  href={tenantSlug ? `/attivita/${encodeURIComponent(tenantSlug)}` : "/attivita"}
                 >
                   Scheda pubblica
                   <Store size={17} aria-hidden />

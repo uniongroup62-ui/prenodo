@@ -1,22 +1,11 @@
-import { buildSlots, todayIso } from "@/lib/appointment-engine";
+import { todayIso } from "@/lib/appointment-engine";
 import { parseRequestBody } from "@/lib/api-utils";
-import { dbFirstValue } from "@/lib/db-first";
-import {
-  centerBySlug,
-  centerServices,
-  locationsByTenant,
-  marketplaceCategories,
-  operators,
-} from "@/lib/demo-data";
 import {
   confirmPublicBooking,
   holdPublicBookingSlot,
   publicBookingContext,
   publicBookingSlots,
   releasePublicBookingHold,
-  type PublicBookingBenefit,
-  type PublicBookingContext,
-  type PublicBookingSlot,
 } from "@/lib/public-booking-db";
 import { upsertPublicCustomerFromBooking } from "@/lib/public-customer-account";
 
@@ -26,32 +15,28 @@ export async function GET(request: Request) {
   const action = url.searchParams.get("action") ?? "context";
 
   try {
+    if (!slug) throw new Error("Attivita non specificata.");
+
     if (action === "slots") {
       const date = url.searchParams.get("date") ?? todayIso();
       const serviceIds = parseIdList(url.searchParams.get("service_ids") ?? url.searchParams.get("services"));
       const staffId = parseOptionalId(url.searchParams.get("staff_id"));
       const locationId = parseOptionalId(url.searchParams.get("location_id"));
-      const { value: slots, sourceMode } = await dbFirstValue(
-        () => publicBookingSlots({ slug, date, serviceIds, staffId, locationId }),
-        () => demoSlots({ date, serviceIds }),
-      );
+      const slots = await publicBookingSlots({ slug, date, serviceIds, staffId, locationId });
 
       return Response.json({
         ok: true,
-        sourceMode,
+        sourceMode: "database",
         date,
         slots,
       });
     }
 
-    const { value: context, sourceMode } = await dbFirstValue(
-      () => publicBookingContext(slug),
-      () => demoContext(slug),
-    );
+    const context = await publicBookingContext(slug);
 
     return Response.json({
       ok: true,
-      sourceMode,
+      sourceMode: "database",
       context,
     });
   } catch (error) {
@@ -66,6 +51,8 @@ export async function POST(request: Request) {
   const action = String(body.action ?? url.searchParams.get("action") ?? "confirm");
 
   try {
+    if (!slug) throw new Error("Attivita non specificata.");
+
     if (action === "hold" || action === "hold_slot") {
       const date = String(body.date ?? todayIso());
       const time = String(body.time ?? "");
@@ -73,9 +60,9 @@ export async function POST(request: Request) {
       const staffId = parseOptionalId(body.staff_id);
       const locationId = parseOptionalId(body.location_id);
       const ownerKey = ownerKeyForRequest(request, body.owner_key);
-      // Write action: never fake a hold on a DB failure — surface the error so
-      // the client can retry (a fake demo hold would let confirm "succeed" with
-      // no real reservation).
+      // Write action: a real booking must hit the DB. On failure, surface the
+      // error so the client can retry instead of confirming a reservation that
+      // was never persisted.
       const hold = await holdPublicBookingSlot({ slug, date, time, serviceIds, staffId, locationId, ownerKey });
 
       return Response.json({
@@ -88,18 +75,15 @@ export async function POST(request: Request) {
     if (action === "release_hold") {
       const token = String(body.hold_token ?? body.appointment_hold_token ?? body.token ?? "");
       const ownerKey = ownerKeyForRequest(request, body.owner_key);
-      const { value: released, sourceMode } = await dbFirstValue(
-        () => releasePublicBookingHold({ slug, token, ownerKey }),
-        () => true,
-      );
-      return Response.json({ ok: true, sourceMode, released });
+      const released = await releasePublicBookingHold({ slug, token, ownerKey });
+      return Response.json({ ok: true, sourceMode: "database", released });
     }
 
     const benefit = parseBenefit(body.benefit_id);
     const ownerKey = ownerKeyForRequest(request, body.owner_key);
     // Write action: a real booking must hit the DB. On failure, surface the
     // error (the outer catch returns {ok:false,error}) instead of confirming a
-    // fake demo appointment the customer would believe was booked.
+    // fake appointment the customer would believe was booked.
     const confirmation = await confirmPublicBooking({
       slug,
       date: String(body.date ?? todayIso()),
@@ -135,81 +119,11 @@ export async function POST(request: Request) {
   }
 }
 
-function demoContext(slug: string): PublicBookingContext {
-  const center = centerBySlug(slug) ?? centerBySlug("centroesteticoelite")!;
-  const locations = locationsByTenant(center.slug);
-  const categories = marketplaceCategories.map((name, index) => ({ id: index + 1, name }));
-  return {
-    business: {
-      name: center.name,
-      about: center.category,
-      email: "info@example.it",
-      phone: locations[0]?.phone ?? "",
-      website: "",
-    },
-    locations: locations.map((location) => ({
-      id: location.id,
-      name: location.name,
-      address: [location.address, location.city].filter(Boolean).join(", "),
-      email: "",
-      phone: location.phone,
-      bookingEnabled: location.bookingEnabled,
-      hoursToday: location.hoursToday,
-    })),
-    categories,
-    services: centerServices.map((service, index) => ({
-      id: index + 1,
-      name: service.name,
-      description: service.description,
-      categoryId: categories[index % categories.length]?.id ?? 1,
-      duration: parseMinutes(service.duration),
-      price: parseMoney(service.price),
-      noOperator: false,
-      locationIds: locations.map((location) => location.id),
-    })),
-    staff: operators.map((name, index) => ({
-      id: index + 1,
-      name,
-      serviceIds: centerServices.map((_, serviceIndex) => serviceIndex + 1),
-      active: true,
-    })),
-    benefits: demoBenefits(),
-    today: todayIso(),
-  };
-}
-
-function demoSlots({ date, serviceIds }: { date: string; serviceIds: number[] }): PublicBookingSlot[] {
-  const services = centerServices.filter((_, index) => serviceIds.includes(index + 1));
-  return buildSlots({
-    date,
-    serviceNames: services.length ? services.map((service) => service.name) : [centerServices[0].name],
-    stepMinutes: 30,
-  }).slice(0, 12).map((slot) => ({
-    time: slot.time,
-    available: slot.available,
-    staffId: slot.operator ? operators.indexOf(slot.operator) + 1 || null : null,
-    staffName: slot.operator ?? "",
-    reason: slot.reason,
-  }));
-}
-
-function demoBenefits(): PublicBookingBenefit[] {
-  return [
-    {
-      id: "coupon:demo",
-      type: "coupon",
-      label: "WELCOME10",
-      detail: "10% di sconto",
-      code: "WELCOME10",
-      discountType: "percent",
-      discountValue: 10,
-    },
-  ];
-}
-
 function normalizeSlug(value: string | null | undefined): string {
-  const slug = String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
-  return slug || "centroesteticoelite";
+  // Multi-tenant-clean: resolve the slug from the request only. No default to a
+  // specific tenant — an empty slug surfaces a clear "attivita non specificata"
+  // error rather than silently serving another center's data.
+  return String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
 }
 
 function parseIdList(value: unknown): number[] {
@@ -237,16 +151,6 @@ function ownerKeyForRequest(request: Request, value: unknown): string {
   const ip = request.headers.get("x-forwarded-for") ?? request.headers.get("x-real-ip") ?? "public";
   const agent = request.headers.get("user-agent") ?? "browser";
   return `${ip}:${agent}`.slice(0, 120);
-}
-
-function parseMinutes(value: string): number {
-  const match = value.match(/\d+/);
-  return match ? Number.parseInt(match[0], 10) : 30;
-}
-
-function parseMoney(value: string): number {
-  const match = value.replace(",", ".").match(/\d+(?:\.\d+)?/);
-  return match ? Number.parseFloat(match[0]) : 0;
 }
 
 function errorMessage(error: unknown): string {
