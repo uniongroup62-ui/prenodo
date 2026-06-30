@@ -40,11 +40,27 @@ import {
 
 type TenantTarget = Awaited<ReturnType<typeof tenantTable>>;
 
+// The BUSINESS header for the printable POS receipt (scontrino) — port of the legacy
+// pos_success.php business identity (name + P.IVA/legal_vat_number + address + logo). The
+// name/address/logo come from the single `businesses` row (reusing the same source the
+// business-profile page reads); the P.IVA + a legal address fallback come from the ACTIVE
+// location's legal_* fields (legal_vat_number / legal_address live on `locations`, not
+// `businesses`). All fields are schema-guarded so older installs still render a name-only
+// header. `logoPath` is the public asset path ("/uploads/logo/...") used directly as <img src>.
+export type PosBusinessHeader = {
+  name: string;
+  legalVatNumber: string;
+  address: string;
+  logoPath: string;
+};
+
 export type ManagePosContext = {
   ok: true;
   source: string;
   sourceMode: "database";
   activeLocationId: number;
+  // Business identity for the printable receipt header (name / P.IVA / address / logo).
+  business: PosBusinessHeader;
   summary: PosSummary;
   sales: PosSale[];
   catalog: {
@@ -132,7 +148,7 @@ export async function getManagePosContext(
 ): Promise<ManagePosContext> {
   const locationContext = await getManageLocationContext(slug);
   const activeLocationId = normalizeLocationId(options.locationId ?? locationContext.currentLocationId, locationContext.locations);
-  const [sales, clients, services, products, packages, giftboxes, rechargeTemplates] = await Promise.all([
+  const [sales, clients, services, products, packages, giftboxes, rechargeTemplates, business] = await Promise.all([
     listPosSales(slug, { locationId: activeLocationId, includeCancelled: options.includeCancelled ?? true, query: options.query ?? "" }),
     listPosClients(slug),
     listPosServices(slug, activeLocationId),
@@ -140,6 +156,7 @@ export async function getManagePosContext(
     listPosPackages(slug, activeLocationId),
     listPosGiftboxes(slug, activeLocationId),
     listPosRechargeTemplates(slug),
+    getPosBusinessHeader(slug, activeLocationId),
   ]);
 
   return {
@@ -147,11 +164,60 @@ export async function getManagePosContext(
     source: sourceLabel,
     sourceMode: "database",
     activeLocationId,
+    business,
     summary: summarizeSales(sales),
     sales,
     catalog: { clients, services, products, packages, giftboxes, rechargeTemplates },
     locations: locationContext.locations.map((location) => ({ id: location.id, name: location.name })),
   };
+}
+
+// Read the BUSINESS header for the printable POS receipt — the business identity the legacy
+// pos_success.php prints (name, P.IVA, address, logo). The name/address/logo come from the
+// single `businesses` row (the same source the business-profile page reads via
+// getBusinessProfile); the P.IVA (legal_vat_number) + a legal address fallback come from the
+// ACTIVE location's legal_* fields (those columns live on `locations`, not `businesses`).
+// Every column read is schema-guarded (a missing column / table degrades to ""), so older
+// installs still get a name-only header. Best-effort: any error returns a name-only header
+// (the slug) so the receipt always has something to print.
+async function getPosBusinessHeader(slug: string, activeLocationId: number): Promise<PosBusinessHeader> {
+  const fallback: PosBusinessHeader = { name: slug, legalVatNumber: "", address: "", logoPath: "" };
+  try {
+    const businessRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "*",
+      orderBy: "id ASC",
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    const business = businessRows[0] ?? null;
+
+    // Active location legal fields (P.IVA + legal address) — schema-guarded read.
+    let legalVatNumber = "";
+    let legalAddress = "";
+    if (activeLocationId > 0) {
+      const locationRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "locations",
+        columns: "*",
+        where: "id=?",
+        params: [activeLocationId],
+        limit: 1,
+      }).catch(() => [] as RowDataPacket[]);
+      const location = locationRows[0] ?? null;
+      if (location) {
+        legalVatNumber = clean(location.legal_vat_number, 40);
+        legalAddress = clean(location.address ?? location.legal_address, 255);
+      }
+    }
+
+    const name = clean(business?.name, 190) || slug;
+    const address = clean(business?.address, 255) || legalAddress;
+    const logoPath = clean(business?.logo_path, 255);
+    return { name, legalVatNumber, address, logoPath };
+  } catch {
+    return fallback;
+  }
 }
 
 // The "Residui" the POS can spend on a sale for a selected client: their wallet CREDIT
