@@ -194,6 +194,100 @@ function monthTitle(iso: string): string {
   return capFirst(`${IT_MONTHS[d.getMonth()] ?? ""} ${d.getFullYear()}`);
 }
 
+// === Mini date-picker helpers (port of the calendar.js datePicker labels) ===
+// IT short month labels (Gen..Dic), matching itShortMonthLabel (Intl 'short',
+// '.' stripped) — used by the Week range sub-label and the Month grid cells.
+const IT_SHORT_MONTHS = [
+  "Gen",
+  "Feb",
+  "Mar",
+  "Apr",
+  "Mag",
+  "Giu",
+  "Lug",
+  "Ago",
+  "Set",
+  "Ott",
+  "Nov",
+  "Dic",
+];
+
+// First-of-month / first-of-year ISO anchors for the picker "cursor".
+function monthStartIso(iso: string): string {
+  const d = new Date(`${iso}T12:00:00`);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-01`;
+}
+// Step the cursor month (Day/Week modes) by ±1 keeping the 1st of the month.
+function shiftMonthIso(iso: string, delta: number): string {
+  const d = new Date(`${iso}T12:00:00`);
+  const next = new Date(d.getFullYear(), d.getMonth() + delta, 1);
+  return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-01`;
+}
+// Step the cursor year (Month mode) by ±1, anchored to 1 January.
+function shiftYearIso(iso: string, delta: number): string {
+  const d = new Date(`${iso}T12:00:00`);
+  return `${d.getFullYear() + delta}-01-01`;
+}
+
+// Full IT long date for the Day picker footer (port of itLongDate), lowercase —
+// the .calendar-mini-picker__selected CSS capitalizes it: "lunedi 1 giugno 2026".
+function pickerLongDate(iso: string): string {
+  const d = new Date(`${iso}T12:00:00`);
+  return `${IT_WEEKDAYS[d.getDay()] ?? ""} ${d.getDate()} ${IT_MONTHS[d.getMonth()] ?? ""} ${d.getFullYear()}`;
+}
+
+// Week-range main label (port of itWeekRangeShortLabel): "29-5".
+function pickerWeekMain(startIso: string): string {
+  const a = new Date(`${startIso}T12:00:00`);
+  const b = new Date(`${addDays(startIso, 6)}T12:00:00`);
+  return `${a.getDate()}-${b.getDate()}`;
+}
+// Week-range sub label (port of itWeekRangeSubLabel): same month -> "Giugno";
+// cross-month same year -> "Giu · Lug"; cross-year -> "Giu 2026 · Lug 2027".
+function pickerWeekSub(startIso: string): string {
+  const a = new Date(`${startIso}T12:00:00`);
+  const b = new Date(`${addDays(startIso, 6)}T12:00:00`);
+  const sameMonth = a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+  const sameYear = a.getFullYear() === b.getFullYear();
+  if (sameMonth) return capFirst(IT_MONTHS[a.getMonth()] ?? "");
+  if (sameYear) return `${IT_SHORT_MONTHS[a.getMonth()] ?? ""} · ${IT_SHORT_MONTHS[b.getMonth()] ?? ""}`;
+  return `${IT_SHORT_MONTHS[a.getMonth()] ?? ""} ${a.getFullYear()} · ${IT_SHORT_MONTHS[b.getMonth()] ?? ""} ${b.getFullYear()}`;
+}
+// Week-range long label for the footer/aria (port of itWeekRangeLongLabel):
+// same month -> "29 - 5 giugno 2026"; cross-month -> "29 giugno - 5 luglio 2026".
+function pickerWeekLong(startIso: string): string {
+  const a = new Date(`${startIso}T12:00:00`);
+  const b = new Date(`${addDays(startIso, 6)}T12:00:00`);
+  const sameMonth = a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+  const sameYear = a.getFullYear() === b.getFullYear();
+  const ma = IT_MONTHS[a.getMonth()] ?? "";
+  const mb = IT_MONTHS[b.getMonth()] ?? "";
+  if (sameMonth) return `${a.getDate()} - ${b.getDate()} ${mb} ${b.getFullYear()}`;
+  if (sameYear) return `${a.getDate()} ${ma} - ${b.getDate()} ${mb} ${b.getFullYear()}`;
+  return `${a.getDate()} ${ma} ${a.getFullYear()} - ${b.getDate()} ${mb} ${b.getFullYear()}`;
+}
+
+// The 42 ISO dates (6x7, Monday-first) filling the picker's Day grid for the month
+// containing `cursorIso` — mirrors renderCalendarDatePickerDays' gridStart logic.
+function pickerDayGridDates(cursorIso: string): string[] {
+  return monthGridDates(monthStartIso(cursorIso));
+}
+// The week-start ISO dates (Mondays) whose week overlaps the cursor month —
+// mirrors renderCalendarDatePickerWeeks (startOfWeek(first) .. <= endOfMonth).
+function pickerWeekStarts(cursorIso: string): string[] {
+  const d = new Date(`${cursorIso}T12:00:00`);
+  const lastIso = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+    new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(),
+  )}`;
+  const out: string[] = [];
+  let ws = weekStart(monthStartIso(cursorIso));
+  while (ws <= lastIso) {
+    out.push(ws);
+    ws = addDays(ws, 7);
+  }
+  return out;
+}
+
 // Month number (0-11) of the focused date — used to dim days outside the month in
 // the 6-week grid (FullCalendar's fc-day-other).
 function monthOf(iso: string): number {
@@ -306,6 +400,17 @@ export function CalendarContent() {
   const [moveError, setMoveError] = useState("");
   // Surfaced inside #calendarNotesAlert when a note save/delete fails.
   const [notesError, setNotesError] = useState("");
+
+  // === "Data" date-picker popover (port of the calendar.js mini date-picker) ===
+  // Whether the popover is open, and the browse "cursor" (ISO) — the month/year being
+  // browsed by the ‹ › steppers, which moves WITHOUT changing the selected `date`
+  // until a cell is clicked (faithful to __calendarDatePickerCursor). The picker MODE
+  // (day/week/month grid) follows the current `view`, like getCalendarDatePickerMode.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerCursor, setPickerCursor] = useState<string>(() => isoLocal(new Date()));
+  // Wraps the toolbar chunk that hosts the Data button; used as the positioned
+  // ancestor for the absolutely-placed popover and for outside-click detection.
+  const pickerHostRef = useRef<HTMLDivElement | null>(null);
 
   // The visible date RANGE (half-open [from, to)) for the active view, used to
   // fetch appointments + notes across the whole grid (not just one day):
@@ -833,6 +938,99 @@ export function CalendarContent() {
     showNotesModal();
   }, [resetNotesForm]);
 
+  // === Date-picker open/close (port of toggle/open/closeCalendarDatePicker) ===
+  // The Data button toggles the popover; opening seeds the browse cursor from the
+  // selected `date` (setCalendarDatePickerCursor(getCalendarFocusDate())).
+  const togglePicker = useCallback(() => {
+    setPickerOpen((open) => {
+      if (!open) setPickerCursor(date);
+      return !open;
+    });
+  }, [date]);
+
+  // Close the popover on outside-click + Esc (port of the body click / keydown wiring
+  // in the legacy). Bound only while open. A click inside pickerHostRef (the toolbar
+  // chunk that contains both the Data button and the popover) is ignored so toggling
+  // and cell clicks are handled by their own onClick, not closed here first.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    if (typeof document === "undefined") return;
+    const onDocClick = (ev: MouseEvent) => {
+      const host = pickerHostRef.current;
+      if (host && ev.target instanceof Node && host.contains(ev.target)) return;
+      setPickerOpen(false);
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setPickerOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [pickerOpen]);
+
+  // Switch the active view and close any open picker (mirrors syncCalendarDatePicker-
+  // State, which closes the open picker on a view change). Used by the Giorno/
+  // Settimana/Mese tabs so a mode switch never leaves a stale-mode popover open.
+  const switchView = useCallback((target: CalendarView) => {
+    setView(target);
+    setPickerOpen(false);
+  }, []);
+
+  // The picker mode follows the active view (getCalendarDatePickerMode):
+  //   Day view -> day grid, Week view -> week list, Month view -> month grid.
+  const pickerMode: "day" | "week" | "month" =
+    view === "timeGridWeek" ? "week" : view === "dayGridMonth" ? "month" : "day";
+
+  // Header label above the grid (port of currentLabel): month+year while browsing
+  // days/weeks, just the year while browsing months.
+  const pickerHeaderLabel =
+    pickerMode === "month" ? String(new Date(`${pickerCursor}T12:00:00`).getFullYear()) : monthTitle(pickerCursor);
+
+  // Footer "selected" label (port of the selectedLabel block).
+  const pickerSelectedLabel =
+    pickerMode === "week"
+      ? `Settimana ${pickerWeekLong(weekStart(date))}`
+      : pickerMode === "month"
+        ? `Mese selezionato: ${IT_MONTHS[monthOf(date)] ?? ""} ${new Date(`${date}T12:00:00`).getFullYear()}`
+        : pickerLongDate(date);
+
+  // Footer "today" link label per mode (port of cfg.todayLabel).
+  const pickerTodayLabel =
+    pickerMode === "week" ? "Questa settimana" : pickerMode === "month" ? "Questo mese" : "Oggi";
+  // Nav button aria-labels per mode (port of cfg.navPrev / navNext).
+  const pickerNavPrev = pickerMode === "month" ? "Anno precedente" : "Mese precedente";
+  const pickerNavNext = pickerMode === "month" ? "Anno successivo" : "Mese successivo";
+  const pickerToolbarLabel =
+    pickerMode === "week" ? "Seleziona una settimana" : pickerMode === "month" ? "Seleziona un mese" : "Seleziona una data";
+
+  // ‹ › steppers: Day/Week step the cursor MONTH, Month steps the cursor YEAR. They
+  // move the browse cursor only — the selected `date` is unchanged until a cell click
+  // (port of shiftCalendarDatePickerCursor).
+  const stepPicker = useCallback(
+    (dir: -1 | 1) => {
+      setPickerCursor((cur) => (pickerMode === "month" ? shiftYearIso(cur, dir) : shiftMonthIso(cur, dir)));
+    },
+    [pickerMode],
+  );
+
+  // The "today" footer link: jump the selected date to today and close (port of the
+  // data-cal-action="today" handler, which gotoDate(today) then closes).
+  const pickerGoToday = useCallback(() => {
+    setDate(isoLocal(new Date()));
+    setPickerOpen(false);
+  }, []);
+
+  // Selecting a cell sets the selected date and closes (port of the data-cal-target-
+  // date handler: gotoDate(selected) then close). For Week mode the value passed is
+  // already the week's Monday; for Month mode it is the first of the month.
+  const pickerSelect = useCallback((iso: string) => {
+    setDate(iso);
+    setPickerOpen(false);
+  }, []);
+
   function viewBtn(target: CalendarView, label: string) {
     const active = view === target;
     return (
@@ -840,7 +1038,7 @@ export function CalendarContent() {
         type="button"
         className={`fc-button fc-button-primary fc-${target}-button${active ? " fc-button-active" : ""}`}
         aria-pressed={active}
-        onClick={() => setView(target)}
+        onClick={() => switchView(target)}
       >
         {label}
       </button>
@@ -1217,7 +1415,7 @@ export function CalendarContent() {
                     <span className="calendar-day-total-label">{totalLabel}</span>
                   </button>
                 </div>
-                <div className="fc-toolbar-chunk">
+                <div className="fc-toolbar-chunk" ref={pickerHostRef} style={{ position: "relative" }}>
                   <div className="fc-button-group">
                     <button type="button" className="fc-prev-button fc-button fc-button-primary" aria-label="prev" onClick={() => go(view === "timeGridWeek" ? -7 : view === "dayGridMonth" ? -30 : -1)}>
                       <span className="fc-icon fc-icon-chevron-left" />
@@ -1232,9 +1430,146 @@ export function CalendarContent() {
                   <button type="button" className="fc-today-button fc-button fc-button-primary" onClick={() => setDate(isoLocal(new Date()))}>
                     Oggi
                   </button>
-                  <button type="button" className="fc-jumpDate-button fc-button fc-button-primary" onClick={() => {}}>
-                    Data
+                  {/* "Data" → toggles the mini date-picker popover. The button carries the
+                      legacy calendar-jump-date-btn class + the calendar icon set by
+                      enhanceCalendarToolbar (the visible "Data" text is replaced by a
+                      visually-hidden label, like the live FullCalendar toolbar). When open
+                      it gets fc-button-active, like openCalendarDatePicker. */}
+                  <button
+                    type="button"
+                    className={`fc-jumpDate-button fc-button fc-button-primary calendar-jump-date-btn${pickerOpen ? " fc-button-active" : ""}`}
+                    title={pickerToolbarLabel}
+                    aria-label={pickerToolbarLabel}
+                    aria-haspopup="dialog"
+                    aria-expanded={pickerOpen}
+                    onClick={togglePicker}
+                  >
+                    <i className="bi bi-calendar3" aria-hidden="true" />
+                    <span className="visually-hidden">{pickerToolbarLabel}</span>
                   </button>
+
+                  {/* === Mini date-picker popover (port of calendar-mini-picker). Rendered
+                      as a controlled JSX child of the toolbar chunk so the page CSS
+                      (.calendar-shell .calendar-mini-picker*) styles it identically; the
+                      grid content + footer depend on the picker mode (= current view). === */}
+                  {pickerOpen ? (
+                    <div
+                      id="calendarDatePickerPopover"
+                      className={`calendar-mini-picker is-open is-mode-${pickerMode}`}
+                      role="dialog"
+                      aria-modal="false"
+                      aria-label={pickerToolbarLabel}
+                    >
+                      <div className="calendar-mini-picker__header">
+                        <button
+                          type="button"
+                          className="calendar-mini-picker__nav-btn"
+                          aria-label={pickerNavPrev}
+                          onClick={() => stepPicker(-1)}
+                        >
+                          <i className="bi bi-chevron-left" />
+                        </button>
+                        <div className="calendar-mini-picker__current-label" aria-live="polite">
+                          {pickerHeaderLabel}
+                        </div>
+                        <button
+                          type="button"
+                          className="calendar-mini-picker__nav-btn"
+                          aria-label={pickerNavNext}
+                          onClick={() => stepPicker(1)}
+                        >
+                          <i className="bi bi-chevron-right" />
+                        </button>
+                      </div>
+
+                      {/* Weekday header row — shown only in Day mode (like weekdays.hidden). */}
+                      {pickerMode === "day" ? (
+                        <div className="calendar-mini-picker__weekdays" aria-hidden="true">
+                          {IT_SHORT_WEEKDAYS_MON.map((wd, i) => (
+                            <span key={i}>{wd}</span>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <div className={`calendar-mini-picker__grid calendar-mini-picker__grid--${pickerMode}`} role="grid">
+                        {pickerMode === "day"
+                          ? pickerDayGridDates(pickerCursor).map((iso) => {
+                              const cur = new Date(`${iso}T12:00:00`);
+                              const outside = cur.getMonth() !== monthOf(pickerCursor);
+                              const isToday = iso === isoLocal(new Date());
+                              const isSelected = iso === date;
+                              return (
+                                <button
+                                  key={iso}
+                                  type="button"
+                                  role="gridcell"
+                                  aria-label={pickerLongDate(iso)}
+                                  aria-current={isSelected ? "date" : undefined}
+                                  className={`calendar-mini-picker__day${outside ? " is-outside" : ""}${
+                                    isToday ? " is-today" : ""
+                                  }${isSelected ? " is-selected" : ""}`}
+                                  onClick={() => pickerSelect(iso)}
+                                >
+                                  {cur.getDate()}
+                                </button>
+                              );
+                            })
+                          : pickerMode === "week"
+                            ? pickerWeekStarts(pickerCursor).map((ws) => {
+                                const we = addDays(ws, 6);
+                                const todayIso = isoLocal(new Date());
+                                const isToday = todayIso >= ws && todayIso <= we;
+                                const isSelected = date >= ws && date <= we;
+                                return (
+                                  <button
+                                    key={ws}
+                                    type="button"
+                                    role="gridcell"
+                                    aria-label={`Settimana ${pickerWeekLong(ws)}`}
+                                    aria-current={isSelected ? "true" : undefined}
+                                    className={`calendar-mini-picker__week${isToday ? " is-today" : ""}${
+                                      isSelected ? " is-selected" : ""
+                                    }`}
+                                    onClick={() => pickerSelect(ws)}
+                                  >
+                                    <span className="calendar-mini-picker__item-main">{pickerWeekMain(ws)}</span>
+                                    <span className="calendar-mini-picker__item-sub">{pickerWeekSub(ws)}</span>
+                                  </button>
+                                );
+                              })
+                            : Array.from({ length: 12 }, (_, m) => {
+                                const year = new Date(`${pickerCursor}T12:00:00`).getFullYear();
+                                const firstIso = `${year}-${pad(m + 1)}-01`;
+                                const now = new Date();
+                                const isToday = now.getFullYear() === year && now.getMonth() === m;
+                                const sel = new Date(`${date}T12:00:00`);
+                                const isSelected = sel.getFullYear() === year && sel.getMonth() === m;
+                                return (
+                                  <button
+                                    key={m}
+                                    type="button"
+                                    role="gridcell"
+                                    aria-label={`${IT_MONTHS[m] ?? ""} ${year}`}
+                                    aria-current={isSelected ? "true" : undefined}
+                                    className={`calendar-mini-picker__month${isToday ? " is-today" : ""}${
+                                      isSelected ? " is-selected" : ""
+                                    }`}
+                                    onClick={() => pickerSelect(firstIso)}
+                                  >
+                                    {IT_SHORT_MONTHS[m]}
+                                  </button>
+                                );
+                              })}
+                      </div>
+
+                      <div className="calendar-mini-picker__footer">
+                        <div className="calendar-mini-picker__selected">{pickerSelectedLabel}</div>
+                        <button type="button" className="calendar-mini-picker__today-btn" onClick={pickerGoToday}>
+                          {pickerTodayLabel}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
                 <div className="fc-toolbar-chunk">
                   <div className="fc-button-group">
