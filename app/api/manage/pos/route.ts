@@ -201,7 +201,18 @@ function normalizeSaleItemInput(item: Record<string, unknown>): PosSaleItemInput
     quantity: parseNumber(item.quantity ?? item.qty, 1),
     unitPrice: item.unitPrice === undefined ? parseNumber(item.unit_price, 0) : parseNumber(item.unitPrice, 0),
     status: item.status ? String(item.status) as PosSaleItemInput["status"] : undefined,
+    // Package sale meta (faithful to the legacy items[idx][package_*] fields): the custom
+    // validity window + note, read only for a type:"package" line at issue time.
+    startDate: packageMetaString(item.startDate ?? item.start_date ?? item.package_start_date),
+    expiresAt: packageMetaString(item.expiresAt ?? item.expires_at ?? item.package_expires_at),
+    note: packageMetaString(item.note ?? item.package_note),
   };
+}
+
+function packageMetaString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim();
+  return text ? text : undefined;
 }
 
 function normalizeItemType(value: string): PosSaleItemType | null {

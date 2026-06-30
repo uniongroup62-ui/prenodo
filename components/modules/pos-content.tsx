@@ -42,11 +42,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // and consumes the points (a points_redeem wallet movement). Checkout is blocked below
 // the configured minimum or above the balance (mirrors the backend).
 //
-// LEFT STATIC / NON-WIRED (rendered faithfully for visual fidelity only): the
-// advanced line types and their modals — Pacchetti, Ricariche, GiftBox, GiftCard
-// (ISSUE), and the installment (rate) plan. These dialogs are reproduced verbatim but
-// their buttons do not mutate state yet. The checkout only sends service/product lines
-// plus the base method + residui tenders + the fidelity points discount.
+// WIRED (package + prepaid sale): the "Vendi pacchetto" modal sells a PACKAGE template
+// (its price + a custom validity window/note) as a {type:"package"} cart line (qty 1);
+// each SERVICE tile carries a "+ Prepagato" affordance that adds a {type:"prepaid"} line
+// (qty = purchased sessions). Both flow through checkout's items_json. At checkout the
+// backend issues a client_packages row (sessions read from the package template,
+// start/expiry/note from the line) and a client_prepaid_services row (purchased_qty =
+// line qty) — issuance is gated on a real client (a bench sale cannot issue).
+//
+// LEFT STATIC / NON-WIRED (rendered faithfully for visual fidelity only): the remaining
+// advanced line types and their modals — Ricariche, GiftBox, GiftCard (ISSUE), and the
+// installment (rate) plan. These dialogs are reproduced verbatim but their buttons do not
+// mutate state yet.
 
 type CatalogService = {
   id: number;
@@ -72,12 +79,24 @@ type CatalogClient = {
   phone?: string;
 };
 
+// A sellable PACKAGE template from /api/manage/pos (port of pos.php $packages):
+// id, name, price, total sessions (-> client_packages.sessions_total when issued) and
+// validity days (seeds the proposed "Valido al" expiry).
+type CatalogPackage = {
+  id: number;
+  name: string;
+  price: number;
+  sessions: number;
+  validityDays: number;
+};
+
 type PosContext = {
   activeLocationId?: number;
   catalog?: {
     clients?: CatalogClient[];
     services?: CatalogService[];
     products?: CatalogProduct[];
+    packages?: CatalogPackage[];
   };
 };
 
@@ -94,12 +113,18 @@ type ClientResiduals = {
 
 type CartLine = {
   key: string;
-  type: "service" | "product";
+  type: "service" | "product" | "package" | "prepaid";
   refId: number;
   name: string;
   quantity: number;
   unitPrice: number;
-  status: "executed" | "collected";
+  status: "executed" | "collected" | "prepaid";
+  // PACKAGE meta (qty is locked to 1; sessions are issued from the template). Carried to
+  // checkout so the issued client_packages row gets the custom validity window + note.
+  startDate?: string;
+  expiresAt?: string;
+  note?: string;
+  sessions?: number;
 };
 
 // Legacy POS base payment type (the single payment_type radio: cash/card/check/bank).
@@ -154,8 +179,25 @@ function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+// Today as YYYY-MM-DD (local), mirrors pos.js pkTodayYMD().
+function todayYMD(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// start-date + N days as YYYY-MM-DD, faithful to pkCalculatePackageExpiry's 'days' base
+// case (the catalog validity is stored in days). Empty when start is invalid or days <= 0.
+function addDaysYMD(startYmd: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(startYmd || "").trim());
+  if (!m || days <= 0) return "";
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  d.setDate(d.getDate() + Math.floor(days));
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 export function PosContent() {
   const slug = tenantSlug();
+  const today = todayYMD();
 
   const [ctx, setCtx] = useState<PosContext | null>(null);
   const [loading, setLoading] = useState(true);
@@ -205,6 +247,15 @@ export function PosContent() {
   const [pointsUseInput, setPointsUseInput] = useState("0");
   const residualsReqRef = useRef(0);
 
+  // PACKAGE sale modal (wired): the chosen template, the optional custom validity window
+  // and note. The expiry is seeded from the template's validityDays (today + N days) and
+  // can be overridden; "touched" tracks a manual edit so re-selecting a package re-seeds it.
+  const [packageId, setPackageId] = useState(0);
+  const [packageStart, setPackageStart] = useState("");
+  const [packageExpires, setPackageExpires] = useState("");
+  const [packageExpiresTouched, setPackageExpiresTouched] = useState(false);
+  const [packageNote, setPackageNote] = useState("");
+
   // Checkout state.
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
@@ -231,6 +282,11 @@ export function PosContent() {
   const clients = useMemo(() => ctx?.catalog?.clients ?? [], [ctx]);
   const services = useMemo(() => ctx?.catalog?.services ?? [], [ctx]);
   const products = useMemo(() => ctx?.catalog?.products ?? [], [ctx]);
+  const packages = useMemo(() => ctx?.catalog?.packages ?? [], [ctx]);
+  const selectedPackage = useMemo(
+    () => packages.find((p) => p.id === packageId) ?? null,
+    [packages, packageId],
+  );
 
   const filteredClients = useMemo(() => {
     const q = clientSearch.trim().toLowerCase();
@@ -451,6 +507,115 @@ export function PosContent() {
     });
   }
 
+  // ---- PREPAID sale (wired) ----
+  // Sell a SERVICE as prepaid: a {type:"prepaid"} cart line whose qty is the purchased
+  // session count (per-session unitPrice). At checkout this issues a client_prepaid_services
+  // row (purchased_qty/remaining_qty = qty). Faithful to the legacy "Prepagato" service
+  // status — issuance requires a client (gated server-side), but the line can be added
+  // without one. Adding from a service tile via the "P" affordance.
+  function addPrepaidTile(tile: { id: number; name: string; price: number }) {
+    setCart((prev) => {
+      const existing = prev.find((l) => l.type === "prepaid" && l.refId === tile.id);
+      if (existing) {
+        return prev.map((l) => (l === existing ? { ...l, quantity: Math.min(1000, l.quantity + 1) } : l));
+      }
+      const line: CartLine = {
+        key: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        type: "prepaid",
+        refId: tile.id,
+        name: tile.name,
+        quantity: 1,
+        unitPrice: tile.price,
+        status: "prepaid",
+      };
+      return [line, ...prev];
+    });
+  }
+
+  // ---- PACKAGE sale (wired) ----
+  // The proposed expiry for the chosen package: the custom value once the staff edits the
+  // field, else today/start + the template's validityDays (pkCalculatePackageExpiry).
+  const packageStartValue = packageStart || today;
+  const proposedPackageExpiry = useMemo(
+    () => (selectedPackage ? addDaysYMD(packageStartValue, selectedPackage.validityDays) : ""),
+    [selectedPackage, packageStartValue],
+  );
+  // The effective "Valido al": the staff's manual override once they've edited the field
+  // (packageExpiresTouched), else the proposed expiry seeded from the template's validity
+  // (today/start + N days). Derived during render — no effect — so re-selecting a package
+  // or changing the start date re-seeds it automatically (mirrors pkSyncExpiryHint).
+  const effectivePackageExpiry = packageExpiresTouched ? packageExpires : proposedPackageExpiry;
+
+  function choosePackage(id: number) {
+    setPackageId(id);
+    setPackageExpires("");
+    setPackageExpiresTouched(false);
+  }
+
+  function resetPackageModal() {
+    setPackageId(0);
+    setPackageStart("");
+    setPackageExpires("");
+    setPackageExpiresTouched(false);
+    setPackageNote("");
+  }
+
+  // "Aggiungi alla lista": validate the dates and push a {type:"package"} cart line — qty 1
+  // at the bundle price, carrying start/expiry/note. The package can be added with no
+  // client; checkout (the backend) gates the client_packages issuance on a real client.
+  function addPackageToCart() {
+    setErrorMsg("");
+    const pkg = packages.find((p) => p.id === packageId);
+    if (!pkg) {
+      setErrorMsg("Seleziona un pacchetto.");
+      return;
+    }
+    const startDate = packageStart || today;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+      setErrorMsg('Data "Valido dal" non valida.');
+      return;
+    }
+    const expiresAt = (effectivePackageExpiry || "").trim();
+    if (expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(expiresAt)) {
+      setErrorMsg('Data "Valido al" non valida.');
+      return;
+    }
+    if (expiresAt && startDate >= expiresAt) {
+      setErrorMsg('La data "Valido al" deve essere successiva a "Valido dal".');
+      return;
+    }
+    setCart((prev) => [
+      {
+        key: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        type: "package",
+        refId: pkg.id,
+        name: pkg.name,
+        quantity: 1,
+        unitPrice: pkg.price,
+        status: "prepaid",
+        startDate,
+        expiresAt: expiresAt || undefined,
+        note: packageNote.trim() || undefined,
+        sessions: pkg.sessions,
+      },
+      ...prev,
+    ]);
+    resetPackageModal();
+    // Close the Bootstrap modal (its data-bs handlers may not run for this dynamic markup).
+    if (typeof document !== "undefined") {
+      const modalEl = document.getElementById("posModalPackages");
+      const w = window as unknown as { bootstrap?: { Modal?: { getOrCreateInstance?: (el: Element) => { hide?: () => void } } } };
+      try {
+        w.bootstrap?.Modal?.getOrCreateInstance?.(modalEl as Element)?.hide?.();
+      } catch {
+        if (modalEl) {
+          modalEl.classList.remove("show");
+          (modalEl as HTMLElement).style.display = "none";
+        }
+      }
+    }
+  }
+
   function setQty(key: string, qty: number) {
     setCart((prev) => prev.map((l) => (l.key === key ? { ...l, quantity: Math.max(1, Math.min(1000, qty || 1)) } : l)));
   }
@@ -592,6 +757,11 @@ export function PosContent() {
         quantity: line.quantity,
         unitPrice: line.unitPrice,
         status: line.status,
+        // Package meta (only set on package lines): the backend reads these to issue the
+        // client_packages row with the right validity window + note.
+        ...(line.type === "package"
+          ? { startDate: line.startDate ?? "", expiresAt: line.expiresAt ?? "", note: line.note ?? "" }
+          : {}),
       })),
     );
     // Faithful tenders: the residui (wallet credit + chosen giftcard) then the base
@@ -651,8 +821,6 @@ export function PosContent() {
       setSubmitting(false);
     }
   }
-
-  const today = "2026-06-29";
 
   return (
     <div className="container-fluid">
@@ -774,11 +942,34 @@ export function PosContent() {
                       </td>
                     </tr>
                   ) : (
-                    cart.map((line) => (
+                    cart.map((line) => {
+                      // A package line is a fixed single unit (qty locked, like the legacy
+                      // disabled qty input); the validity window/note + session count show
+                      // under the name. A prepaid line is a per-session service (qty = sessions).
+                      const isPackage = line.type === "package";
+                      const label = isPackage
+                        ? `Pacchetto • ${line.name}`
+                        : line.type === "prepaid"
+                          ? `Prepagato • ${line.name}`
+                          : line.name;
+                      const subLine = isPackage
+                        ? [
+                            line.startDate ? `Valido dal: ${line.startDate}` : "",
+                            line.expiresAt ? `Valido al: ${line.expiresAt}` : "",
+                            line.sessions ? `${line.sessions} sedute` : "",
+                            line.note ? line.note : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" • ")
+                        : line.type === "prepaid"
+                          ? `${line.quantity} sedute prepagate`
+                          : "";
+                      return (
                       <tr data-item-row="1" data-type={line.type} data-id={line.refId} key={line.key}>
                         <td className="text-uppercase small">{line.type}</td>
                         <td>
-                          <div className="fw-semibold pos-item-name">{line.name}</div>
+                          <div className="fw-semibold pos-item-name">{label}</div>
+                          {subLine ? <div className="text-muted small">{subLine}</div> : null}
                         </td>
                         <td>
                           <input
@@ -787,6 +978,7 @@ export function PosContent() {
                             min={1}
                             step={1}
                             value={line.quantity}
+                            disabled={isPackage}
                             onChange={(e) => setQty(line.key, Number.parseInt(e.target.value, 10))}
                           />
                         </td>
@@ -802,7 +994,8 @@ export function PosContent() {
                           </button>
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
@@ -856,19 +1049,49 @@ export function PosContent() {
                   <div className="text-muted small">{loading ? "Caricamento…" : "Nessun risultato."}</div>
                 ) : (
                   tiles.map((tile) => (
-                    <button
-                      type="button"
+                    <div
                       className="pos-tile"
                       data-id={tile.id}
                       data-type={catalogMode}
                       data-base-price={tile.price.toFixed(2)}
                       key={`${catalogMode}-${tile.id}`}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => addTile(tile)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          addTile(tile);
+                        }
+                      }}
                     >
                       <div className="pos-tile-name">{tile.name}</div>
                       <div className="pos-tile-meta">
                         <div className="small text-muted">
                           {catalogMode === "product" && tile.stock !== undefined ? `Stock: ${tile.stock}` : ""}
+                          {/* Prepaid affordance: sell this SERVICE as prepaid (a session
+                              pack) instead of executing it now. Stops the tile's add. */}
+                          {catalogMode === "service" ? (
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              className="badge bg-light text-primary border pos-tile-prepaid-btn"
+                              title="Vendi come prepagato (sedute)"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                addPrepaidTile(tile);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  addPrepaidTile(tile);
+                                }
+                              }}
+                            >
+                              + Prepagato
+                            </span>
+                          ) : null}
                         </div>
                         <div className="text-end">
                           <div className="pos-tile-price-row">
@@ -878,7 +1101,7 @@ export function PosContent() {
                           </div>
                         </div>
                       </div>
-                    </button>
+                    </div>
                   ))
                 )}
               </div>
@@ -1678,31 +1901,71 @@ export function PosContent() {
 
             <div className="modal-body">
               <div className="small text-muted mb-2">
-                Cliente: <strong id="posPackageClientLabel">—</strong>
+                Cliente: <strong id="posPackageClientLabel">{clientName || "—"}</strong>
               </div>
 
-              <div className="alert alert-warning py-2 px-3 d-none" id="posPackageNoClientWarn">
+              <div className={`alert alert-warning py-2 px-3${clientId ? " d-none" : ""}`} id="posPackageNoClientWarn">
                 Nessun cliente selezionato. Puoi aggiungere il pacchetto alla lista, ma per <strong>concludere</strong> la
                 vendita dovrai selezionare un cliente.
               </div>
 
               <label className="form-label">Pacchetto</label>
-              <select className="form-select" id="posPackageSelect" required defaultValue="">
+              <select
+                className="form-select"
+                id="posPackageSelect"
+                required
+                value={packageId || ""}
+                onChange={(e) => choosePackage(Number.parseInt(e.target.value, 10) || 0)}
+              >
                 <option value="">Seleziona...</option>
+                {packages.map((p) => (
+                  <option
+                    value={p.id}
+                    data-name={p.name}
+                    data-price={p.price.toFixed(2)}
+                    data-validity-days={p.validityDays}
+                    key={p.id}
+                  >
+                    {p.name} — {fmtEUR(p.price)}
+                    {p.sessions > 0 ? ` (${p.sessions} sedute)` : ""}
+                  </option>
+                ))}
               </select>
 
               <div className="row g-2 mt-3">
                 <div className="col-md-6">
                   <label className="form-label">Valido dal</label>
-                  <input className="form-control" type="date" id="posPackageStartDate" defaultValue={today} />
+                  <input
+                    className="form-control"
+                    type="date"
+                    id="posPackageStartDate"
+                    value={packageStart || today}
+                    onChange={(e) => setPackageStart(e.target.value)}
+                  />
                 </div>
                 <div className="col-md-6">
                   <label className="form-label">Valido al</label>
-                  <input className="form-control" type="date" id="posPackageExpiresAt" defaultValue="" />
+                  <input
+                    className="form-control"
+                    type="date"
+                    id="posPackageExpiresAt"
+                    min={addDaysYMD(packageStart || today, 1)}
+                    value={effectivePackageExpiry}
+                    onChange={(e) => {
+                      setPackageExpiresTouched(true);
+                      setPackageExpires(e.target.value);
+                    }}
+                  />
                 </div>
               </div>
 
-              <div className="small text-muted mt-2" id="posPackageExpiryHint"></div>
+              <div className="small text-muted mt-2" id="posPackageExpiryHint">
+                {selectedPackage
+                  ? proposedPackageExpiry
+                    ? `Scadenza proposta dal catalogo: ${proposedPackageExpiry}.`
+                    : "Questo pacchetto non ha una scadenza automatica."
+                  : ""}
+              </div>
 
               <div className="alert alert-info py-2 px-3 d-none" id="posPackageGiftboxModeInfo">
                 <strong>GiftBox attiva:</strong> questo pacchetto verrà inserito come contenuto della GiftBox (non sarà
@@ -1710,7 +1973,14 @@ export function PosContent() {
               </div>
 
               <label className="form-label mt-3">Note</label>
-              <input className="form-control" type="text" id="posPackageNote" placeholder="(opzionale)" />
+              <input
+                className="form-control"
+                type="text"
+                id="posPackageNote"
+                placeholder="(opzionale)"
+                value={packageNote}
+                onChange={(e) => setPackageNote(e.target.value)}
+              />
 
               <div className="small text-muted mt-2">
                 Nota: il pacchetto verrà aggiunto al carrello. Alla chiusura vendita (tasto <strong>Concludi</strong>)
@@ -1731,7 +2001,7 @@ export function PosContent() {
               <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">
                 Annulla
               </button>
-              <button type="button" className="btn btn-primary" id="posPackageAddBtn">
+              <button type="button" className="btn btn-primary" id="posPackageAddBtn" onClick={addPackageToCart}>
                 Aggiungi alla lista
               </button>
             </div>

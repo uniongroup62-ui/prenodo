@@ -49,8 +49,24 @@ export type ManagePosContext = {
     clients: ManagedClient[];
     services: ManagedService[];
     products: ManagedProduct[];
+    // Sellable PACKAGE templates (id, name, price, total sessions, validity days) for the
+    // "Vendi pacchetto" modal; selling one issues a client_packages row at checkout.
+    packages: SellablePackage[];
   };
   locations: Array<{ id: number; name: string }>;
+};
+
+// A package template the POS can SELL (port of the pos.php $packages query:
+// SELECT id, name, price, sessions_total, validity_days FROM packages WHERE is_active=1).
+// `sessions` is the bundle's total sessions (sum of package_services / package_items, or
+// the packages.sessions_total fallback) — it becomes client_packages.sessions_total when
+// the package is issued. `validityDays` seeds the proposed expiry (today + N days).
+export type SellablePackage = {
+  id: number;
+  name: string;
+  price: number;
+  sessions: number;
+  validityDays: number;
 };
 
 const sourceLabel = "app/pages/pos.php + app/pages/pos_history.php";
@@ -61,11 +77,12 @@ export async function getManagePosContext(
 ): Promise<ManagePosContext> {
   const locationContext = await getManageLocationContext(slug);
   const activeLocationId = normalizeLocationId(options.locationId ?? locationContext.currentLocationId, locationContext.locations);
-  const [sales, clients, services, products] = await Promise.all([
+  const [sales, clients, services, products, packages] = await Promise.all([
     listPosSales(slug, { locationId: activeLocationId, includeCancelled: options.includeCancelled ?? true, query: options.query ?? "" }),
     listPosClients(slug),
     listPosServices(slug, activeLocationId),
     listPosProducts(slug, activeLocationId),
+    listPosPackages(slug, activeLocationId),
   ]);
 
   return {
@@ -75,7 +92,7 @@ export async function getManagePosContext(
     activeLocationId,
     summary: summarizeSales(sales),
     sales,
-    catalog: { clients, services, products },
+    catalog: { clients, services, products, packages },
     locations: locationContext.locations.map((location) => ({ id: location.id, name: location.name })),
   };
 }
@@ -476,6 +493,86 @@ async function listPosProducts(slug: string, locationId: number): Promise<Manage
   }));
 }
 
+// Sellable PACKAGE templates for the POS, port of the pos.php $packages query
+// (SELECT id, name, price, sessions_total, validity_days FROM packages WHERE is_active=1),
+// location-filtered like services via package_locations. The total `sessions` is resolved
+// the same way the legacy issue logic does (package_services -> package_items(service) ->
+// packages.sessions_total), so the issued client_packages row gets the right session count.
+async function listPosPackages(slug: string, locationId: number): Promise<SellablePackage[]> {
+  const packagesTable = await tenantTable(slug, "packages").catch(() => null);
+  if (!packagesTable) return [];
+  const clauses = ["COALESCE(p.is_active,1)=1"];
+  const params: unknown[] = [];
+  if (packagesTable.mode === "shared" && await columnExists(packagesTable.name, "tenant_id")) {
+    clauses.unshift("p.tenant_id=?");
+    params.unshift(packagesTable.tenantId ?? 0);
+  }
+  const locationFilter = await packageLocationFilter(slug, locationId);
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT p.*
+       FROM ${quoteIdentifier(packagesTable.name)} p
+      WHERE ${clauses.join(" AND ")}
+        ${locationFilter.sql}
+      ORDER BY p.name ASC, p.id ASC`,
+    [...params, ...locationFilter.params],
+  ).catch(() => [] as RowDataPacket[]);
+  return Promise.all(
+    rows.map(async (row) => {
+      const id = Number(row.id ?? 0);
+      return {
+        id,
+        name: String(row.name ?? "Pacchetto"),
+        price: roundMoney(Number(row.price ?? 0) || 0),
+        sessions: await packageSessionsTotal(slug, id, row),
+        validityDays: Math.max(0, Number(row.validity_days ?? 0) || 0),
+      };
+    }),
+  );
+}
+
+// The total sessions a package grants, resolved exactly like the legacy issue logic:
+// sum of package_services.sessions_total, else sum of package_items(item_type='service')
+// qty, else packages.sessions_total (min 1). This becomes client_packages.sessions_total.
+async function packageSessionsTotal(slug: string, packageId: number, packageRow?: RowDataPacket): Promise<number> {
+  if (packageId > 0) {
+    const serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "package_services",
+      columns: "sessions_total",
+      where: "package_id=?",
+      params: [packageId],
+    }).catch(() => [] as RowDataPacket[]);
+    if (serviceRows.length) {
+      const sum = serviceRows.reduce((total, r) => total + Math.max(1, Number(r.sessions_total ?? 1) || 1), 0);
+      if (sum > 0) return sum;
+    }
+    const itemRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "package_items",
+      columns: "qty",
+      where: "package_id=? AND LOWER(COALESCE(item_type,''))='service'",
+      params: [packageId],
+    }).catch(() => [] as RowDataPacket[]);
+    if (itemRows.length) {
+      const sum = itemRows.reduce((total, r) => total + Math.max(1, Number(r.qty ?? 1) || 1), 0);
+      if (sum > 0) return sum;
+    }
+  }
+  const fallback = Number(packageRow?.sessions_total ?? 1) || 1;
+  return Math.max(1, fallback);
+}
+
+async function packageLocationFilter(slug: string, locationId: number): Promise<{ sql: string; params: unknown[] }> {
+  if (locationId <= 0) return { sql: "", params: [] };
+  const table = await tenantTable(slug, "package_locations").catch(() => null);
+  if (!table) return { sql: "", params: [] };
+  const tenantClause = table.mode === "shared" && await columnExists(table.name, "tenant_id") ? " AND pl.tenant_id=p.tenant_id" : "";
+  return {
+    sql: `AND (EXISTS(SELECT 1 FROM ${quoteIdentifier(table.name)} pl WHERE pl.package_id=p.id AND pl.location_id=?${tenantClause}) OR NOT EXISTS(SELECT 1 FROM ${quoteIdentifier(table.name)} pl_any WHERE pl_any.package_id=p.id${tenantClause.replaceAll("pl.", "pl_any.")}))`,
+    params: [locationId],
+  };
+}
+
 async function mapSale(slug: string, row: RowDataPacket): Promise<PosSale> {
   const id = Number(row.id ?? 0);
   const items = await saleItems(slug, id);
@@ -563,16 +660,27 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
       continue;
     }
 
+    // Special line types (package / prepaid / giftcard / giftbox). For a PACKAGE the cart
+    // line is a single unit at the package price (faithful to pos.php pkAddRowToCart: qty
+    // is fixed to 1, the line price is the bundle price); the validity/expiry/note ride on
+    // the line meta and the issued sessions are read from the package template, NOT the
+    // line qty. For a PREPAID line the qty IS the purchased session count (per-session
+    // unitPrice), so it flows straight into client_prepaid_services.purchased_qty.
+    const isPackage = input.type === "package";
+    const lineQty = isPackage ? 1 : quantity;
     const unitPrice = roundMoney(input.unitPrice ?? 0);
     items.push({
       id: index + 1,
       type: input.type,
       refId,
       name: input.name?.trim() || fallbackItemName(input.type),
-      quantity,
+      quantity: lineQty,
       unitPrice,
-      total: roundMoney(unitPrice * quantity),
+      total: roundMoney(unitPrice * lineQty),
       status: "prepaid",
+      startDate: clean(input.startDate, 10) || undefined,
+      expiresAt: clean(input.expiresAt, 10) || undefined,
+      note: clean(input.note, 255) || undefined,
     });
   }
   return items.filter((item) => item.quantity > 0);
@@ -818,17 +926,49 @@ async function issuePrepaidFromSale(slug: string, saleId: number, saleItemId: nu
 async function issuePackageFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem): Promise<void> {
   const table = await tenantTable(slug, "client_packages").catch(() => null);
   if (!table) return;
+  // Sessions come from the package TEMPLATE (sum of package_services / package_items, or
+  // packages.sessions_total) — faithful to the legacy issue logic, NOT the cart qty (the
+  // package line is always qty 1 at the bundle price). Fall back to the line qty only when
+  // the template can't be read (e.g. ad-hoc package with no id).
+  const packageRow = item.refId > 0 ? await packageRowById(slug, item.refId) : null;
+  const sessions = item.refId > 0
+    ? await packageSessionsTotal(slug, item.refId, packageRow ?? undefined)
+    : Math.max(1, item.quantity);
+  // Expiry: the custom "Valido al" the staff picked, else today + the template's
+  // validity_days (pkCalculatePackageExpiry base case), else null.
+  const startDate = item.startDate && /^\d{4}-\d{2}-\d{2}$/.test(item.startDate) ? item.startDate : todayIso();
+  let expiresAt: string | null = item.expiresAt && /^\d{4}-\d{2}-\d{2}$/.test(item.expiresAt) ? item.expiresAt : null;
+  if (!expiresAt) {
+    const validityDays = Math.max(0, Number(packageRow?.validity_days ?? 0) || 0);
+    if (validityDays > 0) expiresAt = addDaysIso(startDate, validityDays);
+  }
   await tenantInsert(table, await filterColumns(table.name, {
     client_id: clientId,
     sale_id: saleId,
     package_id: item.refId > 0 ? item.refId : null,
     package_name: item.name,
+    service_id: Number(packageRow?.service_id ?? 0) || null,
     purchase_date: todayIso(),
-    start_date: todayIso(),
-    sessions_total: item.quantity,
-    sessions_remaining: item.quantity,
+    start_date: startDate,
+    expires_at: expiresAt,
+    sessions_total: sessions,
+    sessions_remaining: sessions,
     status: "active",
+    notes: item.note ?? null,
   })).catch(() => undefined);
+}
+
+async function packageRowById(slug: string, id: number): Promise<RowDataPacket | null> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "packages", where: "id=?", params: [id], limit: 1 }).catch(() => []);
+  return rows[0] ?? null;
+}
+
+// today/start-date + N days as YYYY-MM-DD (pkAddDurationYmd 'days' base case).
+function addDaysIso(startYmd: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(startYmd);
+  const base = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date();
+  base.setDate(base.getDate() + Math.max(0, Math.floor(days)));
+  return `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, "0")}-${String(base.getDate()).padStart(2, "0")}`;
 }
 
 async function clientName(slug: string, clientId: number): Promise<string> {

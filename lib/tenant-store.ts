@@ -64,6 +64,13 @@ export type PosSaleItemInput = {
   quantity?: number;
   unitPrice?: number;
   status?: PosSaleItemStatus;
+  // Package sale meta (faithful to pos.php pkAddRowToCart): the optional custom validity
+  // window + note the staff sets in the "Vendi pacchetto" modal. Only read for a
+  // type:"package" line; flows through to the issued client_packages row (start_date /
+  // expires_at / notes). Ignored for every other line type.
+  startDate?: string;
+  expiresAt?: string;
+  note?: string;
 };
 
 export type PosPaymentInput = {
@@ -84,6 +91,10 @@ export type PosSaleItem = {
   total: number;
   status: PosSaleItemStatus;
   stockMovementId?: number;
+  // Package sale meta carried from the cart to issuePackageFromSale (start/expiry/note).
+  startDate?: string;
+  expiresAt?: string;
+  note?: string;
 };
 
 export type PosPayment = {
