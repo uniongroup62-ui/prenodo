@@ -436,6 +436,18 @@ export function AppointmentsContent() {
                             <span className={`appointments-status-badge ${badge.className}`}>{badge.label}</span>
                           </td>
                           <td className="text-end">
+                            {/* "Vendita da appuntamento" (Incassa): open the POS pre-loaded
+                                with this appointment's client + services. The POS reads the
+                                ?appointment=<id> query param, fetches action=appointment_cart
+                                and seeds the cart; concluding the sale marks the appointment
+                                'done' (appointment_id threaded to checkoutManageSale). */}
+                            <a
+                              className="btn btn-sm btn-outline-primary"
+                              href={`/${encodeURIComponent(slug)}/pos?appointment=${appt.id}`}
+                              title="Incassa l'appuntamento in cassa"
+                            >
+                              <i className="bi bi-cash-coin me-1"></i>Incassa
+                            </a>{" "}
                             {/* Edit: drives the GLOBAL quick-booking drawer in EDIT MODE.
                                 The drawer (mounted in the manage shell on every page)
                                 has a delegated [data-qb-edit] handler that loads the

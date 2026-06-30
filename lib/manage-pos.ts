@@ -21,6 +21,7 @@ import {
   addDbWalletMovement,
   dbClientGiftcards,
   dbWalletBalance,
+  getDbAppointmentForEdit,
   previewDbCoupon,
   redeemDbGiftCard,
   refundDbGiftCard,
@@ -201,6 +202,73 @@ export async function getManagePosResiduals(slug: string, clientId: number): Pro
       minPoints: settings.minPoints,
     },
   };
+}
+
+// "Vendita da appuntamento" pre-load: the cart seed for cashing out a completed
+// appointment in the POS. Port of the legacy pos.php quote-import flow applied to an
+// appointment — the POS opens pre-filled with the appointment's CLIENT + its SERVICE
+// lines so a normal checkout records the sale AND marks the appointment 'done'
+// (checkoutManageSale sets appointments.status='done' when appointmentId>0). Reuses
+// getDbAppointmentForEdit (clientId/clientName + services[{serviceId,name}]) and enriches
+// each service with the CURRENT catalog price (the same price a manually-clicked POS
+// service tile would charge), so the staff sees the live list price. Tenant-scoped via the
+// repo readers; returns ok=false (empty) when the appointment is missing / not the tenant's.
+export type ManagePosAppointmentCart = {
+  ok: boolean;
+  appointmentId: number;
+  publicCode: string | null;
+  clientId: number;
+  clientName: string;
+  services: Array<{ serviceId: number; name: string; unitPrice: number; quantity: number }>;
+};
+
+export async function getManagePosAppointmentCart(slug: string, appointmentId: number): Promise<ManagePosAppointmentCart> {
+  const id = Math.max(0, Number(appointmentId) || 0);
+  const empty: ManagePosAppointmentCart = { ok: false, appointmentId: 0, publicCode: null, clientId: 0, clientName: "", services: [] };
+  if (id <= 0) return empty;
+
+  const appointment = await getDbAppointmentForEdit(slug, id).catch(() => null);
+  if (!appointment) return empty;
+
+  // Service catalog (id -> current list price) from the SAME source the POS tiles use, so a
+  // pre-loaded line carries exactly the price a manual tile click would add. The POS catalog
+  // price is the formatted "<n> euro" string -> parsed to a number here.
+  const services = await listPosServices(slug, appointment.locationId ?? 0).catch(() => []);
+  const priceById = new Map<number, number>();
+  for (const service of services) {
+    priceById.set(Number(service.id ?? 0), parsePriceLabel(service.price));
+  }
+
+  const cartServices = appointment.services
+    .filter((service) => Number(service.serviceId ?? 0) > 0)
+    .map((service) => ({
+      serviceId: Number(service.serviceId),
+      name: String(service.name ?? "Servizio"),
+      // Current catalog list price (0 when the service is no longer in the catalog — the staff
+      // can still adjust qty/remove the line, mirroring a manual add of an unpriced service).
+      unitPrice: roundMoney(Math.max(0, priceById.get(Number(service.serviceId)) ?? 0)),
+      quantity: 1,
+    }));
+
+  return {
+    ok: true,
+    appointmentId: id,
+    publicCode: appointment.publicCode,
+    clientId: Math.max(0, Number(appointment.clientId ?? 0) || 0),
+    clientName: String(appointment.clientName ?? "").trim(),
+    services: cartServices,
+  };
+}
+
+// Parse a POS catalog price label ("12,00 euro" / "12.00") into a number. Mirrors the
+// pos-content parsePrice helper so the seeded unit price matches what a tile click adds.
+function parsePriceLabel(value: string | number | undefined): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const raw = String(value ?? "").replace(/euro/gi, "").replace(/€/g, "").replace(/\s+/g, "").trim();
+  if (!raw) return 0;
+  const normalized = raw.includes(",") ? raw.replace(/\./g, "").replace(",", ".") : raw;
+  const n = Number.parseFloat(normalized);
+  return Number.isFinite(n) ? n : 0;
 }
 
 // Port of Fidelity::settings() redeem block (app/lib/Fidelity.php ~610-620): read the

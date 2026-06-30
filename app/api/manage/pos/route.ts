@@ -2,7 +2,7 @@ import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/ap
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelManageSale, checkoutManageSale, getManagePosContext, getManagePosResiduals } from "@/lib/manage-pos";
+import { cancelManageSale, checkoutManageSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
@@ -31,6 +31,19 @@ export async function GET(request: Request) {
       return Response.json(await getManagePosResiduals(tenantSlug, clientId));
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore residui POS.");
+    }
+  }
+
+  // "Vendita da appuntamento" pre-load: the cart seed (client + service lines with the
+  // current catalog price) for cashing out a completed appointment in the POS. The UI seeds
+  // the cart from this, then a normal checkout (with appointment_id) records the sale AND
+  // marks the appointment 'done'. Same tenant + POS permission gate as the rest of the route.
+  if (url.searchParams.get("action") === "appointment_cart") {
+    const appointmentId = parseInteger(url.searchParams.get("appointment_id"), 0);
+    try {
+      return Response.json(await getManagePosAppointmentCart(tenantSlug, appointmentId));
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore caricamento appuntamento POS.");
     }
   }
 

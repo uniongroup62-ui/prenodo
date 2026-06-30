@@ -361,6 +361,15 @@ export function PosContent() {
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
+  // "Vendita da appuntamento": when the POS is opened with ?appointment=<id> the cart is
+  // pre-loaded from that appointment's CLIENT + SERVICES (action=appointment_cart). The id
+  // is remembered so handleCheckout sends appointment_id (linking the sale + marking the
+  // appointment 'done' server-side); the code drives the "Vendita da appuntamento #<code>"
+  // banner. Reset to 0/"" on a successful checkout (the sale is no longer from an appointment).
+  const [appointmentSaleId, setAppointmentSaleId] = useState(0);
+  const [appointmentSaleCode, setAppointmentSaleCode] = useState("");
+  const appointmentPreloadRef = useRef(false);
+
   const successTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(() => {
@@ -378,6 +387,91 @@ export function PosContent() {
       if (successTimer.current) clearTimeout(successTimer.current);
     };
   }, [load]);
+
+  // "Vendita da appuntamento" pre-load (mount-once): when the POS URL carries
+  // ?appointment=<id>, fetch the appointment's CLIENT + SERVICE lines
+  // (GET action=appointment_cart) and seed the cart: select the client (the existing
+  // client-select path) and ADD each service as a normal {type:"service"} line at its
+  // current catalog price. The appointment id is remembered so handleCheckout sends
+  // appointment_id (so the sale links + the appointment is marked 'done' server-side); the
+  // code drives the banner. The guard ref makes this run only once. If the fetch fails (or
+  // the appointment is missing/foreign), the POS degrades to an empty cart (no banner).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (appointmentPreloadRef.current) return;
+    const rawId = new URLSearchParams(window.location.search).get("appointment");
+    const appointmentId = Math.max(0, Number.parseInt(String(rawId ?? ""), 10) || 0);
+    if (appointmentId <= 0) {
+      appointmentPreloadRef.current = true;
+      return;
+    }
+    appointmentPreloadRef.current = true;
+    let active = true;
+    fetch(`/api/manage/pos?slug=${encodeURIComponent(slug)}&action=appointment_cart&appointment_id=${appointmentId}`, {
+      headers: { "x-tenant-slug": slug },
+    })
+      .then((r) => r.json())
+      .then(
+        (j: {
+          ok?: boolean;
+          appointmentId?: number;
+          publicCode?: string | null;
+          clientId?: number;
+          clientName?: string;
+          services?: Array<{ serviceId?: number; name?: string; unitPrice?: number; quantity?: number }>;
+        }) => {
+          if (!active) return;
+          if (j?.ok === false || !j) return; // degrade to an empty POS
+          const apptId = Math.max(0, Number(j?.appointmentId ?? appointmentId) || 0);
+          if (apptId <= 0) return;
+          // Select the appointment's client (so residui/fidelity load for them).
+          const cId = Math.max(0, Number(j?.clientId ?? 0) || 0);
+          if (cId > 0) selectClient(cId, String(j?.clientName ?? "").trim());
+          // Add each service line as a normal {type:"service"} cart line.
+          const lines = Array.isArray(j?.services) ? j.services : [];
+          if (lines.length > 0) {
+            setCart((prev) => {
+              // Immutable merge: clone existing service lines on qty bump (no in-place
+              // mutation of the previous state), mirroring how addTile composes the cart.
+              const next = prev.map((l) => ({ ...l }));
+              for (const line of lines) {
+                const refId = Math.max(0, Number(line?.serviceId ?? 0) || 0);
+                if (refId <= 0) continue;
+                const quantity = Math.max(1, Math.round(Number(line?.quantity ?? 1) || 1));
+                const unitPrice = roundMoney(Math.max(0, Number(line?.unitPrice ?? 0) || 0));
+                const existing = next.find((l) => l.type === "service" && l.refId === refId);
+                if (existing) {
+                  existing.quantity = Math.min(1000, existing.quantity + quantity);
+                  continue;
+                }
+                next.push({
+                  key: `${Date.now()}-${Math.floor(Math.random() * 1000)}-${refId}`,
+                  type: "service",
+                  refId,
+                  name: String(line?.name ?? "Servizio"),
+                  quantity: Math.min(1000, quantity),
+                  unitPrice,
+                  status: "executed",
+                });
+              }
+              return next;
+            });
+          }
+          // Remember the appointment id + code (drives the banner + the checkout link).
+          setAppointmentSaleId(apptId);
+          setAppointmentSaleCode(
+            j?.publicCode && String(j.publicCode).trim() ? String(j.publicCode).trim() : `#${apptId}`,
+          );
+        },
+      )
+      .catch(() => {
+        // degrade to an empty POS — the staff can still build the sale manually.
+      });
+    return () => {
+      active = false;
+    };
+    // Runs once on mount; slug is stable for the page lifetime.
+  }, [slug]);
 
   const clients = useMemo(() => ctx?.catalog?.clients ?? [], [ctx]);
   const services = useMemo(() => ctx?.catalog?.services ?? [], [ctx]);
@@ -1191,6 +1285,10 @@ export function PosContent() {
       coupon_code: couponCode.trim(),
       // FIDELITY points to spend as a discount (the backend re-validates + consumes them).
       fidelity_points_use: pointsUsed,
+      // "Vendita da appuntamento": link the sale to the appointment so the backend marks it
+      // 'done' (checkoutManageSale sets appointments.status='done' when appointment_id>0) and
+      // stamps "Appuntamento #<id>" on the sale notes. 0 for a normal POS sale.
+      appointment_id: appointmentSaleId > 0 ? appointmentSaleId : 0,
       notes: notes.trim(),
     };
 
@@ -1218,6 +1316,10 @@ export function PosContent() {
       setBaseMethod("cash");
       setNotes("");
       clearClient();
+      // The sale is no longer "da appuntamento": clear the link + banner (the appointment is
+      // now marked 'done' server-side). A fresh ?appointment= visit re-seeds on a new mount.
+      setAppointmentSaleId(0);
+      setAppointmentSaleCode("");
       setSuccessMsg(`Vendita conclusa${saleCode}.`);
       if (successTimer.current) clearTimeout(successTimer.current);
       successTimer.current = setTimeout(() => setSuccessMsg(""), 6000);
@@ -1246,6 +1348,18 @@ export function PosContent() {
           </div>
         </div>
       </div>
+
+      {/* "Vendita da appuntamento" banner: shown when the POS was opened with
+          ?appointment=<id> and the cart was pre-loaded from that appointment. The
+          checkout sends appointment_id, so concluding the sale marks the appointment 'done'. */}
+      {appointmentSaleId > 0 ? (
+        <div className="alert alert-info d-flex align-items-center gap-2" id="posAppointmentBanner">
+          <i className="bi bi-calendar-check"></i>
+          <span>
+            Vendita da appuntamento <strong>{appointmentSaleCode}</strong> — concludendo la vendita l&apos;appuntamento verrà segnato come eseguito.
+          </span>
+        </div>
+      ) : null}
 
       <form method="post" id="posForm" onSubmit={handleCheckout}>
         <input type="hidden" name="location_id" value={ctx?.activeLocationId ?? ""} />
