@@ -135,6 +135,9 @@ type Appointment = {
   room?: string;
   price?: string;
   status: string;
+  // Real php status code (pending|scheduled|done|canceled|no_show); the list API's
+  // `status` is the collapsed 3-state UI label, so prefer statusCode for the pill.
+  statusCode?: string;
 };
 
 type CalendarView = "staffTimeGridDay" | "timeGridWeek" | "dayGridMonth";
@@ -970,7 +973,7 @@ export function CalendarContent() {
         if (s && (a.operator || "").trim().toLowerCase() !== s.name.trim().toLowerCase()) return false;
       }
       if (filterStatus) {
-        if (statusKeyFromLabel(a.status).key !== filterStatus) return false;
+        if (statusKeyFromLabel(a.statusCode ?? a.status).key !== filterStatus) return false;
       }
       if (filterService) {
         const svc = services.find((s) => String(s.id) === filterService);
@@ -988,7 +991,7 @@ export function CalendarContent() {
     return appointments.filter((a) => {
       if (a.date && a.date !== date) return false;
       if (filterStatus) {
-        const k = statusKeyFromLabel(a.status).key;
+        const k = statusKeyFromLabel(a.statusCode ?? a.status).key;
         if (k !== filterStatus) return false;
       }
       if (filterService) {
@@ -2184,7 +2187,7 @@ export function CalendarContent() {
                     const endMinVal = timeToMin(previewEnd ?? a.endTime ?? "");
                     const durationMin = endMinVal !== null && endMinVal > startMin ? endMinVal - startMin : DEFAULT_DURATION_MIN;
                     const height = Math.max(durationMin * PX_PER_MIN - 2, 18);
-                    const st = statusKeyFromLabel(a.status);
+                    const st = statusKeyFromLabel(a.statusCode ?? a.status);
                     const op = staff.find((s) => (s.name || "").trim().toLowerCase() === (a.operator || "").trim().toLowerCase());
                     const accent = op?.color || "#2f63d8";
                     return (
@@ -2357,7 +2360,7 @@ export function CalendarContent() {
                   </div>
                   <div className="fc-daygrid-day-events" style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 2 }}>
                     {shown.map((a) => {
-                      const st = statusKeyFromLabel(a.status);
+                      const st = statusKeyFromLabel(a.statusCode ?? a.status);
                       const op = staff.find((s) => (s.name || "").trim().toLowerCase() === (a.operator || "").trim().toLowerCase());
                       const accent = op?.color || "#2f63d8";
                       // Compact multi-service hint (Month is an overview, the chip stays a
@@ -2929,7 +2932,7 @@ export function CalendarContent() {
                                     const endMinVal = timeToMin(previewEnd ?? a.endTime ?? "");
                                     const durationMin = endMinVal !== null && endMinVal > startMin ? endMinVal - startMin : DEFAULT_DURATION_MIN;
                                     const height = Math.max(durationMin * PX_PER_MIN - 2, 18);
-                                    const st = statusKeyFromLabel(a.status);
+                                    const st = statusKeyFromLabel(a.statusCode ?? a.status);
                                     return (
                                       <a
                                         key={a.id}

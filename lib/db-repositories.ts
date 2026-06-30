@@ -6792,6 +6792,9 @@ async function mapAppointment(slug: string, row: RowDataPacket): Promise<Appoint
     room: row.cabin_id ? `Cabina #${row.cabin_id}` : "-",
     price: `${roundMoney(primary.price)} euro`,
     status: uiStatus(String(row.status ?? "")),
+    // The true 5-state status code (the calendar uses it for the canceled/no_show pill;
+    // `status` above is the collapsed 3-state UI label).
+    statusCode: phpStatus(String(row.status ?? "")),
     // Real booking code when the column exists + is populated; null -> the list falls
     // back to #id. The column is read straight off the appointments row (selected by
     // tenantSelect '*'), so no extra query is needed; guarded via the row property.

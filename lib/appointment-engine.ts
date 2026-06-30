@@ -37,6 +37,11 @@ export type AppointmentWithMeta = Appointment & {
   // child rows (legacy ms-parent / ms-children Bootstrap collapse). Single-service
   // appointments carry a single entry; the existing `service` string is unchanged.
   services?: AppointmentServiceLine[];
+  // The REAL php status code (pending|scheduled|done|canceled|no_show). `status`
+  // above is the 3-value UI label (uiStatus) which collapses canceled/no_show/
+  // scheduled to "Confermato"; statusCode preserves the true status so the calendar
+  // can render the right pill/colour for canceled + no_show appointments.
+  statusCode?: string;
 };
 
 // One service line on an appointment (from appointment_services), used for the
