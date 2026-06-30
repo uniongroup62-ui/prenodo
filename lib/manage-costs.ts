@@ -133,6 +133,16 @@ export async function getManageCostsContext(
   };
 }
 
+// Edit-form prefill: return ONE cost's editable fields for one id. Port of
+// costs.php action=edit ($editCost). Mirrors the CostRow shape used by the list
+// so the faithful cost_form-content.tsx can hydrate every field.
+export async function getManageCost(slug: string, costId: number): Promise<CostRow | null> {
+  if (costId <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "costs", where: "id=?", params: [costId], limit: 1 }).catch(() => []);
+  if (!rows[0]) return null;
+  return mapCost(rows[0]);
+}
+
 export async function saveCost(slug: string, body: Record<string, string>): Promise<ManageCostsContext> {
   const table = await tenantTable(slug, "costs");
   const id = parseInteger(body.id ?? body.cost_id, 0);

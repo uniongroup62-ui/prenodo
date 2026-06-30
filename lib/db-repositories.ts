@@ -2602,6 +2602,7 @@ export async function createDbQuote(
     total,
     status: "draft",
     public_token: randomHex(32),
+    quote_date: todayIso(),
     valid_until: addDaysDate(30),
     created_at: new Date(),
     updated_at: new Date(),

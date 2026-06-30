@@ -7,6 +7,16 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 // /api/manage/services route (getManageServicesContext): the `categories`
 // array drives the table, the `services` array drives the per-category
 // filter combobox and the delete-block payload.
+//
+// The Nuova/Modifica categoria editors are INLINE Bootstrap modals (faithful to
+// the legacy page, which used modals rather than a separate action=new/edit
+// page). They now persist via /api/manage/services (action=category_save), and
+// the reorder up/down + delete buttons call category_move / category_delete.
+//
+// TODO: the legacy modals also upload a category IMAGE (input file image_file,
+// compressed server-side into image_url). The JSON /api/manage/services save
+// pipeline only accepts an image_url string, not a multipart file upload, so the
+// file input is shown for parity but is not yet wired to a real upload.
 
 type Category = {
   id: number;
@@ -30,6 +40,8 @@ type ServicesContext = {
   services?: Service[];
 };
 
+type CategoryResult = { ok: boolean; error?: string; categories?: Category[]; services?: Service[] };
+
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
@@ -44,6 +56,11 @@ export function ServiceCategoriesContent() {
   const [filterCategoryId, setFilterCategoryId] = useState<string>("");
   const [editModalId, setEditModalId] = useState<number | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [editName, setEditName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [busyMove, setBusyMove] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -70,12 +87,91 @@ export function ServiceCategoriesContent() {
     return `/${encodeURIComponent(slug)}/index.php?page=services&tab=${tab}`;
   }
 
-  function actionHref(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=services&tab=categories${suffix}`;
+  // POST a category action to the services API; on success refresh the list with
+  // the returned categories (faithful: the legacy page reloaded after each save).
+  const postCategory = useCallback(
+    async (payload: Record<string, unknown>): Promise<CategoryResult> => {
+      try {
+        const res = await fetch(`/api/manage/services?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify(payload),
+        });
+        const j = await res.json();
+        return { ok: res.ok && j.ok !== false, error: j.error, categories: j.categories, services: j.services };
+      } catch {
+        return { ok: false, error: "Errore di rete." };
+      }
+    },
+    [slug],
+  );
+
+  function applyResult(j: CategoryResult) {
+    if (Array.isArray(j.categories)) setCategories(j.categories);
+    if (Array.isArray(j.services)) setServices(j.services);
   }
 
-  function formAction(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=services&tab=categories${suffix}`;
+  async function onCreateSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (createName.trim() === "") {
+      setError("Nome categoria obbligatorio.");
+      return;
+    }
+    setSaving(true);
+    const j = await postCategory({ action: "category_save", id: "0", name: createName });
+    setSaving(false);
+    if (!j.ok) {
+      setError(String(j.error ?? "Errore nel salvataggio della categoria."));
+      return;
+    }
+    applyResult(j);
+    setCreateOpen(false);
+    setCreateName("");
+  }
+
+  async function onEditSubmit(event: React.FormEvent, categoryId: number) {
+    event.preventDefault();
+    setError("");
+    if (editName.trim() === "") {
+      setError("Nome categoria obbligatorio.");
+      return;
+    }
+    setSaving(true);
+    const j = await postCategory({ action: "category_save", id: String(categoryId), name: editName });
+    setSaving(false);
+    if (!j.ok) {
+      setError(String(j.error ?? "Errore nel salvataggio della categoria."));
+      return;
+    }
+    applyResult(j);
+    setEditModalId(null);
+  }
+
+  async function onMove(categoryId: number, direction: "up" | "down") {
+    if (busyMove) return;
+    setBusyMove(true);
+    const j = await postCategory({ action: "category_move", id: String(categoryId), direction });
+    setBusyMove(false);
+    if (j.ok) applyResult(j);
+  }
+
+  async function onDelete(category: Category) {
+    const linked = servicesForCategory(category.id);
+    if (linked.length > 0) {
+      // Faithful to services.js: a category with linked services is not
+      // deletable; surface the same guidance instead of attempting the delete.
+      setError(`Categoria "${category.name}" non eliminabile: sono associati ${linked.length} servizi. Sposta o modifica prima i servizi collegati.`);
+      return;
+    }
+    if (typeof window !== "undefined" && !window.confirm(`Eliminare la categoria "${category.name}"?`)) return;
+    setError("");
+    const j = await postCategory({ action: "category_delete", id: String(category.id) });
+    if (!j.ok) {
+      setError(String(j.error ?? "Errore nell'eliminazione della categoria."));
+      return;
+    }
+    applyResult(j);
   }
 
   // Filter combobox data (the PHP page emits these as JSON for the client-side combobox).
@@ -118,9 +214,11 @@ export function ServiceCategoriesContent() {
           <button
             className="btn btn-primary btn-pill"
             type="button"
-            data-bs-toggle="modal"
-            data-bs-target="#serviceCategoryCreateModal"
-            onClick={() => setCreateOpen(true)}
+            onClick={() => {
+              setError("");
+              setCreateName("");
+              setCreateOpen(true);
+            }}
           >
             <i className="bi bi-plus-lg me-1" />
             Nuova categoria
@@ -147,6 +245,8 @@ export function ServiceCategoriesContent() {
       </ul>
 
       <link rel="stylesheet" href="/assets/css/pages/services.css" />
+
+      {error ? <div className="alert alert-danger">{error}</div> : null}
 
       <div className="card p-3 mb-3">
         <form className="row g-2 align-items-end" method="get" onSubmit={(e) => e.preventDefault()}>
@@ -224,47 +324,30 @@ export function ServiceCategoriesContent() {
                   </tr>
                 ) : (
                   rows.map((category, index) => {
-                    const linkedServices = servicesForCategory(category.id);
                     const isFirst = index === 0;
                     const isLast = index === rows.length - 1;
                     return (
                       <tr key={category.id}>
                         <td>
                           <div className="btn-group btn-group-sm" role="group" aria-label="Ordina categoria">
-                            <form method="post" className="d-inline">
-                              <input type="hidden" name="_csrf" value="" />
-                              <input type="hidden" name="category_id" value={category.id} />
-                              <input type="hidden" name="filter_category_id" value={filterCategoryId} />
-                              <input type="hidden" name="p" value="1" />
-                              <input type="hidden" name="direction" value="up" />
-                              <button
-                                className="btn btn-outline-secondary"
-                                type="submit"
-                                name="category_move"
-                                value="1"
-                                title="Sposta su"
-                                disabled={isFirst}
-                              >
-                                <i className="bi bi-chevron-up" />
-                              </button>
-                            </form>
-                            <form method="post" className="d-inline">
-                              <input type="hidden" name="_csrf" value="" />
-                              <input type="hidden" name="category_id" value={category.id} />
-                              <input type="hidden" name="filter_category_id" value={filterCategoryId} />
-                              <input type="hidden" name="p" value="1" />
-                              <input type="hidden" name="direction" value="down" />
-                              <button
-                                className="btn btn-outline-secondary"
-                                type="submit"
-                                name="category_move"
-                                value="1"
-                                title="Sposta giu"
-                                disabled={isLast}
-                              >
-                                <i className="bi bi-chevron-down" />
-                              </button>
-                            </form>
+                            <button
+                              className="btn btn-outline-secondary"
+                              type="button"
+                              title="Sposta su"
+                              disabled={isFirst || busyMove || Boolean(filterCategoryId)}
+                              onClick={() => onMove(category.id, "up")}
+                            >
+                              <i className="bi bi-chevron-up" />
+                            </button>
+                            <button
+                              className="btn btn-outline-secondary"
+                              type="button"
+                              title="Sposta giu"
+                              disabled={isLast || busyMove || Boolean(filterCategoryId)}
+                              onClick={() => onMove(category.id, "down")}
+                            >
+                              <i className="bi bi-chevron-down" />
+                            </button>
                           </div>
                         </td>
                         <td>
@@ -279,27 +362,21 @@ export function ServiceCategoriesContent() {
                           <button
                             className="btn btn-sm btn-outline-secondary"
                             type="button"
-                            data-bs-toggle="modal"
-                            data-bs-target={`#serviceCategoryEditModal${category.id}`}
-                            onClick={() => setEditModalId(category.id)}
+                            onClick={() => {
+                              setError("");
+                              setEditName(category.name);
+                              setEditModalId(category.id);
+                            }}
                           >
                             Modifica
-                          </button>
-                          <a
+                          </button>{" "}
+                          <button
                             className="btn btn-sm btn-outline-danger"
-                            href={actionHref(`&action=delete&id=${category.id}`)}
-                            data-category-name={category.name}
-                            data-category-services={JSON.stringify(
-                              linkedServices.map((s) => ({
-                                id: s.id,
-                                name: s.name,
-                                active: s.isActive ?? s.active ?? false,
-                              })),
-                            )}
-                            data-service-category-delete="1"
+                            type="button"
+                            onClick={() => onDelete(category)}
                           >
                             Elimina
-                          </a>
+                          </button>
                         </td>
                       </tr>
                     );
@@ -314,39 +391,32 @@ export function ServiceCategoriesContent() {
       {/* Edit modals (one per category, pre-filled with current name). */}
       {categories.map((category) => {
         const open = editModalId === category.id;
+        if (!open) return null;
         return (
           <div
             key={category.id}
-            className={`modal fade${open ? " show d-block" : ""}`}
+            className="modal fade show d-block"
             id={`serviceCategoryEditModal${category.id}`}
             tabIndex={-1}
-            aria-hidden={open ? undefined : true}
-            style={open ? { background: "rgba(0,0,0,.5)" } : undefined}
+            style={{ background: "rgba(0,0,0,.5)" }}
           >
             <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
               <div className="modal-content">
-                <form method="post" encType="multipart/form-data" action={formAction(`&action=edit&id=${category.id}`)}>
+                <form method="post" encType="multipart/form-data" onSubmit={(e) => onEditSubmit(e, category.id)}>
                   <div className="modal-header">
                     <div>
                       <div className="page-eyebrow mb-1">Risorse</div>
                       <h5 className="modal-title mb-0">Modifica categoria</h5>
                     </div>
-                    <button
-                      type="button"
-                      className="btn-close"
-                      data-bs-dismiss="modal"
-                      aria-label="Chiudi"
-                      onClick={() => setEditModalId(null)}
-                    />
+                    <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => setEditModalId(null)} />
                   </div>
                   <div className="modal-body">
-                    <input type="hidden" name="_csrf" value="" />
                     <input type="hidden" name="id" value={category.id} />
 
                     <div className="row g-3">
                       <div className="col-md-6">
                         <label className="form-label">Nome</label>
-                        <input className="form-control" name="name" required defaultValue={category.name} />
+                        <input className="form-control" name="name" required value={editName} onChange={(e) => setEditName(e.target.value)} />
                       </div>
                       <div className="col-md-6">
                         <label className="form-label">Immagine categoria</label>
@@ -359,17 +429,12 @@ export function ServiceCategoriesContent() {
                     </div>
                   </div>
                   <div className="modal-footer">
-                    <button
-                      type="button"
-                      className="btn btn-outline-secondary btn-pill"
-                      data-bs-dismiss="modal"
-                      onClick={() => setEditModalId(null)}
-                    >
+                    <button type="button" className="btn btn-outline-secondary btn-pill" onClick={() => setEditModalId(null)}>
                       Annulla
                     </button>
-                    <button className="btn btn-primary btn-pill" type="submit">
+                    <button className="btn btn-primary btn-pill" type="submit" disabled={saving}>
                       <i className="bi bi-check2-circle me-1" />
-                      Salva
+                      {saving ? "Salvataggio…" : "Salva"}
                     </button>
                   </div>
                 </form>
@@ -380,93 +445,50 @@ export function ServiceCategoriesContent() {
       })}
 
       {/* Create modal. */}
-      <div
-        className={`modal fade${createOpen ? " show d-block" : ""}`}
-        id="serviceCategoryCreateModal"
-        tabIndex={-1}
-        aria-hidden={createOpen ? undefined : true}
-        style={createOpen ? { background: "rgba(0,0,0,.5)" } : undefined}
-      >
-        <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
-          <div className="modal-content">
-            <form method="post" encType="multipart/form-data" action={formAction("&action=new")}>
-              <div className="modal-header">
-                <div>
-                  <div className="page-eyebrow mb-1">Risorse</div>
-                  <h5 className="modal-title mb-0">Nuova categoria</h5>
-                </div>
-                <button
-                  type="button"
-                  className="btn-close"
-                  data-bs-dismiss="modal"
-                  aria-label="Chiudi"
-                  onClick={() => setCreateOpen(false)}
-                />
-              </div>
-              <div className="modal-body">
-                <input type="hidden" name="_csrf" value="" />
-                <input type="hidden" name="id" value="0" />
-
-                <div className="row g-3">
-                  <div className="col-md-6">
-                    <label className="form-label">Nome</label>
-                    <input className="form-control" name="name" required defaultValue="" />
+      {createOpen ? (
+        <div className="modal fade show d-block" id="serviceCategoryCreateModal" tabIndex={-1} style={{ background: "rgba(0,0,0,.5)" }}>
+          <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+            <div className="modal-content">
+              <form method="post" encType="multipart/form-data" onSubmit={onCreateSubmit}>
+                <div className="modal-header">
+                  <div>
+                    <div className="page-eyebrow mb-1">Risorse</div>
+                    <h5 className="modal-title mb-0">Nuova categoria</h5>
                   </div>
-                  <div className="col-md-6">
-                    <label className="form-label">Immagine categoria</label>
-                    <input className="form-control" type="file" name="image_file" accept="image/*" />
-                    <div className="form-text">
-                      Consigliato: <strong>1200&times;675</strong> (rapporto 16:9) oppure <strong>800&times;450</strong>. Max{" "}
-                      <strong>5 MB</strong>. L&apos;immagine verr&agrave; compressa automaticamente.
+                  <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => setCreateOpen(false)} />
+                </div>
+                <div className="modal-body">
+                  <input type="hidden" name="id" value="0" />
+
+                  <div className="row g-3">
+                    <div className="col-md-6">
+                      <label className="form-label">Nome</label>
+                      <input className="form-control" name="name" required value={createName} onChange={(e) => setCreateName(e.target.value)} />
+                    </div>
+                    <div className="col-md-6">
+                      <label className="form-label">Immagine categoria</label>
+                      <input className="form-control" type="file" name="image_file" accept="image/*" />
+                      <div className="form-text">
+                        Consigliato: <strong>1200&times;675</strong> (rapporto 16:9) oppure <strong>800&times;450</strong>. Max{" "}
+                        <strong>5 MB</strong>. L&apos;immagine verr&agrave; compressa automaticamente.
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
-              <div className="modal-footer">
-                <button
-                  type="button"
-                  className="btn btn-outline-secondary btn-pill"
-                  data-bs-dismiss="modal"
-                  onClick={() => setCreateOpen(false)}
-                >
-                  Annulla
-                </button>
-                <button className="btn btn-primary btn-pill" type="submit">
-                  <i className="bi bi-check2-circle me-1" />
-                  Salva
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      </div>
-
-      {/* Delete-block modal (shown by services.js when a category has linked services). */}
-      <div className="modal fade" id="categoryDeleteBlockModal" tabIndex={-1} aria-hidden="true">
-        <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
-          <div className="modal-content">
-            <div className="modal-header">
-              <div>
-                <h5 className="modal-title mb-1">Categoria non eliminabile</h5>
-                <div className="text-muted small" id="categoryDeleteBlockSubtitle" />
-              </div>
-              <button type="button" className="btn-close" data-bs-dismiss="modal" aria-label="Chiudi" />
-            </div>
-            <div className="modal-body">
-              <div className="alert alert-warning">
-                Non è possibile eliminare la categoria perché sono associati dei servizi. Sposta o modifica prima i
-                servizi collegati, poi riprova.
-              </div>
-              <div id="categoryDeleteBlockList" />
-            </div>
-            <div className="modal-footer">
-              <button type="button" className="btn btn-outline-secondary btn-pill" data-bs-dismiss="modal">
-                Chiudi
-              </button>
+                <div className="modal-footer">
+                  <button type="button" className="btn btn-outline-secondary btn-pill" onClick={() => setCreateOpen(false)}>
+                    Annulla
+                  </button>
+                  <button className="btn btn-primary btn-pill" type="submit" disabled={saving}>
+                    <i className="bi bi-check2-circle me-1" />
+                    {saving ? "Salvataggio…" : "Salva"}
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }

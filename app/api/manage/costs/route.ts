@@ -3,6 +3,7 @@ import { currentManageSession } from "@/lib/manage-auth";
 import {
   deleteCost,
   deleteCostCategory,
+  getManageCost,
   getManageCostsContext,
   saveCost,
   saveCostCategory,
@@ -26,6 +27,19 @@ export async function GET(request: Request) {
 
   try {
     const url = new URL(request.url);
+
+    // Edit-form prefill: return ONE cost's editable fields for one id. Port of
+    // costs.php action=edit. Gated by the same Scadenziario work permission as
+    // the save action.
+    if (url.searchParams.get("action") === "get") {
+      if (!canAny(session.user.perms, workPerms)) return jsonError("Permesso Scadenziario richiesto.", 403);
+      const costId = parseInteger(url.searchParams.get("id"), 0);
+      if (costId <= 0) return jsonError("ID costo mancante.");
+      const cost = await getManageCost(tenantSlug, costId);
+      if (!cost) return jsonError("Costo non trovato.", 404);
+      return Response.json({ ok: true, source: "costs?action=get", sourceMode: "database", cost });
+    }
+
     const locationId = await resolveManageLocationId({
       slug: tenantSlug,
       raw: url.searchParams.get("location_id"),

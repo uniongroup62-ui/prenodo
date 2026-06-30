@@ -7,6 +7,7 @@ import { ClientFormContent } from "@/components/modules/client_form-content";
 import { ClientDetailContent } from "@/components/modules/client_detail-content";
 import { CommissionsContent } from "@/components/modules/commissions-content";
 import { CostsContent } from "@/components/modules/costs-content";
+import { CostFormContent } from "@/components/modules/cost_form-content";
 import { CouponsContent } from "@/components/modules/coupons-content";
 import { CouponFormContent } from "@/components/modules/coupon_form-content";
 import { LocationsContent } from "@/components/modules/locations-content";
@@ -14,6 +15,7 @@ import { LocationFormContent } from "@/components/modules/location_form-content"
 import { PromotionsContent } from "@/components/modules/promotions-content";
 import { PromotionFormContent } from "@/components/modules/promotion_form-content";
 import { QuotesContent } from "@/components/modules/quotes-content";
+import { QuoteFormContent } from "@/components/modules/quote_form-content";
 import { RechargesContent } from "@/components/modules/recharges-content";
 import { SuppliersContent } from "@/components/modules/suppliers-content";
 import { SupplierFormContent } from "@/components/modules/supplier_form-content";
@@ -35,11 +37,13 @@ import { AccessibilityContent } from "@/components/modules/accessibility-content
 import { AutomationContent } from "@/components/modules/automation-content";
 import { BookingSettingsContent } from "@/components/modules/booking-content";
 import { ConsentModulesContent } from "@/components/modules/consent_modules-content";
+import { ConsentModuleFormContent } from "@/components/modules/consent_module_form-content";
 import { FidelityContent } from "@/components/modules/fidelity-content";
 import { PosHistoryContent } from "@/components/modules/pos_history-content";
 import { PosSaleDetailContent } from "@/components/modules/pos_sale_detail-content";
 import { ReportsContent } from "@/components/modules/reports-content";
 import { StockMovesContent } from "@/components/modules/stock_moves-content";
+import { StockMoveFormContent } from "@/components/modules/stock_move_form-content";
 import { BusinessProfileContent } from "@/components/modules/business_profile-content";
 import { FidelityPointsContent } from "@/components/modules/fidelity_points-content";
 import { FidelityMembershipContent } from "@/components/modules/fidelity_membership-content";
@@ -237,6 +241,55 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <StaffFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful cost NEW / EDIT form. The Scadenziario list links to
+  // index.php?page=costs&tab=scadenziario&action=new|edit; route those to the
+  // faithful editor (instead of the Tailwind ManagementApp fallback). The
+  // categories tab (tab=categories) keeps its own inline modal flow.
+  if (page === "costs" && tab !== "categories" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <CostFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful quote NEW form (quotes.php action=new — "Nuovo preventivo"). The
+  // quotes list links to index.php?page=quotes&action=new; route it to the
+  // faithful CORE editor (client + line items + discount + totals + save). The
+  // action=view/edit detail stays on the existing fallback for now (TODO in the
+  // form component).
+  if (page === "quotes" && query.action === "new") {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <QuoteFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful stock-movement NEW operation form (stock_moves.php action=new —
+  // "Nuovo carico / scarico"). The stock_moves list links to
+  // index.php?page=stock_moves&action=new; route it to the faithful Carico/
+  // Scarico transaction form (instead of the Tailwind ManagementApp fallback).
+  // The action=view detail stays on the existing fallback for now.
+  if (page === "stock_moves" && query.action === "new") {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <StockMoveFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful consent-module NEW / EDIT editor. The consent_modules list links
+  // to index.php?page=consent_modules&action=new|edit; route those to the
+  // faithful editor (instead of the Tailwind ManagementApp fallback).
+  if (page === "consent_modules" && (query.action === "new" || query.action === "edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <ConsentModuleFormContent />
       </ManageShell>
     );
   }

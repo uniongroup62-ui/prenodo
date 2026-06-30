@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { convertDbQuoteToSale, createDbQuote, listDbQuotes, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
+import { convertDbQuoteToSale, createDbQuote, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
@@ -15,6 +15,27 @@ export async function GET(request: Request) {
   if (!can(session.user.perms, "quotes.manage")) return jsonError("Permesso preventivi mancante.", 403);
 
   try {
+    const url = new URL(request.url);
+
+    // Editor context: the catalog the faithful Nuovo preventivo form needs —
+    // clients (for the cliente picker) + services + products (for the line
+    // items). Numeric prices are parsed from the managed catalog so the form can
+    // seed an editable unit price per line.
+    if (url.searchParams.get("action") === "context") {
+      const [clients, services, products] = await Promise.all([
+        listDbClients({ slug: tenantSlug }),
+        listDbServices({ slug: tenantSlug }),
+        listDbProducts({ slug: tenantSlug }),
+      ]);
+      return Response.json({
+        ok: true,
+        sourceMode: "database",
+        clients: clients.map((c) => ({ id: c.id, name: c.name, email: c.email, phone: c.phone })),
+        services: services.map((s) => ({ id: s.id, name: s.name, price: priceFromManaged(s.price) })),
+        products: products.map((p) => ({ id: p.id, name: p.name, price: priceFromManaged(p.price) })),
+      });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -23,6 +44,14 @@ export async function GET(request: Request) {
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore preventivi.");
   }
+}
+
+// The managed catalog formats price as a string (e.g. "30 euro" / "12.5 euro").
+// Parse the leading number for the editor's editable unit-price seed.
+function priceFromManaged(value: unknown): number {
+  const match = String(value ?? "").replace(",", ".").match(/-?\d+(\.\d+)?/);
+  const n = match ? Number.parseFloat(match[0]) : 0;
+  return Number.isFinite(n) ? n : 0;
 }
 
 export async function POST(request: Request) {

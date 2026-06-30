@@ -1,35 +1,42 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 // Faithful port of the PHP recharges page (app/pages/recharges.php +
-// assets/js/pages/recharges.js), fed by the existing /api/manage/fidelity
-// (whose source covers fidelity + wallet + recharges). The "Modelli di
-// ricarica" table is driven by recharge templates; the current API does not
-// expose them, so it renders the original empty state ("Nessun modello.").
+// assets/js/pages/recharges.js). The "Modelli di ricarica" table + its
+// create/edit modal + delete are now DB-backed by /api/manage/recharges
+// (recharge_templates CRUD). The modal mirrors the legacy Bootstrap markup and
+// behaviour: data-mode create/edit prefill, bonus-kind enables/disables the
+// bonus value input, earn_points gated by the fidelity general flag.
 
 type RechargeTemplate = {
   id: number;
   title: string;
-  baseAmount?: number;
-  base_amount?: number;
-  bonusKind?: string;
-  bonus_kind?: string;
-  bonusValue?: number;
-  bonus_value?: number;
-  earnPoints?: number | boolean;
-  earn_points?: number | boolean;
-  isActive?: number | boolean;
-  is_active?: number | boolean;
-  sortOrder?: number;
-  sort_order?: number;
+  baseAmount: number;
+  bonusKind: "none" | "percent" | "fixed";
+  bonusValue: number;
+  bonusAmount: number;
+  totalAmount: number;
+  earnPoints: boolean;
+  isActive: boolean;
+  sortOrder: number;
 };
 
-type FidelityResponse = {
+type RechargesResponse = {
   ok?: boolean;
   fidelityEnabled?: boolean;
   templates?: RechargeTemplate[];
-  rechargeTemplates?: RechargeTemplate[];
+};
+
+type ModalForm = {
+  id: number;
+  title: string;
+  base_amount: string;
+  bonus_kind: "none" | "percent" | "fixed";
+  bonus_value: string;
+  sort_order: string;
+  earn_points: boolean;
+  is_active: boolean;
 };
 
 function tenantSlug(): string {
@@ -37,66 +44,150 @@ function tenantSlug(): string {
   return window.location.pathname.split("/")[1] || "";
 }
 
-function num(value: unknown): number {
-  const n = typeof value === "string" ? parseFloat(value) : Number(value);
-  return Number.isFinite(n) ? n : 0;
-}
-
 function fmtEuro(n: number): string {
-  return `€ ${n.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function bonusAmount(t: RechargeTemplate): number {
-  const base = num(t.baseAmount ?? t.base_amount);
-  const kind = String(t.bonusKind ?? t.bonus_kind ?? "none");
-  const value = num(t.bonusValue ?? t.bonus_value);
-  if (kind === "percent") return (base * value) / 100;
-  if (kind === "fixed") return value;
-  return 0;
+  return `€ ${(Number.isFinite(n) ? n : 0).toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function bonusLabel(t: RechargeTemplate): string {
-  const kind = String(t.bonusKind ?? t.bonus_kind ?? "none");
-  const value = num(t.bonusValue ?? t.bonus_value);
-  if (kind === "percent") return `${value}%`;
-  if (kind === "fixed") return fmtEuro(value);
+  if (t.bonusKind === "percent") return `${t.bonusValue}%`;
+  if (t.bonusKind === "fixed") return fmtEuro(t.bonusValue);
   return "—";
 }
 
-function earnsPoints(t: RechargeTemplate): boolean {
-  const v = t.earnPoints ?? t.earn_points;
-  return v === true || Number(v) === 1;
+function emptyModalForm(fidelityEnabled: boolean): ModalForm {
+  return {
+    id: 0,
+    title: "",
+    base_amount: "",
+    bonus_kind: "none",
+    bonus_value: "0",
+    sort_order: "0",
+    earn_points: fidelityEnabled,
+    is_active: true,
+  };
 }
 
 export function RechargesContent() {
   const slug = tenantSlug();
   const [templates, setTemplates] = useState<RechargeTemplate[]>([]);
+  const [fidelityEnabled, setFidelityEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}`, {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalMode, setModalMode] = useState<"create" | "edit">("create");
+  const [form, setForm] = useState<ModalForm>(emptyModalForm(true));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetch(`/api/manage/recharges?slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
-      .then((j: FidelityResponse) => {
-        if (cancelled) return;
-        const list = j.rechargeTemplates ?? j.templates ?? [];
-        setTemplates(Array.isArray(list) ? list : []);
+      .then((j: RechargesResponse) => {
+        setTemplates(Array.isArray(j.templates) ? j.templates : []);
+        setFidelityEnabled(j.fidelityEnabled !== false);
       })
-      .catch(() => {
-        if (!cancelled) setTemplates([]);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+      .catch(() => setTemplates([]))
+      .finally(() => setLoading(false));
   }, [slug]);
 
-  function href(suffix: string): string {
-    return `/${encodeURIComponent(slug)}/index.php?page=recharges${suffix}`;
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  function set<K extends keyof ModalForm>(key: K, value: ModalForm[K]) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function openCreate() {
+    setError("");
+    setModalMode("create");
+    setForm(emptyModalForm(fidelityEnabled));
+    setModalOpen(true);
+  }
+
+  function openEdit(t: RechargeTemplate) {
+    setError("");
+    setModalMode("edit");
+    setForm({
+      id: t.id,
+      title: t.title,
+      base_amount: String(t.baseAmount),
+      bonus_kind: t.bonusKind,
+      bonus_value: String(t.bonusValue),
+      sort_order: String(t.sortOrder),
+      earn_points: t.earnPoints,
+      is_active: t.isActive,
+    });
+    setModalOpen(true);
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setSaving(false);
+  }
+
+  async function onSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (form.title.trim() === "") {
+      setError("Inserisci un titolo per il modello.");
+      return;
+    }
+    const base = Number.parseFloat(form.base_amount.replace(",", "."));
+    if (!Number.isFinite(base) || base <= 0) {
+      setError("Inserisci un importo ricarica valido.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload: Record<string, unknown> = {
+        action: modalMode === "edit" ? "update_template" : "create_template",
+        template_id: String(form.id),
+        title: form.title,
+        base_amount: form.base_amount,
+        bonus_kind: form.bonus_kind,
+        bonus_value: form.bonus_kind === "none" ? "0" : form.bonus_value,
+        sort_order: form.sort_order,
+        earn_points: form.earn_points ? "1" : "0",
+        is_active: form.is_active ? "1" : "0",
+      };
+      const res = await fetch(`/api/manage/recharges?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify(payload),
+      });
+      const j = await res.json();
+      if (!res.ok || !j.ok) {
+        setError(String(j.error ?? "Errore nel salvataggio del modello."));
+        setSaving(false);
+        return;
+      }
+      setTemplates(Array.isArray(j.templates) ? j.templates : []);
+      closeModal();
+    } catch {
+      setError("Errore nel salvataggio del modello.");
+      setSaving(false);
+    }
+  }
+
+  async function onDelete(t: RechargeTemplate) {
+    if (typeof window !== "undefined" && !window.confirm(`Eliminare il modello "${t.title}"?`)) return;
+    try {
+      const res = await fetch(`/api/manage/recharges?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "delete_template", template_id: String(t.id) }),
+      });
+      const j = await res.json();
+      if (!res.ok || !j.ok) return;
+      setTemplates(Array.isArray(j.templates) ? j.templates : []);
+    } catch {
+      // best-effort; reload to resync
+      load();
+    }
   }
 
   return (
@@ -119,13 +210,7 @@ export function RechargesContent() {
           <div className="card p-3 h-100">
             <div className="d-flex justify-content-between align-items-center mb-2">
               <div className="fw-semibold">Modelli di ricarica</div>
-              <button
-                className="btn btn-sm btn-primary"
-                type="button"
-                data-bs-toggle="modal"
-                data-bs-target="#templateModal"
-                data-mode="create"
-              >
+              <button className="btn btn-sm btn-primary" type="button" onClick={openCreate}>
                 <i className="bi bi-plus" /> Nuovo modello
               </button>
             </div>
@@ -154,26 +239,28 @@ export function RechargesContent() {
                       </td>
                     </tr>
                   ) : (
-                    templates.map((t) => {
-                      const base = num(t.baseAmount ?? t.base_amount);
-                      const bonus = bonusAmount(t);
-                      return (
-                        <tr key={t.id}>
-                          <td className="fw-semibold">{t.title}</td>
-                          <td className="text-end">{fmtEuro(base)}</td>
-                          <td className="text-end">{bonusLabel(t)}</td>
-                          <td className="text-end">{fmtEuro(base + bonus)}</td>
-                          <td className="text-end">
-                            {earnsPoints(t) ? "Importo + bonus" : "Solo ricarica"}
-                          </td>
-                          <td className="text-end">
-                            <a className="btn btn-sm btn-outline-secondary" href={href(`&action=edit&id=${t.id}`)}>
-                              Modifica
-                            </a>
-                          </td>
-                        </tr>
-                      );
-                    })
+                    templates.map((t) => (
+                      <tr key={t.id} className={t.isActive ? "" : "table-light"}>
+                        <td>
+                          <div className="fw-semibold">{t.title}</div>
+                          {t.isActive ? null : <div className="small text-muted">Disattivo</div>}
+                        </td>
+                        <td className="text-end">{fmtEuro(t.baseAmount)}</td>
+                        <td className="text-end text-muted">{bonusLabel(t)}</td>
+                        <td className="text-end fw-semibold">{fmtEuro(t.totalAmount)}</td>
+                        <td className="text-end text-muted">{t.earnPoints ? "Importo + bonus" : "Solo importo"}</td>
+                        <td className="text-end">
+                          <div className="d-inline-flex gap-2">
+                            <button className="btn btn-sm btn-outline-warning" type="button" title="Modifica" onClick={() => openEdit(t)}>
+                              <i className="bi bi-pencil" />
+                            </button>
+                            <button className="btn btn-sm btn-outline-danger" type="button" title="Elimina" onClick={() => onDelete(t)}>
+                              <i className="bi bi-trash" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
                   )}
                 </tbody>
               </table>
@@ -223,25 +310,36 @@ export function RechargesContent() {
       </div>
 
       {/* Modal: Crea/Modifica modello */}
-      <div className="modal fade" id="templateModal" tabIndex={-1} aria-hidden="true">
+      <div
+        className={`modal fade${modalOpen ? " show d-block" : ""}`}
+        id="templateModal"
+        tabIndex={-1}
+        aria-hidden={modalOpen ? undefined : true}
+        style={modalOpen ? { background: "rgba(0,0,0,.5)" } : undefined}
+      >
         <div className="modal-dialog modal-lg">
           <div className="modal-content">
-            <form method="post" id="templateForm">
-              <input type="hidden" name="_mode" id="template_mode" value="create_template" />
-              <input type="hidden" name="template_id" id="template_id_field" value="" />
-
+            <form method="post" id="templateForm" onSubmit={onSubmit}>
               <div className="modal-header">
                 <h5 className="modal-title" id="templateModalTitle">
-                  Nuovo modello
+                  {modalMode === "edit" ? "Modifica modello" : "Nuovo modello"}
                 </h5>
-                <button type="button" className="btn-close" data-bs-dismiss="modal" aria-label="Chiudi" />
+                <button type="button" className="btn-close" aria-label="Chiudi" onClick={closeModal} />
               </div>
 
               <div className="modal-body">
+                {error ? <div className="alert alert-danger">{error}</div> : null}
                 <div className="row g-3">
                   <div className="col-12">
                     <label className="form-label fw-semibold">Titolo</label>
-                    <input className="form-control" name="title" id="t_title" placeholder="Es. Ricarica 100 + 20" required />
+                    <input
+                      className="form-control"
+                      name="title"
+                      placeholder="Es. Ricarica 100 + 20"
+                      required
+                      value={form.title}
+                      onChange={(e) => set("title", e.target.value)}
+                    />
                   </div>
 
                   <div className="col-md-4">
@@ -255,8 +353,9 @@ export function RechargesContent() {
                         min="0.01"
                         max="99999999.99"
                         name="base_amount"
-                        id="t_base_amount"
                         required
+                        value={form.base_amount}
+                        onChange={(e) => set("base_amount", e.target.value)}
                       />
                     </div>
                   </div>
@@ -267,8 +366,8 @@ export function RechargesContent() {
                       <select
                         className="form-select recharge-bonus-kind-select"
                         name="bonus_kind"
-                        id="t_bonus_kind"
-                        defaultValue="none"
+                        value={form.bonus_kind}
+                        onChange={(e) => set("bonus_kind", e.target.value as ModalForm["bonus_kind"])}
                       >
                         <option value="none">Nessuno</option>
                         <option value="percent">% su importo</option>
@@ -281,9 +380,9 @@ export function RechargesContent() {
                         min="0"
                         max="99999999.99"
                         name="bonus_value"
-                        id="t_bonus_value"
-                        defaultValue="0"
-                        disabled
+                        value={form.bonus_value}
+                        disabled={form.bonus_kind === "none"}
+                        onChange={(e) => set("bonus_value", e.target.value)}
                       />
                     </div>
                   </div>
@@ -295,8 +394,8 @@ export function RechargesContent() {
                       type="number"
                       step="1"
                       name="sort_order"
-                      id="t_sort_order"
-                      defaultValue="0"
+                      value={form.sort_order}
+                      onChange={(e) => set("sort_order", e.target.value)}
                     />
                     <div className="form-text">Più basso = più in alto.</div>
                   </div>
@@ -306,11 +405,12 @@ export function RechargesContent() {
                       <input
                         className="form-check-input"
                         type="checkbox"
-                        value="1"
                         name="earn_points"
                         id="t_earn_points"
-                        defaultChecked
+                        checked={form.earn_points}
+                        disabled={!fidelityEnabled}
                         aria-describedby="t_earn_points_help"
+                        onChange={(e) => set("earn_points", e.target.checked)}
                       />
                       <label className="form-check-label" htmlFor="t_earn_points">
                         Calcola i punti anche sul bonus (importo + bonus)
@@ -327,10 +427,10 @@ export function RechargesContent() {
                       <input
                         className="form-check-input"
                         type="checkbox"
-                        value="1"
                         name="is_active"
                         id="t_is_active"
-                        defaultChecked
+                        checked={form.is_active}
+                        onChange={(e) => set("is_active", e.target.checked)}
                       />
                       <label className="form-check-label" htmlFor="t_is_active">
                         Modello attivo
@@ -341,12 +441,12 @@ export function RechargesContent() {
               </div>
 
               <div className="modal-footer">
-                <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">
+                <button type="button" className="btn btn-outline-secondary" onClick={closeModal}>
                   Annulla
                 </button>
-                <button className="btn btn-primary" type="submit">
+                <button className="btn btn-primary" type="submit" disabled={saving}>
                   <i className="bi bi-check2-circle me-1" />
-                  Salva
+                  {saving ? "Salvataggio…" : "Salva"}
                 </button>
               </div>
             </form>

@@ -2,6 +2,7 @@ import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { listDbConfigModule, toggleDbConfigRecord, touchDbConfigModule } from "@/lib/db-repositories";
+import { deleteManageConsentModule, getManageConsentModule, saveManageConsentModule } from "@/lib/manage-consent-modules";
 import { applyExistingPreorders, applyExistingPrepaids, getManagePosSettings, saveManagePosSettings } from "@/lib/manage-pos-settings";
 import {
   getFidelityMembershipSettings,
@@ -46,6 +47,16 @@ export async function GET(request: Request) {
   if (!can(session.user.perms, permissionForFeature(moduleId))) return jsonError("Permesso configurazione mancante.", 403);
 
   try {
+    // Faithful consent-module editor prefill (consent_modules.php action=edit).
+    // Returns ONE module's editable fields for the faithful editor form.
+    if (moduleId === "consent_modules" && url.searchParams.get("action") === "get") {
+      const recordId = parseInteger(url.searchParams.get("id"), 0);
+      if (recordId <= 0) return jsonError("ID modulo mancante.");
+      const consentModule = await getManageConsentModule(tenantSlug, recordId);
+      if (!consentModule) return jsonError("Modulo consenso non trovato.", 404);
+      return Response.json({ ok: true, source: "consent_modules?action=get", sourceMode: "database", consentModule });
+    }
+
     const featureGetter = FEATURE_SETTINGS_GET[moduleId];
     const moduleState = moduleId === "pos_settings"
       ? await getManagePosSettings(tenantSlug)
@@ -106,6 +117,21 @@ export async function POST(request: Request) {
       // Unknown action for a settings module: return current state untouched.
       const moduleState = await FEATURE_SETTINGS_GET[moduleId](tenantSlug);
       return Response.json({ ok: true, source: moduleId, sourceMode: "database", module: moduleState, records: moduleState.records });
+    }
+
+    // Faithful consent-module editor save/delete (consent_modules.php
+    // _mode=save_module / action=delete). Backed by the dedicated reader/saver
+    // over the consent_modules table; the generic config listing reflects the
+    // change on the next list load.
+    if (moduleId === "consent_modules" && (action === "save" || action === "save_module")) {
+      const consentModule = await saveManageConsentModule(tenantSlug, body);
+      const moduleState = await listDbConfigModule(moduleId, tenantSlug);
+      return Response.json({ ok: true, source: "consent_modules?action=save", sourceMode: "database", consentModule, module: moduleState, records: moduleState.records });
+    }
+    if (moduleId === "consent_modules" && (action === "delete" || action === "delete_module")) {
+      const result = await deleteManageConsentModule(tenantSlug, parseInteger(body.id ?? body.record_id, 0));
+      const moduleState = await listDbConfigModule(moduleId, tenantSlug);
+      return Response.json({ ok: true, source: "consent_modules?action=delete", sourceMode: "database", ...result, module: moduleState, records: moduleState.records });
     }
 
     if (action === "toggle") {
