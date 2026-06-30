@@ -179,6 +179,9 @@ export function ClientDetailContent() {
   const [deleteReason, setDeleteReason] = useState("");
   const [deleteSummary, setDeleteSummary] = useState<DeleteSummary | null>(null);
   const [deleteSummaryLoading, setDeleteSummaryLoading] = useState(false);
+  // Stock-restore decision (only relevant when the client has sales). Default
+  // 'no_restore' to match the cascade default (clients.php stockMode default).
+  const [stockRestoreMode, setStockRestoreMode] = useState<"restore_stock" | "no_restore">("no_restore");
 
   // Read the id from the URL after mount (window is only available client-side).
   useEffect(() => {
@@ -307,7 +310,7 @@ export function ClientDetailContent() {
       const res = await fetch(`/api/manage/clients?slug=${encodeURIComponent(slug)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
-        body: JSON.stringify({ action: "delete", id: String(clientId), delete_reason: deleteReason.trim() }),
+        body: JSON.stringify({ action: "delete", id: String(clientId), delete_reason: deleteReason.trim(), stock_restore_mode: stockRestoreMode }),
       });
       const j = await res.json();
       if (!res.ok || !j.ok || !j.deleted) {
@@ -739,6 +742,37 @@ export function ClientDetailContent() {
               ) : (
                 <div className="text-muted small mb-3">Riepilogo non disponibile.</div>
               )}
+              {deleteSummary && deleteSummary.vendite > 0 ? (
+                <div className="mb-3">
+                  <label className="form-label">Magazzino prodotti venduti</label>
+                  <div className="form-check">
+                    <input
+                      className="form-check-input"
+                      type="radio"
+                      name="stock_restore_mode"
+                      id="stock_no_restore"
+                      checked={stockRestoreMode === "no_restore"}
+                      onChange={() => setStockRestoreMode("no_restore")}
+                    />
+                    <label className="form-check-label" htmlFor="stock_no_restore">
+                      Non ripristinare lo stock (lascia le giacenze invariate)
+                    </label>
+                  </div>
+                  <div className="form-check">
+                    <input
+                      className="form-check-input"
+                      type="radio"
+                      name="stock_restore_mode"
+                      id="stock_restore"
+                      checked={stockRestoreMode === "restore_stock"}
+                      onChange={() => setStockRestoreMode("restore_stock")}
+                    />
+                    <label className="form-check-label" htmlFor="stock_restore">
+                      Ripristina lo stock dei prodotti scalati dalle vendite eliminate
+                    </label>
+                  </div>
+                </div>
+              ) : null}
               <label className="form-label">
                 Motivo eliminazione <span className="text-danger">*</span>
               </label>
@@ -748,9 +782,10 @@ export function ClientDetailContent() {
                 onChange={(e) => setDeleteReason(e.target.value)}
                 placeholder="Es. richiesta cancellazione dati (GDPR)"
               />
-              <div className="form-text text-warning">
-                Nota: la replica Next elimina la sola anagrafica cliente. Il cascade completo legacy (~40 tabelle) non è
-                ancora portato.
+              <div className="form-text text-danger">
+                Elimina definitivamente il cliente e tutti i dati collegati (vendite, prenotazioni, pacchetti,
+                prepagati, giftcard/giftbox, omaggi, preventivi, tessere, fidelity, documenti, consensi e schede).
+                Operazione irreversibile.
               </div>
             </div>
             <div className="d-flex justify-content-end gap-2 mt-3">

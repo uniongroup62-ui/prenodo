@@ -118,6 +118,40 @@ export async function withTenant<T>(tenantId: number | null, fn: (client: pg.Poo
   }
 }
 
+// Tenant-aware query fn handed to a withTenantTransaction callback: translates
+// the SQL (MySQL `?`/backticks -> Postgres $n/"quotes") and runs it on the
+// dedicated transaction client, returning the result rows.
+export type TenantTxQuery = <T extends RowDataPacket = RowDataPacket>(sql: string, params?: unknown[]) => Promise<T[]>;
+
+// Run a multi-statement cascade ATOMICALLY on a single dedicated connection,
+// mirroring the legacy $pdo->beginTransaction()/commit()/rollBack(). A dedicated
+// pool client is checked out, app.tenant_id is set (so BEFORE-write triggers and
+// any RLS behave like withTenant), BEGIN is issued, the callback runs against a
+// tenant-aware query fn, then COMMIT on success or ROLLBACK + rethrow on ANY
+// error — so a failure NEVER leaves partial deletes. The client is always
+// released in finally.
+export async function withTenantTransaction<T>(slug: string, fn: (q: TenantTxQuery) => Promise<T>): Promise<T> {
+  const tenantId = await tenantIdForSlug(slug);
+  const client = await getPool().connect();
+  const q: TenantTxQuery = async <R extends RowDataPacket = RowDataPacket>(sql: string, params: unknown[] = []) => {
+    const res = await client.query(toPostgresSql(sql), params as unknown[]);
+    return res.rows as unknown as R[];
+  };
+  try {
+    await client.query("SELECT set_config('app.tenant_id', $1, false)", [String(tenantId ?? 0)]);
+    await client.query("BEGIN");
+    const result = await fn(q);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    await client.query("SELECT set_config('app.tenant_id', '0', false)").catch(() => {});
+    client.release();
+  }
+}
+
 export async function tenantTable(slug: string, baseTable: string): Promise<TenantTable> {
   const normalizedSlug = normalizeTenantSlug(slug) ?? "";
   const safeBase = sanitizeIdentifier(baseTable);

@@ -47,7 +47,7 @@ import type {
   WalletMovement,
   WalletMovementType,
 } from "@/lib/tenant-store";
-import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug, type TenantTable } from "@/lib/tenant-db";
+import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug, withTenantTransaction, type TenantTable } from "@/lib/tenant-db";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 import { assertAppointmentSlotAvailable, type AppointmentSlotSegment } from "@/lib/public-booking-db";
 
@@ -195,29 +195,456 @@ export async function archiveDbClient(id: number, slug: string): Promise<Managed
   return getSingleClient(slug, id);
 }
 
+export type StockRestoreMode = "restore_stock" | "no_restore";
+
+export type DeleteDbClientCascadeResult = {
+  deleted: boolean;
+  client: ManagedClient;
+  reason: string;
+  counts: Record<string, number>;
+  restoredStockQty: number;
+};
+
+// FAITHFUL, ATOMIC cascade port of clients.php client_delete_execute (~1315-1521).
+// Replaces the old shallow deleteDbClient (which removed ONLY the clients row and
+// orphaned ~40 child tables). Collects every related id list (tenant-scoped),
+// then deletes in the EXACT legacy order inside ONE transaction (BEGIN/COMMIT,
+// ROLLBACK + rethrow on any error — no partial deletes). Every statement is
+// tenant-scoped; every table/column is guarded so a missing one is skipped and
+// an empty id-list is a no-op. `reason` is required (legacy guard) and recorded
+// best-effort in client_deletion_logs OUTSIDE the critical path. stockRestoreMode
+// 'restore_stock' restores product stock from the sales' ordered product items
+// (client_delete_restore_product_stock); 'no_restore' (default) leaves stock.
+export async function deleteDbClientCascade(
+  slug: string,
+  clientId: number,
+  options: { reason?: string; stockRestoreMode?: StockRestoreMode } = {},
+): Promise<DeleteDbClientCascadeResult> {
+  if (clientId <= 0) throw new Error("ID cliente mancante.");
+  const reason = String(options.reason ?? "").trim();
+  if (reason === "") throw new Error("La motivazione è obbligatoria.");
+  const stockRestoreMode: StockRestoreMode = options.stockRestoreMode === "restore_stock" ? "restore_stock" : "no_restore";
+
+  // Snapshot the client row before the cascade (used for the return value + log).
+  const client = await getSingleClient(slug, clientId);
+  const clientIds = [clientId];
+
+  // Resolve each table's PHYSICAL name + the tenant clause ONCE (cached). In
+  // shared-tenant mode every row carries tenant_id and we scope every statement
+  // with `tenant_id = <id>` (like tenantDelete/tenantSelect); in prefixed/base
+  // mode the physical table name itself is the tenant boundary.
+  type Resolved = { name: string; tenantClause: string; tenantParams: number[] } | null;
+  const resolvedCache = new Map<string, Resolved>();
+  const resolve = async (base: string): Promise<Resolved> => {
+    if (resolvedCache.has(base)) return resolvedCache.get(base) ?? null;
+    let out: Resolved = null;
+    try {
+      const t = await tenantTable(slug, base);
+      if (await tableExists(t.name)) {
+        const scoped = t.mode === "shared" && (await columnExists(t.name, "tenant_id"));
+        out = {
+          name: t.name,
+          tenantClause: scoped ? "tenant_id = ?" : "",
+          tenantParams: scoped ? [t.tenantId ?? 0] : [],
+        };
+      }
+    } catch {
+      out = null;
+    }
+    resolvedCache.set(base, out);
+    return out;
+  };
+
+  const cleanIds = (ids: Array<number | string | null | undefined>): number[] =>
+    Array.from(new Set(ids.map((v) => Math.trunc(Number(v)) || 0).filter((n) => n > 0)));
+
+  const placeholders = (n: number): string => Array.from({ length: n }, () => "?").join(",");
+
+  // Build the OR'd "col IN (...)" WHERE fragment for the columns that exist on a
+  // resolved table and have a non-empty id list (mirrors client_delete_where_any).
+  // Returns null when nothing applies (so callers no-op).
+  const whereAny = async (
+    res: NonNullable<Resolved>,
+    columnIds: Record<string, number[]>,
+  ): Promise<{ where: string; params: number[] } | null> => {
+    const parts: string[] = [];
+    const params: number[] = [];
+    for (const [column, rawIds] of Object.entries(columnIds)) {
+      const ids = cleanIds(rawIds);
+      if (ids.length === 0) continue;
+      if (!(await columnExists(res.name, column))) continue;
+      parts.push(`${quoteIdentifier(column)} IN (${placeholders(ids.length)})`);
+      params.push(...ids);
+    }
+    if (parts.length === 0) return null;
+    return { where: `(${parts.join(" OR ")})`, params };
+  };
+
+  // COLLECT distinct ids from `idColumn` of `base` where any of columnIds match.
+  const collectIds = async (base: string, idColumn: string, columnIds: Record<string, number[]>): Promise<number[]> => {
+    const res = await resolve(base);
+    if (!res || !(await columnExists(res.name, idColumn))) return [];
+    const clause = await whereAny(res, columnIds);
+    if (!clause) return [];
+    const where = [clause.where, res.tenantClause].filter(Boolean).join(" AND ");
+    const params = [...clause.params, ...res.tenantParams];
+    const rows = await q(`SELECT DISTINCT ${quoteIdentifier(idColumn)} FROM ${quoteIdentifier(res.name)} WHERE ${where}`, params);
+    return cleanIds(rows.map((r) => (r as RowDataPacket)[idColumn] as number));
+  };
+
+  // The single tenant-aware query fn for the whole cascade (set inside the tx).
+  let q!: <T extends RowDataPacket = RowDataPacket>(sql: string, params?: unknown[]) => Promise<T[]>;
+  const counts: Record<string, number> = {};
+  const bump = (label: string, n: number) => {
+    if (n > 0) counts[label] = (counts[label] ?? 0) + n;
+  };
+
+  // DELETE FROM base WHERE (any of columnIds) [AND tenant]. Tenant-scoped + guarded;
+  // a missing table / no applicable column / empty id-list is a no-op.
+  const deleteWhereAny = async (base: string, columnIds: Record<string, number[]>, label: string): Promise<number> => {
+    const res = await resolve(base);
+    if (!res) return 0;
+    const clause = await whereAny(res, columnIds);
+    if (!clause) return 0;
+    const where = [clause.where, res.tenantClause].filter(Boolean).join(" AND ");
+    const params = [...clause.params, ...res.tenantParams];
+    const rows = await q(`DELETE FROM ${quoteIdentifier(res.name)} WHERE ${where}`, params);
+    const n = rows.length; // RETURNING * rows -> affected count
+    bump(label, n);
+    return n;
+  };
+
+  let restoredStockQty = 0;
+
+  await withTenantTransaction(slug, async (txq) => {
+    // Wrap txq so DELETEs return the affected rows (Postgres needs RETURNING to
+    // expose them as rows; SELECT/UPDATE/INSERT pass through unchanged).
+    q = async <T extends RowDataPacket = RowDataPacket>(sql: string, params: unknown[] = []): Promise<T[]> => {
+      const isDelete = /^\s*delete\s/i.test(sql) && !/\breturning\b/i.test(sql);
+      return txq<T>(isDelete ? `${sql} RETURNING *` : sql, params);
+    };
+
+    // --- COLLECT related id lists (tenant-scoped), in the legacy order ---
+    const saleIds = await collectIds("sales", "id", { client_id: clientIds });
+    const appointmentIds = await collectIds("appointments", "id", { client_id: clientIds });
+    const giftcardIds = await collectIds("giftcards", "id", { client_id: clientIds, recipient_client_id: clientIds });
+    const giftboxInstanceIds = await collectIds("giftbox_instances", "id", { client_id: clientIds, recipient_client_id: clientIds });
+    const giftInstanceIds = await collectIds("gift_instances", "id", { client_id: clientIds });
+    const clientPackageIds = await collectIds("client_packages", "id", { client_id: clientIds });
+    const clientPrepaidIds = await collectIds("client_prepaid_services", "id", { client_id: clientIds });
+    const cardIds = await collectIds("cards", "id", { client_id: clientIds });
+    const quoteIds = await collectIds("quotes", "id", { client_id: clientIds });
+    const giftboxRedemptionIds = await collectIds("giftbox_redemptions", "id", { instance_id: giftboxInstanceIds });
+    const installmentPlanIds = await collectIds("sale_installment_plans", "id", { client_id: clientIds, sale_id: saleIds });
+    const installmentIds = await collectIds("sale_installments", "id", { client_id: clientIds, sale_id: saleIds, plan_id: installmentPlanIds });
+
+    // stock_docs linked to the sales via the "Vendita #<id>" note marker
+    // (port of the legacy notes REGEXP collection; Postgres ~ regex).
+    const stockDocIds = await collectStockDocIdsForSales(slug, saleIds, q);
+
+    // staff_commission_payments string refs (legacy stores 'VEN#<id>' / 'APP#<id>'
+    // in source_reference, NOT bare ids — match those, faithful to client_delete_execute).
+    const saleRefs = saleIds.map((id) => `VEN#${id}`);
+    const appointmentRefs = appointmentIds.map((id) => `APP#${id}`);
+
+    // (a) restore product stock from the sales' ordered product items.
+    if (stockRestoreMode === "restore_stock") {
+      restoredStockQty = await restoreProductStockForSales(slug, saleIds, q, resolve, columnExists);
+    }
+
+    // (b) appointment ITEM links
+    await deleteWhereAny("appointment_giftbox_items", { appointment_id: appointmentIds, instance_id: giftboxInstanceIds, redemption_id: giftboxRedemptionIds }, "collegamenti_prenotazioni");
+    await deleteWhereAny("appointment_package_items", { appointment_id: appointmentIds, client_package_id: clientPackageIds }, "collegamenti_prenotazioni");
+    await deleteWhereAny("appointment_prepaid_service_items", { appointment_id: appointmentIds, client_prepaid_service_id: clientPrepaidIds }, "collegamenti_prenotazioni");
+    await deleteWhereAny("appointment_gift_items", { appointment_id: appointmentIds, instance_id: giftInstanceIds }, "collegamenti_prenotazioni");
+
+    // (c) appointment detail rows
+    await deleteWhereAny("appointment_services", { appointment_id: appointmentIds }, "prenotazioni_dettagli");
+    await deleteWhereAny("appointment_segments", { appointment_id: appointmentIds }, "prenotazioni_dettagli");
+
+    // (d) promotion redemptions
+    await deleteWhereAny("promotion_redemptions", { client_id: clientIds, appointment_id: appointmentIds, sale_id: saleIds }, "promozioni");
+
+    // (e) giftbox redemptions
+    await deleteWhereAny("giftbox_redemption_items", { redemption_id: giftboxRedemptionIds }, "giftbox");
+    await deleteWhereAny("giftbox_redemptions", { instance_id: giftboxInstanceIds }, "giftbox");
+
+    // (f) packages / prepaids
+    await deleteWhereAny("client_prepaid_service_usages", { client_prepaid_service_id: clientPrepaidIds, appointment_id: appointmentIds }, "prepagati");
+    await deleteWhereAny("client_package_usages", { client_package_id: clientPackageIds, appointment_id: appointmentIds }, "pacchetti");
+    await deleteWhereAny("client_package_transactions", { client_package_id: clientPackageIds, appointment_id: appointmentIds }, "pacchetti");
+    await deleteWhereAny("client_package_services", { client_package_id: clientPackageIds }, "pacchetti");
+    await deleteWhereAny("client_package_items", { client_package_id: clientPackageIds }, "pacchetti");
+    await deleteWhereAny("client_prepaid_services", { id: clientPrepaidIds, client_id: clientIds }, "prepagati");
+    await deleteWhereAny("client_packages", { id: clientPackageIds, client_id: clientIds }, "pacchetti");
+
+    // (g) gifts (omaggi)
+    await deleteWhereAny("gift_transactions", { client_id: clientIds, instance_id: giftInstanceIds, appointment_id: appointmentIds }, "omaggi");
+    await deleteWhereAny("gift_progress_resets", { client_id: clientIds }, "omaggi");
+    await deleteWhereAny("gift_instances", { id: giftInstanceIds, client_id: clientIds }, "omaggi");
+
+    // (h) giftcards: child rows, then NULL the giftcard refs on sales/appointments, then the giftcards
+    await deleteWhereAny("giftcard_transactions", { giftcard_id: giftcardIds }, "giftcard");
+    await deleteWhereAny("giftcard_items", { giftcard_id: giftcardIds }, "giftcard");
+    await nullGiftcardRefs("sales", giftcardIds, clientIds);
+    await nullGiftcardRefs("appointments", giftcardIds, clientIds);
+    await deleteWhereAny("giftcards", { id: giftcardIds, client_id: clientIds, recipient_client_id: clientIds }, "giftcard");
+
+    // (i) giftbox instances
+    await deleteWhereAny("giftbox_transactions", { instance_id: giftboxInstanceIds }, "giftbox");
+    await deleteWhereAny("giftbox_instance_items", { instance_id: giftboxInstanceIds }, "giftbox");
+    await deleteWhereAny("giftbox_instances", { id: giftboxInstanceIds, client_id: clientIds, recipient_client_id: clientIds }, "giftbox");
+
+    // (j) quotes
+    await deleteWhereAny("quote_items", { quote_id: quoteIds }, "preventivi");
+    await deleteWhereAny("quotes", { id: quoteIds, client_id: clientIds }, "preventivi");
+
+    // (k) stock docs linked to the deleted sales
+    await deleteWhereAny("stock_doc_items", { stock_doc_id: stockDocIds }, "magazzino");
+    await deleteWhereAny("stock_docs", { id: stockDocIds }, "magazzino");
+
+    // (l) POS stock-cancel actions + installments
+    await deleteWhereAny("pos_sale_stock_cancel_actions", { sale_id: saleIds }, "vendite");
+    await deleteWhereAny("sale_installments", { id: installmentIds, plan_id: installmentPlanIds, sale_id: saleIds, client_id: clientIds }, "rate");
+    await deleteWhereAny("sale_installment_plans", { id: installmentPlanIds, sale_id: saleIds, client_id: clientIds }, "rate");
+
+    // (m) staff commission payments (string source_reference, by source_group)
+    await deleteCommissionRefs("pos", saleRefs);
+    await deleteCommissionRefs("appointments", appointmentRefs);
+
+    // (n) sales
+    await deleteWhereAny("sale_items", { sale_id: saleIds }, "vendite");
+    await deleteWhereAny("sales", { id: saleIds, client_id: clientIds }, "vendite");
+
+    // (o) fidelity
+    await deleteWhereAny("point_lots", { client_id: clientIds }, "fidelity");
+    await deleteWhereAny("transactions", { client_id: clientIds }, "fidelity");
+    await deleteWhereAny("events", { client_id: clientIds }, "fidelity");
+
+    // (p) recharges + credit adjustments
+    await deleteWhereAny("recharges", { client_id: clientIds }, "ricariche");
+    await deleteWhereAny("credit_adjustments", { client_id: clientIds }, "rettifiche_credito");
+
+    // (q) cards
+    await deleteWhereAny("card_reminders", { client_id: clientIds, card_id: cardIds }, "tessere");
+    await deleteWhereAny("card_code_registry", { client_id: clientIds, card_id: cardIds }, "tessere");
+    await deleteWhereAny("cards", { id: cardIds, client_id: clientIds }, "tessere");
+
+    // (r) sheets / consents / documents / tags / booking accounts
+    await deleteWhereAny("client_sheet_records", { client_id: clientIds }, "schede_cliente");
+    await deleteWhereAny("client_sheet_templates", { client_id: clientIds }, "schede_cliente");
+    await deleteWhereAny("client_consent_records", { client_id: clientIds }, "consensi");
+    await deleteWhereAny("customer_documents", { client_id: clientIds }, "documenti");
+    await deleteWhereAny("customer_tag_map", { client_id: clientIds }, "tag");
+    await deleteWhereAny("booking_users", { client_id: clientIds }, "account_booking");
+
+    // (s) appointments
+    await deleteWhereAny("appointments", { id: appointmentIds, client_id: clientIds }, "prenotazioni");
+
+    // (t) the clients row itself
+    await deleteWhereAny("clients", { id: clientIds }, "clienti");
+  });
+
+  // --- helpers that close over q/resolve/whereAny (defined here so they share
+  //     the tenant-aware q set inside the transaction) ---
+
+  // UPDATE <table> SET giftcard_id=NULL WHERE giftcard_id IN (...) AND (client_id
+  // IS NULL OR client_id NOT IN (clientIds)) — port of client_delete_null_giftcard_refs.
+  async function nullGiftcardRefs(base: string, giftcardIdList: number[], clientIdList: number[]): Promise<void> {
+    const ids = cleanIds(giftcardIdList);
+    if (ids.length === 0) return;
+    const res = await resolve(base);
+    if (!res || !(await columnExists(res.name, "giftcard_id"))) return;
+    const clauses = [`giftcard_id IN (${placeholders(ids.length)})`];
+    const params: number[] = [...ids];
+    if (clientIdList.length > 0 && (await columnExists(res.name, "client_id"))) {
+      clauses.push(`(client_id IS NULL OR client_id NOT IN (${placeholders(clientIdList.length)}))`);
+      params.push(...clientIdList);
+    }
+    if (res.tenantClause) {
+      clauses.push(res.tenantClause);
+      params.push(...res.tenantParams);
+    }
+    const rows = await q(`UPDATE ${quoteIdentifier(res.name)} SET giftcard_id=NULL WHERE ${clauses.join(" AND ")} RETURNING id`, params);
+    bump("giftcard_riferimenti_scollegati", rows.length);
+  }
+
+  // DELETE FROM staff_commission_payments WHERE source_group=? AND source_reference
+  // IN (refs) — port of the legacy commission deletes (refs are 'VEN#<id>'/'APP#<id>').
+  async function deleteCommissionRefs(group: string, refs: string[]): Promise<void> {
+    if (refs.length === 0) return;
+    const res = await resolve("staff_commission_payments");
+    if (!res) return;
+    if (!(await columnExists(res.name, "source_reference")) || !(await columnExists(res.name, "source_group"))) return;
+    const clauses = ["source_group = ?", `source_reference IN (${placeholders(refs.length)})`];
+    const params: unknown[] = [group, ...refs];
+    if (res.tenantClause) {
+      clauses.push(res.tenantClause);
+      params.push(...res.tenantParams);
+    }
+    const rows = await q(`DELETE FROM ${quoteIdentifier(res.name)} WHERE ${clauses.join(" AND ")} RETURNING id`, params);
+    bump("commissioni", rows.length);
+  }
+
+  // Record the deletion best-effort, OUTSIDE the critical path (a failure here
+  // must NOT roll back the cascade — the rows are already gone).
+  try {
+    await recordClientDeletionLog(slug, clientIds, [client.name], counts, reason, stockRestoreMode, restoredStockQty);
+  } catch {
+    // TODO: surface log failures to an ops channel; the delete itself succeeded.
+  }
+
+  const deletedClients = counts["clienti"] ?? 0;
+  return {
+    deleted: deletedClients > 0,
+    client,
+    reason: deletedClients > 0 ? "Cliente eliminato." : "Cliente non eliminato.",
+    counts,
+    restoredStockQty,
+  };
+}
+
+// Backwards-compatible thin wrapper kept for any existing callers: delegates to
+// the faithful cascade (reason required; default no stock restore).
 export async function deleteDbClient(
   id: number,
   slug: string,
   deleteReason = "",
 ): Promise<{ deleted: boolean; client: ManagedClient; reason: string }> {
-  const client = await getSingleClient(slug, id);
-  const affected = await tenantDelete({ slug, table: "clients", id });
-  // NOTE (cascade scope): this deletes ONLY the `clients` row. The legacy
-  // clients.php delete (client_delete_collect_ids + client_delete_execute,
-  // ~lines 1100-1500) performs a ~40-table cascade (sales, sale_items,
-  // appointments + details, installments/plans, commissions, client_packages,
-  // client_prepaid_services, giftcards/giftbox_instances/gifts + their
-  // transactions, quotes, cards/recharges, customer_documents,
-  // client_consent_records, client_sheet_records, booking_users,
-  // customer_tag_map, transactions/events/point_lots, credit_adjustments, stock
-  // restore, attached files, marketplace links, campaign id-list refs). It is
-  // NOT ported here. The active Postgres schema relies on its own FK rules; rows
-  // in child tables without ON DELETE CASCADE will block or orphan. TODO: port
-  // the full cascade (see getManageClientDeleteSummary for the affected counts).
-  // `deleteReason` is accepted (faithful to the legacy confirm form) but not yet
-  // persisted to an audit log — TODO.
-  void deleteReason;
-  return { deleted: affected > 0, client, reason: affected > 0 ? "Cliente eliminato." : "Cliente non eliminato." };
+  const result = await deleteDbClientCascade(slug, id, { reason: deleteReason, stockRestoreMode: "no_restore" });
+  return { deleted: result.deleted, client: result.client, reason: result.reason };
+}
+
+// Collect stock_docs ids linked to the given sales via the "Vendita #<id>" note
+// marker (port of the legacy notes REGEXP block, Postgres `~` regex). Tenant-scoped.
+async function collectStockDocIdsForSales(
+  slug: string,
+  saleIds: number[],
+  q: <T extends RowDataPacket = RowDataPacket>(sql: string, params?: unknown[]) => Promise<T[]>,
+): Promise<number[]> {
+  if (saleIds.length === 0) return [];
+  try {
+    const t = await tenantTable(slug, "stock_docs");
+    if (!(await tableExists(t.name)) || !(await columnExists(t.name, "notes"))) return [];
+    const scoped = t.mode === "shared" && (await columnExists(t.name, "tenant_id"));
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    for (const sid of saleIds) {
+      // Match "vendita #<id>" with optional spaces, not part of a larger number.
+      clauses.push("LOWER(COALESCE(notes,'')) ~ ?");
+      params.push(`(^|[^0-9])vendita #[[:space:]]*${sid}([^0-9]|$)`);
+    }
+    const where = scoped ? `(${clauses.join(" OR ")}) AND tenant_id = ?` : `(${clauses.join(" OR ")})`;
+    if (scoped) params.push(t.tenantId ?? 0);
+    const rows = await q(`SELECT id FROM ${quoteIdentifier(t.name)} WHERE ${where}`, params);
+    return Array.from(new Set(rows.map((r) => Math.trunc(Number((r as RowDataPacket).id)) || 0).filter((n) => n > 0)));
+  } catch {
+    return [];
+  }
+}
+
+// Restore product stock from the sales' ordered product sale_items (port of
+// client_delete_restore_product_stock + client_delete_product_stock_rows). For
+// each non-"ordered" product line, restore qty minus any already-restored qty
+// (pos_sale_stock_cancel_actions action='restored'), then products.stock += qty.
+// Tenant-scoped via the shared tenant clause. Returns total restored qty.
+async function restoreProductStockForSales(
+  slug: string,
+  saleIds: number[],
+  q: <T extends RowDataPacket = RowDataPacket>(sql: string, params?: unknown[]) => Promise<T[]>,
+  resolve: (base: string) => Promise<{ name: string; tenantClause: string; tenantParams: number[] } | null>,
+  colExists: (table: string, column: string) => Promise<boolean>,
+): Promise<number> {
+  if (saleIds.length === 0) return 0;
+  const saleItemsRes = await resolve("sale_items");
+  const productsRes = await resolve("products");
+  if (!saleItemsRes || !productsRes) return 0;
+  if (!(await colExists(productsRes.name, "stock"))) return 0;
+  for (const col of ["item_type", "item_id", "qty"]) {
+    if (!(await colExists(saleItemsRes.name, col))) return 0;
+  }
+
+  const ph = saleIds.map(() => "?").join(",");
+  const hasStatus = await colExists(saleItemsRes.name, "item_status");
+  const statusExpr = hasStatus ? "LOWER(TRIM(COALESCE(item_status,'')))" : "''";
+  const siWhere = [`sale_id IN (${ph})`, "LOWER(TRIM(COALESCE(item_type,''))) = 'product'", "item_id IS NOT NULL", saleItemsRes.tenantClause].filter(Boolean).join(" AND ");
+  const siParams = [...saleIds, ...saleItemsRes.tenantParams];
+  const items = await q(
+    `SELECT id AS sale_item_id, item_id AS product_id, qty, ${statusExpr} AS st FROM ${quoteIdentifier(saleItemsRes.name)} WHERE ${siWhere}`,
+    siParams,
+  );
+  if (items.length === 0) return 0;
+
+  // Already-restored qty per sale_item from pos_sale_stock_cancel_actions.
+  const restoredBySaleItem = new Map<number, number>();
+  const cancelRes = await resolve("pos_sale_stock_cancel_actions");
+  if (
+    cancelRes &&
+    (await colExists(cancelRes.name, "sale_id")) &&
+    (await colExists(cancelRes.name, "sale_item_id")) &&
+    (await colExists(cancelRes.name, "qty")) &&
+    (await colExists(cancelRes.name, "action"))
+  ) {
+    const cWhere = [`sale_id IN (${ph})`, "LOWER(TRIM(COALESCE(action,''))) = 'restored'", "sale_item_id IS NOT NULL", "sale_item_id > 0", cancelRes.tenantClause].filter(Boolean).join(" AND ");
+    const cParams = [...saleIds, ...cancelRes.tenantParams];
+    const actions = await q(`SELECT sale_item_id, COALESCE(SUM(qty),0) AS qty FROM ${quoteIdentifier(cancelRes.name)} WHERE ${cWhere} GROUP BY sale_item_id`, cParams);
+    for (const a of actions) {
+      const sid = Math.trunc(Number((a as RowDataPacket).sale_item_id)) || 0;
+      restoredBySaleItem.set(sid, Math.max(0, Number((a as RowDataPacket).qty) || 0));
+    }
+  }
+
+  // Sum the qty to restore per product.
+  const qtyByProduct = new Map<number, number>();
+  for (const row of items) {
+    const r = row as RowDataPacket;
+    const saleItemId = Math.trunc(Number(r.sale_item_id)) || 0;
+    const productId = Math.trunc(Number(r.product_id)) || 0;
+    const qty = Math.max(0, Number(r.qty) || 0);
+    const status = String(r.st ?? "").trim().toLowerCase();
+    const isOrdered = status === "ordered" || status === "ordinato";
+    if (isOrdered || productId <= 0) continue;
+    const alreadyRestored = restoredBySaleItem.get(saleItemId) ?? 0;
+    const qtyToRestore = Math.max(0, qty - alreadyRestored);
+    if (qtyToRestore <= 0.00001) continue;
+    qtyByProduct.set(productId, (qtyByProduct.get(productId) ?? 0) + qtyToRestore);
+  }
+
+  let restored = 0;
+  for (const [productId, rawQty] of qtyByProduct) {
+    const qty = Math.max(0, Math.round(rawQty));
+    if (qty <= 0) continue;
+    const where = ["id = ?", productsRes.tenantClause].filter(Boolean).join(" AND ");
+    const params = [qty, productId, ...productsRes.tenantParams];
+    await q(`UPDATE ${quoteIdentifier(productsRes.name)} SET stock = stock + ? WHERE ${where}`, params);
+    restored += qty;
+  }
+  return restored;
+}
+
+// Best-effort audit row in client_deletion_logs (port of client_delete_insert_log).
+// Runs on the pool OUTSIDE the delete transaction; a failure is swallowed by the
+// caller (the cascade already committed). Skips silently if the table is absent.
+async function recordClientDeletionLog(
+  slug: string,
+  clientIds: number[],
+  clientNames: string[],
+  counts: Record<string, number>,
+  reason: string,
+  stockMode: StockRestoreMode,
+  restoredStockQty: number,
+): Promise<void> {
+  if (!(await tableExists((await tenantTable(slug, "client_deletion_logs")).name))) return;
+  const table = await tenantTable(slug, "client_deletion_logs");
+  await tenantInsert(table, {
+    client_ids: clientIds.join(","),
+    client_names: clientNames.join(" | "),
+    deleted_count: counts["clienti"] ?? clientIds.length,
+    stock_restore_mode: stockMode,
+    reason,
+    summary_json: JSON.stringify({ deleted_rows: counts, restored_stock_qty: restoredStockQty }),
+    deleted_by: null,
+  });
 }
 
 // Block / unblock a client — faithful port of clients.php (~lines 1775-1813,

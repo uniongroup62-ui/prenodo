@@ -4,7 +4,7 @@ import {
   archiveDbClient,
   blockDbClient,
   createDbClient,
-  deleteDbClient,
+  deleteDbClientCascade,
   getDbClient,
   getManageClientDeleteSummary,
   getManageClientDetail,
@@ -188,9 +188,14 @@ export async function POST(request: Request) {
     }
 
     if (action === "delete") {
-      // delete_reason is accepted for parity with the legacy confirm form (it is
-      // not yet persisted; see deleteDbClient).
-      const result = await deleteDbClient(id, tenantSlug, String(body.delete_reason ?? body.reason ?? ""));
+      // Faithful, ATOMIC cascade (port of clients.php client_delete_execute). The
+      // reason is REQUIRED (legacy guard) — reject an empty one. stock_restore_mode
+      // selects whether the sales' product stock is restored ('restore_stock') or
+      // left ('no_restore', default). deleteDbClientCascade throws on an empty reason.
+      const reason = String(body.delete_reason ?? body.reason ?? "").trim();
+      if (reason === "") return jsonError("La motivazione è obbligatoria.");
+      const stockRestoreMode = String(body.stock_restore_mode ?? "") === "restore_stock" ? "restore_stock" : "no_restore";
+      const result = await deleteDbClientCascade(tenantSlug, id, { reason, stockRestoreMode });
       return Response.json({ ok: true, source: "clients?action=delete", sourceMode: "database", ...result, clients: await listDbClients({ slug: tenantSlug }) });
     }
 
