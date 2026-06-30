@@ -44,6 +44,10 @@ export async function GET(request: Request) {
         sourceMode: "database",
         summary: context.history,
         residuals: context.residuals,
+        // Available packages for the drawer's per-service "Usa pacchetto" control
+        // (port of api_clients.php action=residuals package block; see
+        // quickBookClientPackages). Each carries the covered service_ids.
+        packages: context.packages,
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");

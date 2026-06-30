@@ -47,7 +47,7 @@ import type {
   WalletMovement,
   WalletMovementType,
 } from "@/lib/tenant-store";
-import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug } from "@/lib/tenant-db";
+import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug, type TenantTable } from "@/lib/tenant-db";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
 
 export async function listDbLocations(slug: string): Promise<Location[]> {
@@ -387,6 +387,14 @@ export type MultiServiceAppointmentInput = {
   cabinId?: number | null;
   staffMap?: Record<number, number>;
   cabinMap?: Record<number, number>;
+  // Quick-booking PACKAGE redeem (assets/js/app.js #qb_package_redeem): per-service
+  // requests to cover a service with a client's prepaid package. Re-validated +
+  // consumed server-side as part of the save (see applyAppointmentPackageRedeems).
+  // Optional/empty -> the non-redeem save path is unchanged.
+  packageRedeems?: AppointmentPackageRedeem[];
+  // Mutable collector the save pushes per-redeem skip warnings into (so the route
+  // can surface them without changing AppointmentWithMeta). Optional.
+  packageWarnings?: string[];
 };
 
 // Resolved multi-service plan: the ordered services, the per-position segment
@@ -497,6 +505,8 @@ export async function createDbAppointment({
   cabinId = null,
   staffMap = {},
   cabinMap = {},
+  packageRedeems = [],
+  packageWarnings,
 }: {
   slug: string;
   clientName: string;
@@ -559,6 +569,19 @@ export async function createDbAppointment({
   // Sequential segments: position 0..n, each from cursor to cursor+duration.
   for (const [position, seg] of plan.segments.entries()) {
     await insertAppointmentSegment(slug, id, seg.service, seg.staffId, seg.startsAt, seg.endsAt, seg.durationMinutes, position, seg.cabinId);
+  }
+  // PACKAGE redeem: re-validate + consume + link AFTER the appointment_services
+  // rows exist (the link/zero-charge targets those rows). Skipped entries become
+  // warnings; the booking itself is never failed (legacy best-effort parity).
+  if (packageRedeems.length > 0) {
+    const { warnings } = await applyAppointmentPackageRedeems({
+      slug,
+      appointmentId: id,
+      clientId: client.id,
+      serviceIds: plan.services.map((service) => Number(service.id ?? 0)),
+      redeems: packageRedeems,
+    });
+    if (packageWarnings) packageWarnings.push(...warnings);
   }
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
@@ -669,6 +692,14 @@ export async function updateDbAppointment({
   for (const [position, seg] of plan.segments.entries()) {
     await insertAppointmentSegment(slug, id, seg.service, seg.staffId, seg.startsAt, seg.endsAt, seg.durationMinutes, position, seg.cabinId);
   }
+  // PACKAGE redeem is intentionally NOT applied on edit: this update DELETES and
+  // re-inserts appointment_services on every save, so re-applying a redeem here
+  // would consume the package session AGAIN on each edit (over-consumption). The
+  // quick-booking drawer only ever CREATES appointments (it never sends
+  // package_redeem with an edit id), so `packageRedeems` is accepted for signature
+  // parity but ignored here. TODO(edit redeem): port the legacy
+  // reserve-on-save/consume-on-done + redeemed_at idempotency before consuming on
+  // edit, so re-saves don't double-decrement.
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
@@ -1543,6 +1574,228 @@ export async function consumeDbClientPackage(id: number, sessions: number, slug:
   });
   await tryInsertPackageUsage(slug, id, -quantity, "Consumo manuale pacchetto");
   return getSingleClientPackage(slug, id);
+}
+
+// One entry from the quick-booking `package_redeem` JSON array (assets/js/app.js
+// qbReadPackageRedeem): apply a client's prepaid package to a service so that
+// service is covered (a session is consumed, no charge). `clientPackageServiceId`
+// is optional — it pins the exact `client_package_services` row when sent.
+export type AppointmentPackageRedeem = {
+  clientPackageId: number;
+  serviceId: number;
+  clientPackageServiceId?: number | null;
+};
+
+// Apply the quick-booking PACKAGE redeems for an appointment AS PART of the save.
+// For each requested redeem this RE-VALIDATES server-side (never trusting the
+// client): the package belongs to the appointment's client, is active + not
+// expired, has sessions_remaining > 0, and COVERS the service (a
+// client_package_services row for that service with its own sessions_remaining,
+// or the legacy single client_packages.service_id). On success it consumes ONE
+// session — decrementing the per-service `client_package_services` pool (when
+// present) AND the package-level `client_packages` pool via consumeDbClientPackage
+// (which flips status to 'completed' at 0 and writes the usage ledger) — and links
+// the matching appointment_services row (client_package_id /
+// client_package_service_id) while zeroing its charge (price 0, list_price kept,
+// 'Pacchetto' badge). A redeem that fails validation is SKIPPED (collected as a
+// warning) and never fails the whole booking; the non-redeem path is untouched.
+//
+// Faithful to api_appointments.php + ClientPackages.php (saveAppointmentSelection
+// validation + redeemAppointmentSelectionIfAny consumption), adapted to the Next
+// port's instruction to link on the appointment_services row and consume at save
+// time. TODO(parity): the legacy RESERVES on save and only consumes on status
+// 'done' (with reservation conflict checks across other active bookings) and
+// rolls back on cancel; here we consume immediately on save and do not reconcile
+// on later status changes.
+export async function applyAppointmentPackageRedeems({
+  slug,
+  appointmentId,
+  clientId,
+  serviceIds,
+  redeems,
+}: {
+  slug: string;
+  appointmentId: number;
+  clientId: number;
+  serviceIds: number[]; // service_ids actually on this appointment (the redeem is filtered to these)
+  redeems: AppointmentPackageRedeem[];
+}): Promise<{ applied: AppointmentPackageRedeem[]; warnings: string[] }> {
+  const applied: AppointmentPackageRedeem[] = [];
+  const warnings: string[] = [];
+  if (!redeems.length) return { applied, warnings };
+
+  // Only the appointment_services snapshot table can carry the linkage; if it
+  // lacks the package columns (older installs) we still consume + log a warning.
+  const servicesTable = await tenantTable(slug, "appointment_services").catch(() => null);
+  const hasLinkColumns = servicesTable
+    ? (await columnExists(servicesTable.name, "client_package_id")) &&
+      (await columnExists(servicesTable.name, "client_package_service_id"))
+    : false;
+
+  // Drop redeems for services not on this appointment, and dedupe so a service is
+  // covered by at most ONE package (first wins) — mirrors the legacy per-service
+  // selection map (qb_filter_selection_by_current_services + bySvc map).
+  const onAppointment = new Set(serviceIds.filter((id) => id > 0));
+  const seenService = new Set<number>();
+
+  for (const redeem of redeems) {
+    const clientPackageId = Number(redeem.clientPackageId ?? 0);
+    const serviceId = Number(redeem.serviceId ?? 0);
+    if (clientPackageId <= 0 || serviceId <= 0) continue;
+    if (!onAppointment.has(serviceId)) continue; // service not on the appointment
+    if (seenService.has(serviceId)) continue; // already covered by another package
+    seenService.add(serviceId);
+
+    try {
+      // 1) Load the package, tenant-scoped (tenantSelect scopes to the tenant).
+      const packageRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "client_packages",
+        columns: "id, client_id, package_name, status, expires_at, sessions_remaining, service_id",
+        where: "id = ?",
+        params: [clientPackageId],
+        limit: 1,
+      });
+      const pkg = packageRows[0];
+      if (!pkg) {
+        warnings.push("Pacchetto non trovato.");
+        continue;
+      }
+
+      // 2) Ownership: the package must belong to the appointment's client.
+      if (Number(pkg.client_id ?? 0) !== clientId) {
+        warnings.push("Il pacchetto selezionato non appartiene al cliente.");
+        continue;
+      }
+
+      // 3) Active + not expired + remaining > 0 (effective status, like pkgStatusCalc).
+      const remaining = Math.max(0, Number(pkg.sessions_remaining ?? 0));
+      const expiresYmd = pkg.expires_at ? String(pkg.expires_at).slice(0, 10) : "";
+      const effectiveStatus = clientPackageStatus(String(pkg.status ?? "active"), remaining, expiresYmd);
+      if (effectiveStatus !== "active") {
+        warnings.push(`Pacchetto ${String(pkg.package_name ?? "")} non utilizzabile (${effectiveStatus}).`.trim());
+        continue;
+      }
+      if (remaining <= 0) {
+        warnings.push("Sedute pacchetto esaurite.");
+        continue;
+      }
+
+      // 4) Coverage: prefer a per-service client_package_services row (with its own
+      //    sessions_remaining > 0); fall back to the legacy single service_id.
+      let coverageRowId: number | null = null;
+      let coverageRemaining: number | null = null;
+      let hasAnyCoverageRows = false;
+      try {
+        const coverageRows = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "client_package_services",
+          columns: "id, sessions_remaining",
+          where: "client_package_id = ? AND service_id = ?",
+          params: [clientPackageId, serviceId],
+          orderBy: "sort_order ASC, id ASC",
+          limit: 1,
+        });
+        if (coverageRows[0]) {
+          coverageRowId = Number(coverageRows[0].id ?? 0) || null;
+          coverageRemaining = Math.max(0, Number(coverageRows[0].sessions_remaining ?? 0));
+        }
+        // Does this package have ANY per-service rows at all?
+        const anyRows = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "client_package_services",
+          columns: "id",
+          where: "client_package_id = ?",
+          params: [clientPackageId],
+          limit: 1,
+        });
+        hasAnyCoverageRows = anyRows.length > 0;
+      } catch {
+        // table absent -> treat as legacy single-service package
+      }
+
+      if (coverageRowId === null) {
+        if (hasAnyCoverageRows) {
+          // Package is multi-service but does not include this service -> not covered.
+          warnings.push("Servizio non incluso nel pacchetto selezionato.");
+          continue;
+        }
+        // Legacy single-service package: the cp.service_id must match (when set).
+        const legacyServiceId = Number(pkg.service_id ?? 0);
+        if (legacyServiceId > 0 && legacyServiceId !== serviceId) {
+          warnings.push("Servizio non incluso nel pacchetto selezionato.");
+          continue;
+        }
+      } else if (coverageRemaining !== null && coverageRemaining <= 0) {
+        // Per-service pool exhausted even though the package-level pool is not.
+        warnings.push("Sedute pacchetto esaurite per il servizio selezionato.");
+        continue;
+      }
+
+      // 5) Consume ONE session. Decrement the AUTHORITATIVE package-level pool FIRST
+      //    via consumeDbClientPackage (it re-reads remaining and THROWS on
+      //    insufficient sessions + flips status to 'completed' at 0 + writes the
+      //    usage ledger) — so we never over-consume, and a failure here leaves the
+      //    per-service pool untouched. Then mirror the decrement on the per-service
+      //    client_package_services row, keeping package.remaining == SUM(cps.remaining)
+      //    (the legacy recomputes the package total from the cps rows after redeem).
+      await consumeDbClientPackage(clientPackageId, 1, slug);
+      if (coverageRowId !== null && coverageRemaining !== null) {
+        await tenantUpdate({
+          slug,
+          table: "client_package_services",
+          id: coverageRowId,
+          values: { sessions_remaining: Math.max(0, coverageRemaining - 1) },
+        });
+      }
+
+      // 6) Link the appointment_services row + zero its charge (keep list_price).
+      if (hasLinkColumns && servicesTable) {
+        await updateAppointmentServicePackageLink(slug, servicesTable, appointmentId, serviceId, {
+          clientPackageId,
+          clientPackageServiceId: coverageRowId ?? redeem.clientPackageServiceId ?? null,
+        });
+      } else {
+        warnings.push("Sessione pacchetto consumata, ma il collegamento al servizio non è disponibile su questo archivio.");
+      }
+
+      applied.push({ clientPackageId, serviceId, clientPackageServiceId: coverageRowId ?? null });
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : "Errore riscatto pacchetto.");
+    }
+  }
+
+  return { applied, warnings };
+}
+
+// Set the package linkage on a single appointment_services row (keyed by the
+// composite appointment_id + service_id — the table has no surrogate id) and zero
+// its charge: price 0, list_price preserved as the catalog reference, and a
+// 'Pacchetto' discount_badge (faithful to the legacy zero-charge presentation).
+async function updateAppointmentServicePackageLink(
+  slug: string,
+  table: TenantTable,
+  appointmentId: number,
+  serviceId: number,
+  link: { clientPackageId: number; clientPackageServiceId: number | null },
+): Promise<void> {
+  const assignments: string[] = [
+    "client_package_id = ?",
+    "client_package_service_id = ?",
+    "price = 0",
+  ];
+  const params: unknown[] = [link.clientPackageId, link.clientPackageServiceId];
+  if (await columnExists(table.name, "discount_badge")) assignments.push("discount_badge = 'Pacchetto'");
+  const clauses = ["appointment_id = ?", "service_id = ?"];
+  params.push(appointmentId, serviceId);
+  if (table.mode === "shared" && (await columnExists(table.name, "tenant_id"))) {
+    clauses.push("tenant_id = ?");
+    params.push(table.tenantId ?? 0);
+  }
+  await dbExecute(
+    `UPDATE ${quoteIdentifier(table.name)} SET ${assignments.join(", ")} WHERE ${clauses.join(" AND ")}`,
+    params,
+  );
 }
 
 export async function listDbPrepaids(slug: string): Promise<ClientPrepaid[]> {
@@ -3802,9 +4055,26 @@ export type QuickBookClientResidualsSummary = {
   total: number;
 };
 
+// One available (redeemable) package for the quick-booking drawer's per-service
+// "Usa pacchetto" control. `service_ids` are the services this package COVERS and
+// still has sessions for (the per-service `client_package_services` rows with
+// sessions_remaining > 0, or the legacy single `client_packages.service_id`).
+// `serviceItemIds` maps a covered service_id -> its `client_package_services.id`
+// (the legacy `client_package_service_id`) so the redeem can pin the exact row;
+// absent for legacy single-service packages (the package-level pool is used).
+export type QuickBookClientPackage = {
+  id: number;
+  name: string;
+  sessions_remaining: number;
+  expires_at: string | null;
+  service_ids: number[];
+  serviceItemIds: Record<number, number>;
+};
+
 export type QuickBookClientContext = {
   history: QuickBookClientHistorySummary;
   residuals: QuickBookClientResidualsSummary;
+  packages: QuickBookClientPackage[];
 };
 
 // History summary — port of api_clients.php lines ~3926-3958:
@@ -4049,9 +4319,102 @@ export async function quickBookClientContext({
   locationId?: number;
 }): Promise<QuickBookClientContext> {
   if (clientId <= 0) throw new Error("client_id mancante");
-  const [history, residuals] = await Promise.all([
+  const [history, residuals, packages] = await Promise.all([
     quickBookClientHistorySummary(slug, clientId),
     quickBookClientResidualsSummary(slug, clientId),
+    quickBookClientPackages(slug, clientId),
   ]);
-  return { history, residuals };
+  return { history, residuals, packages };
+}
+
+// Available (redeemable) packages for a client, with the services each package
+// covers — drives the drawer's per-service "Usa pacchetto" control. Port of the
+// api_clients.php action=residuals PACKAGE block (the "available" filter +
+// per-service `client_package_services` breakdown), narrowed to what the redeem
+// UI needs. Tenant-scoped via `tenantSelect`; every read is guarded so a missing
+// table/column degrades to an empty list (mirrors the legacy table_exists guards).
+//
+// "Available" mirrors the legacy WHERE exactly: status='active' AND
+// sessions_remaining > 0 AND (expires_at IS NULL OR expires_at >= CURRENT_DATE),
+// client-scoped. Coverage is the per-service `client_package_services` rows with
+// their own sessions_remaining > 0; when a package has no such rows we fall back
+// to the legacy single `client_packages.service_id` (package-level pool).
+async function quickBookClientPackages(slug: string, clientId: number): Promise<QuickBookClientPackage[]> {
+  if (clientId <= 0) return [];
+  let packageRows: RowDataPacket[] = [];
+  try {
+    const packageTable = await tenantTable(slug, "client_packages");
+    const hasExpiry = await columnExists(packageTable.name, "expires_at");
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    packageRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_packages",
+      columns: "id, package_name, sessions_remaining, service_id, expires_at",
+      where: `client_id = ? AND status = 'active' AND sessions_remaining > 0${expiry}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 50,
+    });
+  } catch {
+    return [];
+  }
+  if (packageRows.length === 0) return [];
+
+  // Per-service coverage rows (own sessions_remaining > 0) for all packages at once.
+  const ids = packageRows.map((row) => Number(row.id ?? 0)).filter((id) => id > 0);
+  const coverageByPackage = new Map<number, Array<{ serviceId: number; itemId: number }>>();
+  if (ids.length > 0) {
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      const coverageRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "client_package_services",
+        columns: "id, client_package_id, service_id, sessions_remaining",
+        where: `client_package_id IN (${placeholders}) AND sessions_remaining > 0`,
+        params: ids,
+        orderBy: "client_package_id ASC, sort_order ASC, id ASC",
+      });
+      for (const row of coverageRows) {
+        const packageId = Number(row.client_package_id ?? 0);
+        const serviceId = Number(row.service_id ?? 0);
+        const itemId = Number(row.id ?? 0);
+        if (packageId <= 0 || serviceId <= 0) continue;
+        const list = coverageByPackage.get(packageId) ?? [];
+        list.push({ serviceId, itemId });
+        coverageByPackage.set(packageId, list);
+      }
+    } catch {
+      // client_package_services may be absent (legacy single-service packages only).
+    }
+  }
+
+  const out: QuickBookClientPackage[] = [];
+  for (const row of packageRows) {
+    const id = Number(row.id ?? 0);
+    if (id <= 0) continue;
+    const coverage = coverageByPackage.get(id) ?? [];
+    const serviceIds: number[] = [];
+    const serviceItemIds: Record<number, number> = {};
+    if (coverage.length > 0) {
+      for (const { serviceId, itemId } of coverage) {
+        if (!serviceIds.includes(serviceId)) serviceIds.push(serviceId);
+        // First (lowest sort_order) covering row wins for the pin id.
+        if (serviceItemIds[serviceId] === undefined) serviceItemIds[serviceId] = itemId;
+      }
+    } else {
+      // Legacy single-service package: cover only client_packages.service_id.
+      const legacyServiceId = Number(row.service_id ?? 0);
+      if (legacyServiceId > 0) serviceIds.push(legacyServiceId);
+    }
+    if (serviceIds.length === 0) continue; // nothing this package can cover -> not offerable
+    out.push({
+      id,
+      name: String(row.package_name ?? "Pacchetto"),
+      sessions_remaining: Math.max(0, Number(row.sessions_remaining ?? 0)),
+      expires_at: row.expires_at ? String(row.expires_at).slice(0, 10) : null,
+      service_ids: serviceIds,
+      serviceItemIds,
+    });
+  }
+  return out;
 }

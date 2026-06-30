@@ -16,7 +16,7 @@ import { normalizeTenantSlug, tenantPrefix } from "@/lib/tenant-runtime";
 
 type TableMode = "prefixed" | "shared" | "base";
 
-type TenantTable = {
+export type TenantTable = {
   name: string;
   mode: TableMode;
   tenantId: number | null;

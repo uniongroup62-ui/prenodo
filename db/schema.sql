@@ -161,6 +161,14 @@ CREATE TABLE "appointment_services" (
   "list_price" numeric(10,2) DEFAULT 0.00 NOT NULL,
   "discount_badge" varchar(32),
   "duration_min" integer DEFAULT 0 NOT NULL,
+  -- Package redeem linkage (quick-booking "Usa pacchetto"): when a service is
+  -- covered by a client's prepaid package the row is linked to the consumed
+  -- package (and, for multi-service packages, the specific client_package_services
+  -- row) and its `price` is zeroed (the catalog price is preserved in list_price
+  -- with a 'Pacchetto' discount_badge). Mirrors the legacy linkage the PHP keeps
+  -- in `appointment_package_items` (api.client_package_id/client_package_service_id).
+  "client_package_id" integer,
+  "client_package_service_id" integer,
   PRIMARY KEY ("tenant_id", "appointment_id", "service_id")
 );
 

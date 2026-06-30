@@ -175,7 +175,29 @@ type QbResidualsSummary = {
   credit_count?: number;
   credit_available?: number;
 };
-type QbClientContextResponse = { ok?: boolean; summary?: QbHistorySummary; residuals?: QbResidualsSummary };
+// One available (redeemable) package for the per-service "Usa pacchetto" control
+// (port of api_clients.php action=residuals package block; returned by
+// quickbook_client_context). `service_ids` are the services this package COVERS;
+// `serviceItemIds` maps covered service_id -> its client_package_services.id (the
+// client_package_service_id used to pin the redeem), absent for legacy packages.
+type QbClientPackage = {
+  id: number;
+  name: string;
+  sessions_remaining: number;
+  expires_at?: string | null;
+  service_ids: number[];
+  serviceItemIds?: Record<number, number>;
+};
+type QbClientContextResponse = {
+  ok?: boolean;
+  summary?: QbHistorySummary;
+  residuals?: QbResidualsSummary;
+  packages?: QbClientPackage[];
+};
+
+// One entry written to #qb_package_redeem (assets/js/app.js qbReadPackageRedeem):
+// a per-service request to cover that service with the client's prepaid package.
+type QbPackageRedeem = { client_package_id: number; service_id: number; client_package_service_id: number | null };
 
 // History summary line, EXACT port of qbLoadClientHistory: "Appuntamenti: N •
 // Ultimo: … • Prossimo: …" (+ " • Vendite: €…" when sales_total > 0).
@@ -232,6 +254,15 @@ export function QuickBookingDrawer() {
   const [residualsError, setResidualsError] = useState<string>("");
   const [contextLoading, setContextLoading] = useState(false);
   const contextReqRef = useRef(0);
+
+  // ---- PACKAGE redeem (#qb_package_redeem) ----
+  // The selected client's AVAILABLE packages (covering >=1 service, with sessions
+  // left), and the per-service redeem selection the staff applies in the drawer.
+  // `packageRedeems` is keyed by service_id (one package covers a service at most
+  // once); it is serialized to #qb_package_redeem and sent on save. Both are
+  // cleared on client change (clearClientContext) and pruned on service change.
+  const [clientPackages, setClientPackages] = useState<QbClientPackage[]>([]);
+  const [packageRedeems, setPackageRedeems] = useState<Record<number, QbPackageRedeem>>({});
 
   // ---- Services multiselect state ----
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([]);
@@ -316,6 +347,8 @@ export function QuickBookingDrawer() {
     setResidualsSummary(null);
     setResidualsError("");
     setContextLoading(false);
+    setClientPackages([]);
+    setPackageRedeems({});
     setSelectedServiceIds([]);
     setStaffPicks({});
     setCabinPicks({});
@@ -605,6 +638,66 @@ export function QuickBookingDrawer() {
 
   const needle = lower(serviceSearch);
 
+  // ---- PACKAGE redeem derivation (per-service "Usa pacchetto") ----
+  // For each SELECTED service, the client's available packages that COVER it (and
+  // still have sessions). Drives the per-service control; a service with no
+  // covering package shows nothing. Recomputed from the loaded packages + the
+  // current selection (no effect/state — like the rest of this file).
+  const packageOptionsByService = useMemo<Record<number, QbClientPackage[]>>(() => {
+    const out: Record<number, QbClientPackage[]> = {};
+    for (const serviceId of selectedServiceIds) {
+      const covering = clientPackages.filter(
+        (pkg) => pkg.sessions_remaining > 0 && pkg.service_ids.includes(serviceId),
+      );
+      if (covering.length) out[serviceId] = covering;
+    }
+    return out;
+  }, [selectedServiceIds, clientPackages]);
+
+  // Effective per-service redeem selection: keep only entries whose service is
+  // still selected AND whose package still covers it (prunes on service/client
+  // change). This DERIVED map (not raw `packageRedeems`) drives the UI + the
+  // serialized payload, so a stale pick can never leak into the save.
+  const effectivePackageRedeems = useMemo<Record<number, QbPackageRedeem>>(() => {
+    const out: Record<number, QbPackageRedeem> = {};
+    for (const serviceId of selectedServiceIds) {
+      const pick = packageRedeems[serviceId];
+      if (!pick) continue;
+      const options = packageOptionsByService[serviceId] ?? [];
+      if (options.some((pkg) => pkg.id === pick.client_package_id)) out[serviceId] = pick;
+    }
+    return out;
+  }, [selectedServiceIds, packageRedeems, packageOptionsByService]);
+
+  // Serialize the effective redeem -> #qb_package_redeem JSON array (the shape
+  // assets/js/app.js qbReadPackageRedeem produces and the save route parses).
+  const packageRedeemJson = useMemo(() => {
+    const arr = Object.values(effectivePackageRedeems);
+    return arr.length ? JSON.stringify(arr) : "";
+  }, [effectivePackageRedeems]);
+
+  // Apply / clear a package on a service. Selecting records {client_package_id,
+  // service_id, client_package_service_id}; clearing removes the entry. Changing
+  // services never invalidates a hold (the redeem doesn't move the slot).
+  const setPackageForService = useCallback(
+    (serviceId: number, pkg: QbClientPackage | null) => {
+      setPackageRedeems((prev) => {
+        const next = { ...prev };
+        if (!pkg) {
+          delete next[serviceId];
+        } else {
+          next[serviceId] = {
+            client_package_id: pkg.id,
+            service_id: serviceId,
+            client_package_service_id: pkg.serviceItemIds?.[serviceId] ?? null,
+          };
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
   // ---- Client HISTORY + RESIDUALS fetch (port of qbLoadClientHistory + qbLoadClientResiduals) ----
   // Driven from the client select/clear flow (NOT an effect) so it never calls
   // setState synchronously inside an effect body — matching this file's
@@ -621,6 +714,9 @@ export function QuickBookingDrawer() {
     setResidualsSummary(null);
     setResidualsError("");
     setContextLoading(false);
+    // The packages + per-service redeem belong to the client; clear on client change.
+    setClientPackages([]);
+    setPackageRedeems({});
   }, []);
 
   const loadClientContext = useCallback(
@@ -631,6 +727,9 @@ export function QuickBookingDrawer() {
       setHistoryError("");
       setResidualsSummary(null);
       setResidualsError("");
+      // New client -> drop any previous packages + per-service redeem selection.
+      setClientPackages([]);
+      setPackageRedeems({});
 
       const params = new URLSearchParams({ slug, action: "quickbook_client_context", client_id: id });
       const locId = String(locationId || "").trim();
@@ -647,6 +746,7 @@ export function QuickBookingDrawer() {
           }
           setHistorySummary(data.summary ?? {});
           setResidualsSummary(data.residuals ?? {});
+          setClientPackages(Array.isArray(data.packages) ? data.packages : []);
         })
         .catch(() => {
           if (myReq !== contextReqRef.current) return;
@@ -884,6 +984,9 @@ export function QuickBookingDrawer() {
             staff_map: staffMapRaw,
             cabin_map: cabinMapRaw,
             cabin_id: effectiveCabinId,
+            // PACKAGE redeem: per-service requests to cover a service with the
+            // client's prepaid package (re-validated + consumed server-side).
+            package_redeem: packageRedeemJson,
             date,
             time: startTime,
             location_id: locationId,
@@ -892,10 +995,15 @@ export function QuickBookingDrawer() {
             appointment_hold_token: holdToken,
           }),
         });
-        const data: { ok?: boolean; error?: string } = await res.json().catch(() => ({}));
+        const data: { ok?: boolean; error?: string; packageWarnings?: string[] } = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false || data.error) {
           setFormError(String(data.error || "Errore salvataggio."));
           return;
+        }
+        // Per-redeem skips don't fail the booking, but surface them before the
+        // reload so the staff knows a package wasn't applied (legacy notify parity).
+        if (Array.isArray(data.packageWarnings) && data.packageWarnings.length > 0) {
+          if (typeof window !== "undefined") window.alert("Pacchetti:\n" + data.packageWarnings.join("\n"));
         }
         closeOffcanvas();
         // Refresh the page so any calendar/list on screen shows the new booking,
@@ -907,7 +1015,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, closeOffcanvas],
+    [client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, closeOffcanvas],
   );
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
@@ -951,7 +1059,7 @@ export function QuickBookingDrawer() {
             <input type="hidden" name="id" id="qb_appt_id" value="" readOnly />
             <input type="hidden" name="giftbox_redeem" id="qb_giftbox_redeem" value="" readOnly />
             <input type="hidden" name="gift_redeem" id="qb_gift_redeem" value="" readOnly />
-            <input type="hidden" name="package_redeem" id="qb_package_redeem" value="" readOnly />
+            <input type="hidden" name="package_redeem" id="qb_package_redeem" value={packageRedeemJson} readOnly />
             <input type="hidden" name="prepaid_service_redeem" id="qb_prepaid_service_redeem" value="" readOnly />
             <input type="hidden" name="giftcard_redeem" id="qb_giftcard_redeem" value="" readOnly />
 
@@ -1169,6 +1277,75 @@ export function QuickBookingDrawer() {
               <div id="qb_service_ids_container" />
               <div className="form-text">Seleziona i servizi dal menu: puoi cercare, scegliere più servizi e la durata verrà calcolata automaticamente.</div>
             </div>
+
+            {/* PACKAGE redeem (Pacchetti) — per-service "Usa pacchetto" control.
+                Faithful to the legacy intent (assets/js/app.js residuals package
+                block: a per-service selection that writes {client_package_id,
+                service_id, client_package_service_id} into #qb_package_redeem). Only
+                shown for SELECTED services the client has an available covering
+                package for; a covered service reads "Incluso nel pacchetto" with no
+                charge. Selecting consumes a session on save (validated server-side). */}
+            {Object.keys(packageOptionsByService).length > 0 ? (
+              <div className="card p-2 mb-3" id="qbPackageRedeemBox">
+                <div className="fw-bold mb-1">Pacchetti</div>
+                <div className="text-muted small mb-2">
+                  Applica un pacchetto del cliente a un servizio: la seduta verrà scalata dal pacchetto e il servizio non sarà addebitato.
+                </div>
+                {selectedServiceIds.map((serviceId) => {
+                  const options = packageOptionsByService[serviceId];
+                  if (!options || options.length === 0) return null;
+                  const svc = services.find((s) => s.id === serviceId);
+                  const serviceName = svc?.name ?? `Servizio #${serviceId}`;
+                  const redeem = effectivePackageRedeems[serviceId];
+                  const selectedPkg = redeem ? options.find((pkg) => pkg.id === redeem.client_package_id) ?? null : null;
+                  return (
+                    <div className="border-top pt-2 mt-2 qb-cp-package" key={serviceId} data-service-id={serviceId}>
+                      <div className="d-flex justify-content-between align-items-center">
+                        <div className="fw-semibold">{serviceName}</div>
+                        {selectedPkg ? (
+                          <span className="badge badge-soft text-success">Incluso nel pacchetto</span>
+                        ) : null}
+                      </div>
+                      <div className="d-flex align-items-center gap-2 mt-1">
+                        <select
+                          className="form-select form-select-sm qb-cp-svc-select"
+                          data-service-id={serviceId}
+                          aria-label={`Usa pacchetto per ${serviceName}`}
+                          value={selectedPkg ? String(selectedPkg.id) : ""}
+                          onChange={(e) => {
+                            const id = Number.parseInt(e.target.value, 10);
+                            const pkg = options.find((p) => p.id === id) ?? null;
+                            setPackageForService(serviceId, pkg);
+                          }}
+                        >
+                          <option value="">Non usare pacchetto</option>
+                          {options.map((pkg) => (
+                            <option value={pkg.id} key={pkg.id}>
+                              Usa pacchetto: {pkg.name} ({pkg.sessions_remaining} residue)
+                            </option>
+                          ))}
+                        </select>
+                        {selectedPkg ? (
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-link text-danger p-0 qb-cp-remove"
+                            onClick={() => setPackageForService(serviceId, null)}
+                            title="Rimuovi pacchetto"
+                          >
+                            Rimuovi
+                          </button>
+                        ) : null}
+                      </div>
+                      {selectedPkg ? (
+                        <div className="small text-success mt-1">
+                          Incluso nel pacchetto {selectedPkg.name} — nessun addebito.
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
 
             <div className="row g-2">
               <div className="col-12">

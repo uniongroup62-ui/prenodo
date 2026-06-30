@@ -13,6 +13,7 @@ import {
   listDbAppointments,
   updateDbAppointment,
   updateDbAppointmentStatus,
+  type AppointmentPackageRedeem,
 } from "@/lib/db-repositories";
 import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/lib/appointment-lifecycle-email";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -302,6 +303,11 @@ export async function POST(request: Request) {
     const cabinMap = parseIdMap(body.cabin_map);
     const explicitCabinId = parseOptionalId(body.cabin_id);
     const serviceIds = parseIdList(body.service_ids);
+    // Quick-booking PACKAGE redeem (#qb_package_redeem JSON array): per-service
+    // requests to cover a service with the client's prepaid package. Parsed here,
+    // re-validated + consumed server-side inside createDbAppointment (never trusted).
+    const packageRedeems = parsePackageRedeem(body.package_redeem);
+    const packageWarnings: string[] = [];
     let serviceNames = parseServiceNamesFromBody(body);
     if (serviceIds.length > 0) {
       // `service_ids` is unambiguous (no comma-in-name issue) so it wins when sent.
@@ -329,6 +335,8 @@ export async function POST(request: Request) {
       holdToken,
       staffNotes: emptyToNull(String(body.staff_notes ?? "")),
       customerNotes: emptyToNull(String(body.customer_notes ?? body.notes ?? "")),
+      packageRedeems,
+      packageWarnings,
     };
 
     let appointment;
@@ -358,6 +366,9 @@ export async function POST(request: Request) {
       sourceMode: "database",
       appointment,
       appointments: await listDbAppointments({ slug: tenantSlug }),
+      // Per-redeem skip messages (e.g. package not covering a service / exhausted):
+      // the booking still succeeds (legacy best-effort parity); the drawer may show them.
+      ...(packageWarnings.length > 0 ? { packageWarnings } : {}),
     });
   } catch (error) {
     return Response.json(
@@ -478,6 +489,46 @@ function parseOptionalId(raw: unknown): number | null {
   if (raw === null || raw === undefined || raw === "") return null;
   const id = Number.parseInt(String(raw).trim(), 10);
   return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+// Parse the quick-booking `package_redeem` payload — a JSON array (or already an
+// array) of { client_package_id, service_id, client_package_service_id? } items —
+// into AppointmentPackageRedeem[]. Mirrors assets/js/app.js qbReadPackageRedeem:
+// items missing a positive client_package_id or service_id are dropped, and a
+// service is kept at most once (first wins) since one service is covered by one
+// package. The real validation (ownership/active/coverage/sessions) happens
+// server-side in applyAppointmentPackageRedeems — this only shapes the input.
+function parsePackageRedeem(raw: unknown): AppointmentPackageRedeem[] {
+  let source: unknown = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      source = JSON.parse(trimmed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(source)) return [];
+  const out: AppointmentPackageRedeem[] = [];
+  const seenService = new Set<number>();
+  for (const item of source) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    const clientPackageId = Number.parseInt(String(entry.client_package_id ?? ""), 10);
+    const serviceId = Number.parseInt(String(entry.service_id ?? ""), 10);
+    if (!Number.isFinite(clientPackageId) || clientPackageId <= 0) continue;
+    if (!Number.isFinite(serviceId) || serviceId <= 0) continue;
+    if (seenService.has(serviceId)) continue;
+    seenService.add(serviceId);
+    const rawItemId = Number.parseInt(String(entry.client_package_service_id ?? ""), 10);
+    out.push({
+      clientPackageId,
+      serviceId,
+      clientPackageServiceId: Number.isFinite(rawItemId) && rawItemId > 0 ? rawItemId : null,
+    });
+  }
+  return out;
 }
 
 function resolveServiceIds(context: PublicBookingContext, serviceNames: string[]): number[] {
