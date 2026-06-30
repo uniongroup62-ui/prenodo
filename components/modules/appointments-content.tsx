@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 
 // Pixel-faithful port of the PHP appointments list page (?page=appointments),
 // fed by the existing DB-backed /api/manage/appointments?action=list.
@@ -23,15 +23,29 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react
 // by a separate widget not present in Next) is intentionally not ported; the drawer
 // here reuses the legacy Bootstrap classes so it stays on-brand.
 //
-// FAITHFUL-BUT-STATIC: the bulk-delete form and the new-appointment quick-booking
-// flow are reproduced as inert markup (no submit/JS handlers). Legacy `_csrf`
-// hidden inputs are dropped.
+// WIRED (live): DELETE — the per-row "Elimina" POSTs action=delete (JSON, confirm)
+// and the header "select all" + per-row checkboxes drive the selection that the
+// "Elimina selezionati" button POSTs as action=bulk_delete (confirm). The route
+// restores the redeems the appointment consumed (deleteDbAppointment) and returns the
+// refreshed list; the component re-fetches after each delete. Legacy `_csrf` hidden
+// inputs are dropped; the per-row href stays as the legacy ?action=delete URL but is
+// intercepted (preventDefault) so it never navigates.
+//
+// FAITHFUL-BUT-STATIC: the new-appointment quick-booking flow is reproduced as inert
+// markup (no submit/JS handlers) — handled by the global "Nuova prenotazione" drawer.
 //
 // DATA NOTE: the Next API returns { id, date, locationId, time, client, service,
-// operator, room, price, status } and exposes NO booking code and NO end time.
-// The PHP page rendered `<code>#NNNNN</code>` and a `start → end` range; here the
-// code column is synthesized as `#{id}` and the date cell shows the start time
-// only (the API does not return an end time / booking code).
+// operator, room, price, status, publicCode, services[] }. The "Codice prenotazione"
+// column shows the real appointments.public_code when present (fallback `#{id}`), and
+// a multi-service appointment renders as a parent row + collapsible per-service child
+// rows (legacy ms-parent / ms-children). The date cell still shows the start time only
+// (the API does not return an end time).
+
+type AppointmentServiceLine = {
+  serviceId: number;
+  name: string;
+  price: string;
+};
 
 type Appointment = {
   id: number;
@@ -44,6 +58,11 @@ type Appointment = {
   room: string;
   price: string;
   status: string;
+  // Real booking code (appointments.public_code); null -> fall back to #id.
+  publicCode?: string | null;
+  // Ordered service list for the multi-service parent/child rendering. A single-service
+  // appointment carries one entry; absent/empty -> render the single `service` string.
+  services?: AppointmentServiceLine[];
 };
 
 function tenantSlug(): string {
@@ -104,6 +123,20 @@ export function AppointmentsContent() {
   const [form, setForm] = useState({ client: "", service: "", operator: "", date: "", time: "", staffNotes: "", customerNotes: "" });
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+
+  // Bulk-delete state: the set of selected appointment ids (drives the per-row +
+  // "select all" checkboxes and the "Elimina selezionati" button), and a deleting
+  // flag that disables the delete controls while a request is in flight.
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [deleting, setDeleting] = useState(false);
+
+  // Multi-service grouping: the set of appointment ids whose child service rows are
+  // expanded (legacy ms-children Bootstrap collapse, driven inline since the Bootstrap
+  // JS bundle is not loaded here).
+  const [expandedRows, setExpandedRows] = useState<number[]>([]);
+  const toggleExpanded = useCallback((id: number) => {
+    setExpandedRows((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }, []);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -186,6 +219,62 @@ export function AppointmentsContent() {
     [editing, form, load, saving, slug],
   );
 
+  // POST a delete (single id) / bulk_delete (CSV ids) to the manage route, then
+  // refresh the list. The route restores the consumed redeems server-side
+  // (deleteDbAppointment) and returns the refreshed list; we re-fetch via load() so
+  // the table + selection reflect the server truth.
+  const runDelete = useCallback(
+    async (ids: number[]) => {
+      if (!ids.length || deleting) return;
+      setDeleting(true);
+      try {
+        const res = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify(
+            ids.length === 1
+              ? { action: "delete", id: ids[0] }
+              : { action: "bulk_delete", ids: ids.join(",") },
+          ),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || json?.ok === false || json?.error) {
+          window.alert(String(json?.error || "Errore durante l'eliminazione dell'appuntamento."));
+          return;
+        }
+        // Drop the deleted ids from the selection, then reload from the server.
+        setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
+        load();
+      } catch {
+        window.alert("Errore di rete durante l'eliminazione.");
+      } finally {
+        setDeleting(false);
+      }
+    },
+    [deleting, load, slug],
+  );
+
+  // Per-row "Elimina": confirm then delete the single appointment.
+  const deleteOne = useCallback(
+    (id: number) => {
+      if (!window.confirm("Eliminare questo appuntamento?")) return;
+      void runDelete([id]);
+    },
+    [runDelete],
+  );
+
+  // "Elimina selezionati": confirm then bulk-delete the selected appointments.
+  const deleteSelected = useCallback(() => {
+    if (!selectedIds.length) return;
+    if (!window.confirm(`Eliminare ${selectedIds.length} appuntamenti selezionati?`)) return;
+    void runDelete(selectedIds);
+  }, [runDelete, selectedIds]);
+
+  // Toggle one row's checkbox in the selection set.
+  const toggleSelected = useCallback((id: number, checked: boolean) => {
+    setSelectedIds((prev) => (checked ? (prev.includes(id) ? prev : [...prev, id]) : prev.filter((x) => x !== id)));
+  }, []);
+
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
     return appointments.filter((appt) => {
@@ -193,12 +282,26 @@ export function AppointmentsContent() {
       if (from && day && day < from) return false;
       if (to && day && day > to) return false;
       if (term) {
-        const haystack = `${appt.client} #${appt.id}`.toLowerCase();
+        const code = appt.publicCode ? String(appt.publicCode) : `#${appt.id}`;
+        const haystack = `${appt.client} ${code} #${appt.id}`.toLowerCase();
         if (!haystack.includes(term)) return false;
       }
       return true;
     });
   }, [appointments, from, to, q]);
+
+  // Selection helpers over the CURRENTLY VISIBLE (filtered) rows: the "select all"
+  // header checkbox checks/clears these ids, and reflects "all visible selected".
+  const visibleIds = useMemo(() => filtered.map((appt) => appt.id), [filtered]);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+  const toggleSelectAll = useCallback(
+    (checked: boolean) => {
+      setSelectedIds((prev) =>
+        checked ? Array.from(new Set([...prev, ...visibleIds])) : prev.filter((id) => !visibleIds.includes(id)),
+      );
+    },
+    [visibleIds],
+  );
 
   function pageHref(suffix: string): string {
     return `/${encodeURIComponent(slug)}/index.php?page=appointments${suffix}`;
@@ -288,21 +391,25 @@ export function AppointmentsContent() {
         <div className="appointments-list-card">
           <div className="appointments-list-toolbar">
             <div className="appointments-selection-info" id="bulkSelInfo">
-              0 selezionati
+              {selectedIds.length} selezionati
             </div>
-            {/* Faithful-but-static: legacy bulk-delete form (no submit handler, _csrf dropped). */}
+            {/* Bulk-delete: the selected ids drive #bulkDeleteIds (kept for markup
+                parity); the button POSTs action=bulk_delete (confirm) via deleteSelected. */}
             <form
               method="post"
               action={pageHref("&action=bulk_delete")}
               className="appointments-bulk-actions"
-              onSubmit={(e) => e.preventDefault()}
+              onSubmit={(e) => {
+                e.preventDefault();
+                deleteSelected();
+              }}
             >
-              <input type="hidden" name="ids" id="bulkDeleteIds" value="" />
+              <input type="hidden" name="ids" id="bulkDeleteIds" value={selectedIds.join(",")} />
               <button
                 className="btn btn-outline-danger appointments-bulk-delete"
                 type="submit"
                 id="bulkDeleteBtn"
-                disabled
+                disabled={selectedIds.length === 0 || deleting}
               >
                 <i className="bi bi-trash me-1"></i>Elimina selezionati
               </button>
@@ -313,7 +420,14 @@ export function AppointmentsContent() {
               <thead>
                 <tr>
                   <th className="appointments-select-col">
-                    <input className="form-check-input" type="checkbox" id="apptSelectAll" aria-label="Seleziona tutti" />
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="apptSelectAll"
+                      aria-label="Seleziona tutti"
+                      checked={allVisibleSelected}
+                      onChange={(e) => toggleSelectAll(e.target.checked)}
+                    />
                   </th>
                   <th>Data</th>
                   <th>Cliente</th>
@@ -334,51 +448,110 @@ export function AppointmentsContent() {
                 ) : (
                   filtered.map((appt) => {
                     const badge = statusBadge(appt.status);
+                    // Real booking code when present, else the synthesized #id.
+                    const code = appt.publicCode ? String(appt.publicCode) : `#${appt.id}`;
+                    // MULTI-SERVICE: a parent row + one collapsible child row per service
+                    // (legacy ms-parent / ms-children). Only group when there is >1 service.
+                    const lines = appt.services && appt.services.length > 0 ? appt.services : [{ serviceId: 0, name: appt.service, price: appt.price }];
+                    const isMulti = lines.length > 1;
+                    const collapseId = `apptMs${appt.id}`;
+                    const expanded = expandedRows.includes(appt.id);
                     return (
-                      <tr key={appt.id}>
-                        <td>
-                          <input
-                            className="form-check-input appt-select"
-                            type="checkbox"
-                            value={appt.id}
-                            aria-label="Seleziona appuntamento"
-                            title=""
-                          />
-                        </td>
-                        <td>
-                          {fmtDate(appt.date)} {appt.time}
-                        </td>
-                        <td className="fw-semibold">{appt.client}</td>
-                        <td className="text-muted">
-                          <code>#{appt.id}</code>
-                        </td>
-                        <td className="text-muted">{appt.service}</td>
-                        <td className="text-muted">{appt.operator}</td>
-                        <td>
-                          <span className={`appointments-status-badge ${badge.className}`}>{badge.label}</span>
-                        </td>
-                        <td className="text-end">
-                          {/* Native edit: opens the prefilled drawer (action=save WITH id). */}
-                          <a
-                            className="btn btn-sm btn-outline-secondary"
-                            href="#"
-                            data-qb-edit={appt.id}
-                            onClick={(e) => {
-                              e.preventDefault();
-                              openEdit(appt);
-                            }}
-                          >
-                            Modifica
-                          </a>{" "}
-                          <a
-                            className="btn btn-sm btn-outline-danger"
-                            href={pageHref(`&action=delete&id=${appt.id}`)}
-                            data-confirm="Eliminare questo appuntamento?"
-                          >
-                            Elimina
-                          </a>
-                        </td>
-                      </tr>
+                      <Fragment key={appt.id}>
+                        <tr className={isMulti ? "ms-parent" : undefined}>
+                          <td>
+                            <input
+                              className="form-check-input appt-select"
+                              type="checkbox"
+                              value={appt.id}
+                              aria-label="Seleziona appuntamento"
+                              title=""
+                              checked={selectedIds.includes(appt.id)}
+                              onChange={(e) => toggleSelected(appt.id, e.target.checked)}
+                            />
+                          </td>
+                          <td>
+                            {fmtDate(appt.date)} {appt.time}
+                          </td>
+                          <td className="fw-semibold">{appt.client}</td>
+                          <td className="text-muted">
+                            <code>{code}</code>
+                          </td>
+                          <td className="text-muted">
+                            {isMulti ? (
+                              // Parent service cell: a collapse toggle showing the count.
+                              // data-bs-* kept for legacy fidelity; the inline expandedRows
+                              // state actually drives the child rows (no Bootstrap JS here).
+                              <a
+                                className="appointments-ms-toggle"
+                                href={`#${collapseId}`}
+                                role="button"
+                                data-bs-toggle="collapse"
+                                data-bs-target={`#${collapseId}`}
+                                aria-expanded={expanded}
+                                aria-controls={collapseId}
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  toggleExpanded(appt.id);
+                                }}
+                              >
+                                <i className={`bi ${expanded ? "bi-chevron-down" : "bi-chevron-right"} me-1`}></i>
+                                {lines.length} servizi
+                              </a>
+                            ) : (
+                              lines[0]?.name ?? appt.service
+                            )}
+                          </td>
+                          <td className="text-muted">{appt.operator}</td>
+                          <td>
+                            <span className={`appointments-status-badge ${badge.className}`}>{badge.label}</span>
+                          </td>
+                          <td className="text-end">
+                            {/* Native edit: opens the prefilled drawer (action=save WITH id). */}
+                            <a
+                              className="btn btn-sm btn-outline-secondary"
+                              href="#"
+                              data-qb-edit={appt.id}
+                              onClick={(e) => {
+                                e.preventDefault();
+                                openEdit(appt);
+                              }}
+                            >
+                              Modifica
+                            </a>{" "}
+                            {/* Per-row delete: confirm + POST action=delete, then refresh. */}
+                            <a
+                              className="btn btn-sm btn-outline-danger"
+                              href={pageHref(`&action=delete&id=${appt.id}`)}
+                              data-confirm="Eliminare questo appuntamento?"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                deleteOne(appt.id);
+                              }}
+                            >
+                              Elimina
+                            </a>
+                          </td>
+                        </tr>
+                        {isMulti &&
+                          lines.map((line, index) => (
+                            <tr
+                              key={`${appt.id}-svc-${line.serviceId || index}`}
+                              id={collapseId}
+                              className={`ms-children collapse${expanded ? " show" : ""}`}
+                              style={expanded ? undefined : { display: "none" }}
+                            >
+                              <td></td>
+                              <td></td>
+                              <td></td>
+                              <td></td>
+                              <td className="text-muted ps-4">{line.name}</td>
+                              <td className="text-muted">{line.price}</td>
+                              <td></td>
+                              <td></td>
+                            </tr>
+                          ))}
+                      </Fragment>
                     );
                   })
                 )}

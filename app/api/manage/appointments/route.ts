@@ -7,6 +7,7 @@ import {
   appointmentCustomerVisibleChanged,
   appointmentPhpStatus,
   createDbAppointment,
+  deleteDbAppointment,
   getDbAppointmentCustomerVisibleSnapshot,
   getDbAppointmentMoveSnapshot,
   getDbAppointmentPhpStatus,
@@ -23,7 +24,7 @@ import { lifecycleKindForStatusChange, sendAppointmentLifecycleEmail } from "@/l
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { canAny } from "@/lib/role-permissions";
+import { can, canAny } from "@/lib/role-permissions";
 import {
   holdPublicBookingSlot,
   publicBookingContext,
@@ -169,6 +170,50 @@ export async function POST(request: Request) {
       const token = String(body.appointment_hold_token ?? body.token ?? "");
       const hold = await renewPublicBookingHold({ slug: tenantSlug, token, ownerKey: "manage" });
       return Response.json({ ok: true, sourceMode: "database", ...hold });
+    }
+
+    // DELETE — per-row "Elimina" (app/pages/appointments.php ~79-130) + bulk_delete
+    // (~292-520). Deleting RESTORES every redeem the appointment consumed and removes
+    // its child rows (see deleteDbAppointment). Gated on appointments.manage (the
+    // legacy delete/bulk_delete is a management action), stricter than the POST
+    // umbrella check above which also admits plan/quick_booking.
+    if (action === "delete" || action === "bulk_delete") {
+      if (!can(session.user.perms, "appointments.manage")) {
+        return jsonError("Permesso eliminazione appuntamenti mancante.", 403);
+      }
+
+      // Collect the target ids. `delete` takes a single id (body/query); `bulk_delete`
+      // takes `ids` as an array or a CSV string (mirrors the legacy `ids` POST field).
+      const ids: number[] = [];
+      const pushId = (raw: unknown) => {
+        const id = Number.parseInt(String(raw).trim(), 10);
+        if (Number.isFinite(id) && id > 0 && !ids.includes(id)) ids.push(id);
+      };
+      if (action === "delete") {
+        pushId(body.id ?? url.searchParams.get("id") ?? "0");
+      } else {
+        const rawIds = body.ids ?? url.searchParams.get("ids") ?? "";
+        if (Array.isArray(rawIds)) rawIds.forEach(pushId);
+        else String(rawIds).split(",").forEach(pushId);
+      }
+      if (ids.length === 0) {
+        return Response.json({ ok: false, error: "Nessun appuntamento selezionato." }, { status: 400 });
+      }
+
+      // Best-effort per id: a row that is not the tenant's / already gone returns
+      // false and is simply not counted, mirroring the legacy tolerant bulk delete.
+      let deleted = 0;
+      for (const id of ids) {
+        if (await deleteDbAppointment(tenantSlug, id)) deleted += 1;
+      }
+
+      return Response.json({
+        ok: true,
+        source: "app/pages/appointments.php?action=delete|bulk_delete",
+        sourceMode: "database",
+        deleted,
+        appointments: await listDbAppointments({ slug: tenantSlug }),
+      });
     }
 
     if (action === "status") {

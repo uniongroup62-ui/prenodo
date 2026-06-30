@@ -21,6 +21,22 @@ export type AppointmentWithMeta = Appointment & {
   date?: string;
   locationId?: number | null;
   holdToken?: string;
+  // Real 5-digit booking code (appointments.public_code) when present; the list
+  // shows it in the "Codice prenotazione" column, falling back to #id when absent.
+  publicCode?: string | null;
+  // The appointment's ordered service list (one entry per appointment_services row).
+  // Lets the list render a multi-service appointment as a parent row + per-service
+  // child rows (legacy ms-parent / ms-children Bootstrap collapse). Single-service
+  // appointments carry a single entry; the existing `service` string is unchanged.
+  services?: AppointmentServiceLine[];
+};
+
+// One service line on an appointment (from appointment_services), used for the
+// multi-service parent/child rendering in the appointments list.
+export type AppointmentServiceLine = {
+  serviceId: number;
+  name: string;
+  price: string;
 };
 
 export type AppointmentHold = {

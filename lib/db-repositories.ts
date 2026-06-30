@@ -977,6 +977,310 @@ export async function getDbAppointmentPhpStatus(slug: string, id: number): Promi
   return phpStatus(String(rows[0].status ?? ""));
 }
 
+// DELETE an appointment (single-row "Elimina" + bulk_delete). Tenant-scoped port of
+// app/pages/appointments.php (single delete ~79-130 + bulk_delete ~292-520) and the
+// api_appointments.php delete rollback (~9665). This app CONSUMES redeems at SAVE
+// time (see applyAppointment*Redeems), so deleting must RESTORE everything the
+// appointment consumed before removing the row. The restore is driven off the
+// appointment_services linkage snapshot (the same columns the apply helpers set):
+//
+//   - PACKAGE (client_package_id / client_package_service_id): +1 session back on
+//     client_packages.sessions_remaining (re-activating a 'completed' package) and,
+//     when a per-service row id is linked, +1 on its client_package_services row.
+//   - PREPAID (client_prepaid_service_id): +1 remaining_qty on client_prepaid_services
+//     (re-activating a 'completed' prepaid).
+//   - GIFTBOX (giftbox_instance_id / giftbox_item_id): delete this appointment's
+//     giftbox_redemptions rows (source_type='appointment', source_id=id) + their
+//     giftbox_redemption_items, and reactivate the instance ('issued') if it had been
+//     flipped to 'redeemed' by this redemption.
+//   - GIFT (gift_instance_id / reward_item_index): the appointment_gift_items rows are
+//     deleted (below), so reactivate the gift instance to 'disponibile' if 'riscattato'.
+//   - GIFTCARD (appointments.giftcard_id / giftcard_used): refund giftcard_used to
+//     giftcards.balance, re-activating a 'redeemed' card.
+//
+// Then the child snapshot rows (appointment_segments / _services / _staff / _locations
+// and the appointment_gift_items redeem links) are removed, and finally the
+// appointments row itself. Every step is best-effort per table (wrapped in try/catch,
+// columnExists-guarded) so a missing column/table on an older install never aborts the
+// delete — the row still goes away. Returns true when the appointment row was removed.
+export async function deleteDbAppointment(slug: string, id: number): Promise<boolean> {
+  const appointmentId = Number(id);
+  if (!Number.isFinite(appointmentId) || appointmentId <= 0) return false;
+
+  // 1) Tenant-scoped existence guard: only the tenant's own row is deletable. A row
+  //    from another tenant (or a missing id) yields no match -> nothing to do.
+  const existing = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, giftcard_id, giftcard_used",
+    where: "id = ?",
+    params: [appointmentId],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  if (!existing[0]) return false;
+
+  // 2) Read the appointment_services linkage snapshot BEFORE deleting anything, so we
+  //    know which redeems to restore. Best-effort: a missing table -> no restores.
+  let serviceRows: RowDataPacket[] = [];
+  try {
+    serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      where: "appointment_id = ?",
+      params: [appointmentId],
+    });
+  } catch {
+    serviceRows = [];
+  }
+
+  // 2a) Restore PACKAGE + PREPAID + GIFTBOX + GIFT redeems per appointment_services row.
+  for (const row of serviceRows) {
+    // PACKAGE: give the session back (package pool + the per-service pool when linked).
+    const clientPackageId = Number(row.client_package_id ?? 0);
+    if (clientPackageId > 0) {
+      await restoreClientPackageSession(slug, clientPackageId, Number(row.client_package_service_id ?? 0) || null);
+    }
+    // PREPAID: give the unit back.
+    const clientPrepaidServiceId = Number(row.client_prepaid_service_id ?? 0);
+    if (clientPrepaidServiceId > 0) {
+      await restoreClientPrepaidUnit(slug, clientPrepaidServiceId);
+    }
+    // GIFTBOX: remove this appointment's redemption rows + reactivate the instance.
+    const giftboxInstanceId = Number(row.giftbox_instance_id ?? 0);
+    if (giftboxInstanceId > 0) {
+      await restoreGiftboxRedemption(slug, giftboxInstanceId, appointmentId);
+    }
+    // GIFT: the appointment_gift_items rows are deleted below; reactivate the instance.
+    const giftInstanceId = Number(row.gift_instance_id ?? 0);
+    if (giftInstanceId > 0) {
+      await restoreGiftInstance(slug, giftInstanceId);
+    }
+  }
+
+  // 2b) Restore the appointment-level GIFTCARD redeem (refund the used amount).
+  const giftcardId = Number(existing[0].giftcard_id ?? 0);
+  const giftcardUsed = roundMoney(Math.max(0, parseMoney(existing[0].giftcard_used, 0)));
+  if (giftcardId > 0 && giftcardUsed > 0) {
+    await restoreGiftcardBalance(slug, giftcardId, giftcardUsed);
+  }
+
+  // 3) Delete the child snapshot rows + redeem links (best-effort per table). The
+  //    appointment_gift_items rows are the gift redeem links; deleting them (paired
+  //    with the gift-instance reactivation above) fully rolls back the gift redeem.
+  await deleteAppointmentChildren(slug, "appointment_segments", appointmentId);
+  await deleteAppointmentChildren(slug, "appointment_services", appointmentId);
+  await deleteAppointmentChildren(slug, "appointment_staff", appointmentId);
+  await deleteAppointmentChildren(slug, "appointment_locations", appointmentId);
+  await deleteAppointmentChildren(slug, "appointment_gift_items", appointmentId);
+
+  // 4) Finally remove the appointment row itself (tenant-scoped).
+  const removed = await tenantDelete({ slug, table: "appointments", id: appointmentId }).catch(() => 0);
+  return removed > 0;
+}
+
+// Inverse of the PACKAGE redeem consume (applyAppointmentPackageRedeems step 5):
+// +1 session on the package-level pool (re-activating a 'completed' package) and,
+// when a per-service client_package_services row is linked, +1 on that pool too,
+// keeping package.remaining == SUM(cps.remaining). Best-effort + columnExists-guarded.
+async function restoreClientPackageSession(slug: string, clientPackageId: number, clientPackageServiceId: number | null): Promise<void> {
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_packages",
+      columns: "id, sessions_remaining, status",
+      where: "id = ?",
+      params: [clientPackageId],
+      limit: 1,
+    });
+    if (!rows[0]) return;
+    const remaining = Math.max(0, Number(rows[0].sessions_remaining ?? 0)) + 1;
+    const values: Record<string, unknown> = { sessions_remaining: remaining };
+    // A package the redeem flipped to 'completed' becomes usable again.
+    if (String(rows[0].status ?? "") === "completed") values.status = "active";
+    await tenantUpdate({ slug, table: "client_packages", id: clientPackageId, values });
+    // Write the inverse usage ledger entry (+1), mirroring the -1 the consume wrote.
+    await tryInsertPackageUsage(slug, clientPackageId, 1, "Ripristino eliminazione appuntamento").catch(() => {});
+  } catch {
+    // best-effort: a missing column/table must not abort the delete.
+  }
+  if (clientPackageServiceId && clientPackageServiceId > 0) {
+    try {
+      const cps = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "client_package_services",
+        columns: "id, sessions_remaining",
+        where: "id = ?",
+        params: [clientPackageServiceId],
+        limit: 1,
+      });
+      if (cps[0]) {
+        await tenantUpdate({
+          slug,
+          table: "client_package_services",
+          id: clientPackageServiceId,
+          values: { sessions_remaining: Math.max(0, Number(cps[0].sessions_remaining ?? 0)) + 1 },
+        });
+      }
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+// Inverse of the PREPAID redeem consume (applyAppointmentPrepaidRedeems step 5):
+// +1 remaining_qty on the client_prepaid_services row (re-activating a 'completed'
+// prepaid). Best-effort + columnExists-guarded.
+async function restoreClientPrepaidUnit(slug: string, clientPrepaidServiceId: number): Promise<void> {
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_prepaid_services",
+      columns: "id, remaining_qty, status",
+      where: "id = ?",
+      params: [clientPrepaidServiceId],
+      limit: 1,
+    });
+    if (!rows[0]) return;
+    const remaining = Math.max(0, Number(rows[0].remaining_qty ?? 0)) + 1;
+    const values: Record<string, unknown> = { remaining_qty: remaining };
+    if (String(rows[0].status ?? "") === "completed") values.status = "active";
+    await tenantUpdate({ slug, table: "client_prepaid_services", id: clientPrepaidServiceId, values });
+  } catch {
+    // best-effort
+  }
+}
+
+// Inverse of the GIFTBOX redeem record (applyAppointmentGiftboxRedeems steps 6-7):
+// delete THIS appointment's giftbox_redemptions rows (source_type='appointment',
+// source_id=appointmentId) and their giftbox_redemption_items child rows, then
+// reactivate the instance ('issued') if this redemption had flipped it to 'redeemed'.
+// Best-effort + columnExists/tableExists-guarded.
+async function restoreGiftboxRedemption(slug: string, instanceId: number, appointmentId: number): Promise<void> {
+  try {
+    // Find this appointment's redemption headers for the instance.
+    const redemptions = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftbox_redemptions",
+      columns: "id",
+      where: "instance_id = ? AND source_type = 'appointment' AND source_id = ?",
+      params: [instanceId, appointmentId],
+    });
+    for (const redemption of redemptions) {
+      const redemptionId = Number(redemption.id ?? 0);
+      if (redemptionId <= 0) continue;
+      // Delete the redemption-item rows first (tenant-scoped raw delete).
+      try {
+        const itemsTable = await tenantTable(slug, "giftbox_redemption_items");
+        const clauses = ["redemption_id = ?"];
+        const params: unknown[] = [redemptionId];
+        if (itemsTable.mode === "shared" && (await columnExists(itemsTable.name, "tenant_id"))) {
+          clauses.push("tenant_id = ?");
+          params.push(itemsTable.tenantId ?? 0);
+        }
+        await dbExecute(`DELETE FROM ${quoteIdentifier(itemsTable.name)} WHERE ${clauses.join(" AND ")}`, params);
+      } catch {
+        // best-effort
+      }
+      await tenantDelete({ slug, table: "giftbox_redemptions", id: redemptionId }).catch(() => 0);
+    }
+  } catch {
+    // best-effort: redemption tables may be absent on older installs.
+  }
+  // Reactivate the instance if THIS appointment's redemption had auto-closed it.
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftbox_instances",
+      columns: "id, status, redeemed_source_type, redeemed_source_id",
+      where: "id = ?",
+      params: [instanceId],
+      limit: 1,
+    });
+    const inst = rows[0];
+    if (!inst) return;
+    const closedByThis =
+      String(inst.status ?? "") === "redeemed" &&
+      String(inst.redeemed_source_type ?? "") === "appointment" &&
+      Number(inst.redeemed_source_id ?? 0) === appointmentId;
+    if (closedByThis) {
+      await tenantUpdate({
+        slug,
+        table: "giftbox_instances",
+        id: instanceId,
+        values: { status: "issued", redeemed_at: null, redeemed_source_type: null, redeemed_source_id: null },
+      });
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+// Inverse of the GIFT redeem record (applyAppointmentGiftRedeems step 7): reactivate
+// the gift instance to state='disponibile' when the redeem had flipped it to
+// 'riscattato' (the appointment_gift_items redeem rows are deleted by the caller).
+// Best-effort + columnExists-guarded.
+async function restoreGiftInstance(slug: string, instanceId: number): Promise<void> {
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "gift_instances",
+      columns: "id, state",
+      where: "id = ?",
+      params: [instanceId],
+      limit: 1,
+    });
+    const inst = rows[0];
+    if (!inst) return;
+    if (String(inst.state ?? "") === "riscattato") {
+      await tenantUpdate({
+        slug,
+        table: "gift_instances",
+        id: instanceId,
+        values: { state: "disponibile", redeemed_at: null, redeemed_source_type: null, redeemed_source_id: null },
+      });
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+// Inverse of the GIFTCARD redeem (applyAppointmentGiftcardRedeem step 5): refund the
+// used amount back to giftcards.balance and re-activate a 'redeemed' card. A reversal
+// giftcard_transactions movement is written to mirror the redeem ledger entry.
+// Best-effort + columnExists/tableExists-guarded.
+async function restoreGiftcardBalance(slug: string, giftcardId: number, amount: number): Promise<void> {
+  const refund = roundMoney(Math.max(0, amount));
+  if (refund <= 0) return;
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftcards",
+      columns: "id, balance, status",
+      where: "id = ?",
+      params: [giftcardId],
+      limit: 1,
+    });
+    if (!rows[0]) return;
+    const balance = roundMoney(Math.max(0, parseMoney(rows[0].balance, 0)) + refund);
+    const values: Record<string, unknown> = { balance };
+    // A card the redeem flipped to 'redeemed' (balance hit 0) becomes usable again.
+    if (String(rows[0].status ?? "") === "redeemed") {
+      values.status = "active";
+      values.redeemed_at = null;
+    }
+    await tenantUpdate({ slug, table: "giftcards", id: giftcardId, values });
+    await tenantInsert(await tenantTable(slug, "giftcard_transactions"), {
+      giftcard_id: giftcardId,
+      type: "refund",
+      amount: refund,
+      note: "Storno eliminazione appuntamento",
+      created_at: new Date(),
+    }).catch(() => 0);
+  } catch {
+    // best-effort
+  }
+}
+
 // Exported so the manage route can normalize the incoming target status to the
 // same PHP code the DB write uses, then map old->new to a lifecycle email kind.
 export function appointmentPhpStatus(status: AppointmentStatus | string): string {
@@ -4562,23 +4866,79 @@ function quoteStatus(status: string): QuoteStatus {
 }
 
 async function mapAppointment(slug: string, row: RowDataPacket): Promise<AppointmentWithMeta> {
+  const appointmentId = Number(row.id ?? 0);
   const clientName = await appointmentClientName(slug, Number(row.client_id ?? 0));
-  const service = await appointmentService(slug, row);
-  const staffName = await appointmentStaffName(slug, Number(row.id ?? 0));
+  // Full ordered service list (one per appointment_services row) for the multi-service
+  // parent/child rendering. The primary (first) line drives the existing single-line
+  // `service`/`price` summary so the row is unchanged for single-service appointments.
+  const serviceLines = await appointmentServiceLines(slug, row);
+  const primary = serviceLines[0] ?? { serviceId: 0, name: "Servizio", price: 0 };
+  const staffName = await appointmentStaffName(slug, appointmentId);
   const startsAt = toDate(row.starts_at);
 
   return {
-    id: Number(row.id ?? 0),
+    id: appointmentId,
     date: dateIsoLocal(startsAt),
     locationId: row.location_id === null || row.location_id === undefined ? null : Number(row.location_id),
     time: timeLocal(startsAt),
     client: clientName,
-    service: service.name,
+    service: primary.name,
     operator: staffName,
     room: row.cabin_id ? `Cabina #${row.cabin_id}` : "-",
-    price: `${roundMoney(service.price)} euro`,
+    price: `${roundMoney(primary.price)} euro`,
     status: uiStatus(String(row.status ?? "")),
+    // Real booking code when the column exists + is populated; null -> the list falls
+    // back to #id. The column is read straight off the appointments row (selected by
+    // tenantSelect '*'), so no extra query is needed; guarded via the row property.
+    publicCode: row.public_code === null || row.public_code === undefined || String(row.public_code).trim() === ""
+      ? null
+      : String(row.public_code).trim(),
+    // Ordered service lines for the multi-service grouping (parent + child rows).
+    services: serviceLines.map((line) => ({ serviceId: line.serviceId, name: line.name, price: `${roundMoney(line.price)} euro` })),
   };
+}
+
+// Read the appointment's ORDERED service list from appointment_services (one entry
+// per row, preserving sort order). Falls back to the single services-table lookup
+// (legacy single-service appointments without snapshot rows) so the list always has
+// at least one entry. Mirrors appointmentService but returns ALL services, not just
+// the primary, for the multi-service parent/child rendering.
+async function appointmentServiceLines(
+  slug: string,
+  appointment: RowDataPacket,
+): Promise<Array<{ serviceId: number; name: string; price: number }>> {
+  const appointmentId = Number(appointment.id ?? 0);
+  try {
+    const serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      columns: "service_id, service_name, price",
+      where: "appointment_id = ?",
+      params: [appointmentId],
+      orderBy: "service_id ASC",
+    });
+    if (serviceRows.length > 0) {
+      return serviceRows.map((row) => ({
+        serviceId: Number(row.service_id ?? 0),
+        name: String(row.service_name ?? "Servizio"),
+        price: Number(row.price ?? 0),
+      }));
+    }
+  } catch {
+    // fallback below
+  }
+
+  const serviceId = Number(appointment.service_id ?? 0);
+  if (serviceId > 0) {
+    try {
+      const rows = await tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, name, price", where: "id = ?", params: [serviceId], limit: 1 });
+      if (rows[0]) return [{ serviceId, name: String(rows[0].name ?? "Servizio"), price: Number(rows[0].price ?? 0) }];
+    } catch {
+      // fallback below
+    }
+  }
+
+  return [{ serviceId: 0, name: "Servizio", price: 0 }];
 }
 
 async function appointmentClientName(slug: string, clientId: number): Promise<string> {
