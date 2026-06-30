@@ -6,6 +6,7 @@ import { cancelManageSale, checkoutManageSale, getManagePosAppointmentCart, getM
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
+  PosInstallmentPlanInput,
   PosPaymentInput,
   PosPaymentMethod,
   PosSaleItemInput,
@@ -131,9 +132,37 @@ async function checkoutInputFromBody(body: Record<string, string>, tenantSlug: s
     installments: parseInteger(body.installments, 0),
     // FIDELITY points the staff applies as a discount (legacy POST field fidelity_points_use).
     fidelityPointsUse: parseNumber(body.fidelity_points_use, 0),
+    // RATEIZZAZIONE: the optional installment plan params (faithful to the legacy
+    // installment_plan_json POST field). Present only when the staff chose "Rateizzato".
+    installmentPlan: installmentPlanFromBody(body),
     items: saleItemsFromBody(body),
     payments: paymentsFromBody(body),
   };
+}
+
+// Parse the optional installment plan params from the checkout body. The UI sends an
+// installment_plan JSON blob ({count, down_payment, interval_value, interval_unit,
+// first_due_date, note}) when "Rateizzato" is active. Returns undefined for a single payment
+// (the common path) or any malformed / count < 2 plan, so the backend skips plan creation.
+function installmentPlanFromBody(body: Record<string, string>): PosInstallmentPlanInput | undefined {
+  const raw = body.installment_plan ?? body.installment_plan_json;
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const count = parseInteger(parsed.count ?? parsed.installments_count, 0);
+    if (count < 2) return undefined;
+    const unit = String(parsed.intervalUnit ?? parsed.interval_unit ?? "month").toLowerCase();
+    return {
+      count,
+      downPayment: parseNumber(parsed.downPayment ?? parsed.down_payment ?? parsed.down_payment_amount, 0),
+      intervalValue: parseInteger(parsed.intervalValue ?? parsed.interval_value, 1),
+      intervalUnit: unit === "day" || unit === "week" ? unit : "month",
+      firstDueDate: String(parsed.firstDueDate ?? parsed.first_due_date ?? "").trim() || undefined,
+      note: String(parsed.note ?? parsed.notes ?? "").trim() || undefined,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 function saleItemsFromBody(body: Record<string, string>): PosSaleItemInput[] {

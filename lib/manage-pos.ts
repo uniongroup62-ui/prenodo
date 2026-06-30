@@ -438,11 +438,184 @@ export async function checkoutManageSale(
     await tenantUpdate({ slug, table: "appointments", id: input.appointmentId, values: { status: "done" } }).catch(() => 0);
   }
 
+  // RATEIZZAZIONE: when a rate plan was configured (count >= 2) AND the sale has a real
+  // client + a positive total, write the sale_installment_plans row + N sale_installments
+  // rows scheduling the financed remainder (total - downPayment). Faithful to pos.php's
+  // `SaleInstallments::createPlan` call after the sale insert. The sale total + payments are
+  // unchanged: the plan only schedules the financing (the down payment is collected at the
+  // sale, the remainder over the installments). A bench sale (no client) or a single payment
+  // skips this — mirroring the legacy `client_id <= 0` guard in createPlan.
+  const plan = input.installmentPlan;
+  if (plan && client.id > 0 && total > 0.00001 && Math.max(1, Math.round(plan.count)) >= 2) {
+    await createManageInstallmentPlan(slug, {
+      saleId,
+      clientId: client.id,
+      total,
+      downPayment: plan.downPayment ?? 0,
+      count: plan.count,
+      intervalValue: plan.intervalValue ?? 1,
+      intervalUnit: plan.intervalUnit ?? "month",
+      firstDueDate: plan.firstDueDate ?? "",
+      note: plan.note ?? "",
+      paymentType: baseMethod,
+      createdBy: operator.id,
+    });
+  }
+
   const sale = await getSale(slug, saleId);
   return {
     ...await getManagePosContext(slug, { locationId, includeCancelled: true }),
     sale,
   };
+}
+
+// Faithful port of SaleInstallments::createPlan (via preparePlanConfig + buildSchedule).
+// Writes a sale_installment_plans row (down_payment_amount, financed_amount = total -
+// downPayment, installments_count, interval_value/unit, first_due_date, last_due_date,
+// sale_total, status 'active') + `count` sale_installments rows (installment_no 1..N,
+// status 'pending'). The schedule splits the FINANCED amount (not the sale total): legacy
+// buildSchedule works in cents — base = financedCents / count, remainder = financedCents -
+// base*count, and the FIRST `remainder` installments each get +1 cent (front-loaded), so the
+// row amounts sum exactly to the financed amount. Due dates step from first_due_date by
+// interval_value * (i-1) of interval_unit (installment 1 = first_due_date itself, i.e. 0
+// iterations). Best-effort: a no-op on installs without the tables (older installs).
+async function createManageInstallmentPlan(
+  slug: string,
+  input: {
+    saleId: number;
+    clientId: number;
+    total: number;
+    downPayment: number;
+    count: number;
+    intervalValue: number;
+    intervalUnit: "day" | "week" | "month";
+    firstDueDate: string;
+    note: string;
+    paymentType: PosPaymentMethod;
+    createdBy: number | null;
+  },
+): Promise<void> {
+  try {
+    const saleTotal = roundMoney(Math.max(0, input.total));
+    if (saleTotal <= 0.00001) return;
+
+    const count = Math.max(1, Math.min(120, Math.round(input.count)));
+    if (count < 2) return;
+
+    // Down payment (acconto) collected at the sale; must stay below the sale total so the
+    // financed remainder is positive (legacy: downPayment >= saleTotal throws). Clamp it.
+    const downPayment = roundMoney(Math.min(Math.max(0, input.downPayment), Math.max(0, saleTotal - 0.01)));
+    const financed = roundMoney(saleTotal - downPayment);
+    if (financed <= 0.00001) return;
+
+    const intervalUnit: "day" | "week" | "month" =
+      input.intervalUnit === "day" || input.intervalUnit === "week" ? input.intervalUnit : "month";
+    const maxInterval = intervalUnit === "day" ? 365 : intervalUnit === "week" ? 52 : 24;
+    const intervalValue = Math.max(1, Math.min(maxInterval, Math.round(input.intervalValue) || 1));
+
+    const firstDue = normalizeInstallmentDate(input.firstDueDate) || addDaysIso(todayIso(), 30);
+    const paymentType = installmentPaymentType(input.paymentType);
+
+    // buildSchedule (cents, front-loaded remainder): the row amounts sum exactly to financed.
+    const financedCents = Math.round(financed * 100);
+    const base = Math.floor(financedCents / count);
+    const remainder = financedCents - base * count;
+    const schedule = Array.from({ length: count }, (_, idx) => {
+      const no = idx + 1;
+      const cents = base + (no <= remainder ? 1 : 0);
+      return {
+        installmentNo: no,
+        dueDate: shiftInstallmentDate(firstDue, intervalUnit, intervalValue, idx),
+        amount: roundMoney(cents / 100),
+      };
+    });
+    const lastDue = schedule.length ? schedule[schedule.length - 1].dueDate : firstDue;
+
+    const plansTable = await tenantTable(slug, "sale_installment_plans");
+    const planId = await tenantInsert(plansTable, await filterColumns(plansTable.name, {
+      sale_id: input.saleId,
+      client_id: input.clientId,
+      payment_type: paymentType,
+      status: "active",
+      sale_total: saleTotal,
+      down_payment_amount: downPayment,
+      financed_amount: financed,
+      installments_count: count,
+      interval_value: intervalValue,
+      interval_unit: intervalUnit,
+      first_due_date: firstDue,
+      last_due_date: lastDue,
+      notes: clean(input.note, 1000) || null,
+      config_json: JSON.stringify({
+        source: "next",
+        client_id: input.clientId,
+        sale_total: saleTotal,
+        payment_type: paymentType,
+        down_payment_amount: downPayment,
+        financed_amount: financed,
+        installments_count: count,
+        interval_value: intervalValue,
+        interval_unit: intervalUnit,
+        first_due_date: firstDue,
+        last_due_date: lastDue,
+        schedule,
+      }),
+      created_by: input.createdBy,
+      updated_by: input.createdBy,
+    }));
+
+    const installmentsTable = await tenantTable(slug, "sale_installments");
+    for (const row of schedule) {
+      await tenantInsert(installmentsTable, await filterColumns(installmentsTable.name, {
+        plan_id: planId,
+        sale_id: input.saleId,
+        client_id: input.clientId,
+        installment_no: row.installmentNo,
+        due_date: row.dueDate,
+        amount: row.amount,
+        status: "pending",
+        payment_type: paymentType,
+        created_by: input.createdBy,
+        updated_by: input.createdBy,
+      }));
+    }
+  } catch {
+    // Optional module/table can be absent in older installs.
+  }
+}
+
+// Map the POS base method (PosPaymentMethod: cash/card/transfer/giftcard/wallet) to the
+// installment payment_type enum SaleInstallments::normalizePaymentType yields (cash/card/
+// check/bank). transfer -> bank; wallet/giftcard residui tenders default to card.
+function installmentPaymentType(method: PosPaymentMethod): string {
+  if (method === "cash") return "cash";
+  if (method === "transfer") return "bank";
+  return "card";
+}
+
+// Validate a YYYY-MM-DD installment date; "" when invalid (caller falls back to +30d).
+function normalizeInstallmentDate(value: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value ?? "").trim());
+  if (!m) return "";
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const dim = new Date(year, month, 0).getDate();
+  if (month < 1 || month > 12 || day < 1 || day > dim) return "";
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+// Port of SaleInstallments::shiftDate: step firstDue by interval_value * iterations of the
+// unit (day/week/month). iterations === 0 returns the date unchanged (installment #1 lands on
+// first_due_date). Month stepping clamps the day to the target month length (e.g. 31 -> 30/28).
+function shiftInstallmentDate(date: string, unit: "day" | "week" | "month", value: number, iterations: number): string {
+  const safeDate = normalizeInstallmentDate(date) || todayIso();
+  const steps = Math.max(0, Math.round(iterations));
+  if (steps === 0) return safeDate;
+  const step = Math.max(1, Math.round(value));
+  if (unit === "day") return addDaysIso(safeDate, step * steps);
+  if (unit === "week") return addDaysIso(safeDate, step * steps * 7);
+  return addMonthsIso(safeDate, step * steps);
 }
 
 export async function cancelManageSale(

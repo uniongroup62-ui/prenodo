@@ -251,6 +251,65 @@ function addDaysYMD(startYmd: string, days: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// Validate a YYYY-MM-DD date (returns "" when invalid). Used by the installment schedule.
+function validYMD(value: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || "").trim());
+  if (!m) return "";
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const dim = new Date(year, month, 0).getDate();
+  if (month < 1 || month > 12 || day < 1 || day > dim) return "";
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+// start + N months as YYYY-MM-DD, clamping the day to the target month length (31 -> 30/28).
+// Port of SaleInstallments::shiftDate's month branch.
+function addMonthsYMD(startYmd: string, months: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(startYmd || "").trim());
+  if (!m) return startYmd;
+  const day = Number(m[3]);
+  const total = Number(m[1]) * 12 + (Number(m[2]) - 1) + Math.max(0, Math.floor(months));
+  const ny = Math.floor(total / 12);
+  const nmo = (total % 12) + 1;
+  const dim = new Date(ny, nmo, 0).getDate();
+  const nd = Math.min(day, dim);
+  return `${ny}-${String(nmo).padStart(2, "0")}-${String(nd).padStart(2, "0")}`;
+}
+
+// Step firstDue by interval_value * iterations of the unit (day/week/month). iterations === 0
+// returns the date unchanged (installment #1 = first_due_date). Port of SaleInstallments::shiftDate.
+function shiftScheduleDate(date: string, unit: "day" | "week" | "month", value: number, iterations: number): string {
+  const safe = validYMD(date) || todayYMD();
+  const steps = Math.max(0, Math.floor(iterations));
+  if (steps === 0) return safe;
+  const step = Math.max(1, Math.floor(value) || 1);
+  if (unit === "day") return addDaysYMD(safe, step * steps);
+  if (unit === "week") return addDaysYMD(safe, step * steps * 7);
+  return addMonthsYMD(safe, step * steps);
+}
+
+// Build the installment schedule (cents, front-loaded remainder) — faithful to
+// SaleInstallments::buildSchedule. Splits the FINANCED amount into `count` rows whose amounts
+// sum exactly to financed; due dates step from firstDue by interval_value of interval_unit.
+function buildInstallmentSchedule(
+  financed: number,
+  count: number,
+  firstDue: string,
+  unit: "day" | "week" | "month",
+  intervalValue: number,
+): Array<{ no: number; dueDate: string; amount: number }> {
+  const safeCount = Math.max(1, Math.min(120, Math.floor(count) || 1));
+  const cents = Math.round(Math.max(0, financed) * 100);
+  const base = Math.floor(cents / safeCount);
+  const remainder = cents - base * safeCount;
+  return Array.from({ length: safeCount }, (_, idx) => {
+    const no = idx + 1;
+    const c = base + (no <= remainder ? 1 : 0);
+    return { no, dueDate: shiftScheduleDate(firstDue, unit, intervalValue, idx), amount: roundMoney(c / 100) };
+  });
+}
+
 export function PosContent() {
   const slug = tenantSlug();
   const today = todayYMD();
@@ -290,6 +349,20 @@ export function PosContent() {
   // payment_type radio). Defaults to Contanti.
   const [baseMethod, setBaseMethod] = useState<PaymentMethod>("cash");
   const [notes, setNotes] = useState("");
+
+  // RATEIZZAZIONE (installment plan): the single/rate choice + the configured params. mode
+  // "single" = pagamento unico (no plan), "installment" = a rate plan is active. The params
+  // (acconto, numero rate, intervallo, prima scadenza, note) mirror the legacy
+  // installment_plan_json; the schedule is derived (installmentSchedule below) and sent as
+  // installment_plan JSON at checkout when mode === "installment". Defaults: monthly, +30d
+  // first due, 0 down, 3 rate.
+  const [installmentMode, setInstallmentMode] = useState<"single" | "installment">("single");
+  const [installmentDownInput, setInstallmentDownInput] = useState("0");
+  const [installmentCountInput, setInstallmentCountInput] = useState("3");
+  const [installmentIntervalValueInput, setInstallmentIntervalValueInput] = useState("1");
+  const [installmentIntervalUnit, setInstallmentIntervalUnit] = useState<"day" | "week" | "month">("month");
+  const [installmentFirstDue, setInstallmentFirstDue] = useState("");
+  const [installmentNote, setInstallmentNote] = useState("");
 
   // Residui: the selected client's spendable wallet CREDIT + GiftCards, and the amounts
   // the staff applies. creditUse / giftcardUse are the applied (clamped) amounts;
@@ -582,6 +655,54 @@ export function PosContent() {
     [subtotal, manualDiscount, codeDiscount, fidelityDiscount],
   );
 
+  // ---- rateizzazione (installment plan) math ----
+  // The chosen plan params, clamped + derived for the schedule preview and the checkout
+  // payload. count >= 2; the acconto stays below the total (so financed > 0); financed =
+  // total - acconto; the schedule splits financed across `count` rows summing to financed.
+  const installmentCount = useMemo(
+    () => Math.max(1, Math.min(120, Math.floor(Number.parseInt(installmentCountInput, 10) || 0))),
+    [installmentCountInput],
+  );
+  const installmentIntervalValue = useMemo(() => {
+    const max = installmentIntervalUnit === "day" ? 365 : installmentIntervalUnit === "week" ? 52 : 24;
+    return Math.max(1, Math.min(max, Math.floor(Number.parseInt(installmentIntervalValueInput, 10) || 1)));
+  }, [installmentIntervalValueInput, installmentIntervalUnit]);
+  // The first due defaults to today + 30 days (faithful default) until the staff picks one.
+  const installmentFirstDueValue = useMemo(
+    () => validYMD(installmentFirstDue) || addDaysYMD(today, 30),
+    [installmentFirstDue, today],
+  );
+  const installmentDownPayment = useMemo(
+    () => roundMoney(Math.min(Math.max(0, Number.parseFloat(installmentDownInput.replace(",", ".")) || 0), Math.max(0, total - 0.01))),
+    [installmentDownInput, total],
+  );
+  const installmentFinanced = useMemo(() => roundMoney(Math.max(0, total - installmentDownPayment)), [total, installmentDownPayment]);
+  const installmentSchedule = useMemo(
+    () => buildInstallmentSchedule(installmentFinanced, installmentCount, installmentFirstDueValue, installmentIntervalUnit, installmentIntervalValue),
+    [installmentFinanced, installmentCount, installmentFirstDueValue, installmentIntervalUnit, installmentIntervalValue],
+  );
+  const installmentLastDue = useMemo(
+    () => (installmentSchedule.length ? installmentSchedule[installmentSchedule.length - 1].dueDate : installmentFirstDueValue),
+    [installmentSchedule, installmentFirstDueValue],
+  );
+  // A rate plan is "active" (sent at checkout) only when the staff chose it, the sale has a
+  // real client + a positive total, and count >= 2 (mirrors the backend guard).
+  const installmentActive = useMemo(
+    () => installmentMode === "installment" && installmentCount >= 2 && total > 0.00001 && !!clientId && clientId > 0,
+    [installmentMode, installmentCount, total, clientId],
+  );
+  // Modal validation (mirrors preparePlanConfig): a client + positive total are required, the
+  // acconto must be below the total (financed > 0) and there must be >= 2 rate. The save
+  // button is disabled + the reason shown when the plan is not valid to commit.
+  const installmentModalError = useMemo(() => {
+    if (!clientId || clientId <= 0) return "Seleziona un cliente per configurare la rateizzazione.";
+    if (total <= 0.00001) return "La rateizzazione non è disponibile con totale a zero.";
+    if (installmentCount < 2) return "Servono almeno 2 rate per un piano rateale.";
+    if (installmentFinanced <= 0.00001) return "L’acconto iniziale deve essere inferiore al totale della vendita.";
+    return "";
+  }, [clientId, total, installmentCount, installmentFinanced]);
+  const installmentCanSave = useMemo(() => installmentModalError === "", [installmentModalError]);
+
   // ---- residui math ----
   // The chosen giftcard's available balance (0 when none / not in the list anymore).
   const selectedGiftcard = useMemo(
@@ -635,6 +756,17 @@ export function PosContent() {
     // The residui fetch effect's cleanup resets the applied residui on the clientId change.
     setClientId(null);
     setClientName("");
+  }
+
+  // RATEIZZAZIONE handlers. "Pagamento unico" clears any rate plan; "Salva piano rate" (the
+  // modal footer) commits the configured plan (mode -> installment). Bootstrap's data-attrs
+  // open/close the modal; React drives the inputs + the schedule preview.
+  function chooseInstallmentSingle() {
+    setInstallmentMode("single");
+  }
+  function saveInstallmentPlan() {
+    if (!installmentCanSave) return;
+    setInstallmentMode("installment");
   }
 
   // Fetch the selected client's residui (wallet CREDIT + GiftCards) whenever the client
@@ -1290,6 +1422,20 @@ export function PosContent() {
       // stamps "Appuntamento #<id>" on the sale notes. 0 for a normal POS sale.
       appointment_id: appointmentSaleId > 0 ? appointmentSaleId : 0,
       notes: notes.trim(),
+      // RATEIZZAZIONE: when a rate plan is active (mode installment + client + count >= 2),
+      // send the plan params as JSON. The backend writes the sale_installment_plans row + N
+      // sale_installments rows scheduling the financed remainder (total - acconto). Omitted
+      // (empty) for a single payment — the common path.
+      installment_plan: installmentActive
+        ? JSON.stringify({
+            count: installmentCount,
+            down_payment: installmentDownPayment,
+            interval_value: installmentIntervalValue,
+            interval_unit: installmentIntervalUnit,
+            first_due_date: installmentFirstDueValue,
+            note: installmentNote.trim(),
+          })
+        : "",
     };
 
     setSubmitting(true);
@@ -1315,6 +1461,14 @@ export function PosContent() {
       setCouponOpen(false);
       setBaseMethod("cash");
       setNotes("");
+      // Reset the rate plan back to "pagamento unico" (+ default params) for the next sale.
+      setInstallmentMode("single");
+      setInstallmentDownInput("0");
+      setInstallmentCountInput("3");
+      setInstallmentIntervalValueInput("1");
+      setInstallmentIntervalUnit("month");
+      setInstallmentFirstDue("");
+      setInstallmentNote("");
       clearClient();
       // The sale is no longer "da appuntamento": clear the link + banner (the appointment is
       // now marked 'done' server-side). A fresh ?appointment= visit re-seeds on a new mount.
@@ -2029,27 +2183,40 @@ export function PosContent() {
                   </div>
                 </div>
 
-                {/* Rateizzazione — resa fedelmente, non collegata. */}
+                {/* Rateizzazione (installment plan) — WIRED: the staff chooses "Pagamento
+                    unico" (no plan) or "Rateizzato" (the modal configures acconto + rate +
+                    intervallo + prima scadenza). When a rate plan is active, the summary shows
+                    the financed remainder + the per-rata schedule, and checkout sends
+                    installment_plan JSON (the backend writes the sale_installment_plans row +
+                    the sale_installments rows). A rate plan needs a real client + positive
+                    total; the badge prompts when those are missing. */}
                 <div className="mb-3 pos-installment-card" id="posInstallmentCard">
                   <div className="d-flex justify-content-between align-items-center gap-2 mb-2">
                     <div className="small text-muted mb-0" id="posInstallmentHeadline">
                       Seleziona modalità di saldo
                     </div>
                     <span
-                      className="badge rounded-pill d-none pos-installment-required-badge"
+                      className={`badge rounded-pill pos-installment-required-badge${installmentMode === "installment" && (!clientId || clientId <= 0 || total <= 0.00001) ? "" : " d-none"}`}
                       id="posInstallmentRequiredBadge"
                     >
-                      Scelta obbligatoria
+                      {!clientId || clientId <= 0 ? "Seleziona un cliente" : "Totale a zero"}
                     </span>
                   </div>
                   <div className="pos-installment-choice-grid">
-                    <button type="button" className="btn pos-installment-choice-btn" id="posInstallmentSingleBtn">
+                    <button
+                      type="button"
+                      className={`btn pos-installment-choice-btn${installmentMode === "single" ? " active" : ""}`}
+                      id="posInstallmentSingleBtn"
+                      aria-pressed={installmentMode === "single"}
+                      onClick={chooseInstallmentSingle}
+                    >
                       Pagamento unico
                     </button>
                     <button
                       type="button"
-                      className="btn pos-installment-choice-btn"
+                      className={`btn pos-installment-choice-btn${installmentMode === "installment" ? " active" : ""}`}
                       id="posInstallmentConfigureBtn"
+                      aria-pressed={installmentMode === "installment"}
                       data-bs-toggle="modal"
                       data-bs-target="#posInstallmentModal"
                     >
@@ -2060,10 +2227,18 @@ export function PosContent() {
                     Seleziona esplicitamente se il cliente paga in unica soluzione oppure con un piano rate.
                   </div>
 
-                  <div className="pos-installment-summary d-none" id="posInstallmentSummary">
-                    <div className="small fw-semibold mb-1" id="posInstallmentSummaryText"></div>
-                    <div className="small text-muted d-none mb-2" id="posInstallmentSummaryNote"></div>
-                    <div className="table-responsive d-none" id="posInstallmentScheduleWrap">
+                  <div className={`pos-installment-summary${installmentActive ? "" : " d-none"}`} id="posInstallmentSummary">
+                    <div className="small fw-semibold mb-1" id="posInstallmentSummaryText">
+                      Piano rate: acconto {fmtEUR(installmentDownPayment)} • residuo {fmtEUR(installmentFinanced)} •{" "}
+                      {installmentCount} rate • prima scadenza {installmentFirstDueValue}
+                    </div>
+                    <div
+                      className={`small text-muted mb-2${installmentNote.trim() ? "" : " d-none"}`}
+                      id="posInstallmentSummaryNote"
+                    >
+                      {installmentNote.trim()}
+                    </div>
+                    <div className="table-responsive mb-2" id="posInstallmentScheduleWrap">
                       <table className="table table-sm mb-2 pos-installment-schedule-table">
                         <thead>
                           <tr>
@@ -2072,11 +2247,25 @@ export function PosContent() {
                             <th className="text-end">Importo</th>
                           </tr>
                         </thead>
-                        <tbody id="posInstallmentScheduleBody"></tbody>
+                        <tbody id="posInstallmentScheduleBody">
+                          {installmentSchedule.map((row) => (
+                            <tr key={row.no}>
+                              <td>{row.no}</td>
+                              <td>{row.dueDate}</td>
+                              <td className="text-end">{fmtEUR(row.amount)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
                       </table>
                     </div>
                     <div className="d-flex gap-2">
-                      <button type="button" className="btn btn-outline-primary btn-sm" id="posInstallmentEditBtn">
+                      <button
+                        type="button"
+                        className="btn btn-outline-primary btn-sm"
+                        id="posInstallmentEditBtn"
+                        data-bs-toggle="modal"
+                        data-bs-target="#posInstallmentModal"
+                      >
                         Modifica
                       </button>
                     </div>
@@ -2256,35 +2445,70 @@ export function PosContent() {
                   <div className="row g-2">
                     <div className="col-12 col-md-6">
                       <label className="form-label small text-muted mb-1">Cliente</label>
-                      <input type="text" className="form-control" id="posInstallmentClientLabel" defaultValue="—" readOnly />
+                      <input type="text" className="form-control" id="posInstallmentClientLabel" value={clientName || "—"} readOnly />
                     </div>
                     <div className="col-12 col-md-6">
                       <label className="form-label small text-muted mb-1">Totale vendita</label>
-                      <input type="text" className="form-control" id="posInstallmentSaleTotal" defaultValue="€ 0,00" readOnly />
+                      <input type="text" className="form-control" id="posInstallmentSaleTotal" value={fmtEUR(total)} readOnly />
                     </div>
                     <div className="col-12 col-md-6">
                       <label className="form-label small text-muted mb-1">Tipo pagamento</label>
-                      <input type="text" className="form-control" id="posInstallmentPaymentType" defaultValue="" readOnly />
+                      <input type="text" className="form-control" id="posInstallmentPaymentType" value={PAYMENT_METHOD_LABELS[baseMethod]} readOnly />
                     </div>
                     <div className="col-12 col-md-6">
                       <label className="form-label small text-muted mb-1">Acconto iniziale</label>
-                      <input type="number" step="0.01" min="0" className="form-control" id="posInstallmentDownPayment" defaultValue="0.00" />
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        className="form-control"
+                        id="posInstallmentDownPayment"
+                        value={installmentDownInput}
+                        onChange={(e) => setInstallmentDownInput(e.target.value)}
+                      />
                     </div>
                     <div className="col-12 col-md-4">
                       <label className="form-label small text-muted mb-1">Numero rate</label>
-                      <input type="number" min="1" max="120" className="form-control" id="posInstallmentCount" defaultValue="3" />
+                      <input
+                        type="number"
+                        min="1"
+                        max="120"
+                        className="form-control"
+                        id="posInstallmentCount"
+                        value={installmentCountInput}
+                        onChange={(e) => setInstallmentCountInput(e.target.value)}
+                      />
                     </div>
                     <div className="col-12 col-md-4">
                       <label className="form-label small text-muted mb-1">Prima scadenza</label>
-                      <input type="date" className="form-control" id="posInstallmentFirstDue" />
+                      <input
+                        type="date"
+                        className="form-control"
+                        id="posInstallmentFirstDue"
+                        value={installmentFirstDueValue}
+                        onChange={(e) => setInstallmentFirstDue(e.target.value)}
+                      />
                     </div>
                     <div className="col-6 col-md-2">
                       <label className="form-label small text-muted mb-1">Ogni</label>
-                      <input type="number" min="1" max="24" className="form-control" id="posInstallmentIntervalValue" defaultValue="1" />
+                      <input
+                        type="number"
+                        min="1"
+                        max="24"
+                        className="form-control"
+                        id="posInstallmentIntervalValue"
+                        value={installmentIntervalValueInput}
+                        onChange={(e) => setInstallmentIntervalValueInput(e.target.value)}
+                      />
                     </div>
                     <div className="col-6 col-md-2">
                       <label className="form-label small text-muted mb-1">Unità</label>
-                      <select className="form-select" id="posInstallmentIntervalUnit" defaultValue="month">
+                      <select
+                        className="form-select"
+                        id="posInstallmentIntervalUnit"
+                        value={installmentIntervalUnit}
+                        onChange={(e) => setInstallmentIntervalUnit(e.target.value as "day" | "week" | "month")}
+                      >
                         <option value="month">Mesi</option>
                         <option value="week">Settimane</option>
                         <option value="day">Giorni</option>
@@ -2297,25 +2521,32 @@ export function PosContent() {
                         id="posInstallmentNotes"
                         rows={3}
                         placeholder="Es. acconto in cassa, accordi col cliente, note operative..."
+                        value={installmentNote}
+                        onChange={(e) => setInstallmentNote(e.target.value)}
                       ></textarea>
                     </div>
                   </div>
-                  <div className="alert alert-danger small mt-3 d-none" id="posInstallmentModalError"></div>
+                  <div
+                    className={`alert alert-danger small mt-3${installmentModalError ? "" : " d-none"}`}
+                    id="posInstallmentModalError"
+                  >
+                    {installmentModalError}
+                  </div>
                 </div>
                 <div className="col-12 col-lg-5">
                   <div className="pos-installment-preview-card">
                     <div className="fw-semibold mb-2">Anteprima piano</div>
                     <div className="d-flex justify-content-between small mb-1">
                       <span>Acconto oggi</span>
-                      <strong id="posInstallmentPreviewDownPayment">€ 0,00</strong>
+                      <strong id="posInstallmentPreviewDownPayment">{fmtEUR(installmentDownPayment)}</strong>
                     </div>
                     <div className="d-flex justify-content-between small mb-1">
                       <span>Residuo rateizzato</span>
-                      <strong id="posInstallmentPreviewFinanced">€ 0,00</strong>
+                      <strong id="posInstallmentPreviewFinanced">{fmtEUR(installmentFinanced)}</strong>
                     </div>
                     <div className="d-flex justify-content-between small mb-3">
                       <span>Ultima scadenza</span>
-                      <strong id="posInstallmentPreviewLastDue">—</strong>
+                      <strong id="posInstallmentPreviewLastDue">{installmentLastDue || "—"}</strong>
                     </div>
                     <div className="table-responsive">
                       <table className="table table-sm mb-0 pos-installment-schedule-table">
@@ -2326,7 +2557,15 @@ export function PosContent() {
                             <th className="text-end">Importo</th>
                           </tr>
                         </thead>
-                        <tbody id="posInstallmentPreviewBody"></tbody>
+                        <tbody id="posInstallmentPreviewBody">
+                          {installmentSchedule.map((row) => (
+                            <tr key={row.no}>
+                              <td>{row.no}</td>
+                              <td>{row.dueDate}</td>
+                              <td className="text-end">{fmtEUR(row.amount)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
                       </table>
                     </div>
                   </div>
@@ -2334,7 +2573,14 @@ export function PosContent() {
               </div>
             </div>
             <div className="modal-footer">
-              <button type="button" className="btn btn-primary" id="posInstallmentSaveBtn">
+              <button
+                type="button"
+                className="btn btn-primary"
+                id="posInstallmentSaveBtn"
+                disabled={!installmentCanSave}
+                data-bs-dismiss={installmentCanSave ? "modal" : undefined}
+                onClick={saveInstallmentPlan}
+              >
                 <i className="bi bi-check2-circle me-1"></i>Salva piano rate
               </button>
             </div>

@@ -189,8 +189,26 @@ export type PosCheckoutInput = {
   // The backend converts points -> euro discount (points x euro_per_point), validates
   // against the client balance + redeem settings, and consumes them. 0 / undefined = none.
   fidelityPointsUse?: number;
+  // RATEIZZAZIONE: the optional installment plan (faithful to SaleInstallments::createPlan).
+  // When present with count >= 2, the backend writes a sale_installment_plans row + N
+  // sale_installments rows scheduling the financed remainder (total - downPayment). The sale
+  // total + payments are unchanged: the plan only documents/schedules the financing.
+  installmentPlan?: PosInstallmentPlanInput;
   items: PosSaleItemInput[];
   payments: PosPaymentInput[];
+};
+
+// The installment plan params the staff configures in the "Rateizzazione" panel.
+// Faithful to the legacy installment_plan_json (preparePlanConfig input): the down payment
+// (acconto), the number of installments, the interval value + unit, the first due date and
+// an optional note. The financed amount + schedule are derived server-side.
+export type PosInstallmentPlanInput = {
+  count: number;
+  downPayment?: number;
+  intervalValue?: number;
+  intervalUnit?: "day" | "week" | "month";
+  firstDueDate?: string;
+  note?: string;
 };
 
 export type PosSummary = {
