@@ -57,6 +57,10 @@ export type ManagePosContext = {
     // "Emetti GiftBox" modal; selling one issues a giftbox_instances row (+ its items copied
     // from the template's giftbox_items) owned by the recipient at checkout.
     giftboxes: SellableGiftbox[];
+    // Sellable RECHARGE templates (id, title, base/bonus/total, earn-points flag) for the
+    // "Ricarica credito" modal; selling one inserts a recharges row + CREDITS the wallet by
+    // base+bonus (+ earns fidelity points) at checkout.
+    rechargeTemplates: SellableRecharge[];
   };
   locations: Array<{ id: number; name: string }>;
 };
@@ -101,6 +105,24 @@ export type SellableGiftbox = {
   items: SellableGiftboxItem[];
 };
 
+// A RECHARGE template the POS can SELL — port of the recharge_templates catalog the legacy
+// recharge modal precompiles from (SELECT id, title, base_amount, bonus_kind, bonus_value,
+// earn_points FROM recharge_templates WHERE is_active=1 ORDER BY sort_order). The client PAYS
+// `baseAmount` (the sale line price) and RECEIVES `baseAmount + bonusAmount` (the wallet
+// credit). `bonusAmount` is computed from bonus_kind/bonus_value exactly like recharges-content
+// (percent: base*value/100, fixed: value, none: 0). `earnPoints` decides whether fidelity
+// points are earned on the bonus too (base+bonus) or on the base only. Custom (amount-only)
+// recharges use templateId 0 and are configured entirely in the modal.
+export type SellableRecharge = {
+  id: number;
+  title: string;
+  baseAmount: number;
+  bonusKind: string;
+  bonusValue: number;
+  bonusAmount: number;
+  earnPoints: boolean;
+};
+
 const sourceLabel = "app/pages/pos.php + app/pages/pos_history.php";
 
 export async function getManagePosContext(
@@ -109,13 +131,14 @@ export async function getManagePosContext(
 ): Promise<ManagePosContext> {
   const locationContext = await getManageLocationContext(slug);
   const activeLocationId = normalizeLocationId(options.locationId ?? locationContext.currentLocationId, locationContext.locations);
-  const [sales, clients, services, products, packages, giftboxes] = await Promise.all([
+  const [sales, clients, services, products, packages, giftboxes, rechargeTemplates] = await Promise.all([
     listPosSales(slug, { locationId: activeLocationId, includeCancelled: options.includeCancelled ?? true, query: options.query ?? "" }),
     listPosClients(slug),
     listPosServices(slug, activeLocationId),
     listPosProducts(slug, activeLocationId),
     listPosPackages(slug, activeLocationId),
     listPosGiftboxes(slug, activeLocationId),
+    listPosRechargeTemplates(slug),
   ]);
 
   return {
@@ -125,7 +148,7 @@ export async function getManagePosContext(
     activeLocationId,
     summary: summarizeSales(sales),
     sales,
-    catalog: { clients, services, products, packages, giftboxes },
+    catalog: { clients, services, products, packages, giftboxes, rechargeTemplates },
     locations: locationContext.locations.map((location) => ({ id: location.id, name: location.name })),
   };
 }
@@ -337,6 +360,10 @@ export async function checkoutManageSale(
     // in their residui and the drawer's giftbox redeem can consume it. A bench sale with no
     // resolvable recipient is skipped inside issueGiftboxFromSale.
     if (item.type === "giftbox") await issueGiftboxFromSale(slug, saleId, client.id, item, locationId);
+    // SELL a RECHARGE: insert a recharges row (base/bonus/total/points), CREDIT the wallet by
+    // base+bonus, and EARN fidelity points (when earn_points + eligible). A recharge tops up
+    // a real client's wallet, so it requires client.id > 0 (a bench sale has no wallet).
+    if (item.type === "recharge" && client.id > 0) await issueRechargeFromSale(slug, saleId, client.id, item, locationId, operator.id);
   }
 
   if (input.appointmentId && input.appointmentId > 0) {
@@ -394,7 +421,7 @@ export async function cancelManageSale(
     reason,
     note: cancelNote(input.saleId, input.userName, reason, stockMode, productItems),
   });
-  await cancelLinkedSaleResidues(slug, input.saleId, reason, saleRow);
+  await cancelLinkedSaleResidues(slug, input.saleId, reason, saleRow, input.userId);
 
   const updated = await getSale(slug, input.saleId);
   return {
@@ -688,6 +715,61 @@ async function giftboxTemplateItems(slug: string, giftboxId: number): Promise<Se
   });
 }
 
+// Sellable RECHARGE templates for the POS "Ricarica credito" modal — port of the
+// recharge_templates catalog the legacy modal precompiles from (SELECT id, title,
+// base_amount, bonus_kind, bonus_value, earn_points FROM recharge_templates WHERE
+// is_active=1 ORDER BY sort_order, title). The bonus is computed exactly like
+// recharges-content.tsx (percent: base*value/100, fixed: value, none: 0). There is no
+// recharge_locations table, so the catalog is not location-filtered. Tolerates the table
+// being absent (-> empty list).
+async function listPosRechargeTemplates(slug: string): Promise<SellableRecharge[]> {
+  const table = await tenantTable(slug, "recharge_templates").catch(() => null);
+  if (!table) return [];
+  const clauses = ["COALESCE(t.is_active,1)=1"];
+  const params: unknown[] = [];
+  if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
+    clauses.unshift("t.tenant_id=?");
+    params.unshift(table.tenantId ?? 0);
+  }
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT t.*
+       FROM ${quoteIdentifier(table.name)} t
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY COALESCE(t.sort_order,0) ASC, t.title ASC, t.id ASC`,
+    params,
+  ).catch(() => [] as RowDataPacket[]);
+  return rows.map((row) => {
+    const baseAmount = roundMoney(Math.max(0, Number(row.base_amount ?? 0) || 0));
+    const bonusKind = normalizeBonusKind(row.bonus_kind);
+    const bonusValue = roundMoney(Math.max(0, Number(row.bonus_value ?? 0) || 0));
+    return {
+      id: Number(row.id ?? 0) || 0,
+      title: String(row.title ?? "Ricarica"),
+      baseAmount,
+      bonusKind,
+      bonusValue,
+      bonusAmount: rechargeBonusAmount(baseAmount, bonusKind, bonusValue),
+      earnPoints: Number(row.earn_points ?? 1) === 1,
+    };
+  });
+}
+
+// The € bonus credit for a recharge — faithful to recharges-content.tsx bonusAmount():
+// percent -> base*value/100, fixed -> value, none/other -> 0. Always >= 0, money-rounded.
+function rechargeBonusAmount(baseAmount: number, bonusKind: string, bonusValue: number): number {
+  const base = Math.max(0, Number(baseAmount) || 0);
+  const value = Math.max(0, Number(bonusValue) || 0);
+  if (bonusKind === "percent") return roundMoney((base * value) / 100);
+  if (bonusKind === "fixed") return roundMoney(value);
+  return 0;
+}
+
+// Clamp a bonus kind to the schema's CHECK ('none','percent','fixed'), defaulting to 'none'.
+function normalizeBonusKind(value: unknown): string {
+  const kind = String(value ?? "none").toLowerCase();
+  return kind === "percent" || kind === "fixed" ? kind : "none";
+}
+
 async function mapSale(slug: string, row: RowDataPacket): Promise<PosSale> {
   const id = Number(row.id ?? 0);
   const items = await saleItems(slug, id);
@@ -787,12 +869,28 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
     // on the line meta and are read by issueGiftcardFromSale at checkout.
     // A GIFTBOX line is also a single unit at the box price (like a giftcard); the recipient
     // OWNER + expiry/event/dedica ride on the line meta and are read by issueGiftboxFromSale.
+    // A RECHARGE line is also a single unit, but its price is the BASE amount (what the client
+    // pays); the base/bonus/total + earn-points flag ride on the line meta and are read by
+    // issueRechargeFromSale (which credits the wallet by base+bonus and earns points). The
+    // bonus is free credit, so it is NEVER added to the sale line price.
     const isPackage = input.type === "package";
     const isGiftcard = input.type === "giftcard";
     const isGiftbox = input.type === "giftbox";
+    const isRecharge = input.type === "recharge";
     const isVoucher = isGiftcard || isGiftbox; // shares the recipient/expiry/event/dedica meta
-    const lineQty = isPackage || isVoucher ? 1 : quantity;
-    const unitPrice = roundMoney(input.unitPrice ?? 0);
+    const lineQty = isPackage || isVoucher || isRecharge ? 1 : quantity;
+    // Recharge line price = the base amount (the client pays the base; the bonus is free). For
+    // every other special line the price is the supplied unitPrice.
+    const rechargeBase = isRecharge
+      ? roundMoney(Math.max(0, Number(input.baseAmount ?? input.unitPrice ?? 0) || 0))
+      : 0;
+    const unitPrice = isRecharge ? rechargeBase : roundMoney(input.unitPrice ?? 0);
+    // Recharge bonus/total: trust the client's bonus_kind/bonus_value and RECOMPUTE the bonus
+    // server-side (never trust a client-sent total), then total = base + bonus.
+    const rechargeBonusKind = isRecharge ? normalizeBonusKind(input.bonusKind) : "none";
+    const rechargeBonusValue = isRecharge ? roundMoney(Math.max(0, Number(input.bonusValue ?? 0) || 0)) : 0;
+    const rechargeBonus = isRecharge ? rechargeBonusAmount(rechargeBase, rechargeBonusKind, rechargeBonusValue) : 0;
+    const rechargeTotal = isRecharge ? roundMoney(rechargeBase + rechargeBonus) : 0;
     items.push({
       id: index + 1,
       type: input.type,
@@ -812,6 +910,12 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
       eventType: isVoucher ? clean(input.eventType, 40) || undefined : undefined,
       message: isVoucher ? clean(input.message, 2000) || undefined : undefined,
       hideAmount: isVoucher ? input.hideAmount === true : undefined,
+      baseAmount: isRecharge ? rechargeBase : undefined,
+      bonusKind: isRecharge ? rechargeBonusKind : undefined,
+      bonusValue: isRecharge ? rechargeBonusValue : undefined,
+      bonusAmount: isRecharge ? rechargeBonus : undefined,
+      totalAmount: isRecharge ? rechargeTotal : undefined,
+      earnPoints: isRecharge ? input.earnPoints === true : undefined,
     });
   }
   return items.filter((item) => item.quantity > 0);
@@ -984,7 +1088,7 @@ async function markSaleCancelled(slug: string, saleId: number, input: { userId: 
   }
 }
 
-async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: string, saleRow?: RowDataPacket): Promise<void> {
+async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: string, saleRow?: RowDataPacket, voidedBy: number | null = null): Promise<void> {
   await updateBySaleId(slug, "client_prepaid_services", saleId, { status: "cancelled", canceled_at: new Date(), cancel_note: reason });
   await updateBySaleId(slug, "client_packages", saleId, { status: "canceled", updated_at: new Date() });
   await updateBySaleId(slug, "sale_installment_plans", saleId, { status: "cancelled", cancelled_at: new Date(), cancelled_reason: reason });
@@ -1002,6 +1106,15 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   // restore (which reverses a CONSUMED giftbox via giftbox_redemptions) — a different
   // operation keyed off the sale linkage, so the two never collide.
   await cancelIssuedSaleGiftboxes(slug, saleId, reason);
+
+  // REVERSE the RECHARGE this sale ISSUED (the SELL path): flip each recharges row for this
+  // sale to is_void=1 (+ voided_at/by), DEBIT the wallet by total_amount (the inverse of the
+  // top-up credit) and reverse the earned points (points_redeem). Found by recharges.sale_id
+  // (the table HAS sale_id + is_void). Idempotent: only a not-yet-void row is reversed, so a
+  // re-void is a no-op. Kept distinct from the residui-credit restore below (that re-credits
+  // SPENT credit, keyed off sales.credit_used) — both touch clients.credit_balance but are
+  // linked to different rows/notes and guarded by recharges.is_void, so they never collide.
+  await reverseIssuedSaleRecharges(slug, saleId, voidedBy);
 
   // Restore the residui consumed at checkout: refund the GiftCard balance (re-activating
   // a card the redeem flipped to 'redeemed') and credit the wallet back. Both are linked
@@ -1169,6 +1282,63 @@ async function cancelIssuedSaleGiftboxes(slug: string, saleId: number, reason: s
   }
 }
 
+// Reverse any RECHARGE(s) this sale ISSUED (the SELL path), found via recharges.sale_id (the
+// table HAS sale_id + is_void). For each not-yet-void row: flip is_void=1 (+ voided_at/by),
+// DEBIT the wallet by total_amount (a negative 'debit' movement — credit_adjustments row +
+// clients.credit_balance decrement, the inverse of the top-up credit) and reverse the earned
+// points (a negative 'points_redeem' movement — transactions row + clients.points decrement,
+// the inverse of the earned points). Best-effort + idempotent: a row already void is skipped,
+// so a re-void is a no-op. Kept distinct from the residui-credit restore (which RE-CREDITS
+// credit the sale SPENT, keyed off sales.credit_used) — guarded by recharges.is_void so the
+// two credit_balance operations never collide.
+async function reverseIssuedSaleRecharges(slug: string, saleId: number, voidedBy: number | null): Promise<void> {
+  const table = await tenantTable(slug, "recharges").catch(() => null);
+  if (!table) return;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: table.name,
+    columns: "id, client_id, total_amount, points_earned, is_void",
+    where: "sale_id=?",
+    params: [saleId],
+  }).catch(() => [] as RowDataPacket[]);
+
+  for (const row of rows) {
+    const rechargeId = Math.max(0, Number(row.id ?? 0) || 0);
+    if (rechargeId <= 0) continue;
+    // Idempotent: skip a recharge already voided (a re-void must not double-debit).
+    if (Number(row.is_void ?? 0) === 1) continue;
+    const clientId = Math.max(0, Number(row.client_id ?? 0) || 0);
+    const totalAmount = roundMoney(Math.max(0, Number(row.total_amount ?? 0) || 0));
+    const pointsEarned = normalizePoints(Number(row.points_earned ?? 0) || 0);
+
+    // Flip is_void FIRST so the row is guarded even if a wallet movement throws (a re-void
+    // then skips it). Schema-guarded via filterColumns.
+    await tenantUpdate({
+      slug,
+      table: table.name,
+      id: rechargeId,
+      values: { is_void: 1, voided_at: new Date(), voided_by: voidedBy },
+    }).catch(() => 0);
+
+    if (clientId > 0 && totalAmount > 0) {
+      // DEBIT the wallet by the credited total (negative -> credit_adjustments debit row +
+      // clients.credit_balance decrement), the inverse of the issue-time top-up credit.
+      await addDbWalletMovement(
+        { clientId, type: "debit", amount: -totalAmount, note: `Storno ricarica vendita #${saleId}` },
+        slug,
+      ).catch(() => undefined);
+    }
+    if (clientId > 0 && pointsEarned > 0) {
+      // REVERSE the earned points (negative points_redeem -> transactions row +
+      // clients.points decrement), the inverse of the issue-time points_earn.
+      await addDbWalletMovement(
+        { clientId, type: "points_redeem", points: -pointsEarned, source: "recharge", note: `Storno punti ricarica vendita #${saleId}` },
+        slug,
+      ).catch(() => undefined);
+    }
+  }
+}
+
 async function issuePrepaidFromSale(slug: string, saleId: number, saleItemId: number, clientId: number, item: PosSaleItem): Promise<void> {
   const table = await tenantTable(slug, "client_prepaid_services").catch(() => null);
   if (!table) return;
@@ -1224,6 +1394,140 @@ async function issuePackageFromSale(slug: string, saleId: number, clientId: numb
 async function packageRowById(slug: string, id: number): Promise<RowDataPacket | null> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "packages", where: "id=?", params: [id], limit: 1 }).catch(() => []);
   return rows[0] ?? null;
+}
+
+// SELL a RECHARGE at checkout — faithful port of the pos.php recharge action (~2195-2259) +
+// recharge_templates. Inserts a `recharges` row (base/bonus/total/earn_points/points_earned,
+// template_id, sale_id, location_id, created_by), CREDITS the wallet by total_amount
+// (addDbWalletMovement type 'recharge', positive — inserts a credit_adjustments row +
+// increments clients.credit_balance), and EARNS fidelity points (addDbWalletMovement
+// 'points_earn', positive — inserts a transactions row + increments clients.points) when
+// earn_points is set AND the client is eligible. The client PAID the base_amount (the sale
+// line) and RECEIVES base+bonus as credit; the bonus is free credit. Skips silently when the
+// total is not positive. Returns the new recharges id (0 when not issued).
+async function issueRechargeFromSale(
+  slug: string,
+  saleId: number,
+  clientId: number,
+  item: PosSaleItem,
+  locationId: number,
+  createdBy: number | null,
+): Promise<number> {
+  const table = await tenantTable(slug, "recharges").catch(() => null);
+  if (!table) return 0;
+  if (clientId <= 0) return 0;
+
+  // Base = the line price (qty forced to 1, so total === unitPrice). Bonus/total ride on the
+  // line meta (recomputed server-side in buildSaleItems, never trusting a client total).
+  const baseAmount = roundMoney(Math.max(0, Number(item.baseAmount ?? item.total ?? item.unitPrice ?? 0) || 0));
+  if (baseAmount <= 0.00001) return 0;
+  const bonusKind = normalizeBonusKind(item.bonusKind);
+  const bonusValue = roundMoney(Math.max(0, Number(item.bonusValue ?? 0) || 0));
+  const bonusAmount = roundMoney(Math.max(0, Number(item.bonusAmount ?? rechargeBonusAmount(baseAmount, bonusKind, bonusValue)) || 0));
+  const totalAmount = roundMoney(baseAmount + bonusAmount);
+  const earnPointsFlag = item.earnPoints === true;
+  const templateId = Math.max(0, Number(item.refId ?? 0) || 0);
+
+  // POINTS: faithful to pos_recharge_points_info — earn only when the template's earn_points
+  // flag is set AND the client is recharge-points eligible. The earn BASE is base+bonus when
+  // the flag is set (the legacy "Importo + bonus" rule the modal exposes), else base only.
+  // The points themselves are computed from the fidelity earn rule (floor(amount / earn_step)).
+  // TODO(parity): the full eligibility (campaign windows + min_spend + card levels via
+  // Fidelity::calcEarnPointsForAmountWithCampaign / credit_wallet_recharge_points_eligible) is
+  // NOT ported — only the global fidelity_enabled gate + the flat earn-step rate. A campaign
+  // (fidelity_campaigns) or level-restricted earn would diverge here.
+  const earnSettings = await getFidelityEarnSettings(slug);
+  const eligible = earnPointsFlag && earnSettings.enabled;
+  const earnBase = earnSettings.earnOnBonus ? totalAmount : baseAmount;
+  const pointsEarned = eligible ? earnFidelityPoints(earnBase, earnSettings.earnStep) : 0;
+
+  const note = rechargeNote(baseAmount, bonusAmount, pointsEarned, item.note);
+
+  const rechargeId = await tenantInsert(table, await filterColumns(table.name, {
+    client_id: clientId,
+    card_id: 0,
+    template_id: templateId > 0 ? templateId : null,
+    sale_id: saleId,
+    location_id: locationId > 0 ? locationId : null,
+    base_amount: baseAmount,
+    bonus_kind: bonusKind,
+    bonus_value: bonusValue,
+    bonus_amount: bonusAmount,
+    total_amount: totalAmount,
+    earn_points: eligible ? 1 : 0,
+    points_earned: pointsEarned,
+    note,
+    is_void: 0,
+    created_at: new Date(),
+    created_by: createdBy,
+  })).catch(() => 0);
+  if (!rechargeId) return 0;
+
+  // CREDIT the wallet by base+bonus (a positive 'recharge' movement: credit_adjustments row +
+  // clients.credit_balance increment), tagged with the sale id so a later void can reverse it.
+  await addDbWalletMovement(
+    { clientId, type: "recharge", amount: totalAmount, note: `Ricarica vendita #${saleId}` },
+    slug,
+  ).catch(() => undefined);
+
+  // EARN the fidelity points (a positive 'points_earn' movement: transactions row +
+  // clients.points increment), tagged with the sale id so a later void can reverse them.
+  if (pointsEarned > 0) {
+    await addDbWalletMovement(
+      { clientId, type: "points_earn", points: pointsEarned, source: "recharge", note: `Punti ricarica vendita #${saleId}` },
+      slug,
+    ).catch(() => undefined);
+  }
+
+  return rechargeId;
+}
+
+// The recharge fidelity EARN settings — port of Fidelity::settings() earn block (always
+// 'amount' mode now): fidelity_enabled gate + the flat earn step (€ per point). `earnOnBonus`
+// is ALWAYS true here (the per-template earn_points flag already decides whether points are
+// earned at all; when earned, the base is base+bonus per the modal's "Importo + bonus" copy).
+// Schema-guarded: a missing column / table falls back to disabled with a 10€ step.
+type FidelityEarnSettings = { enabled: boolean; earnStep: number; earnOnBonus: boolean };
+
+async function getFidelityEarnSettings(slug: string): Promise<FidelityEarnSettings> {
+  const defaults: FidelityEarnSettings = { enabled: false, earnStep: 10, earnOnBonus: true };
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "fidelity_enabled,fidelity_points_enabled,fidelity_earn_step_euro",
+      orderBy: "id ASC",
+      limit: 1,
+    });
+    const row = rows[0];
+    if (!row) return defaults;
+    const enabled = Number(row.fidelity_enabled ?? 0) === 1 && Number(row.fidelity_points_enabled ?? 1) === 1;
+    let earnStep = Number(row.fidelity_earn_step_euro ?? 10);
+    if (!Number.isFinite(earnStep) || earnStep <= 0) earnStep = 10;
+    if (earnStep > 100000) earnStep = 100000;
+    return { enabled, earnStep: roundMoney(earnStep), earnOnBonus: true };
+  } catch {
+    return defaults;
+  }
+}
+
+// Points earned for an amount — port of Fidelity::calcEarnPointsWithStep (floor(amount/step),
+// whole points). Returns 0 when the step or amount is non-positive.
+function earnFidelityPoints(amount: number, earnStep: number): number {
+  const value = Math.max(0, Number(amount) || 0);
+  const step = Number(earnStep) || 0;
+  if (step <= 0 || value <= 0) return 0;
+  return normalizePoints(value / step);
+}
+
+// The recharge ledger note — faithful to the legacy "Ricarica credito: € base • +N Punti • user".
+function rechargeNote(baseAmount: number, bonusAmount: number, pointsEarned: number, userNote?: string): string {
+  const parts = [`Ricarica credito: € ${formatMoney(baseAmount)}`];
+  if (bonusAmount > 0.00001) parts.push(`bonus € ${formatMoney(bonusAmount)}`);
+  if (pointsEarned > 0.00001) parts.push(`+${pointsEarned} Punti`);
+  const note = clean(userNote, 180);
+  if (note) parts.push(note);
+  return clean(parts.join(" • "), 255);
 }
 
 // Marker stored on the issue giftcard_transactions row (note + meta_json) so a later sale
@@ -1846,6 +2150,7 @@ function fallbackItemName(type: PosSaleItemType): string {
   if (type === "package") return "Pacchetto";
   if (type === "giftbox") return "GiftBox";
   if (type === "prepaid") return "Prepagato";
+  if (type === "recharge") return "Ricarica";
   return "Voce";
 }
 

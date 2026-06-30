@@ -110,6 +110,20 @@ type CatalogGiftbox = {
   items: CatalogGiftboxItem[];
 };
 
+// A sellable RECHARGE template from /api/manage/pos (port of recharge_templates): id, title,
+// base amount, bonus kind/value (+ the precomputed € bonus), and whether points are earned on
+// the bonus too. Picking one precompiles the modal; "Aggiungi" pushes a {type:"recharge"} cart
+// line that credits the wallet by base+bonus at checkout.
+type CatalogRecharge = {
+  id: number;
+  title: string;
+  baseAmount: number;
+  bonusKind: string;
+  bonusValue: number;
+  bonusAmount: number;
+  earnPoints: boolean;
+};
+
 type PosContext = {
   activeLocationId?: number;
   catalog?: {
@@ -118,6 +132,7 @@ type PosContext = {
     products?: CatalogProduct[];
     packages?: CatalogPackage[];
     giftboxes?: CatalogGiftbox[];
+    rechargeTemplates?: CatalogRecharge[];
   };
 };
 
@@ -134,7 +149,7 @@ type ClientResiduals = {
 
 type CartLine = {
   key: string;
-  type: "service" | "product" | "package" | "prepaid" | "giftcard" | "giftbox";
+  type: "service" | "product" | "package" | "prepaid" | "giftcard" | "giftbox" | "recharge";
   refId: number;
   name: string;
   quantity: number;
@@ -157,6 +172,15 @@ type CartLine = {
   eventType?: string;
   message?: string;
   hideAmount?: boolean;
+  // RECHARGE meta (qty locked to 1; the line price is the BASE amount the client pays). Carried
+  // to checkout so issueRechargeFromSale writes the recharges row + credits the wallet by
+  // base+bonus. refId is the recharge_templates id (0 = custom amount).
+  baseAmount?: number;
+  bonusKind?: string;
+  bonusValue?: number;
+  bonusAmount?: number;
+  totalAmount?: number;
+  earnPoints?: boolean;
 };
 
 // Legacy POS base payment type (the single payment_type radio: cash/card/check/bank).
@@ -320,6 +344,18 @@ export function PosContent() {
   const [gbMessage, setGbMessage] = useState("");
   const [gbHideAmount, setGbHideAmount] = useState(false);
 
+  // RECHARGE sale modal (wired): the chosen recharge_templates id (0 = custom amount), the base
+  // amount the client pays, the bonus rule (kind/value), the earn-points-on-bonus toggle, and an
+  // optional note. Picking a template precompiles base/bonus/earn-points (all still editable).
+  // "Aggiungi" pushes a {type:"recharge"} cart line whose price is the base; the wallet is
+  // credited base+bonus at checkout. A recharge requires a real client to conclude (gated below).
+  const [rechargeTemplateId, setRechargeTemplateId] = useState(0);
+  const [rechargeAmount, setRechargeAmount] = useState("");
+  const [rechargeBonusKindInput, setRechargeBonusKindInput] = useState("none");
+  const [rechargeBonusValueInput, setRechargeBonusValueInput] = useState("0");
+  const [rechargeEarnPoints, setRechargeEarnPoints] = useState(true);
+  const [rechargeNoteInput, setRechargeNoteInput] = useState("");
+
   // Checkout state.
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
@@ -356,6 +392,7 @@ export function PosContent() {
     () => giftboxes.find((g) => g.id === gbTemplateId) ?? null,
     [giftboxes, gbTemplateId],
   );
+  const rechargeTemplates = useMemo(() => ctx?.catalog?.rechargeTemplates ?? [], [ctx]);
 
   const filteredClients = useMemo(() => {
     const q = clientSearch.trim().toLowerCase();
@@ -866,6 +903,86 @@ export function PosContent() {
     closePosModal("posModalGiftbox");
   }
 
+  // ---- RECHARGE sale (wired) ----
+  // The € bonus credit for the current modal inputs — faithful to the backend rechargeBonusAmount
+  // (percent: base*value/100, fixed: value, none: 0). Derived during render so the preview always
+  // matches what the server will recompute.
+  const rechargeBase = useMemo(
+    () => roundMoney(Math.max(0, Number.parseFloat(rechargeAmount.replace(",", ".")) || 0)),
+    [rechargeAmount],
+  );
+  const rechargeBonus = useMemo(() => {
+    const value = Math.max(0, Number.parseFloat(rechargeBonusValueInput.replace(",", ".")) || 0);
+    if (rechargeBonusKindInput === "percent") return roundMoney((rechargeBase * value) / 100);
+    if (rechargeBonusKindInput === "fixed") return roundMoney(value);
+    return 0;
+  }, [rechargeBase, rechargeBonusKindInput, rechargeBonusValueInput]);
+  const rechargeTotal = useMemo(() => roundMoney(rechargeBase + rechargeBonus), [rechargeBase, rechargeBonus]);
+  // Points preview (informational): floor((earnPoints ? total : base) / euroPerPoint-ish) is not
+  // known client-side (the earn step is a business setting, not the redeem rate). We show the
+  // earn BASE (importo+bonus vs solo importo) the backend will use; the exact points are computed
+  // server-side. Kept simple to avoid drifting from the backend earn rule.
+  const rechargeEarnBase = useMemo(
+    () => (rechargeEarnPoints ? rechargeTotal : rechargeBase),
+    [rechargeEarnPoints, rechargeTotal, rechargeBase],
+  );
+
+  // Picking a template precompiles the base/bonus/earn-points (all still editable). The empty
+  // option (id 0) is a custom amount — leaves the fields as typed.
+  function chooseRechargeTemplate(id: number) {
+    setRechargeTemplateId(id);
+    const tpl = rechargeTemplates.find((t) => t.id === id);
+    if (!tpl) return;
+    setRechargeAmount(tpl.baseAmount > 0 ? tpl.baseAmount.toFixed(2) : "");
+    setRechargeBonusKindInput(tpl.bonusKind || "none");
+    setRechargeBonusValueInput(tpl.bonusValue > 0 ? String(tpl.bonusValue) : "0");
+    setRechargeEarnPoints(tpl.earnPoints);
+  }
+
+  function resetRechargeModal() {
+    setRechargeTemplateId(0);
+    setRechargeAmount("");
+    setRechargeBonusKindInput("none");
+    setRechargeBonusValueInput("0");
+    setRechargeEarnPoints(true);
+    setRechargeNoteInput("");
+  }
+
+  // "Aggiungi alla lista": validate the amount and push a {type:"recharge"} cart line — qty 1 at
+  // the BASE amount (what the client pays); the bonus/total/earn-points ride on the line meta so
+  // the backend credits the wallet by base+bonus + earns points. The recharge can be added with
+  // no client, but checkout requires a real client to conclude (gated server-side). refId = the
+  // chosen template id (0 = custom).
+  function addRechargeToCart() {
+    setErrorMsg("");
+    if (rechargeBase <= 0) {
+      setErrorMsg("Inserisci un importo ricarica valido.");
+      return;
+    }
+    const label = `Ricarica € ${rechargeBase.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    setCart((prev) => [
+      {
+        key: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        type: "recharge",
+        refId: rechargeTemplateId > 0 ? rechargeTemplateId : 0,
+        name: label,
+        quantity: 1,
+        unitPrice: rechargeBase,
+        status: "prepaid",
+        note: rechargeNoteInput.trim() || undefined,
+        baseAmount: rechargeBase,
+        bonusKind: rechargeBonusKindInput,
+        bonusValue: Math.max(0, Number.parseFloat(rechargeBonusValueInput.replace(",", ".")) || 0),
+        bonusAmount: rechargeBonus,
+        totalAmount: rechargeTotal,
+        earnPoints: rechargeEarnPoints,
+      },
+      ...prev,
+    ]);
+    resetRechargeModal();
+    closePosModal("posModalRecharge");
+  }
+
   // ---- Coupon preview (wired) ----
   // Reset the applied coupon (invalidates any in-flight preview via the req-id).
   const clearCouponState = useCallback(() => {
@@ -988,6 +1105,12 @@ export function PosContent() {
       setErrorMsg("Seleziona un cliente per usare i punti.");
       return;
     }
+    // RECHARGE: a top-up credits a real client's wallet, so it requires a selected client (the
+    // backend skips issuance on a bench sale; this mirrors it for a clean client-side error).
+    if (cart.some((line) => line.type === "recharge") && (!clientId || clientId <= 0)) {
+      setErrorMsg("Seleziona un cliente per registrare la ricarica.");
+      return;
+    }
 
     // items_json / payments_json MUST be JSON strings: parseRequestBody() collapses
     // top-level arrays with join(","), so we stringify ourselves.
@@ -1030,6 +1153,19 @@ export function PosContent() {
               expiresAt: line.expiresAt ?? "",
               message: line.message ?? "",
               hideAmount: line.hideAmount ? 1 : 0,
+            }
+          : {}),
+        // Recharge meta (only set on recharge lines): the backend reads these to insert the
+        // recharges row + credit the wallet by base+bonus (the bonus is recomputed server-side).
+        ...(line.type === "recharge"
+          ? {
+              baseAmount: line.baseAmount ?? line.unitPrice,
+              bonusKind: line.bonusKind ?? "none",
+              bonusValue: line.bonusValue ?? 0,
+              bonusAmount: line.bonusAmount ?? 0,
+              totalAmount: line.totalAmount ?? line.unitPrice,
+              earnPoints: line.earnPoints ? 1 : 0,
+              note: line.note ?? "",
             }
           : {}),
       })),
@@ -1221,11 +1357,14 @@ export function PosContent() {
                       const isPackage = line.type === "package";
                       const isGiftcard = line.type === "giftcard";
                       const isGiftbox = line.type === "giftbox";
+                      const isRecharge = line.type === "recharge";
                       const label = isPackage
                         ? `Pacchetto • ${line.name}`
                         : line.type === "prepaid"
                           ? `Prepagato • ${line.name}`
-                          : line.name;
+                          : isRecharge
+                            ? `Ricarica • ${line.name}`
+                            : line.name;
                       const subLine = isPackage
                         ? [
                             line.startDate ? `Valido dal: ${line.startDate}` : "",
@@ -1253,7 +1392,16 @@ export function PosContent() {
                                 ]
                                   .filter(Boolean)
                                   .join(" • ")
-                              : "";
+                              : isRecharge
+                                ? [
+                                    (line.bonusAmount ?? 0) > 0 ? `Bonus: ${fmtEUR(line.bonusAmount ?? 0)}` : "",
+                                    `Credito caricato: ${fmtEUR(line.totalAmount ?? line.unitPrice)}`,
+                                    line.earnPoints ? "Punti su importo + bonus" : "Punti su solo importo",
+                                    line.note ? line.note : "",
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" • ")
+                                : "";
                       return (
                       <tr data-item-row="1" data-type={line.type} data-id={line.refId} key={line.key}>
                         <td className="text-uppercase small">{line.type}</td>
@@ -1268,7 +1416,7 @@ export function PosContent() {
                             min={1}
                             step={1}
                             value={line.quantity}
-                            disabled={isPackage || isGiftcard || isGiftbox}
+                            disabled={isPackage || isGiftcard || isGiftbox || isRecharge}
                             onChange={(e) => setQty(line.key, Number.parseInt(e.target.value, 10))}
                           />
                         </td>
@@ -2084,7 +2232,7 @@ export function PosContent() {
       <div className="modal fade" id="posModalRecharge" tabIndex={-1} aria-hidden="true">
         <div className="modal-dialog">
           <div className="modal-content">
-            <input type="hidden" id="posRechargeClientId" value="" readOnly />
+            <input type="hidden" id="posRechargeClientId" value={clientId ?? ""} readOnly />
             <div className="modal-header">
               <h5 className="modal-title">Ricarica credito</h5>
               <button type="button" className="btn-close" data-bs-dismiss="modal" aria-label="Chiudi"></button>
@@ -2092,17 +2240,28 @@ export function PosContent() {
 
             <div className="modal-body">
               <div className="small text-muted mb-2">
-                Cliente: <strong id="posRechargeClientLabel">—</strong>
+                Cliente: <strong id="posRechargeClientLabel">{clientName || "—"}</strong>
               </div>
 
-              <div className="alert alert-info small mb-3">
-                Nessun <strong>modello di ricarica</strong> disponibile. Puoi comunque inserire importo e bonus
-                manualmente, oppure crearne uno nella pagina <strong>Ricariche</strong>.
+              <div className={`alert alert-warning py-2 px-3${clientId ? " d-none" : ""}`} id="posRechargeNoClientWarn">
+                Nessun cliente selezionato. Puoi aggiungere la ricarica alla lista, ma per <strong>concludere</strong> la
+                vendita dovrai selezionare un cliente.
               </div>
 
               <label className="form-label">Modello</label>
-              <select className="form-select" id="posRechargeTemplateSelect" defaultValue="">
-                <option value="">Seleziona...</option>
+              <select
+                className="form-select"
+                id="posRechargeTemplateSelect"
+                value={rechargeTemplateId || ""}
+                onChange={(e) => chooseRechargeTemplate(Number.parseInt(e.target.value, 10) || 0)}
+              >
+                <option value="">Importo personalizzato…</option>
+                {rechargeTemplates.map((t) => (
+                  <option value={t.id} key={t.id}>
+                    {t.title} — {fmtEUR(t.baseAmount)}
+                    {t.bonusAmount > 0 ? ` (+${fmtEUR(t.bonusAmount)} bonus)` : ""}
+                  </option>
+                ))}
               </select>
               <div className="form-text">
                 Seleziona un modello <strong>(opzionale)</strong>: precompila importo e bonus (puoi modificare i valori).
@@ -2111,58 +2270,98 @@ export function PosContent() {
               <div className="row g-2 mt-2">
                 <div className="col-6">
                   <label className="form-label">Importo ricarica (€)</label>
-                  <input className="form-control" type="number" step="0.01" min="0.01" max="99999999.99" id="posRechargeAmount" />
+                  <input
+                    className="form-control"
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    max="99999999.99"
+                    id="posRechargeAmount"
+                    value={rechargeAmount}
+                    onChange={(e) => setRechargeAmount(e.target.value)}
+                  />
                 </div>
                 <div className="col-6">
                   <label className="form-label">Bonus</label>
                   <div className="input-group">
-                    <select className="form-select pos-recharge-bonus-kind" id="posRechargeBonusKind" defaultValue="none">
+                    <select
+                      className="form-select pos-recharge-bonus-kind"
+                      id="posRechargeBonusKind"
+                      value={rechargeBonusKindInput}
+                      onChange={(e) => setRechargeBonusKindInput(e.target.value)}
+                    >
                       <option value="none">Nessuno</option>
                       <option value="percent">% su importo</option>
                       <option value="fixed">€ fisso</option>
                     </select>
-                    <input className="form-control" type="number" step="0.01" min="0" max="99999999.99" id="posRechargeBonusValue" defaultValue="0" disabled />
+                    <input
+                      className="form-control"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      max="99999999.99"
+                      id="posRechargeBonusValue"
+                      value={rechargeBonusValueInput}
+                      disabled={rechargeBonusKindInput === "none"}
+                      onChange={(e) => setRechargeBonusValueInput(e.target.value)}
+                    />
                   </div>
                 </div>
               </div>
 
               <div className="form-check mt-3" id="posRechargeEarnPointsWrap">
-                <input className="form-check-input" type="checkbox" id="posRechargeEarnPoints" value="1" defaultChecked />
+                <input
+                  className="form-check-input"
+                  type="checkbox"
+                  id="posRechargeEarnPoints"
+                  value="1"
+                  checked={rechargeEarnPoints}
+                  onChange={(e) => setRechargeEarnPoints(e.target.checked)}
+                />
                 <label className="form-check-label" htmlFor="posRechargeEarnPoints">
                   Calcola i punti anche sul bonus (importo + bonus)
                 </label>
                 <div className="form-text">
                   Se attivo, i Punti saranno calcolati su <strong>importo + bonus</strong>. Se disattivo, verranno
-                  calcolati <strong>solo sull'importo ricarica</strong>.
+                  calcolati <strong>solo sull&apos;importo ricarica</strong>.
                 </div>
               </div>
 
               <label className="form-label mt-3">Note</label>
-              <input className="form-control" type="text" id="posRechargeNote" placeholder="(opzionale)" />
+              <input
+                className="form-control"
+                type="text"
+                id="posRechargeNote"
+                placeholder="(opzionale)"
+                value={rechargeNoteInput}
+                onChange={(e) => setRechargeNoteInput(e.target.value)}
+              />
 
               <div className="border rounded p-2 mt-3 bg-light">
                 <div className="d-flex justify-content-between small">
                   <span>Ricarica</span>
-                  <span id="posRechargePrevBase">€ 0,00</span>
+                  <span id="posRechargePrevBase">{fmtEUR(rechargeBase)}</span>
                 </div>
                 <div className="d-flex justify-content-between small">
                   <span>Bonus</span>
-                  <span id="posRechargePrevBonus">€ 0,00</span>
+                  <span id="posRechargePrevBonus">{fmtEUR(rechargeBonus)}</span>
                 </div>
                 <div className="d-flex justify-content-between fw-semibold">
                   <span>Totale credito caricato</span>
-                  <span id="posRechargePrevTotal">€ 0,00</span>
+                  <span id="posRechargePrevTotal">{fmtEUR(rechargeTotal)}</span>
                 </div>
                 <div className="d-flex justify-content-between small text-muted">
-                  <span>Punti accreditati</span>
-                  <span id="posRechargePrevPoints">0,00</span>
+                  <span>Calcolo punti su</span>
+                  <span id="posRechargePrevPoints">
+                    {rechargeEarnPoints ? `Importo + bonus (${fmtEUR(rechargeEarnBase)})` : `Solo importo (${fmtEUR(rechargeEarnBase)})`}
+                  </span>
                 </div>
               </div>
 
-              <div className="form-text mt-2" id="posRechargeClientHelp"></div>
-
               <div className="small text-muted mt-2">
-                La ricarica verrà <strong>aggiunta al carrello</strong> e registrata quando premi <strong>Concludi</strong>.
+                Il cliente paga <strong>{fmtEUR(rechargeBase)}</strong> e riceve <strong>{fmtEUR(rechargeTotal)}</strong> di
+                credito sul wallet. La ricarica verrà <strong>aggiunta al carrello</strong> e registrata quando premi{" "}
+                <strong>Concludi</strong>.
               </div>
             </div>
 
@@ -2170,7 +2369,7 @@ export function PosContent() {
               <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">
                 Annulla
               </button>
-              <button type="button" className="btn btn-primary" id="posRechargeAddBtn">
+              <button type="button" className="btn btn-primary" id="posRechargeAddBtn" onClick={addRechargeToCart}>
                 Aggiungi alla lista
               </button>
             </div>

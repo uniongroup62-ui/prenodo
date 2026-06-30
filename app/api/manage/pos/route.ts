@@ -218,6 +218,15 @@ function normalizeSaleItemInput(item: Record<string, unknown>): PosSaleItemInput
     eventType: packageMetaString(item.eventType ?? item.event_type),
     message: packageMetaString(item.message ?? item.gift_message),
     hideAmount: parseBoolean(item.hideAmount ?? item.hide_amount),
+    // RECHARGE sale meta (faithful to the legacy recharge POST fields): the base/bonus/total
+    // top-up + the earn-points-on-bonus toggle, read only for a type:"recharge" line. The
+    // wallet credit + recharges row are written from these at checkout (issueRechargeFromSale).
+    baseAmount: item.baseAmount === undefined && item.base_amount === undefined ? undefined : parseNumber(item.baseAmount ?? item.base_amount, 0),
+    bonusKind: packageMetaString(item.bonusKind ?? item.bonus_kind),
+    bonusValue: item.bonusValue === undefined && item.bonus_value === undefined ? undefined : parseNumber(item.bonusValue ?? item.bonus_value, 0),
+    bonusAmount: item.bonusAmount === undefined && item.bonus_amount === undefined ? undefined : parseNumber(item.bonusAmount ?? item.bonus_amount, 0),
+    totalAmount: item.totalAmount === undefined && item.total_amount === undefined ? undefined : parseNumber(item.totalAmount ?? item.total_amount, 0),
+    earnPoints: parseBoolean(item.earnPoints ?? item.earn_points),
   };
 }
 
@@ -237,7 +246,7 @@ function packageMetaString(value: unknown): string | undefined {
 }
 
 function normalizeItemType(value: string): PosSaleItemType | null {
-  if (value === "service" || value === "product" || value === "prepaid" || value === "giftcard" || value === "package" || value === "giftbox") return value;
+  if (value === "service" || value === "product" || value === "prepaid" || value === "giftcard" || value === "package" || value === "giftbox" || value === "recharge") return value;
   return null;
 }
 

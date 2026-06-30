@@ -52,7 +52,7 @@ export type ManagedProduct = Product & {
   updatedAt: string;
 };
 
-export type PosSaleItemType = "service" | "product" | "prepaid" | "giftcard" | "package" | "giftbox";
+export type PosSaleItemType = "service" | "product" | "prepaid" | "giftcard" | "package" | "giftbox" | "recharge";
 export type PosSaleItemStatus = "executed" | "prepaid" | "collected" | "ordered";
 export type PosPaymentMethod = "cash" | "card" | "transfer" | "giftcard" | "wallet";
 export type PosSaleStatus = "active" | "cancelled";
@@ -87,6 +87,18 @@ export type PosSaleItemInput = {
   eventType?: string;
   message?: string;
   hideAmount?: boolean;
+  // RECHARGE sale meta (faithful to pos.php recharge action + recharge_templates): the
+  // top-up the staff configured in the "Ricarica credito" modal. Read only for a
+  // type:"recharge" line at checkout (refId = the recharge_templates id, or 0 for a custom
+  // amount). The client PAYS baseAmount (the sale line price = unitPrice) and RECEIVES
+  // base+bonus (totalAmount) as wallet credit, plus pointsEarned fidelity points when
+  // earnPoints is set + the client is eligible. Ignored for other line types.
+  baseAmount?: number;
+  bonusKind?: string;
+  bonusValue?: number;
+  bonusAmount?: number;
+  totalAmount?: number;
+  earnPoints?: boolean;
 };
 
 export type PosPaymentInput = {
@@ -122,6 +134,16 @@ export type PosSaleItem = {
   eventType?: string;
   message?: string;
   hideAmount?: boolean;
+  // RECHARGE sale meta carried from the cart to issueRechargeFromSale (base/bonus/total/
+  // earn-points). Set on a type:"recharge" line; refId is the recharge_templates id (0 =
+  // custom amount). unitPrice/total = baseAmount (the client pays the base); totalAmount =
+  // base+bonus is credited to the wallet; pointsEarned is derived server-side.
+  baseAmount?: number;
+  bonusKind?: string;
+  bonusValue?: number;
+  bonusAmount?: number;
+  totalAmount?: number;
+  earnPoints?: boolean;
 };
 
 export type PosPayment = {
@@ -2591,6 +2613,7 @@ function specialSaleItemName(type: PosSaleItemType): string {
   if (type === "giftcard") return "GiftCard";
   if (type === "package") return "Pacchetto";
   if (type === "giftbox") return "GiftBox";
+  if (type === "recharge") return "Ricarica";
   return "Prepagato";
 }
 
