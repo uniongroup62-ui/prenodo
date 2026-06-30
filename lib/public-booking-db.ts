@@ -600,20 +600,43 @@ async function hoursLabel(slug: string, locationId: number | null, date: string)
   return `Oggi ${intervals.map(([start, end]) => `${minutesToTime(start)} - ${minutesToTime(end)}`).join(" / ")}`;
 }
 
-async function busyRangesForDate(slug: string, date: string): Promise<BusyRange[]> {
+// Gather the busy ranges for a date. Optional exclusions let a manage save check
+// availability against everyone EXCEPT (a) the appointment it is editing
+// (excludeAppointmentId — its appointments row + its appointment_staff rows) and
+// (b) the booking's own active hold (excludeHoldToken). Without these exclusions a
+// save would conflict with itself / its own [Disponibilità] hold. The public slot
+// finder calls this with no exclusions, so its behavior is unchanged.
+async function busyRangesForDate(
+  slug: string,
+  date: string,
+  options: { excludeAppointmentId?: number | null; excludeHoldToken?: string | null } = {},
+): Promise<BusyRange[]> {
+  const excludeAppointmentId = options.excludeAppointmentId && options.excludeAppointmentId > 0 ? options.excludeAppointmentId : null;
+  const excludeHoldToken = (options.excludeHoldToken ?? "").trim();
+
+  const appointmentWhere = excludeAppointmentId
+    ? "starts_at::date = ? AND status NOT IN ('canceled','cancelled') AND id <> ?"
+    : "starts_at::date = ? AND status NOT IN ('canceled','cancelled')";
+  const appointmentParams = excludeAppointmentId ? [date, excludeAppointmentId] : [date];
+
+  const holdWhere = excludeHoldToken
+    ? "starts_at::date = ? AND status = 'active' AND expires_at > NOW() AND token <> ?"
+    : "starts_at::date = ? AND status = 'active' AND expires_at > NOW()";
+  const holdParams = excludeHoldToken ? [date, excludeHoldToken] : [date];
+
   const [appointmentRows, holdRows] = await Promise.all([
     tenantSelect<RowDataPacket>({
       slug,
       table: "appointments",
-      where: "starts_at::date = ? AND status NOT IN ('canceled','cancelled')",
-      params: [date],
+      where: appointmentWhere,
+      params: appointmentParams,
       orderBy: "starts_at ASC",
     }).catch(() => [] as RowDataPacket[]),
     tenantSelect<RowDataPacket>({
       slug,
       table: "appointment_holds",
-      where: "starts_at::date = ? AND status = 'active' AND expires_at > NOW()",
-      params: [date],
+      where: holdWhere,
+      params: holdParams,
       orderBy: "starts_at ASC",
     }).catch(() => [] as RowDataPacket[]),
   ]);
@@ -654,6 +677,71 @@ function candidateFree(candidate: StaffCandidate, start: number, end: number, lo
     if (!busy.staffIds.length || busy.staffIds.includes(candidate.id)) return false;
   }
   return true;
+}
+
+// Find the busy range an assigned operator overlaps with at [start, end], reusing
+// the candidateFree staff-overlap rule (same location, overlapping window, and the
+// range either has no staff or includes this operator). Returns the first
+// conflicting range (so the caller can name the time) or null when free.
+function firstConflictingRange(staffId: number, start: number, end: number, locationId: number | null, busyRanges: BusyRange[]): BusyRange | null {
+  const candidate: StaffCandidate = { id: staffId, name: "", serviceIds: new Set<number>() };
+  for (const busy of busyRanges) {
+    if (!candidateFree(candidate, start, end, locationId, [busy])) return busy;
+  }
+  return null;
+}
+
+export type AppointmentSlotSegment = {
+  staffId: number | null;
+  startsAt: string;
+  endsAt: string;
+  locationId?: number | null;
+};
+
+// Double-booking guard for the manage save (quick-booking drawer + any save).
+// Faithful to the legacy, which enforces operator availability before booking.
+// Gathers the date's busy ranges EXCLUDING the appointment being edited
+// (excludeAppointmentId) and the booking's own active hold (excludeHoldToken), then
+// for EACH segment with a positive staffId checks the staff-overlap rule
+// (candidateFree, same-location) against those ranges. Segments with no operator are
+// skipped (an unassigned operator can't be double-booked — matching the slot
+// finder, which treats no-staff ranges specially). Throws a clear Italian error on
+// the first detected overlap. Best-effort: a failed busy-range query (missing table)
+// never blocks the booking — only a REAL detected overlap throws.
+export async function assertAppointmentSlotAvailable({
+  slug,
+  date,
+  segments,
+  excludeAppointmentId = null,
+  excludeHoldToken = null,
+}: {
+  slug: string;
+  date: string;
+  segments: AppointmentSlotSegment[];
+  excludeAppointmentId?: number | null;
+  excludeHoldToken?: string | null;
+}): Promise<void> {
+  // Only segments with a real assigned operator can conflict.
+  const staffedSegments = segments.filter((seg) => typeof seg.staffId === "number" && (seg.staffId ?? 0) > 0);
+  if (staffedSegments.length === 0) return;
+
+  const busyRanges = await busyRangesForDate(slug, date, { excludeAppointmentId, excludeHoldToken });
+  // No ranges to compare against (or the query failed silently): nothing to block.
+  if (busyRanges.length === 0) return;
+
+  for (const seg of staffedSegments) {
+    const staffId = seg.staffId as number;
+    const start = timeToMinutes(timeFromSql(seg.startsAt));
+    const end = timeToMinutes(timeFromSql(seg.endsAt));
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    const locationId = seg.locationId === undefined ? null : nullableNumber(seg.locationId);
+    const conflict = firstConflictingRange(staffId, start, end, locationId, busyRanges);
+    if (conflict) {
+      throw new Error(
+        `Operatore già occupato dalle ${minutesToTime(conflict.start)} alle ${minutesToTime(conflict.end)}. Scegli un altro orario o operatore.`,
+      );
+    }
+  }
 }
 
 async function assertActivePublicHold({

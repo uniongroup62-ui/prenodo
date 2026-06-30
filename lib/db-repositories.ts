@@ -49,6 +49,7 @@ import type {
 } from "@/lib/tenant-store";
 import { tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate, columnExists, dbExecute, dbQuery, quoteIdentifier, tableExists, tenantIdForSlug, type TenantTable } from "@/lib/tenant-db";
 import { buildModernEmailTemplate, emailConfigured, sendEmail } from "@/lib/email";
+import { assertAppointmentSlotAvailable } from "@/lib/public-booking-db";
 
 export async function listDbLocations(slug: string): Promise<Location[]> {
   const table = await tenantTable(slug, "locations");
@@ -590,6 +591,16 @@ export async function createDbAppointment({
       locationId,
     });
   }
+  // Double-booking guard: refuse to book an operator already busy at this time.
+  // Exclude this booking's own active hold (its [Disponibilità] reservation), so
+  // the slot it reserved doesn't count against itself. Best-effort: only a real
+  // detected overlap throws (the route turns it into { ok:false, error }).
+  await assertAppointmentSlotAvailable({
+    slug,
+    date,
+    segments: plan.segments.map((seg) => ({ staffId: seg.staffId, startsAt: seg.startsAt, endsAt: seg.endsAt, locationId })),
+    excludeHoldToken: token || null,
+  });
   const appointments = await tenantTable(slug, "appointments");
   const id = await tenantInsert(appointments, {
     client_id: client.id,
@@ -775,6 +786,17 @@ export async function updateDbAppointment({
       locationId,
     });
   }
+  // Double-booking guard: refuse to move/edit onto a slot where an operator is
+  // already busy. Exclude THIS appointment (so it doesn't conflict with its own
+  // existing row/staff) and its own active hold. Best-effort: only a real detected
+  // overlap throws (the route turns it into { ok:false, error }).
+  await assertAppointmentSlotAvailable({
+    slug,
+    date,
+    segments: plan.segments.map((seg) => ({ staffId: seg.staffId, startsAt: seg.startsAt, endsAt: seg.endsAt, locationId })),
+    excludeAppointmentId: id,
+    excludeHoldToken: token || null,
+  });
 
   await tenantUpdate({
     slug,
