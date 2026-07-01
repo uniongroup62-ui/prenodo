@@ -1,9 +1,28 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import { commissionDbSummary, listDbCommissions, markDbCommissionPaid } from "@/lib/db-repositories";
-import { getCommissionSettings, saveCommissionSettings, setCommissionModuleEnabled, type CommissionStaffSettingInput } from "@/lib/manage-commissions";
+import {
+  buildCommissionDashboard,
+  getCommissionSettings,
+  markCommissionEntryPaid,
+  saveCommissionSettings,
+  setCommissionModuleEnabled,
+  type CommissionStaffSettingInput,
+} from "@/lib/manage-commissions";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
+
+// Current-month [start, end] as 'YYYY-MM-DD' strings (default dashboard range).
+function currentMonthRange(): { from: string; to: string } {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const first = new Date(y, m, 1);
+  const last = new Date(y, m + 1, 0);
+  const fmt = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return { from: fmt(first), to: fmt(last) };
+}
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -21,9 +40,23 @@ export async function GET(request: Request) {
     if (url.searchParams.get("action") === "settings") {
       return Response.json({ ok: true, sourceMode: "database", settings: await getCommissionSettings(tenantSlug) });
     }
+
+    // Default GET: the commission dashboard — accrue+persist POS entries in the
+    // requested range, reconcile stale snapshots, then return entries + summaries.
+    const range = currentMonthRange();
+    const from = (url.searchParams.get("from") || "").trim() || range.from;
+    const to = (url.searchParams.get("to") || "").trim() || range.to;
+    const staffId = parseInteger(url.searchParams.get("staff_id"), 0);
+    const source = url.searchParams.get("source") || "all";
+    const locationId = parseInteger(url.searchParams.get("location_id"), 0);
+
+    const dashboard = await buildCommissionDashboard(tenantSlug, { from, to, staffId, source, locationId });
     return Response.json({
       ok: true,
       sourceMode: "database",
+      dashboard,
+      // Keep the legacy keys so the pre-existing consumers don't break until the
+      // report block adapts to `dashboard`.
       summary: await commissionDbSummary(tenantSlug),
       commissions: await listDbCommissions(tenantSlug),
     });
@@ -75,6 +108,22 @@ export async function POST(request: Request) {
     if (action === "save_commission_settings" || action === "save_settings") {
       const settings = await saveCommissionSettings(tenantSlug, parseCommissionRows(body.rows ?? body.rows_json), session.user.id);
       return Response.json({ ok: true, sourceMode: "database", settings });
+    }
+
+    // Toggle an accrued entry's paid status by entry_key (throws if cancelled),
+    // then return the refreshed dashboard for the requested range.
+    if (action === "toggle_commission_paid") {
+      const entryKey = String(body.entry_key ?? "").trim();
+      const markPaid = ["1", "true", "yes", "on"].includes(String(body.mark_paid ?? "").toLowerCase());
+      await markCommissionEntryPaid(tenantSlug, entryKey, markPaid, session.user.id);
+      const range = currentMonthRange();
+      const from = String(body.from ?? "").trim() || range.from;
+      const to = String(body.to ?? "").trim() || range.to;
+      const staffId = parseInteger(body.staff_id, 0);
+      const source = String(body.source ?? "all") || "all";
+      const locationId = parseInteger(body.location_id, 0);
+      const dashboard = await buildCommissionDashboard(tenantSlug, { from, to, staffId, source, locationId });
+      return Response.json({ ok: true, sourceMode: "database", dashboard });
     }
 
     return jsonError("Azione commissioni non supportata.");

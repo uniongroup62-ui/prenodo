@@ -1,12 +1,14 @@
 import "server-only";
 
+import { createHash } from "node:crypto";
+
 import type { RowDataPacket } from "@/lib/tenant-db";
-import { tenantInsert, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
+import { columnExists, dbQuery, quoteIdentifier, tenantInsert, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
 
 // Commission SETTINGS + module toggle — faithful port of the Commissions.php settings layer
-// (defaultSettings / settingsMap / saveSettings / moduleSettings / setModuleEnabled). The accrual
-// engine (buildDashboard) lands in a later block; this module is the config foundation the settings
-// tab writes and the engine reads.
+// (defaultSettings / settingsMap / saveSettings / moduleSettings / setModuleEnabled). The POS
+// accrual engine (buildCommissionDashboard) is ported below; this module is both the config
+// foundation the settings tab writes and the engine that computes/persists commission snapshots.
 
 export type CommissionCalculationMode = "paid_amount" | "list_price";
 
@@ -179,4 +181,787 @@ export async function saveCommissionSettings(
     }
   }
   return getCommissionSettings(slug);
+}
+
+// ===========================================================================
+// COMMISSION ACCRUAL ENGINE — POS path (faithful port of Commissions.php
+// buildPosEntriesFromSales / upsertEntrySnapshot / syncEntrySnapshots /
+// buildDashboard / setEntryPaidStatus, scoped to POS/sales only).
+//
+// On GET the engine iterates the tenant's non-cancelled SALES in [from,to],
+// computes one commission entry per (sale line x resolved operator), UPSERTs
+// each as a snapshot (preserving is_paid/paid_at/paid_by), reconciles any
+// stale POS snapshot in scope that no longer maps to a produced entry (marks it
+// 'cancelled' — never deletes), then loads the persisted entries (active +
+// cancelled) and builds the per-operator + global summaries.
+//
+// TODO(appointment-accrual): the APPOINTMENT accrual path (buildAppointmentEntries
+// + appointment stale-cancellation/reactivation reconcile, source_group='appointments')
+// is a separate later block. This block only produces/reconciles source_group='pos'
+// snapshots; appointment* summary fields are always 0 here and pre-existing
+// appointment snapshots are loaded read-only (never accrued or reconciled).
+//
+// CAVEAT(pos_other binary model): the Next sale_items.item_type is BINARY
+// ('product' | 'service' — every non-product line is stored as 'service'), so
+// classifyPosItem below can only yield 'pos_product' or 'pos_service'. The
+// legacy 'pos_other' bucket (settings.pos_other_percent) is therefore effectively
+// unreachable in this data model and pos_other_percent is unused for accrual.
+// ===========================================================================
+
+// A single commission movement row returned to the UI.
+export type CommissionEntry = {
+  entryKey: string;
+  staffId: number;
+  operatorName: string;
+  datetime: string;
+  sourceGroup: string;
+  sourceLabel: string;
+  sourceReference: string;
+  clientName: string;
+  itemLabel: string;
+  baseAmount: number;
+  percent: number;
+  commissionAmount: number;
+  entryStatus: string;
+  isPaid: boolean;
+  paidAt: string | null;
+  cancelledAt: string | null;
+  locationId: number;
+  locationName: string;
+  note: string;
+};
+
+// Per-operator aggregate over ACTIVE entries (cancelled tracked separately).
+export type CommissionOperatorSummary = {
+  staffId: number;
+  operatorName: string;
+  appointmentsBase: number;
+  appointmentsCommission: number;
+  posBase: number;
+  posCommission: number;
+  paidCommission: number;
+  unpaidCommission: number;
+  cancelledCommission: number;
+  totalBase: number;
+  totalCommission: number;
+  entriesCount: number;
+  paidEntriesCount: number;
+  unpaidEntriesCount: number;
+  cancelledEntriesCount: number;
+};
+
+export type CommissionSummary = Omit<CommissionOperatorSummary, "staffId" | "operatorName">;
+
+export type CommissionDashboard = {
+  moduleEnabled: boolean;
+  configuredRates: number;
+  entries: CommissionEntry[];
+  operatorSummary: CommissionOperatorSummary[];
+  summary: CommissionSummary;
+};
+
+export type CommissionDashboardParams = {
+  from: string;
+  to: string;
+  staffId?: number;
+  source?: string;
+  locationId?: number;
+};
+
+// roundMoney — 2dp, matches the manage-costs/manage-recharges helper (round(x*100)/100
+// with EPSILON), standing in for PHP round($v, 2).
+function roundMoney(value: number): number {
+  return Math.round(((Number(value) || 0) + Number.EPSILON) * 100) / 100;
+}
+
+// entryKey — sha1 hex of the raw key string (Commissions::entryKey → sha1()).
+function commissionEntryKey(raw: string): string {
+  return createHash("sha1").update(raw).digest("hex");
+}
+
+// classifyPosItem (Commissions.php ~2874): product+id → pos_product, service+id →
+// pos_service, else pos_other. In the Next binary item_type model, item_id may be
+// null for a free-text line; we treat any 'product'/'service' type as its bucket
+// (the id>0 guard is relaxed vs legacy because the Next stores item_id nullable and
+// the percent still applies to the line by type). Non product/service → pos_other.
+function classifyPosItem(itemType: string): "pos_product" | "pos_service" | "pos_other" {
+  const type = String(itemType ?? "").trim().toLowerCase();
+  if (type === "product") return "pos_product";
+  if (type === "service") return "pos_service";
+  return "pos_other";
+}
+
+// normalizeDateTimeValue (Commissions.php ~823): coerce a date/datetime string to
+// 'Y-m-d H:i:s'; date-only → append 00:00:00; empty → fallback.
+function normalizeDateTimeValue(value: unknown, fallback = ""): string {
+  const txt = String(value ?? "").trim();
+  if (txt === "") return fallback;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(txt)) return `${txt} 00:00:00`;
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}$/.test(txt)) return `${txt.replace("T", " ")}:00`;
+  const m = txt.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+  if (m) return `${m[1]} ${m[2]}`;
+  const ts = Date.parse(txt);
+  if (Number.isNaN(ts)) return fallback;
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function nowDateTime(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// A produced POS entry (before persistence), mirroring the buildPosEntriesFromSales row.
+type ProducedPosEntry = {
+  entryKey: string;
+  datetime: string;
+  staffId: number;
+  operatorName: string;
+  sourceId: number;
+  locationId: number;
+  locationName: string;
+  sourceGroup: "pos";
+  sourceReference: string;
+  sourceLabel: string;
+  clientName: string;
+  itemLabel: string;
+  baseAmount: number;
+  percent: number;
+  commissionAmount: number;
+  note: string;
+};
+
+// Resolve a sales row's operator_name (trimmed, case-insensitive) to an ENABLED
+// commission staff row. Returns null when no enabled staff matches — the sale is
+// then skipped (no commission), faithful to resolveSaleOperator + the settings gate.
+function resolveSaleStaff(
+  operatorName: string,
+  staffByName: Map<string, CommissionStaffSetting>,
+): CommissionStaffSetting | null {
+  const key = String(operatorName ?? "").trim().toLowerCase();
+  if (key === "") return null;
+  const staff = staffByName.get(key);
+  if (!staff || !staff.isEnabled) return null;
+  return staff;
+}
+
+// Resolve a location name for display (locations.name), memoised per call.
+async function locationNameResolver(slug: string): Promise<(id: number) => Promise<string>> {
+  const cache = new Map<number, string>();
+  return async (id: number): Promise<string> => {
+    if (id <= 0) return "";
+    if (cache.has(id)) return cache.get(id) ?? "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "locations",
+      columns: "name",
+      where: "id=?",
+      params: [id],
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    const name = String(rows[0]?.name ?? "").trim();
+    cache.set(id, name);
+    return name;
+  };
+}
+
+// buildPosEntriesFromSales — the POS accrual. For each non-cancelled sale in
+// [from,to] whose operator maps to an ENABLED staff, produce one entry per
+// sale_item (percent by item type; base by calculation mode; commission = base ×
+// %/100). Faithful to Commissions::buildPosEntriesFromSales, adapted to the Next
+// schema + the prompt's netFactor formula.
+async function buildPosEntriesFromSales(
+  slug: string,
+  params: { from: string; to: string; staffId: number; locationId: number },
+  staffByName: Map<string, CommissionStaffSetting>,
+  resolveLocationName: (id: number) => Promise<string>,
+): Promise<ProducedPosEntry[]> {
+  const { from, to, staffId, locationId } = params;
+
+  const salesTable = await tenantTable(slug, "sales");
+  const clientsTable = await tenantTable(slug, "clients").catch(() => null);
+  const clauses: string[] = [];
+  const queryParams: unknown[] = [];
+
+  if (salesTable.mode === "shared" && (await columnExists(salesTable.name, "tenant_id"))) {
+    clauses.push("s.tenant_id=?");
+    queryParams.push(salesTable.tenantId ?? 0);
+  }
+  // Date range on sale_date (inclusive day span). from/to are 'YYYY-MM-DD'.
+  clauses.push("DATE(s.sale_date) BETWEEN ? AND ?");
+  queryParams.push(from, to);
+  // Skip cancelled sales.
+  clauses.push("LOWER(COALESCE(s.status,'')) NOT IN ('cancelled','canceled','annullata','annullato')");
+  if (locationId > 0 && (await columnExists(salesTable.name, "location_id"))) {
+    clauses.push("(s.location_id IS NULL OR s.location_id=?)");
+    queryParams.push(locationId);
+  }
+
+  const clientJoin = clientsTable
+    ? `LEFT JOIN ${quoteIdentifier(clientsTable.name)} c ON c.id=s.client_id${
+        clientsTable.mode === "shared" && (await columnExists(clientsTable.name, "tenant_id")) ? " AND c.tenant_id=s.tenant_id" : ""
+      }`
+    : "";
+
+  const sales = await dbQuery<RowDataPacket[]>(
+    `SELECT s.*, c.full_name AS client_name
+       FROM ${quoteIdentifier(salesTable.name)} s
+       ${clientJoin}
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY s.sale_date DESC, s.id DESC`,
+    queryParams,
+  ).catch(() => [] as RowDataPacket[]);
+
+  if (!sales.length) return [];
+
+  // Fetch all sale_items for these sales in one pass (tenant-safe via tenantSelect scope).
+  const saleIds = sales.map((s) => Number(s.id ?? 0) || 0).filter((id) => id > 0);
+  const itemsBySale = new Map<number, RowDataPacket[]>();
+  if (saleIds.length) {
+    const placeholders = saleIds.map(() => "?").join(",");
+    const itemRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "sale_items",
+      where: `sale_id IN (${placeholders})`,
+      params: saleIds,
+      orderBy: "id ASC",
+    }).catch(() => [] as RowDataPacket[]);
+    for (const it of itemRows) {
+      const sid = Number(it.sale_id ?? 0) || 0;
+      if (sid <= 0) continue;
+      if (!itemsBySale.has(sid)) itemsBySale.set(sid, []);
+      itemsBySale.get(sid)!.push(it);
+    }
+  }
+
+  const entries: ProducedPosEntry[] = [];
+
+  for (const sale of sales) {
+    const saleId = Number(sale.id ?? 0) || 0;
+    if (saleId <= 0) continue;
+
+    const operatorName = String(sale.operator_name ?? "").trim();
+    const staff = resolveSaleStaff(operatorName, staffByName);
+    if (!staff) continue; // operator not an enabled commission staff → no commission
+    if (staffId > 0 && staff.staffId !== staffId) continue;
+
+    const items = itemsBySale.get(saleId) ?? [];
+    if (!items.length) continue;
+
+    // subtotal = sales.subtotal (fallback Σ line_total); saleTotal = sales.total
+    // (fallback subtotal); netFactor = subtotal>0 ? saleTotal/subtotal : 1.
+    const lineSum = items.reduce((sum, it) => sum + Math.max(0, Number(it.line_total ?? 0) || 0), 0);
+    let subtotal = Number(sale.subtotal ?? 0) || 0;
+    if (!(subtotal > 0)) subtotal = lineSum;
+    let saleTotal = Number(sale.total ?? 0) || 0;
+    if (!(saleTotal > 0)) saleTotal = subtotal;
+    const netFactor = subtotal > 0 ? saleTotal / subtotal : 1;
+
+    const saleLocationId = Number(sale.location_id ?? 0) || 0;
+    const saleLocationName = saleLocationId > 0 ? await resolveLocationName(saleLocationId) : "";
+    const clientName = String(sale.client_name ?? "").trim();
+
+    for (const item of items) {
+      const itemId = Number(item.id ?? 0) || 0;
+      if (itemId <= 0) continue;
+      const kind = classifyPosItem(String(item.item_type ?? ""));
+
+      const percent =
+        kind === "pos_product" ? staff.posProductPercent : kind === "pos_service" ? staff.posServicePercent : staff.posOtherPercent;
+      if (!(percent > 0)) continue;
+
+      const listBase = roundMoney(Math.max(0, Number(item.line_total ?? 0) || 0));
+      const paidBase = roundMoney(listBase * netFactor);
+      const base = staff.calculationMode === "list_price" ? listBase : paidBase;
+      if (!(base > 0)) continue;
+
+      const commission = roundMoney((base * percent) / 100);
+
+      const label =
+        String(item.item_name ?? "").trim() ||
+        (kind === "pos_product" ? "Prodotto POS" : kind === "pos_service" ? "Servizio POS" : "Altra vendita POS");
+      const sourceLabel = kind === "pos_product" ? "POS prodotto" : kind === "pos_service" ? "POS servizio" : "POS altra vendita";
+
+      entries.push({
+        entryKey: commissionEntryKey(`pos|${saleId}|${itemId}|${staff.staffId}`),
+        datetime: normalizeDateTimeValue(sale.sale_date, ""),
+        staffId: staff.staffId,
+        operatorName,
+        sourceId: saleId,
+        locationId: saleLocationId,
+        locationName: saleLocationName,
+        sourceGroup: "pos",
+        sourceReference: `VEN#${saleId}`,
+        sourceLabel,
+        clientName,
+        itemLabel: label,
+        baseAmount: base,
+        percent: roundMoney(percent),
+        commissionAmount: commission,
+        note: kind === "pos_other" ? "Riga POS non catalogo" : "",
+      });
+    }
+  }
+
+  return entries;
+}
+
+// upsertEntrySnapshot — idempotent per (tenant, entry_key). If a row exists →
+// UPDATE the accrual fields + re-activate (entry_status='active', clear
+// cancelled_*), PRESERVING is_paid/paid_at/paid_by. Else INSERT (is_paid=0,
+// entry_status='active'). Tenant-safe: tenantSelect to find the row id, then
+// tenantUpdate/tenantInsert (the BEFORE INSERT trigger fills tenant_id).
+async function upsertEntrySnapshot(
+  slug: string,
+  table: Awaited<ReturnType<typeof tenantTable>>,
+  entry: ProducedPosEntry,
+  existingId: number | null,
+): Promise<void> {
+  const values: Record<string, unknown> = {
+    source_group: entry.sourceGroup,
+    source_reference: entry.sourceReference || null,
+    source_id: entry.sourceId > 0 ? entry.sourceId : null,
+    location_id: entry.locationId > 0 ? entry.locationId : null,
+    location_name: entry.locationName ? entry.locationName.slice(0, 190) : null,
+    movement_datetime: entry.datetime || null,
+    client_name: entry.clientName ? entry.clientName.slice(0, 190) : null,
+    item_label: entry.itemLabel ? entry.itemLabel.slice(0, 190) : null,
+    base_amount: entry.baseAmount,
+    percent_value: entry.percent,
+    operator_name: entry.operatorName ? entry.operatorName.slice(0, 190) : null,
+    source_label: entry.sourceLabel ? entry.sourceLabel.slice(0, 60) : null,
+    commission_amount: entry.commissionAmount,
+    entry_status: "active",
+  };
+
+  if (existingId && existingId > 0) {
+    // Re-activate: refresh accrual fields, clear cancellation, PRESERVE is_paid/paid_at/paid_by.
+    await tenantUpdate({
+      slug,
+      table: table.name,
+      id: existingId,
+      values: {
+        ...values,
+        // Only set note when producing one (POS produces a note only for pos_other);
+        // otherwise leave any existing note untouched to match the legacy COALESCE-on-empty rule.
+        ...(entry.note ? { note: entry.note.slice(0, 255) } : {}),
+        cancelled_at: null,
+        cancelled_by: null,
+        cancellation_reason: null,
+        updated_at: new Date(),
+      },
+    });
+  } else {
+    await tenantInsert(table, {
+      ...values,
+      entry_key: entry.entryKey,
+      staff_id: entry.staffId,
+      note: entry.note ? entry.note.slice(0, 255) : null,
+      is_paid: 0,
+      paid_at: null,
+      paid_by: null,
+      cancelled_at: null,
+      cancelled_by: null,
+      cancellation_reason: null,
+    });
+  }
+}
+
+// syncEntrySnapshots + POS reconcile: UPSERT every produced entry, then mark any
+// EXISTING 'pos' snapshot in [from,to] (respecting the location filter) whose
+// entry_key is NOT in the produced set as 'cancelled' (a voided/deleted sale's
+// commission stays as "Annullato" — never deleted). Faithful to syncEntrySnapshots
+// scoped to POS. is_paid is never touched by the reconcile.
+async function syncPosEntrySnapshots(
+  slug: string,
+  params: { from: string; to: string; locationId: number },
+  produced: ProducedPosEntry[],
+): Promise<void> {
+  const table = await tenantTable(slug, "staff_commission_payments");
+
+  // Load existing POS snapshots in scope keyed by entry_key (id + status), so we
+  // can decide UPDATE vs INSERT and detect stale rows to cancel.
+  const scopeClauses = ["source_group=?", "DATE(COALESCE(movement_datetime, created_at)) BETWEEN ? AND ?"];
+  const scopeParams: unknown[] = ["pos", params.from, params.to];
+  if (params.locationId > 0 && (await columnExists(table.name, "location_id"))) {
+    scopeClauses.push("(location_id=? OR location_id IS NULL)");
+    scopeParams.push(params.locationId);
+  }
+  const existingRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: table.name,
+    columns: "id, entry_key, entry_status",
+    where: scopeClauses.join(" AND "),
+    params: scopeParams,
+  }).catch(() => [] as RowDataPacket[]);
+
+  const existingByKey = new Map<string, { id: number; entryStatus: string }>();
+  for (const r of existingRows) {
+    const key = String(r.entry_key ?? "").trim();
+    if (key) existingByKey.set(key, { id: Number(r.id ?? 0) || 0, entryStatus: String(r.entry_status ?? "active") });
+  }
+
+  const producedKeys = new Set<string>();
+  for (const entry of produced) {
+    producedKeys.add(entry.entryKey);
+    // The producing scope may differ from the reconcile scope (e.g. staffId filter),
+    // so resolve the row id by entry_key directly if not present in the scan.
+    let existingId = existingByKey.get(entry.entryKey)?.id ?? null;
+    if (existingId === null) {
+      const found = await tenantSelect<RowDataPacket>({
+        slug,
+        table: table.name,
+        columns: "id",
+        where: "entry_key=?",
+        params: [entry.entryKey],
+        limit: 1,
+      }).catch(() => [] as RowDataPacket[]);
+      existingId = found[0] ? Number(found[0].id ?? 0) || 0 : null;
+    }
+    await upsertEntrySnapshot(slug, table, entry, existingId);
+  }
+
+  // Reconcile: any existing in-scope POS snapshot not in the produced set → cancel.
+  const nowTs = nowDateTime();
+  for (const [key, row] of existingByKey.entries()) {
+    if (producedKeys.has(key)) continue;
+    if (row.entryStatus === "cancelled") continue; // already cancelled — leave as-is
+    await tenantUpdate({
+      slug,
+      table: table.name,
+      id: row.id,
+      values: { entry_status: "cancelled", cancelled_at: nowTs, updated_at: new Date() },
+    });
+  }
+}
+
+// Map a persisted staff_commission_payments row → CommissionEntry (entryFromPersistedRow).
+function mapPersistedEntry(row: RowDataPacket, staffByName: Map<string, CommissionStaffSetting>): CommissionEntry {
+  const staffId = Number(row.staff_id ?? 0) || 0;
+  const sourceGroup = String(row.source_group ?? "") === "pos" ? "pos" : "appointments";
+  let sourceLabel = String(row.source_label ?? "").trim();
+  if (sourceLabel === "") sourceLabel = sourceGroup === "pos" ? "POS" : "Appuntamento";
+  let operatorName = String(row.operator_name ?? "").trim();
+  if (operatorName === "" && staffId > 0) {
+    for (const s of staffByName.values()) {
+      if (s.staffId === staffId) {
+        operatorName = s.name;
+        break;
+      }
+    }
+  }
+  const datetime = normalizeDateTimeValue(row.movement_datetime ?? row.created_at ?? "", "");
+  const entryStatus = String(row.entry_status ?? "active").trim() || "active";
+  return {
+    entryKey: String(row.entry_key ?? "").trim(),
+    staffId,
+    operatorName,
+    datetime,
+    sourceGroup,
+    sourceLabel,
+    sourceReference: String(row.source_reference ?? "").trim(),
+    clientName: String(row.client_name ?? "").trim(),
+    itemLabel: String(row.item_label ?? "").trim(),
+    baseAmount: roundMoney(Number(row.base_amount ?? 0) || 0),
+    percent: roundMoney(Number(row.percent_value ?? 0) || 0),
+    commissionAmount: roundMoney(Number(row.commission_amount ?? 0) || 0),
+    entryStatus,
+    isPaid: Number(row.is_paid ?? 0) === 1,
+    paidAt: row.paid_at ? String(row.paid_at) : null,
+    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
+    locationId: Number(row.location_id ?? 0) || 0,
+    locationName: String(row.location_name ?? "").trim(),
+    note: String(row.note ?? "").trim(),
+  };
+}
+
+// loadPersistedEntriesByStatus — read persisted entries in scope
+// (DATE(movement_datetime|created_at) in [from,to]; staff/source/location filters;
+// the requested entry_status). Faithful to loadPersistedEntriesByStatus.
+async function loadPersistedEntries(
+  slug: string,
+  params: { from: string; to: string; staffId: number; source: string; locationId: number },
+  staffByName: Map<string, CommissionStaffSetting>,
+): Promise<CommissionEntry[]> {
+  const table = await tenantTable(slug, "staff_commission_payments");
+  const clauses = ["DATE(COALESCE(movement_datetime, created_at)) BETWEEN ? AND ?"];
+  const queryParams: unknown[] = [params.from, params.to];
+  if (params.staffId > 0) {
+    clauses.push("staff_id=?");
+    queryParams.push(params.staffId);
+  }
+  if (params.source === "appointments" || params.source === "pos") {
+    clauses.push("source_group=?");
+    queryParams.push(params.source);
+  }
+  if (params.locationId > 0 && (await columnExists(table.name, "location_id"))) {
+    clauses.push("(location_id=? OR location_id IS NULL)");
+    queryParams.push(params.locationId);
+  }
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: table.name,
+    where: clauses.join(" AND "),
+    params: queryParams,
+    orderBy: "COALESCE(movement_datetime, created_at) DESC, id DESC",
+  }).catch(() => [] as RowDataPacket[]);
+  return rows.map((row) => mapPersistedEntry(row, staffByName));
+}
+
+function emptySummary(): CommissionSummary {
+  return {
+    appointmentsBase: 0,
+    appointmentsCommission: 0,
+    posBase: 0,
+    posCommission: 0,
+    paidCommission: 0,
+    unpaidCommission: 0,
+    cancelledCommission: 0,
+    totalBase: 0,
+    totalCommission: 0,
+    entriesCount: 0,
+    paidEntriesCount: 0,
+    unpaidEntriesCount: 0,
+    cancelledEntriesCount: 0,
+  };
+}
+
+// buildCommissionDashboard — the GET path. Accrue+persist POS entries in scope,
+// reconcile stale POS snapshots, then load persisted entries (active + cancelled)
+// and compute the per-operator + global summaries. When the module is disabled,
+// NO accrual happens but any pre-existing snapshots are still loaded for display.
+export async function buildCommissionDashboard(slug: string, rawParams: CommissionDashboardParams): Promise<CommissionDashboard> {
+  const source = ["all", "appointments", "pos"].includes(String(rawParams.source ?? "all")) ? String(rawParams.source ?? "all") : "all";
+  const staffId = Math.max(0, Number(rawParams.staffId ?? 0) || 0);
+  const locationId = Math.max(0, Number(rawParams.locationId ?? 0) || 0);
+  const from = String(rawParams.from ?? "").trim();
+  const to = String(rawParams.to ?? "").trim();
+
+  const settings = await getCommissionSettings(slug);
+  const staffByName = new Map<string, CommissionStaffSetting>();
+  for (const s of settings.staff) {
+    const key = s.name.trim().toLowerCase();
+    if (key) staffByName.set(key, s);
+  }
+
+  // Accrue POS only when the module is enabled and the source includes POS.
+  // (TODO: appointment accrual is a separate later block — not run here.)
+  if (settings.moduleEnabled && from && to && (source === "all" || source === "pos")) {
+    const resolveLocationName = await locationNameResolver(slug);
+    const produced = await buildPosEntriesFromSales(slug, { from, to, staffId, locationId }, staffByName, resolveLocationName);
+    // Reconcile stale POS snapshots only for a full (unfiltered-by-staff) accrual,
+    // faithful to the legacy $canCancelStaleAppointments = $staffId <= 0 gate — a
+    // per-operator view must not cancel another operator's still-valid entries.
+    if (staffId <= 0) {
+      await syncPosEntrySnapshots(slug, { from, to, locationId }, produced);
+    } else {
+      // Per-operator view: upsert this operator's produced entries only, no reconcile.
+      const table = await tenantTable(slug, "staff_commission_payments");
+      for (const entry of produced) {
+        const found = await tenantSelect<RowDataPacket>({
+          slug,
+          table: table.name,
+          columns: "id",
+          where: "entry_key=?",
+          params: [entry.entryKey],
+          limit: 1,
+        }).catch(() => [] as RowDataPacket[]);
+        const existingId = found[0] ? Number(found[0].id ?? 0) || 0 : null;
+        await upsertEntrySnapshot(slug, table, entry, existingId);
+      }
+    }
+  }
+
+  // Load persisted entries in scope (active + cancelled) for display.
+  const entries = from && to ? await loadPersistedEntries(slug, { from, to, staffId, source, locationId }, staffByName) : [];
+
+  // Sort: datetime DESC, operator ASC, item_label ASC (faithful to buildDashboard usort).
+  entries.sort((a, b) => {
+    const d = b.datetime.localeCompare(a.datetime);
+    if (d !== 0) return d;
+    const d2 = a.operatorName.localeCompare(b.operatorName);
+    if (d2 !== 0) return d2;
+    return a.itemLabel.localeCompare(b.itemLabel);
+  });
+
+  // Aggregate. Totals are over ACTIVE entries; cancelled tracked separately.
+  const operatorSummaryMap = new Map<number, CommissionOperatorSummary>();
+  const summary = emptySummary();
+
+  for (const entry of entries) {
+    const sid = entry.staffId;
+    const isCancelled = entry.entryStatus === "cancelled";
+    const group = entry.sourceGroup === "pos" ? "pos" : "appointments";
+    const commission = entry.commissionAmount;
+    const base = entry.baseAmount;
+
+    if (sid > 0 && !operatorSummaryMap.has(sid)) {
+      operatorSummaryMap.set(sid, {
+        staffId: sid,
+        operatorName: entry.operatorName,
+        appointmentsBase: 0,
+        appointmentsCommission: 0,
+        posBase: 0,
+        posCommission: 0,
+        paidCommission: 0,
+        unpaidCommission: 0,
+        cancelledCommission: 0,
+        totalBase: 0,
+        totalCommission: 0,
+        entriesCount: 0,
+        paidEntriesCount: 0,
+        unpaidEntriesCount: 0,
+        cancelledEntriesCount: 0,
+      });
+    }
+    const op = sid > 0 ? operatorSummaryMap.get(sid)! : null;
+
+    if (isCancelled) {
+      summary.cancelledCommission += commission;
+      summary.cancelledEntriesCount += 1;
+      if (op) {
+        op.cancelledCommission += commission;
+        op.cancelledEntriesCount += 1;
+      }
+      continue; // cancelled entries do not contribute to base/commission totals
+    }
+
+    // Active entry contributes to base/commission + paid/unpaid split.
+    if (group === "pos") {
+      summary.posBase += base;
+      summary.posCommission += commission;
+    } else {
+      summary.appointmentsBase += base;
+      summary.appointmentsCommission += commission;
+    }
+    summary.entriesCount += 1;
+    if (entry.isPaid) {
+      summary.paidCommission += commission;
+      summary.paidEntriesCount += 1;
+    } else {
+      summary.unpaidCommission += commission;
+      summary.unpaidEntriesCount += 1;
+    }
+
+    if (op) {
+      if (group === "pos") {
+        op.posBase += base;
+        op.posCommission += commission;
+      } else {
+        op.appointmentsBase += base;
+        op.appointmentsCommission += commission;
+      }
+      op.entriesCount += 1;
+      if (entry.isPaid) {
+        op.paidCommission += commission;
+        op.paidEntriesCount += 1;
+      } else {
+        op.unpaidCommission += commission;
+        op.unpaidEntriesCount += 1;
+      }
+    }
+  }
+
+  // If a specific staff was requested but produced no rows, still surface the operator
+  // row (faithful to buildDashboard's staff-row backfill).
+  if (staffId > 0 && !operatorSummaryMap.has(staffId)) {
+    const staff = settings.staff.find((s) => s.staffId === staffId);
+    if (staff) {
+      operatorSummaryMap.set(staffId, {
+        staffId,
+        operatorName: staff.name,
+        appointmentsBase: 0,
+        appointmentsCommission: 0,
+        posBase: 0,
+        posCommission: 0,
+        paidCommission: 0,
+        unpaidCommission: 0,
+        cancelledCommission: 0,
+        totalBase: 0,
+        totalCommission: 0,
+        entriesCount: 0,
+        paidEntriesCount: 0,
+        unpaidEntriesCount: 0,
+        cancelledEntriesCount: 0,
+      });
+    }
+  }
+
+  const operatorSummary = Array.from(operatorSummaryMap.values()).map((op) => {
+    op.appointmentsBase = roundMoney(op.appointmentsBase);
+    op.appointmentsCommission = roundMoney(op.appointmentsCommission);
+    op.posBase = roundMoney(op.posBase);
+    op.posCommission = roundMoney(op.posCommission);
+    op.paidCommission = roundMoney(op.paidCommission);
+    op.unpaidCommission = roundMoney(op.unpaidCommission);
+    op.cancelledCommission = roundMoney(op.cancelledCommission);
+    op.totalBase = roundMoney(op.appointmentsBase + op.posBase);
+    op.totalCommission = roundMoney(op.appointmentsCommission + op.posCommission);
+    return op;
+  });
+  operatorSummary.sort((a, b) => {
+    const d = b.totalCommission - a.totalCommission;
+    if (d !== 0) return d;
+    return a.operatorName.localeCompare(b.operatorName);
+  });
+
+  summary.appointmentsBase = roundMoney(summary.appointmentsBase);
+  summary.appointmentsCommission = roundMoney(summary.appointmentsCommission);
+  summary.posBase = roundMoney(summary.posBase);
+  summary.posCommission = roundMoney(summary.posCommission);
+  summary.paidCommission = roundMoney(summary.paidCommission);
+  summary.unpaidCommission = roundMoney(summary.unpaidCommission);
+  summary.cancelledCommission = roundMoney(summary.cancelledCommission);
+  summary.totalBase = roundMoney(summary.appointmentsBase + summary.posBase);
+  summary.totalCommission = roundMoney(summary.appointmentsCommission + summary.posCommission);
+
+  return {
+    moduleEnabled: settings.moduleEnabled,
+    configuredRates: settings.configuredRates,
+    entries,
+    operatorSummary,
+    summary,
+  };
+}
+
+// markCommissionEntryPaid — set is_paid/paid_at/paid_by by entry_key. THROWS if the
+// entry is cancelled (faithful to setEntryPaidStatus's entry_status='cancelled' guard).
+// Tenant-safe: tenantSelect to find the row + validate, then tenantUpdate by id.
+export async function markCommissionEntryPaid(
+  slug: string,
+  entryKey: string,
+  isPaid: boolean,
+  userId: number | null,
+): Promise<void> {
+  const key = String(entryKey ?? "").trim();
+  if (key === "") throw new Error("Movimento commissione non valido.");
+
+  const table = await tenantTable(slug, "staff_commission_payments");
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: table.name,
+    columns: "id, entry_status",
+    where: "entry_key=?",
+    params: [key],
+    limit: 1,
+  });
+  const row = rows[0];
+  if (!row) throw new Error("Movimento commissione non trovato.");
+  if (String(row.entry_status ?? "active").trim() === "cancelled") {
+    throw new Error("La commissione annullata non può essere modificata.");
+  }
+
+  await tenantUpdate({
+    slug,
+    table: table.name,
+    id: Number(row.id ?? 0) || 0,
+    values: {
+      is_paid: isPaid ? 1 : 0,
+      paid_at: isPaid ? nowDateTime() : null,
+      paid_by: isPaid ? (userId && userId > 0 ? userId : null) : null,
+      updated_at: new Date(),
+    },
+  });
 }
