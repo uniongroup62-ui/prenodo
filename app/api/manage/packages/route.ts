@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
-import { consumeDbClientPackage, deleteManagePackageCatalog, getManagePackageCatalog, getPackageCatalogFormContext, issueDbClientPackage, listDbPackageState, listManagePackageCatalog, saveManagePackageCatalog } from "@/lib/db-repositories";
+import { consumeDbClientPackage, deleteManagePackageCatalog, getManageClientPackage, getManagePackageCatalog, getPackageCatalogFormContext, issueDbClientPackage, listDbPackageState, listManagePackageCatalog, saveManagePackageCatalog, updateManageClientPackageExpiry } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { canAny } from "@/lib/role-permissions";
@@ -39,6 +39,14 @@ export async function GET(request: Request) {
       const template = await getManagePackageCatalog(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
       if (!template) return jsonError("Pacchetto catalogo non trovato.", 404);
       return Response.json({ ok: true, sourceMode: "database", template });
+    }
+
+    // Client-package DETAIL (tab=clients action=view/client_view): header +
+    // per-service contents + usage history + expiry-edit flag.
+    if (url.searchParams.get("action") === "view" || url.searchParams.get("action") === "client_view") {
+      const detail = await getManageClientPackage(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
+      if (!detail) return jsonError("Pacchetto cliente non trovato.", 404);
+      return Response.json({ ok: true, sourceMode: "database", detail });
     }
 
     return Response.json({
@@ -86,6 +94,14 @@ export async function POST(request: Request) {
       if (!canAny(session.user.perms, packageCatalogPerms)) return jsonError("Permesso catalogo pacchetti mancante.", 403);
       const saved = await saveManagePackageCatalog(tenantSlug, body, parseInteger(body.id, 0));
       return Response.json({ ok: true, source: "packages?action=catalog_save", sourceMode: "database", ...saved, catalog: await listManagePackageCatalog(tenantSlug) });
+    }
+
+    // Update a client package's expiry (port of update_client_package_expiry).
+    if (action === "update_expiry" || action === "update_client_package_expiry") {
+      const cpId = parseInteger(body.client_package_id ?? body.id, 0);
+      await updateManageClientPackageExpiry(tenantSlug, cpId, String(body.expires_at ?? ""));
+      const detail = await getManageClientPackage(tenantSlug, cpId);
+      return Response.json({ ok: true, source: "packages?action=update_expiry", sourceMode: "database", detail });
     }
 
     // Delete a catalog template (port of action=catalog_delete): detach client

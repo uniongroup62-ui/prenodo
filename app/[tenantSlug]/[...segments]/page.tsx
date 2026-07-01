@@ -70,6 +70,7 @@ import { ServiceRecommendationsContent } from "@/components/modules/service_reco
 import { PackagesContent } from "@/components/modules/packages-content";
 import { PackagesCatalogContent } from "@/components/modules/packages_catalog-content";
 import { PackagesCatalogFormContent } from "@/components/modules/packages_catalog_form-content";
+import { ClientPackageDetailContent } from "@/components/modules/client_package_detail-content";
 import { PackageSettingsContent } from "@/components/modules/package_settings-content";
 import { MarketplaceSettingsContent } from "@/components/modules/marketplace-content";
 import { FidelityWalletContent } from "@/components/modules/fidelity_wallet-content";
@@ -358,6 +359,17 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <PackagesCatalogFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful client-package DETAIL (packages.php tab=clients action=view/
+  // client_view): the client package header + contents + usage history + expiry
+  // edit, instead of the Tailwind fallback.
+  if (page === "packages" && (query.action === "view" || query.action === "client_view")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <ClientPackageDetailContent />
       </ManageShell>
     );
   }

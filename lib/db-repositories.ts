@@ -4420,6 +4420,157 @@ export async function saveManagePackageCatalog(slug: string, body: Record<string
   return { id: packageId };
 }
 
+// ---- Client package DETAIL (packages.php action=client_view) ------------------
+export type ClientPackageContent = { id: number; serviceId: number; serviceName: string; sessionsTotal: number; sessionsRemaining: number };
+export type ClientPackageUsage = { id: number; usedAt: string; delta: number; note: string; itemType: string; itemName: string; appointmentCode: string };
+export type ManageClientPackageDetail = {
+  id: number;
+  clientId: number;
+  clientName: string;
+  packageName: string;
+  serviceName: string;
+  sessionsTotal: number;
+  sessionsRemaining: number;
+  status: string;
+  statusLabel: string;
+  statusBadge: string;
+  purchaseDate: string;
+  startDate: string;
+  expiresAt: string;
+  saleId: number | null;
+  contents: ClientPackageContent[];
+  usages: ClientPackageUsage[];
+  canEditExpiry: boolean;
+};
+
+function clientPackageStatusMeta(stored: string, remaining: number, expiresAt: string): { key: string; label: string; badge: string } {
+  const s = String(stored ?? "").trim().toLowerCase();
+  if (s === "canceled" || s === "cancelled") return { key: "cancelled", label: "Annullato", badge: "bg-danger" };
+  if (remaining <= 0) return { key: "completed", label: "Completato", badge: "bg-secondary" };
+  const exp = String(expiresAt ?? "").slice(0, 10);
+  if (exp !== "" && exp < todayIso()) return { key: "expired", label: "Scaduto", badge: "bg-warning text-dark" };
+  return { key: "active", label: "Attivo", badge: "bg-success" };
+}
+
+// Full client-package DETAIL (port of packages.php action=client_view): the
+// header (client/package/sessions/expiry/status/sale link), the per-service
+// contents (client_package_services, sessions total/remaining — the aggregate
+// sessions are re-derived from these), and the usage history
+// (client_package_usages). Read-only; expiry edit is a separate action.
+export async function getManageClientPackage(slug: string, id: number): Promise<ManageClientPackageDetail | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "client_packages", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const cp = rows[0];
+
+  const clientId = Number(cp.client_id ?? 0);
+  let clientName = "";
+  if (clientId > 0) {
+    const cRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "full_name", where: "id = ?", params: [clientId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    clientName = String(cRows[0]?.full_name ?? "");
+  }
+  const serviceName = await serviceNameById(slug, Number(cp.service_id ?? 0), "");
+
+  // Per-service contents.
+  const cpsRows = await tenantSelect<RowDataPacket>({ slug, table: "client_package_services", where: "client_package_id = ?", params: [id], orderBy: "sort_order ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const contents: ClientPackageContent[] = [];
+  let sumTotal = 0;
+  let sumRemaining = 0;
+  for (const r of cpsRows) {
+    const sid = Number(r.service_id ?? 0);
+    const total = Math.max(0, Number(r.sessions_total ?? 0));
+    const remaining = Math.max(0, Number(r.sessions_remaining ?? 0));
+    sumTotal += total;
+    sumRemaining += remaining;
+    contents.push({ id: Number(r.id ?? 0), serviceId: sid, serviceName: snapshotServiceName(r.service_snapshot_json) || (await serviceNameById(slug, sid, `Servizio #${sid}`)), sessionsTotal: total, sessionsRemaining: remaining });
+  }
+  const sessionsTotal = sumTotal > 0 ? sumTotal : Math.max(0, Number(cp.sessions_total ?? 0));
+  const sessionsRemaining = sumTotal > 0 ? sumRemaining : Math.max(0, Number(cp.sessions_remaining ?? 0));
+
+  // Usage history (client_package_usages), newest first.
+  const usageRows = await tenantSelect<RowDataPacket>({ slug, table: "client_package_usages", where: "client_package_id = ?", params: [id], orderBy: "used_at DESC, id DESC", limit: 100 }).catch(() => [] as RowDataPacket[]);
+  const usages: ClientPackageUsage[] = [];
+  for (const r of usageRows) {
+    const itemType = String(r.item_type ?? "") || (r.service_id ? "service" : "");
+    const itemId = Number(r.item_id ?? r.service_id ?? 0);
+    let itemName = "";
+    if (itemType === "product" && itemId > 0) {
+      const pr = await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "name", where: "id = ?", params: [itemId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+      itemName = String(pr[0]?.name ?? `Prodotto #${itemId}`);
+    } else if (itemId > 0) {
+      itemName = await serviceNameById(slug, itemId, `Servizio #${itemId}`);
+    }
+    let appointmentCode = "";
+    const apptId = Number(r.appointment_id ?? 0);
+    if (apptId > 0) {
+      const ap = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "public_code", where: "id = ?", params: [apptId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+      appointmentCode = String(ap[0]?.public_code ?? "");
+    }
+    usages.push({ id: Number(r.id ?? 0), usedAt: toIso(r.used_at ?? r.created_at), delta: Number(r.delta ?? 0), note: String(r.note ?? ""), itemType, itemName, appointmentCode });
+  }
+
+  const meta = clientPackageStatusMeta(String(cp.status ?? "active"), sessionsRemaining, String(cp.expires_at ?? ""));
+  // Expiry is editable only when the package is not cancelled and untouched
+  // (no consumption yet), mirroring updateClientPackageExpiry's guards.
+  const canEditExpiry = meta.key !== "cancelled" && sessionsRemaining === sessionsTotal && usages.length === 0;
+
+  return {
+    id,
+    clientId,
+    clientName,
+    packageName: String(cp.package_name ?? ""),
+    serviceName,
+    sessionsTotal,
+    sessionsRemaining,
+    status: meta.key,
+    statusLabel: meta.label,
+    statusBadge: meta.badge,
+    purchaseDate: cp.purchase_date ? toIso(cp.purchase_date) : "",
+    startDate: cp.start_date ? toIso(cp.start_date) : "",
+    expiresAt: cp.expires_at ? String(cp.expires_at).slice(0, 10) : "",
+    saleId: Number(cp.sale_id ?? 0) || null,
+    contents,
+    usages,
+    canEditExpiry,
+  };
+}
+
+// Update a client package's expiry (port of ClientPackages::updateClientPackageExpiry):
+// requires a valid date not before today / the package start, refuses a cancelled or
+// already-used package, then writes expires_at + recomputes status.
+export async function updateManageClientPackageExpiry(slug: string, id: number, expiresAt: string): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Pacchetto non valido.");
+  const requested = String(expiresAt ?? "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested)) throw new Error("Seleziona una nuova data di scadenza valida.");
+  const today = todayIso();
+  if (requested < today) throw new Error("La nuova data di scadenza non può essere precedente a oggi.");
+
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "client_packages", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Pacchetto cliente non trovato.");
+  const cp = rows[0];
+  const stored = String(cp.status ?? "active").trim().toLowerCase();
+  if (stored === "canceled" || stored === "cancelled") throw new Error("Non è possibile modificare la scadenza di un pacchetto annullato.");
+
+  // Already-used guard: any consumption (remaining < total) or a usage row.
+  const sumRows = await tenantSelect<RowDataPacket>({ slug, table: "client_package_services", columns: "sessions_total, sessions_remaining", where: "client_package_id = ?", params: [id] }).catch(() => [] as RowDataPacket[]);
+  let sumTotal = 0;
+  let sumRemaining = 0;
+  for (const r of sumRows) { sumTotal += Number(r.sessions_total ?? 0); sumRemaining += Number(r.sessions_remaining ?? 0); }
+  const total = sumTotal > 0 ? sumTotal : Number(cp.sessions_total ?? 0);
+  const remaining = sumTotal > 0 ? sumRemaining : Number(cp.sessions_remaining ?? 0);
+  const usageCount = (await tenantSelect<RowDataPacket>({ slug, table: "client_package_usages", columns: "id", where: "client_package_id = ?", params: [id], limit: 1 }).catch(() => [] as RowDataPacket[])).length;
+  if (remaining !== total || usageCount > 0) throw new Error("Non è possibile modificare la scadenza di un pacchetto già utilizzato.");
+
+  const startYmd = cp.start_date ? String(cp.start_date).slice(0, 10) : "";
+  if (startYmd !== "" && requested < startYmd) throw new Error("La nuova data di scadenza non può essere precedente all'inizio del pacchetto.");
+
+  // Recompute status from the new expiry (active/expired), preserving cancelled/completed.
+  let newStatus = stored;
+  if (stored !== "completed" && remaining > 0) newStatus = requested < today ? "expired" : "active";
+  await tenantUpdate({ slug, table: "client_packages", id, values: { expires_at: requested, status: newStatus } });
+  return { ok: true };
+}
+
 export async function issueDbClientPackage(
   input: { packageId?: number; clientId?: number; clientName?: string; expiresAt?: string; sourceSaleId?: number },
   slug: string,
