@@ -110,6 +110,9 @@ type AppointmentEditPayload = {
   fidelityPointsUsed?: number;
   creditUsed?: number;
   coupon?: { code: string; discount: number } | null;
+  // Item 3: warning when the edited appointment links a now-EXPIRED redeem source
+  // (package/prepaid/giftbox/gift/giftcard). "" / absent when nothing is expired.
+  expiredLinkWarning?: string;
 };
 
 // Minimal Bootstrap offcanvas/modal surface used here (the bundle is loaded by
@@ -524,6 +527,13 @@ export function QuickBookingDrawer() {
   const [staffNotes, setStaffNotes] = useState<string>("");
   const [customerNotes, setCustomerNotes] = useState<string>("");
   const [holdToken, setHoldToken] = useState<string>("");
+  // Item 3: the expired-linked warning shown in #qbExpiredLinkedAlert (from action=get).
+  const [expiredLinkWarning, setExpiredLinkWarning] = useState<string>("");
+  // Item 4: the edit-load lifecycle. `editLoading` drives #qbLoadingState (spinner) around
+  // the action=get fetch; `editLoadError` (already present) drives #qbLoadErrorState. Both
+  // block the form while set. A separate #qbLoadErrorState (with a working Riprova button)
+  // replaces the ad-hoc header alert for edit-load failures.
+  const [editLoading, setEditLoading] = useState<boolean>(false);
 
   // ---- CANCEL-DONE PREVIEW MODAL (#qbDoneCancelModal) ----
   // The rich preview-lock flow replacing the bare window.confirm on a done->canceled/
@@ -552,6 +562,9 @@ export function QuickBookingDrawer() {
   const [bookingCode, setBookingCode] = useState<string>("");
   const [editLoadError, setEditLoadError] = useState<string>("");
   const editReqRef = useRef(0);
+  // Item 4: the last edit-load id, so #qbLoadErrorState's "Riprova" button can retry
+  // (port of qbLastOpenEditArgs). Empty -> the retry button hides.
+  const lastEditIdRef = useRef<string>("");
 
   // ---- Find-client modal state ----
   const [findQuery, setFindQuery] = useState("");
@@ -593,6 +606,49 @@ export function QuickBookingDrawer() {
       });
   }, [slug]);
 
+  // Item 1: release an availability hold on the server (port of qbReleaseAvailabilityHold,
+  // app.js ~3404-3421). Best-effort, fire-and-forget: POSTs {action:"release_hold", token}
+  // with keepalive:true so it survives a drawer close / page unload; never blocks the UI and
+  // swallows errors. No-op on an empty token. Called right BEFORE every place a non-empty
+  // held token is dropped (close/reset, operator/cabin/location/service/date/time change) and
+  // on pagehide/beforeunload, so an abandoned technical hold is freed instead of lingering.
+  const releaseHold = useCallback(
+    (token: string) => {
+      const tok = String(token || "").trim();
+      if (!tok || typeof fetch === "undefined") return;
+      try {
+        void fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
+          method: "POST",
+          keepalive: true,
+          headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+          body: JSON.stringify({ action: "release_hold", token: tok }),
+        }).catch(() => undefined);
+      } catch {
+        // best-effort: a failed release just lets the technical hold expire on its own.
+      }
+    },
+    [slug],
+  );
+
+  // Latest held token, kept in a ref so the pagehide/beforeunload listeners (bound once)
+  // always release the CURRENT hold without re-binding, and dropAndReleaseHold can read it
+  // without threading the token through every setter.
+  const holdTokenRef = useRef<string>("");
+  useEffect(() => {
+    holdTokenRef.current = holdToken;
+  }, [holdToken]);
+
+  // Item 1: drop the local held token AND release it on the server in one place, so every
+  // caller that invalidates a held slot (close/reset, operator/cabin/location/service/date/
+  // time change) both clears the input and frees the technical hold. Reads the latest token
+  // from the ref (avoids threading it through every setter). No-op when there is no hold.
+  const dropAndReleaseHold = useCallback(() => {
+    const tok = holdTokenRef.current;
+    if (tok) releaseHold(tok);
+    holdTokenRef.current = "";
+    setHoldToken("");
+  }, [releaseHold]);
+
   // Reset the whole form to "new appointment" defaults (port of qbResetForm).
   const resetForm = useCallback(() => {
     setClient(null);
@@ -622,7 +678,11 @@ export function QuickBookingDrawer() {
     setStaffId("");
     setStaffNotes("");
     setCustomerNotes("");
-    setHoldToken("");
+    // Item 1: reset drops any technical hold — release it on the server too (not just locally).
+    dropAndReleaseHold();
+    // Item 3/4: a fresh form carries no expired-linked alert and no edit-load lifecycle.
+    setExpiredLinkWarning("");
+    setEditLoading(false);
     // Manual sconto + coupon belong to the booking; reset to "none" (port of qbResetForm).
     setDiscountType("");
     setDiscountValue("");
@@ -651,7 +711,7 @@ export function QuickBookingDrawer() {
     setBookingCode("");
     setEditLoadError("");
     setLocationId((prev) => prev || (ctx.currentLocationId ? String(ctx.currentLocationId) : ""));
-  }, [ctx.currentLocationId]);
+  }, [ctx.currentLocationId, dropAndReleaseHold]);
 
   // GLOBAL open wiring: ANY [data-qb-new] click opens THIS offcanvas in place.
   // Listener is delegated on document so it works for buttons rendered anywhere
@@ -690,7 +750,9 @@ export function QuickBookingDrawer() {
 
     const el = document.getElementById("quickBooking");
     const onHidden = () => {
-      setHoldToken("");
+      // Item 1: closing the drawer releases the technical hold on the server (resetForm's
+      // dropAndReleaseHold does this) — not just a local clear (port of qbReleaseAvailabilityHold
+      // fired on drawer close).
       resetForm();
     };
 
@@ -708,6 +770,25 @@ export function QuickBookingDrawer() {
     const api = bootstrap()?.Offcanvas;
     if (el && api) api.getOrCreateInstance(el).hide();
   }, []);
+
+  // Item 1: release the hold on page unload (port of app.js ~3613 pagehide listener + a
+  // beforeunload for reliability). keepalive:true (inside releaseHold) lets the POST finish.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onUnload = () => {
+      const tok = holdTokenRef.current;
+      if (tok) {
+        releaseHold(tok);
+        holdTokenRef.current = "";
+      }
+    };
+    window.addEventListener("pagehide", onUnload);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      window.removeEventListener("pagehide", onUnload);
+      window.removeEventListener("beforeunload", onUnload);
+    };
+  }, [releaseHold]);
 
   // ---- Services: derived selected set + total duration -> end time (syncEnd) ----
   const totalDuration = useMemo(
@@ -814,10 +895,11 @@ export function QuickBookingDrawer() {
   }, [isMultiService, staffPickerRows, staffMap]);
 
   const setStaffForService = useCallback((serviceId: number, value: string) => {
-    // Changing any operator invalidates a previously held slot (port: clear hold).
-    setHoldToken("");
+    // Changing any operator invalidates a previously held slot: drop it locally AND release
+    // it on the server (port of qbReleaseAvailabilityHold on a staff change).
+    dropAndReleaseHold();
     setStaffPicks((prev) => ({ ...prev, [serviceId]: value }));
-  }, []);
+  }, [dropAndReleaseHold]);
 
   // The date/availability/operator controls (and now the cabin select) stay
   // gated until at least one service is selected (port of the start gate).
@@ -889,33 +971,34 @@ export function QuickBookingDrawer() {
   }, [cabinMap]);
 
   const setCabinForService = useCallback((serviceId: number, value: string) => {
-    // Changing any cabin invalidates a previously held slot (port: clear hold).
-    setHoldToken("");
+    // Changing any cabin invalidates a previously held slot: drop + release (port of
+    // qbReleaseAvailabilityHold on a cabin change).
+    dropAndReleaseHold();
     setCabinPicks((prev) => ({ ...prev, [serviceId]: value }));
-  }, []);
+  }, [dropAndReleaseHold]);
 
   // Changing services / location / date / start time invalidates any held slot
   // (port of qbReleaseAvailabilityHold). We drop the token locally inside the
   // setters rather than in an effect (avoids a cascading-render setState).
   const toggleService = useCallback((id: number) => {
-    setHoldToken("");
+    dropAndReleaseHold();
     setSelectedServiceIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-  }, []);
+  }, [dropAndReleaseHold]);
   const changeDate = useCallback((value: string) => {
-    setHoldToken("");
+    dropAndReleaseHold();
     setDate(value);
-  }, []);
+  }, [dropAndReleaseHold]);
   const changeStartTime = useCallback((value: string) => {
-    setHoldToken("");
+    dropAndReleaseHold();
     setStartTime(value);
     // A manually edited start invalidates a drag-select end override (the fixed end was
     // chosen relative to the original start) — fall back to the services-derived end.
     setPrefillEndTime("");
-  }, []);
+  }, [dropAndReleaseHold]);
   const changeLocation = useCallback((value: string) => {
-    setHoldToken("");
+    dropAndReleaseHold();
     setLocationId(value);
-  }, []);
+  }, [dropAndReleaseHold]);
 
   // Location filter for a service item (port of qbServiceItemAllowedForLocation).
   const serviceAllowedForLocation = useCallback(
@@ -1689,10 +1772,18 @@ export function QuickBookingDrawer() {
       const numericId = Number.parseInt(editId, 10);
       if (!Number.isFinite(numericId) || numericId <= 0) return;
 
+      // Item 4: remember the id so the #qbLoadErrorState "Riprova" button can re-invoke
+      // this load (port of qbLastOpenEditArgs / qbLoadRetryBtn).
+      lastEditIdRef.current = editId;
+
       loadContext();
       resetForm();
       const myReq = ++editReqRef.current;
       setEditLoadError("");
+      // Item 4: enter the loading state (spinner #qbLoadingState, form blocked) for the
+      // duration of the action=get fetch (port of qbSetLoading). Cleared to ready on
+      // success (qbSetLoadReady) or to the error state on failure (qbSetLoadError).
+      setEditLoading(true);
 
       // Open the offcanvas immediately (the legacy shows a loading state while the
       // GET resolves); the prefill applies as soon as the payload arrives.
@@ -1706,6 +1797,9 @@ export function QuickBookingDrawer() {
         .then((data: { ok?: boolean; error?: string; appointment?: AppointmentEditPayload }) => {
           if (myReq !== editReqRef.current) return; // stale (drawer re-opened meanwhile)
           if (!data || data.ok === false || !data.appointment) {
+            // Item 4: load FAILED -> leave the loading state and show #qbLoadErrorState
+            // (with a working Riprova button) instead of an ad-hoc header alert.
+            setEditLoading(false);
             setEditLoadError(String(data?.error || "Impossibile caricare la prenotazione."));
             return;
           }
@@ -1788,9 +1882,16 @@ export function QuickBookingDrawer() {
           }
           // An existing slot is already booked: no hold needed (the update reuses it).
           setHoldToken("");
+          // Item 3: surface the expired-linked-residual warning in #qbExpiredLinkedAlert
+          // (port of qbSetExpiredLinkedAlert(a.expired_link_warning)). "" hides it.
+          setExpiredLinkWarning(String(a.expiredLinkWarning ?? "").trim());
+          // Item 4: prefill done -> ready (spinner hidden, form unblocked; qbSetLoadReady).
+          setEditLoading(false);
         })
         .catch(() => {
           if (myReq !== editReqRef.current) return;
+          // Item 4: a network failure shows #qbLoadErrorState with the Riprova button.
+          setEditLoading(false);
           setEditLoadError("Errore di rete durante il caricamento della prenotazione.");
         });
     },
@@ -2139,7 +2240,31 @@ export function QuickBookingDrawer() {
         });
         const data: { ok?: boolean; error?: string; packageWarnings?: string[]; prepaidWarnings?: string[]; giftcardWarnings?: string[]; giftboxWarnings?: string[]; giftWarnings?: string[] } = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false || data.error) {
-          setFormError(String(data.error || "Errore salvataggio."));
+          const msg = String(data.error || "Errore salvataggio.");
+          // Item 2: EXPIRED-HOLD recovery (port of qbHandleHoldExpired, app.js ~3374-3393).
+          // When the server rejects the save because the held slot went stale, the stale
+          // hold token + time + cabin are still in the form: a naive retry would re-send the
+          // SAME dead token and fail again. So on a match we CLEAR the hold token, the
+          // start/end time and the cabin selection, and prompt the operator to re-run
+          // "Disponibilità" instead of leaving the dead selection in place.
+          // The regex matches BOTH the legacy family (riserva/disponibilit/orario/cabina)
+          // AND the Next server's own hold-rejection messages, which read "Hold appuntamento
+          // scaduto o non valido." / "Hold non coerente con orario|servizio|operatore|sede
+          // selezionata." (assertDbAppointmentHold, db-repositories.ts ~7660) — hence the
+          // added "hold"/"coerente"/"scadut" alternatives so the recovery actually fires.
+          if (/riserva|disponibilit|orario non piu disponibile|orario non più disponibile|cabina|\bhold\b|coerente|scadut/i.test(msg)) {
+            setHoldToken("");
+            holdTokenRef.current = "";
+            setStartTime("");
+            setPrefillEndTime("");
+            // Clear the cabin selection (single + per-service picks), like the legacy resets
+            // #qb_cabin_id + #qb_cabin_map on an expired hold.
+            setCabinId("");
+            setCabinPicks({});
+            setFormError("Disponibilità scaduta: riseleziona data/ora.");
+            return;
+          }
+          setFormError(msg);
           return;
         }
         // Per-redeem skips don't fail the booking, but surface them before the
@@ -2296,27 +2421,48 @@ export function QuickBookingDrawer() {
             <div id="qbBookingCodeRow" className="small text-muted mt-1" style={{ display: isEditMode && bookingCode ? "block" : "none" }}>
               Codice prenotazione: <code id="qbBookingCode">{bookingCode ? `#${bookingCode}` : ""}</code>
             </div>
-            <div id="qbExpiredLinkedAlert" className="alert alert-warning small py-2 px-2 mt-2 mb-0" style={{ display: "none" }} />
-            {editLoadError ? (
-              <div className="alert alert-danger small py-2 px-2 mt-2 mb-0">{editLoadError}</div>
-            ) : null}
+            {/* Item 3: expired-linked residual warning (React-driven, was hardcoded display:none). */}
+            <div
+              id="qbExpiredLinkedAlert"
+              className="alert alert-warning small py-2 px-2 mt-2 mb-0"
+              style={{ display: expiredLinkWarning ? "block" : "none" }}
+            >
+              {expiredLinkWarning}
+            </div>
           </div>
           <button type="button" className="btn-close" data-bs-dismiss="offcanvas" aria-label="Chiudi" />
         </div>
         <div className="offcanvas-body">
-          <div id="qbLoadingState" className="qb-loading-state" role="status" aria-live="polite" hidden>
+          {/* Item 4: loading state during the action=get edit-load (port of qbSetLoading);
+              hidden unless editLoading. Blocks the form (rendered but visually hidden below). */}
+          <div id="qbLoadingState" className="qb-loading-state" role="status" aria-live="polite" hidden={!editLoading}>
             <div className="spinner-border text-primary" aria-hidden="true" />
             <div className="fw-semibold mt-3" id="qbLoadingText">Caricamento prenotazione...</div>
             <div className="small text-muted mt-1">Preparo dati, orari e prezzi.</div>
           </div>
 
-          <div id="qbLoadErrorState" className="alert alert-danger qb-load-error" role="alert" hidden>
+          {/* Item 4: load-error state (port of qbSetLoadError) — shown when the edit-load
+              failed; the Riprova button re-invokes openEditAppointment for the last id. */}
+          <div id="qbLoadErrorState" className="alert alert-danger qb-load-error" role="alert" hidden={!editLoadError}>
             <div className="fw-semibold mb-1">Prenotazione non caricata</div>
-            <div className="small" id="qbLoadErrorText">Impossibile caricare la prenotazione.</div>
-            <button type="button" className="btn btn-sm btn-outline-danger mt-2" id="qbLoadRetryBtn">Riprova</button>
+            <div className="small" id="qbLoadErrorText">{editLoadError || "Impossibile caricare la prenotazione."}</div>
+            {lastEditIdRef.current ? (
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-danger mt-2"
+                id="qbLoadRetryBtn"
+                onClick={() => {
+                  const retryId = lastEditIdRef.current;
+                  if (retryId) openEditAppointment(retryId);
+                }}
+              >
+                Riprova
+              </button>
+            ) : null}
           </div>
 
-          <form id="quickBookingForm" onSubmit={submitBooking}>
+          {/* Item 4: hide the form while loading or on a load error (qbSetFormHydrationBlocked). */}
+          <form id="quickBookingForm" onSubmit={submitBooking} style={editLoading || editLoadError ? { display: "none" } : undefined}>
             <div id="qbSegmentViewAlert" className="alert alert-warning small" style={{ display: "none" }} />
             <div id="qbCancellationAlert" className="alert alert-warning small" style={{ display: "none" }} />
 
@@ -3110,7 +3256,8 @@ export function QuickBookingDrawer() {
                   id="qb_cabin_id"
                   value={effectiveCabinId}
                   onChange={(e) => {
-                    setHoldToken("");
+                    // Item 1: a cabin change invalidates the held slot — drop + release it.
+                    dropAndReleaseHold();
                     setCabinId(e.target.value);
                   }}
                   disabled={!cabinGateOpen || availableCabins.length === 1}

@@ -2075,7 +2075,112 @@ export type AppointmentEditPayload = {
   fidelityPointsUsed: number;
   creditUsed: number;
   coupon: { code: string; discount: number } | null;
+  // Port of api_appointments.php `get` -> a.expired_link_warning (rendered in the
+  // drawer's #qbExpiredLinkedAlert). Non-empty when the edited appointment references
+  // a redeem source (package/prepaid/giftbox/gift/giftcard) that is now EXPIRED — a
+  // heads-up so the operator knows a linked residual can't be re-applied. "" when none.
+  expiredLinkWarning: string;
 };
+
+// Compute the expired-linked warning for an appointment being edited (Item 3, port of
+// the legacy a.expired_link_warning filled by qbSetExpiredLinkedAlert). Walks the
+// appointment's redeem links — appointment_services.{client_package_id,
+// client_prepaid_service_id, giftbox_instance_id, gift_instance_id} + the
+// appointment-level appointments.giftcard_id — and, for any that reference a source
+// row that is now EXPIRED (expires_at in the past, or a 'expired'/'scaduto' status),
+// builds a short "Attenzione: ..." warning. Best-effort per source (a missing table /
+// column / row just skips that check); returns "" when nothing is expired.
+async function computeExpiredLinkWarning(slug: string, appointmentId: number, giftcardId: number): Promise<string> {
+  const today = todayIso();
+  // True when a source row is expired: an explicit expired/scaduto status, OR an
+  // expires_at/valid_to date strictly before today (date-only compare, like the redeem
+  // eligibility checks). NULL/empty expiry = no expiry (never expired by date).
+  const isExpired = (statusRaw: unknown, expiryRaw: unknown): boolean => {
+    const status = String(statusRaw ?? "").trim().toLowerCase();
+    if (status === "expired" || status === "scaduto" || status === "scaduta") return true;
+    const expiry = expiryRaw ? String(expiryRaw).slice(0, 10) : "";
+    return expiry !== "" && expiry < today;
+  };
+  const expired: string[] = [];
+
+  // Per-service redeem links from appointment_services (best-effort; a missing table or
+  // the redeem columns absent on older installs just yields no per-service warnings).
+  let serviceRows: RowDataPacket[] = [];
+  try {
+    serviceRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_services",
+      where: "appointment_id = ?",
+      params: [appointmentId],
+    });
+  } catch {
+    serviceRows = [];
+  }
+
+  // Collect the distinct source ids per redeem type (dedup so one expired package tied
+  // to several services warns once).
+  const packageIds = new Set<number>();
+  const prepaidIds = new Set<number>();
+  const giftboxIds = new Set<number>();
+  const giftIds = new Set<number>();
+  for (const row of serviceRows) {
+    const pkg = Number(row.client_package_id ?? 0);
+    if (pkg > 0) packageIds.add(pkg);
+    const prepaid = Number(row.client_prepaid_service_id ?? 0);
+    if (prepaid > 0) prepaidIds.add(prepaid);
+    const giftbox = Number(row.giftbox_instance_id ?? 0);
+    if (giftbox > 0) giftboxIds.add(giftbox);
+    const gift = Number(row.gift_instance_id ?? 0);
+    if (gift > 0) giftIds.add(gift);
+  }
+
+  // Helper: read one source row (id) and push a label when it is expired. `col` names the
+  // expiry column (expires_at for the residual pools, expires_at for giftbox/gift too).
+  const checkSource = async (table: string, ids: Set<number>, expiryCol: string, label: string) => {
+    for (const id of ids) {
+      try {
+        const rows = await tenantSelect<RowDataPacket>({
+          slug,
+          table,
+          columns: `id, status, ${expiryCol}`,
+          where: "id = ?",
+          params: [id],
+          limit: 1,
+        });
+        if (rows[0] && isExpired(rows[0].status, rows[0][expiryCol])) expired.push(label);
+      } catch {
+        // tolerate a missing table/column (older installs) — skip this source.
+      }
+    }
+  };
+
+  await checkSource("client_packages", packageIds, "expires_at", "un pacchetto");
+  await checkSource("client_prepaid_services", prepaidIds, "expires_at", "un prepagato");
+  await checkSource("giftbox_instances", giftboxIds, "expires_at", "una GiftBox");
+  await checkSource("gift_instances", giftIds, "expires_at", "un omaggio");
+
+  // Appointment-level giftcard (appointments.giftcard_id).
+  if (giftcardId > 0) {
+    try {
+      const rows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftcards",
+        columns: "id, status, expires_at",
+        where: "id = ?",
+        params: [giftcardId],
+        limit: 1,
+      });
+      if (rows[0] && isExpired(rows[0].status, rows[0].expires_at)) expired.push("una GiftCard");
+    } catch {
+      // tolerate a missing table/column.
+    }
+  }
+
+  if (expired.length === 0) return "";
+  // Dedup labels while preserving order (e.g. two expired packages -> "un pacchetto" once).
+  const distinct = Array.from(new Set(expired));
+  return `Attenzione: questa prenotazione è collegata a ${distinct.join(", ")} ormai scaduta/o. Il residuo collegato non può più essere applicato.`;
+}
 
 export async function getDbAppointmentForEdit(slug: string, id: number): Promise<AppointmentEditPayload | null> {
   // Tenant-scoped read of the appointments row (tenantSelect '*' so public_code /
@@ -2164,6 +2269,9 @@ export async function getDbAppointmentForEdit(slug: string, id: number): Promise
   const startsAt = toDate(row.starts_at);
   const primaryCabinId = row.cabin_id === null || row.cabin_id === undefined || Number(row.cabin_id) <= 0 ? null : Number(row.cabin_id);
 
+  // Item 3: the expired-linked warning (checks the redeem sources this appointment links).
+  const expiredLinkWarning = await computeExpiredLinkWarning(slug, Number(row.id ?? id), Number(row.giftcard_id ?? 0) || 0);
+
   return {
     id: Number(row.id ?? id),
     publicCode:
@@ -2197,6 +2305,7 @@ export async function getDbAppointmentForEdit(slug: string, id: number): Promise
       const meta = extractCouponMetaFromNotes(row.notes);
       return meta.code && meta.discount > 0 ? meta : null;
     })(),
+    expiredLinkWarning,
   };
 }
 
