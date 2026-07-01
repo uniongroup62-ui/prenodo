@@ -6562,6 +6562,21 @@ export async function toggleDbAutomationRule(id: number, enabled: boolean, slug:
   return rule;
 }
 
+// Persist the installment due-alert window (automation_settings.installment_alert_days), clamped to
+// 0..365 — faithful to Helpers::installment_notification_days save. Updates the single settings row,
+// inserting one if the tenant has none yet. Returns the stored value.
+export async function saveDbInstallmentAlertDays(slug: string, days: number): Promise<number> {
+  const clamped = Math.max(0, Math.min(365, Math.round(Number(days) || 0)));
+  const table = await tenantTable(slug, "automation_settings");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: table.name, columns: "id", orderBy: "id ASC", limit: 1 });
+  if (rows[0]) {
+    await tenantUpdate({ slug, table: "automation_settings", id: Number(rows[0].id ?? 0), values: { installment_alert_days: clamped } });
+  } else {
+    await tenantInsert(table, { installment_alert_days: clamped });
+  }
+  return clamped;
+}
+
 export async function runDbAutomationRule(id: number, slug: string): Promise<{ rule: AutomationRule; notifications: NotificationItem[] }> {
   const rules = await listDbAutomationRules(slug);
   const rule = rules.find((item) => item.id === id);

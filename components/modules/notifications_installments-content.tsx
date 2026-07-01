@@ -41,9 +41,24 @@ type DueRow = {
   overdue: boolean;
 };
 
+type DueGroup = {
+  key: string;
+  title: string;
+  kind: "danger" | "warning" | "info";
+  rows: DueRow[];
+};
+
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
+}
+
+// Hide the Bootstrap settings modal after a successful save (bootstrap 5 global, loaded by the shell).
+function closeInstallmentSettingsModal(): void {
+  if (typeof window === "undefined") return;
+  const el = document.getElementById("installmentNotificationSettingsModal");
+  const bs = (window as unknown as { bootstrap?: { Modal?: { getOrCreateInstance: (e: Element) => { hide: () => void } } } }).bootstrap;
+  if (el && bs?.Modal) bs.Modal.getOrCreateInstance(el).hide();
 }
 
 function startOfDay(d: Date): number {
@@ -69,9 +84,11 @@ export function NotificationsInstallmentsContent() {
   const slug = tenantSlug();
   const [plans, setPlans] = useState<ApiInstallmentPlan[]>([]);
   const [loading, setLoading] = useState(true);
-  // No persistence endpoint for this setting; initialise to the PHP default (7).
+  // The alert window is PERSISTED (automation_settings.installment_alert_days) — seeded from the API
+  // response on load, saved back via POST action=save_alert_days from the settings modal.
   const [alertDays, setAlertDays] = useState(DEFAULT_ALERT_DAYS);
   const [alertDaysInput, setAlertDaysInput] = useState(String(DEFAULT_ALERT_DAYS));
+  const [savingSettings, setSavingSettings] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -79,7 +96,13 @@ export function NotificationsInstallmentsContent() {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
-      .then((j) => setPlans(Array.isArray(j.plans) ? j.plans : []))
+      .then((j) => {
+        setPlans(Array.isArray(j.plans) ? j.plans : []);
+        if (typeof j.alertDays === "number" && Number.isFinite(j.alertDays)) {
+          setAlertDays(j.alertDays);
+          setAlertDaysInput(String(j.alertDays));
+        }
+      })
       .catch(() => setPlans([]))
       .finally(() => setLoading(false));
   }, [slug]);
@@ -116,8 +139,61 @@ export function NotificationsInstallmentsContent() {
     return out.sort((a, b) => Date.parse(a.dueDate) - Date.parse(b.dueDate));
   }, [plans, alertDays]);
 
+  // Group the due rows by days-to-due (overdue → danger, today/tomorrow → warning, later → info),
+  // faithful to SaleInstallments::getDueAlertGroups' overdue + due_N buckets.
+  const groups = useMemo<DueGroup[]>(() => {
+    const today = startOfDay(new Date());
+    const dayMs = 24 * 60 * 60 * 1000;
+    const byKey = new Map<string, { daysDiff: number; rows: DueRow[] }>();
+    for (const row of rows) {
+      const dueDay = startOfDay(new Date(Date.parse(row.dueDate)));
+      const daysDiff = Math.round((dueDay - today) / dayMs);
+      const key = daysDiff < 0 ? "overdue" : `due_${daysDiff}`;
+      let bucket = byKey.get(key);
+      if (!bucket) {
+        bucket = { daysDiff, rows: [] };
+        byKey.set(key, bucket);
+      }
+      bucket.rows.push(row);
+    }
+    const titleFor = (daysDiff: number): string => {
+      if (daysDiff < 0) return "Rate scadute";
+      if (daysDiff === 0) return "Rate in scadenza oggi";
+      if (daysDiff === 1) return "Rate in scadenza domani";
+      return `Rate in scadenza tra ${daysDiff} giorni`;
+    };
+    const kindFor = (daysDiff: number): DueGroup["kind"] => (daysDiff < 0 ? "danger" : daysDiff <= 1 ? "warning" : "info");
+    return [...byKey.entries()]
+      .sort((a, b) => (a[1].daysDiff < 0 ? -1 : b[1].daysDiff < 0 ? 1 : a[1].daysDiff - b[1].daysDiff))
+      .map(([key, bucket]) => ({ key, title: titleFor(bucket.daysDiff), kind: kindFor(bucket.daysDiff), rows: bucket.rows }));
+  }, [rows]);
+
   function manageHref(): string {
     return `/${encodeURIComponent(slug)}/installments_manage`;
+  }
+
+  // Persist the alert window (POST action=save_alert_days) then close the settings modal.
+  async function saveAlertDays() {
+    const parsed = Number.parseInt(alertDaysInput, 10);
+    const days = Number.isFinite(parsed) ? Math.min(365, Math.max(0, parsed)) : alertDays;
+    setSavingSettings(true);
+    try {
+      const res = await fetch(`/api/manage/installments?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "save_alert_days", alert_days: String(days) }),
+      });
+      const json = await res.json().catch(() => ({}));
+      const saved = typeof json?.alertDays === "number" ? json.alertDays : days;
+      setAlertDays(saved);
+      setAlertDaysInput(String(saved));
+      closeInstallmentSettingsModal();
+    } catch {
+      // Keep the modal open on failure; the local value still reflects the attempt.
+      setAlertDays(days);
+    } finally {
+      setSavingSettings(false);
+    }
   }
 
   return (
@@ -129,7 +205,7 @@ export function NotificationsInstallmentsContent() {
           <div className="bs-page-kicker">Notifiche</div>
           <h1 className="bs-page-title">Rate in scadenza / scadute</h1>
           <div className="bs-page-subtitle">
-            Mostra le rate gia scadute e quelle in scadenza nei prossimi {alertDays} giorni. Sede: Sede1.
+            Mostra le rate gia scadute e quelle in scadenza nei prossimi {alertDays} giorni.
           </div>
         </div>
         <div className="bs-page-actions">
@@ -151,7 +227,7 @@ export function NotificationsInstallmentsContent() {
         </div>
       </div>
 
-      {rows.length === 0 ? (
+      {groups.length === 0 ? (
         <div className="card p-4">
           <div className="fw-semibold">
             {loading ? "Caricamento…" : "Nessuna rata in scadenza o scaduta."}
@@ -161,28 +237,36 @@ export function NotificationsInstallmentsContent() {
           </div>
         </div>
       ) : (
-        <div className="d-flex flex-column gap-2">
-          {rows.map((row) => (
-            <div
-              key={row.key}
-              className={`card notification-card notification-main ${
-                row.overdue ? "notification-main--danger" : "notification-main--warning"
-              } p-3`}
-            >
-              <div className="d-flex flex-wrap justify-content-between align-items-center gap-2">
-                <div>
-                  <div className="fw-semibold">{row.clientName}</div>
-                  <div className="text-muted small">
-                    {row.overdue ? "Rata scaduta" : "Rata in scadenza"} - Scadenza: {fmtDate(row.dueDate)}
+        <div className="d-flex flex-column gap-4">
+          {groups.map((group) => (
+            <div key={group.key}>
+              <div className="d-flex align-items-center gap-2 mb-2">
+                <span className={`badge text-bg-${group.kind}`}>{group.rows.length}</span>
+                <h2 className="h6 mb-0">{group.title}</h2>
+              </div>
+              <div className="d-flex flex-column gap-2">
+                {group.rows.map((row) => (
+                  <div
+                    key={row.key}
+                    className={`card notification-card notification-main notification-main--${group.kind} p-3`}
+                  >
+                    <div className="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                      <div>
+                        <div className="fw-semibold">{row.clientName}</div>
+                        <div className="text-muted small">
+                          {row.overdue ? "Rata scaduta" : "Rata in scadenza"} - Scadenza: {fmtDate(row.dueDate)}
+                        </div>
+                      </div>
+                      <div className="d-flex align-items-center gap-3">
+                        <div className="fw-semibold">{fmtEur(row.amount)}</div>
+                        <a className="btn btn-sm btn-outline-primary" href={manageHref()}>
+                          <i className="bi bi-cash-stack me-1" />
+                          Apri Gestione Rate
+                        </a>
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div className="d-flex align-items-center gap-3">
-                  <div className="fw-semibold">{fmtEur(row.amount)}</div>
-                  <a className="btn btn-sm btn-outline-primary" href={manageHref()}>
-                    <i className="bi bi-cash-stack me-1" />
-                    Apri Gestione Rate
-                  </a>
-                </div>
+                ))}
               </div>
             </div>
           ))}
@@ -201,10 +285,7 @@ export function NotificationsInstallmentsContent() {
             className="modal-content"
             onSubmit={(e) => {
               e.preventDefault();
-              const parsed = Number.parseInt(alertDaysInput, 10);
-              if (Number.isFinite(parsed)) {
-                setAlertDays(Math.min(365, Math.max(0, parsed)));
-              }
+              void saveAlertDays();
             }}
           >
             <input type="hidden" name="action" value="save_settings" />
@@ -240,9 +321,9 @@ export function NotificationsInstallmentsContent() {
               <button type="button" className="btn btn-outline-secondary" data-bs-dismiss="modal">
                 Annulla
               </button>
-              <button className="btn btn-primary" type="submit">
+              <button className="btn btn-primary" type="submit" disabled={savingSettings}>
                 <i className="bi bi-check2-circle me-1" />
-                Salva
+                {savingSettings ? "Salvataggio…" : "Salva"}
               </button>
             </div>
           </form>

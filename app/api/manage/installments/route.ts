@@ -2,7 +2,8 @@ import type { RowDataPacket } from "@/lib/tenant-db";
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelDbInstallmentPlan, createDbInstallmentPlan, listDbInstallmentPlans, searchDbInstallmentPlans } from "@/lib/db-repositories";
+import { cancelDbInstallmentPlan, createDbInstallmentPlan, listDbInstallmentPlans, saveDbInstallmentAlertDays, searchDbInstallmentPlans } from "@/lib/db-repositories";
+import { automationAlertDays } from "@/lib/manage-shell-context";
 import { can } from "@/lib/role-permissions";
 import { tenantSelect, tenantUpdate } from "@/lib/tenant-db";
 import type { InstallmentPlan } from "@/lib/tenant-store";
@@ -33,6 +34,9 @@ export async function GET(request: Request) {
       ok: true,
       sourceMode: "database",
       plans: await searchDbInstallmentPlans(tenantSlug, filters),
+      // The persisted due-alert window (automation_settings.installment_alert_days) — drives the
+      // notifications_installments page default + the "Impostazioni avviso rate" modal.
+      alertDays: await automationAlertDays(tenantSlug, "installment_alert_days"),
     });
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore rate.");
@@ -88,6 +92,12 @@ export async function POST(request: Request) {
         ["1", "true", "yes"].includes(String(body.allow_paid ?? "").toLowerCase()),
       );
       return Response.json({ ok: true, source: "installments?action=cancel", sourceMode: "database", plan, plans: await listDbInstallmentPlans(tenantSlug) });
+    }
+
+    // Persist the due-alert window (faithful to the "Impostazioni avviso rate" modal → save_settings).
+    if (action === "save_alert_days" || action === "save_settings") {
+      const alertDays = await saveDbInstallmentAlertDays(tenantSlug, parseInteger(body.alert_days ?? body.installment_alert_days ?? body.days, 7));
+      return Response.json({ ok: true, source: "installments?action=save_alert_days", sourceMode: "database", alertDays });
     }
 
     return jsonError("Azione rate non supportata.");
