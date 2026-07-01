@@ -45,6 +45,9 @@ export function FidelityPointsContent() {
   const [redeemEnabled, setRedeemEnabled] = useState(false);
   const [redeemEuroPerPoint, setRedeemEuroPerPoint] = useState("0.1");
   const [redeemMinPoints, setRedeemMinPoints] = useState("0");
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const [settingsFlash, setSettingsFlash] = useState("");
 
   useEffect(() => {
     setLoading(true);
@@ -58,6 +61,56 @@ export function FidelityPointsContent() {
       .catch(() => setClients([]))
       .finally(() => setLoading(false));
   }, [slug]);
+
+  // Load the REAL saved fidelity points settings (was pre-filled with PHP defaults).
+  useEffect(() => {
+    fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}&action=points_settings`, { headers: { "x-tenant-slug": slug } })
+      .then((r) => r.json())
+      .then((j) => {
+        const s = j?.settings;
+        if (!s) return;
+        setPointsEnabled(Boolean(s.pointsEnabled));
+        setExpireEnabled(Boolean(s.expireEnabled));
+        setExpireDays(String(s.expireDays ?? 365));
+        setExpireWarnDays(String(s.expireWarnDays ?? 30));
+        setRedeemEnabled(Boolean(s.redeemEnabled));
+        setRedeemEuroPerPoint(String(s.redeemEuroPerPoint ?? 0.1));
+        setRedeemMinPoints(String(s.redeemMinPoints ?? 0));
+      })
+      .catch(() => {});
+  }, [slug]);
+
+  async function saveSettings(e: React.FormEvent) {
+    e.preventDefault();
+    if (savingSettings) return;
+    setSavingSettings(true);
+    setSettingsError("");
+    setSettingsFlash("");
+    try {
+      const res = await fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({
+          action: "save_points_settings",
+          fidelity_points_enabled: pointsEnabled ? "1" : "0",
+          fidelity_expire_enabled: expireEnabled ? "1" : "0",
+          fidelity_expire_days: expireDays,
+          fidelity_expire_warn_days: expireWarnDays,
+          fidelity_redeem_enabled: redeemEnabled ? "1" : "0",
+          fidelity_redeem_euro_per_point: redeemEuroPerPoint,
+          fidelity_redeem_min_points: redeemMinPoints,
+        }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        setSettingsError(String(j?.error ?? "Impossibile salvare le impostazioni."));
+      } else {
+        setSettingsFlash("Impostazioni salvate.");
+      }
+    } finally {
+      setSavingSettings(false);
+    }
+  }
 
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`fidelity_points${suffix}`.replace("&", "?")}`;
@@ -338,15 +391,9 @@ export function FidelityPointsContent() {
       <div className="row g-3">
         <div className="col-lg-7">
           <div className="card p-4 ">
-            <form method="post" className="row g-3" id="fidSettingsForm">
-              <input type="hidden" name="_mode" value="save_settings" />
-              <input
-                type="hidden"
-                name="disable_redeem_appointments_confirmed"
-                id="disableRedeemConfirmedInput"
-                value="0"
-              />
-              <input type="hidden" name="expiry_settings_confirmed" id="expirySettingsConfirmedInput" value="0" />
+            <form className="row g-3" id="fidSettingsForm" onSubmit={saveSettings}>
+              {settingsError ? <div className="col-12"><div className="alert alert-danger mb-0">{settingsError}</div></div> : null}
+              {settingsFlash ? <div className="col-12"><div className="alert alert-success mb-0">{settingsFlash}</div></div> : null}
 
               <div className="col-12 d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3">
                 <div>
@@ -499,9 +546,9 @@ export function FidelityPointsContent() {
               </div>
 
               <div className="col-12 d-flex gap-2">
-                <button className="btn btn-primary btn-pill" type="submit">
+                <button className="btn btn-primary btn-pill" type="submit" disabled={savingSettings}>
                   <i className="bi bi-check2-circle me-1" />
-                  Salva
+                  {savingSettings ? "Salvataggio…" : "Salva"}
                 </button>
                 <a className="btn btn-outline-secondary btn-pill" href={href("")}>
                   Annulla

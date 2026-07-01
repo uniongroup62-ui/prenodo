@@ -8771,6 +8771,108 @@ export async function setFidelityEnabled(
   return { ok: true, enabled: false, strippedAppointments: linked.length, deactivatedCampaigns };
 }
 
+// ---- Fidelity POINTS settings (fidelity_points.php save_settings) ------------
+export type FidelityPointsSettings = {
+  globalEnabled: boolean;
+  pointsEnabled: boolean;
+  earnStepEuro: number;
+  redeemEnabled: boolean;
+  redeemEuroPerPoint: number;
+  redeemMinPoints: number;
+  expireEnabled: boolean;
+  expireDays: number;
+  expireWarnDays: number;
+};
+
+function clampNum(n: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(n) || n <= min) return fallback;
+  return Math.min(max, n);
+}
+
+export async function getFidelityPointsSettings(slug: string): Promise<FidelityPointsSettings> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", orderBy: "id ASC", limit: 1 });
+  const r = rows[0] ?? ({} as RowDataPacket);
+  let epp = Number(r.fidelity_redeem_euro_per_point ?? 0.1);
+  if (!Number.isFinite(epp) || epp <= 0) epp = 0.1;
+  let step = Number(r.fidelity_earn_step_euro ?? 10);
+  if (!Number.isFinite(step) || step <= 0) step = 10;
+  return {
+    globalEnabled: Number(r.fidelity_enabled ?? 0) === 1,
+    pointsEnabled: Number(r.fidelity_points_enabled ?? 0) === 1,
+    earnStepEuro: Math.min(100000, step),
+    redeemEnabled: Number(r.fidelity_redeem_enabled ?? 0) === 1,
+    redeemEuroPerPoint: roundMoney(Math.min(100000, epp)),
+    redeemMinPoints: Math.max(0, Math.round(Number(r.fidelity_redeem_min_points ?? 0))),
+    expireEnabled: Number(r.fidelity_expire_enabled ?? 0) === 1,
+    expireDays: Math.max(0, Math.min(36500, Math.round(Number(r.fidelity_expire_days ?? 365)))),
+    expireWarnDays: Math.max(0, Math.min(36500, Math.round(Number(r.fidelity_expire_warn_days ?? 30)))),
+  };
+}
+
+// Save the fidelity points earn/redeem/expire settings (port of fidelity_points.php
+// save_settings): the earn step (€/point), redeem toggle + rate + min points, and
+// the points-expiry window. When the Points module is OFF the redeem/expiry prefs
+// are PRESERVED (not zeroed) for reactivation. Enabling expiry needs days > 0 when
+// the program is operational. earn_mode is fixed to 'amount' and earn-on-done is
+// always on (legacy: those toggles were removed).
+export async function saveFidelityPointsSettings(slug: string, body: Record<string, string>): Promise<FidelityPointsSettings> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", orderBy: "id ASC", limit: 1 });
+  if (!rows[0]) throw new Error("Business non trovato.");
+  const existing = rows[0];
+  const bizId = Number(existing.id ?? 0);
+  const truthy = (v: unknown) => ["1", "true", "on", "yes"].includes(String(v ?? "").toLowerCase());
+
+  const pointsEnabled = truthy(body.fidelity_points_enabled);
+  // Earn step lives in the campaign editor, not the main settings form: fall back
+  // to the existing value (legacy: $_POST[...] ?? $settings['earn_step_euro'] ?? 10).
+  const earnStepFallback = clampNum(Number(existing.fidelity_earn_step_euro ?? 10), 0, 100000, 10);
+  const earnStep = String(body.fidelity_earn_step_euro ?? "").trim() !== ""
+    ? clampNum(Number(String(body.fidelity_earn_step_euro).replace(",", ".")), 0, 100000, 10)
+    : earnStepFallback;
+  let redeemEnabled = truthy(body.fidelity_redeem_enabled);
+  let epp = clampNum(Number(String(body.fidelity_redeem_euro_per_point ?? "").replace(",", ".")), 0, 100000, 0.1);
+  let minPts = Math.max(0, Math.min(100000000, Math.round(Number(String(body.fidelity_redeem_min_points ?? "0").replace(",", ".")) || 0)));
+  // Parse an int, keeping 0 (a plain `Number(x)||def` would turn 0 into def).
+  const intOr = (v: unknown, def: number): number => { const s = String(v ?? "").trim(); if (s === "") return def; const n = Number(s.replace(",", ".")); return Number.isFinite(n) ? Math.round(n) : def; };
+  let expireEnabled = truthy(body.fidelity_expire_enabled);
+  let expireDays = Math.max(0, Math.min(36500, intOr(body.fidelity_expire_days, 365)));
+  let warnDays = Math.max(0, Math.min(36500, intOr(body.fidelity_expire_warn_days, 30)));
+
+  // Points OFF → preserve the stored redeem/expiry preferences.
+  if (!pointsEnabled) {
+    redeemEnabled = Number(existing.fidelity_redeem_enabled ?? 0) === 1;
+    expireEnabled = Number(existing.fidelity_expire_enabled ?? 0) === 1;
+    expireDays = Math.max(0, Math.min(36500, Math.round(Number(existing.fidelity_expire_days ?? expireDays))));
+    warnDays = Math.max(0, Math.min(36500, Math.round(Number(existing.fidelity_expire_warn_days ?? warnDays))));
+    epp = clampNum(Number(existing.fidelity_redeem_euro_per_point ?? epp), 0, 100000, 0.1);
+    minPts = Math.max(0, Math.min(100000000, Math.round(Number(existing.fidelity_redeem_min_points ?? minPts))));
+  }
+
+  const globalEnabled = Number(existing.fidelity_enabled ?? 0) === 1;
+  if (globalEnabled && pointsEnabled && expireEnabled && expireDays <= 0) {
+    throw new Error('Per abilitare la scadenza punti inserisci un valore maggiore di 0 in "Scadenza dopo".');
+  }
+
+  const values = await filterColumns((await tenantTable(slug, "businesses")).name, {
+    fidelity_points_enabled: pointsEnabled ? 1 : 0,
+    fidelity_points_label: "Punti",
+    fidelity_earn_mode: "amount",
+    fidelity_earn_step_euro: roundMoney(earnStep),
+    fidelity_earn_points_per_appointment: 0,
+    fidelity_earn_on_appointment_done: 1,
+    fidelity_redeem_enabled: redeemEnabled ? 1 : 0,
+    fidelity_redeem_euro_per_point: roundMoney(epp),
+    fidelity_redeem_min_points: minPts,
+    fidelity_redeem_auto_discount_enabled: 0,
+    fidelity_expire_enabled: expireEnabled ? 1 : 0,
+    fidelity_expire_days: expireDays,
+    fidelity_expire_warn_days: warnDays,
+    updated_at: new Date(),
+  });
+  await tenantUpdate({ slug, table: "businesses", id: bizId, values });
+  return getFidelityPointsSettings(slug);
+}
+
 async function getSingleClient(slug: string, id: number): Promise<ManagedClient> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Cliente non trovato.");

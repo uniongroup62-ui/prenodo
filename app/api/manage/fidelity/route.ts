@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { addDbWalletMovement, dbWalletBalance, getFidelityEnabled, listDbClients, listDbWalletMovements, setFidelityEnabled } from "@/lib/db-repositories";
+import { addDbWalletMovement, dbWalletBalance, getFidelityEnabled, getFidelityPointsSettings, listDbClients, listDbWalletMovements, saveFidelityPointsSettings, setFidelityEnabled } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -22,6 +22,11 @@ export async function GET(request: Request) {
     // Global Fidelity enabled flag (for the main fidelity.php page toggle).
     if (url.searchParams.get("action") === "state") {
       return Response.json({ ok: true, sourceMode: "database", enabled: await getFidelityEnabled(tenantSlug) });
+    }
+
+    // Fidelity Points earn/redeem/expire settings (fidelity_points.php).
+    if (url.searchParams.get("action") === "points_settings") {
+      return Response.json({ ok: true, sourceMode: "database", settings: await getFidelityPointsSettings(tenantSlug) });
     }
 
     const clients = await listDbClients({ slug: tenantSlug });
@@ -51,6 +56,13 @@ export async function POST(request: Request) {
       const confirmed = ["1", "true", "on", "yes"].includes(String(body.disable_appointments_confirmed ?? body.confirmed ?? "").toLowerCase());
       const result = await setFidelityEnabled(tenantSlug, enabled, confirmed);
       return Response.json({ sourceMode: "database", ...result });
+    }
+
+    // Save the Fidelity Points settings (port of fidelity_points.php save_settings).
+    if (body.action === "save_points_settings" || body._mode === "save_settings") {
+      if (!can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso punti fidelity mancante.", 403);
+      const settings = await saveFidelityPointsSettings(tenantSlug, body);
+      return Response.json({ ok: true, sourceMode: "database", settings });
     }
 
     const input = {
