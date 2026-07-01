@@ -2,7 +2,7 @@ import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/ap
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelManageSale, checkoutManageSale, deleteCancelledSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected, markPrepaidManualExecution, undoManageSaleItemCollected, undoPrepaidManualExecution } from "@/lib/manage-pos";
+import { cancelManageSale, checkoutManageSale, deleteCancelledSale, getManagePosAppointmentCart, getManagePosContext, getManagePosQuoteCart, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected, markPrepaidManualExecution, undoManageSaleItemCollected, undoPrepaidManualExecution } from "@/lib/manage-pos";
 import type { PointsStornoMode } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
@@ -46,6 +46,18 @@ export async function GET(request: Request) {
       return Response.json(await getManagePosAppointmentCart(tenantSlug, appointmentId));
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore caricamento appuntamento POS.");
+    }
+  }
+
+  // IN-POS QUOTE IMPORT pre-load (faithful to pos.php ?quote_id=N): the LOCKED cart seed for a
+  // quote (client + quote lines at the quote's snapshot prices). The UI seeds a locked cart from
+  // this, then a normal checkout (with source_quote_id) records the sale + flips the quote.
+  if (url.searchParams.get("action") === "quote_cart") {
+    const quoteId = parseInteger(url.searchParams.get("quote_id") ?? url.searchParams.get("id"), 0);
+    try {
+      return Response.json(await getManagePosQuoteCart(tenantSlug, quoteId));
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore caricamento preventivo POS.");
     }
   }
 
@@ -241,6 +253,8 @@ async function checkoutInputFromBody(body: Record<string, string>, tenantSlug: s
     // RATEIZZAZIONE: the optional installment plan params (faithful to the legacy
     // installment_plan_json POST field). Present only when the staff chose "Rateizzato".
     installmentPlan: installmentPlanFromBody(body),
+    // IN-POS quote import: the source quote id when the cart was pre-loaded (locked) from a quote.
+    sourceQuoteId: parseInteger(body.source_quote_id ?? body.quote_id, 0),
     items: saleItemsFromBody(body),
     payments: paymentsFromBody(body),
   };

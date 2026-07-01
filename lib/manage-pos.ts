@@ -16,12 +16,14 @@ import type {
   PosSaleItemStatus,
   PosSaleItemType,
   PosSummary,
+  Quote,
 } from "@/lib/tenant-store";
 import {
   addDbWalletMovement,
   dbClientGiftcards,
   dbWalletBalance,
   getDbAppointmentForEdit,
+  listDbQuotes,
   previewDbCoupon,
   redeemDbGiftCard,
   refundDbGiftCard,
@@ -382,6 +384,53 @@ export async function getManagePosAppointmentCart(slug: string, appointmentId: n
   };
 }
 
+// IN-POS QUOTE IMPORT pre-load (faithful to pos.php ?quote_id=N → quote_sale_load_quote +
+// quote_sale_load_quote_items). Returns the LOCKED cart seed for a quote: the client + one line
+// per quote line (type/refId/name/qty carried, unitPrice TRUSTED from the quote snapshot — NOT
+// re-derived from the catalog, mirroring the legacy). Gated: the quote must exist and not be
+// already converted. The UI seeds a locked cart from this, then a normal checkout with
+// sourceQuoteId records sales.source_quote_id + flips the quote to 'converted'.
+export type ManagePosQuoteCart = {
+  ok: boolean;
+  quoteId: number;
+  code: string | null;
+  clientId: number;
+  clientName: string;
+  discount: number;
+  locked: boolean;
+  error?: string;
+  items: Array<{ type: PosSaleItemType; refId: number; name: string; unitPrice: number; quantity: number }>;
+};
+
+export async function getManagePosQuoteCart(slug: string, quoteId: number): Promise<ManagePosQuoteCart> {
+  const id = Math.max(0, Number(quoteId) || 0);
+  const empty: ManagePosQuoteCart = { ok: false, quoteId: 0, code: null, clientId: 0, clientName: "", discount: 0, locked: true, items: [] };
+  if (id <= 0) return empty;
+
+  const quote = (await listDbQuotes(slug).catch(() => [] as Quote[])).find((q) => q.id === id);
+  if (!quote) return { ...empty, error: "Preventivo non trovato." };
+  if (quote.status === "converted") return { ...empty, quoteId: id, error: "Preventivo gia convertito." };
+
+  return {
+    ok: true,
+    quoteId: id,
+    code: quote.code || null,
+    clientId: Math.max(0, Number(quote.clientId ?? 0) || 0),
+    clientName: String(quote.clientName ?? "").trim(),
+    discount: roundMoney(Math.max(0, Number(quote.discount ?? 0) || 0)),
+    locked: true,
+    items: quote.lines
+      .filter((line) => Number(line.quantity ?? 0) > 0)
+      .map((line) => ({
+        type: line.type,
+        refId: Math.max(0, Number(line.refId ?? 0) || 0),
+        name: String(line.name ?? "").trim() || "Riga preventivo",
+        unitPrice: roundMoney(Math.max(0, Number(line.unitPrice ?? 0) || 0)),
+        quantity: Math.max(1, Number(line.quantity ?? 1) || 1),
+      })),
+  };
+}
+
 // Parse a POS catalog price label ("12,00 euro" / "12.00") into a number. Mirrors the
 // pos-content parsePrice helper so the seeded unit price matches what a tile click adds.
 function parsePriceLabel(value: string | number | undefined): number {
@@ -496,7 +545,9 @@ export async function checkoutManageSale(
     coupon_code: emptyToNull(couponCode),
     notes: saleNotes(input.notes, input.appointmentId, baseMethod),
     status: "done",
-    source_quote_id: undefined,
+    // IN-POS quote import: link the sale back to the source quote (faithful to pos.php:4802
+    // UPDATE sales SET source_quote_id). The quote itself is flipped to 'converted' below.
+    source_quote_id: input.sourceQuoteId && input.sourceQuoteId > 0 ? input.sourceQuoteId : undefined,
     created_by: operator.id,
     operator_name: clean(operator.name, 120),
     location_id: locationId,
@@ -616,6 +667,13 @@ export async function checkoutManageSale(
     });
   }
 
+  // IN-POS quote import: flip the source quote to 'converted' now the sale exists (faithful to
+  // QuoteSale::mark_quote_paid — the Next quote lifecycle uses 'converted'/converted_sale_id, not
+  // 'paid'). Best-effort + guarded: only when a quote was imported and it isn't already converted.
+  if (input.sourceQuoteId && input.sourceQuoteId > 0) {
+    await markQuoteConvertedFromSale(slug, input.sourceQuoteId, saleId).catch(() => undefined);
+  }
+
   const sale = await getSale(slug, saleId);
   return {
     ...await getManagePosContext(slug, { locationId, includeCancelled: true }),
@@ -623,6 +681,24 @@ export async function checkoutManageSale(
     // The GiftCard/GiftBox codes this sale issued, for the printable receipt (empty when none).
     issuedVouchers,
   };
+}
+
+// Flip an imported quote to 'converted' + stamp converted_sale_id/at, mirroring the quotes-module
+// convertDbQuoteToSale flip (kept identical so both conversion paths leave the same quote state).
+// Guarded: reads the current status and skips if the quote is missing or already converted, so a
+// re-checkout never overwrites the original conversion.
+async function markQuoteConvertedFromSale(slug: string, quoteId: number, saleId: number): Promise<void> {
+  const quoteTable = await tenantTable(slug, "quotes").catch(() => null);
+  if (!quoteTable) return;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: quoteTable.name, columns: "id, status", where: "id=?", params: [quoteId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  const current = rows[0];
+  if (!current) return;
+  if (String(current.status ?? "").toLowerCase() === "converted") return;
+  const values: Record<string, unknown> = { status: "converted" };
+  if (await columnExists(quoteTable.name, "converted_sale_id")) values.converted_sale_id = saleId;
+  if (await columnExists(quoteTable.name, "converted_at")) values.converted_at = new Date();
+  if (await columnExists(quoteTable.name, "updated_at")) values.updated_at = new Date();
+  await tenantUpdate({ slug, table: "quotes", id: quoteId, values }).catch(() => 0);
 }
 
 // Faithful port of SaleInstallments::createPlan (via preparePlanConfig + buildSchedule).
