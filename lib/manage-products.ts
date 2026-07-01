@@ -317,6 +317,17 @@ export async function saveSupplier(slug: string, body: Record<string, string>): 
   await ensureSupplierNameAvailable(slug, name, id);
   const warehouseLocationIds = parseIdList(body.warehouse_location_ids ?? body.location_ids);
   const costLocationIds = parseIdList(body.cost_location_ids);
+  const isActive = truthy(body.is_active ?? "1");
+  const isActiveCosts = truthy(body.is_active_costs ?? "1");
+  // Faithful to suppliers.php saveSupplier: when the tenant has active sedi, an active
+  // context (Magazzino / Scadenziario e Costi) must have at least one sede selected.
+  const activeLocationCount = (await listProductLocations(slug).catch(() => [])).filter((l) => l.isActive).length;
+  if (activeLocationCount > 0 && isActive && warehouseLocationIds.length === 0) {
+    throw new Error("Seleziona almeno una sede per il magazzino del fornitore.");
+  }
+  if (activeLocationCount > 0 && isActiveCosts && costLocationIds.length === 0) {
+    throw new Error("Seleziona almeno una sede per costi e scadenziario del fornitore.");
+  }
   const values = await filterColumns(table.name, {
     name,
     business_name: emptyToNull(clean(body.business_name, 255)),
@@ -336,8 +347,8 @@ export async function saveSupplier(slug: string, body: Record<string, string>): 
     email: emptyToNull(clean(body.email, 190)),
     pec: emptyToNull(clean(body.pec, 190)),
     website: emptyToNull(clean(body.website, 190)),
-    is_active: truthy(body.is_active ?? "1") ? 1 : 0,
-    is_active_costs: truthy(body.is_active_costs ?? "1") ? 1 : 0,
+    is_active: isActive ? 1 : 0,
+    is_active_costs: isActiveCosts ? 1 : 0,
   });
 
   let supplierId = id;

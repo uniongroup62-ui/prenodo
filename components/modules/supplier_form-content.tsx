@@ -178,9 +178,18 @@ export function SupplierFormContent() {
     event.preventDefault();
     setError("");
 
-    // Validation faithful to suppliers.php saveSupplier: name is required.
+    // Validation faithful to suppliers.php saveSupplier: name is required, and when
+    // the tenant has active sedi, an active context needs at least one sede selected.
     if (form.name.trim() === "") {
       setError("Nome fornitore obbligatorio.");
+      return;
+    }
+    if (activeLocations.length > 0 && form.is_active && form.warehouse_location_ids.length === 0) {
+      setError("Seleziona almeno una sede per il magazzino del fornitore.");
+      return;
+    }
+    if (activeLocations.length > 0 && form.is_active_costs && form.cost_location_ids.length === 0) {
+      setError("Seleziona almeno una sede per costi e scadenziario del fornitore.");
       return;
     }
 
