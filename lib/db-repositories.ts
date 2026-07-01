@@ -10591,6 +10591,209 @@ export async function saveManageGift(slug: string, body: Record<string, string>,
   return saved;
 }
 
+// ---- Gift CAMPAIGN list / toggle / delete (gifts.php) -------------------------
+export type ManageGiftListRow = {
+  id: number;
+  name: string;
+  description: string;
+  active: boolean;
+  isCurrentlyActive: boolean;
+  autoDisabled: boolean;
+  fidelityOnly: boolean;
+  validFrom: string;
+  validTo: string;
+  instancesCount: number;
+  rewardSummary: string;
+  locationIds: number[];
+};
+
+// Parse a gift row's reward items (reward_items_json, fallback to reward_* columns).
+function giftRewardRefsFromRow(row: RowDataPacket): { type: "service" | "product" | "custom"; serviceId: number; productId: number; label: string; qty: number }[] {
+  const out: { type: "service" | "product" | "custom"; serviceId: number; productId: number; label: string; qty: number }[] = [];
+  let parsed: unknown[] = [];
+  try { const p = JSON.parse(String(row.reward_items_json ?? "[]")); if (Array.isArray(p)) parsed = p; } catch { parsed = []; }
+  if (parsed.length > 0) {
+    for (const it of parsed) {
+      const o = it as Record<string, unknown>;
+      out.push({ type: normalizeGiftRewardType(o.type), serviceId: Number(o.service_id ?? 0) || 0, productId: Number(o.product_id ?? 0) || 0, label: String(o.custom_label ?? ""), qty: Math.max(1, Number(o.qty ?? 1) || 1) });
+    }
+  } else {
+    out.push({ type: normalizeGiftRewardType(row.reward_type), serviceId: Number(row.reward_service_id ?? 0) || 0, productId: Number(row.reward_product_id ?? 0) || 0, label: String(row.reward_custom_label ?? ""), qty: 1 });
+  }
+  return out;
+}
+
+export async function listManageGifts(slug: string): Promise<ManageGiftListRow[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "gifts", where: "deleted_at IS NULL", orderBy: "id DESC" }).catch(() => [] as RowDataPacket[]);
+  if (rows.length === 0) return [];
+
+  // Instance counts (grouped) + locations (grouped) + reward item names (batched).
+  const instTable = await tenantTable(slug, "gift_instances");
+  const instRows = await dbQuery<RowDataPacket[]>(`SELECT gift_id, COUNT(*) c FROM ${quoteIdentifier(instTable.name)} WHERE tenant_id = ? GROUP BY gift_id`, [instTable.tenantId ?? 0]).catch(() => [] as RowDataPacket[]);
+  const instMap = new Map<number, number>(instRows.map((r) => [Number(r.gift_id), Number(r.c)]));
+
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "gift_locations", columns: "gift_id, location_id" }).catch(() => [] as RowDataPacket[]);
+  const locMap = new Map<number, number[]>();
+  for (const r of locRows) {
+    const gid = Number(r.gift_id ?? 0);
+    if (!locMap.has(gid)) locMap.set(gid, []);
+    const lid = Number(r.location_id ?? 0);
+    if (lid > 0) locMap.get(gid)!.push(lid);
+  }
+
+  const refsByGift = new Map<number, ReturnType<typeof giftRewardRefsFromRow>>();
+  const serviceIds = new Set<number>();
+  const productIds = new Set<number>();
+  for (const g of rows) {
+    const refs = giftRewardRefsFromRow(g);
+    refsByGift.set(Number(g.id), refs);
+    for (const r of refs) { if (r.serviceId > 0) serviceIds.add(r.serviceId); if (r.productId > 0) productIds.add(r.productId); }
+  }
+  const svcNames = new Map<number, string>();
+  const prdNames = new Map<number, string>();
+  if (serviceIds.size > 0) {
+    const ids = [...serviceIds];
+    const sr = await tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, name", where: `id IN (${ids.map(() => "?").join(",")})`, params: ids }).catch(() => [] as RowDataPacket[]);
+    for (const r of sr) svcNames.set(Number(r.id), String(r.name ?? ""));
+  }
+  if (productIds.size > 0) {
+    const ids = [...productIds];
+    const pr = await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "id, name", where: `id IN (${ids.map(() => "?").join(",")})`, params: ids }).catch(() => [] as RowDataPacket[]);
+    for (const r of pr) prdNames.set(Number(r.id), String(r.name ?? ""));
+  }
+
+  const now = Date.now();
+  return rows.map((g) => {
+    const id = Number(g.id ?? 0);
+    const active = Number(g.active ?? 0) === 1;
+    const validFrom = g.valid_from ? toIso(g.valid_from) : "";
+    const validTo = g.valid_to ? toIso(g.valid_to) : "";
+    const withinWindow = validFrom !== "" && validTo !== "" && new Date(validFrom).getTime() <= now && new Date(validTo).getTime() >= now;
+    const refs = refsByGift.get(id) ?? [];
+    const rewardSummary = refs
+      .map((r) => {
+        const base = r.type === "service" ? svcNames.get(r.serviceId) || `Servizio #${r.serviceId}` : r.type === "product" ? prdNames.get(r.productId) || `Prodotto #${r.productId}` : r.label || "Premio personalizzato";
+        return r.qty > 1 ? `${base} ×${r.qty}` : base;
+      })
+      .join(", ");
+    return {
+      id,
+      name: String(g.name ?? ""),
+      description: String(g.description ?? ""),
+      active,
+      isCurrentlyActive: active && withinWindow,
+      autoDisabled: Number(g.auto_disabled_by_fidelity ?? 0) === 1,
+      fidelityOnly: String(g.eligibility ?? "fidelity_only") === "fidelity_only",
+      validFrom: validFrom ? validFrom.slice(0, 10) : "",
+      validTo: validTo ? validTo.slice(0, 10) : "",
+      instancesCount: instMap.get(id) ?? 0,
+      rewardSummary: rewardSummary || "—",
+      locationIds: locMap.get(id) ?? [],
+    };
+  });
+}
+
+// Reward/rule references that must resolve to a live service/product before a gift
+// campaign can be (re)activated (port of Gifts::activationContentIssues).
+async function giftActivationContentIssues(slug: string, id: number): Promise<string[]> {
+  const gift = await getManageGift(slug, id);
+  if (!gift) return [];
+  const refs: { type: "service" | "product"; refId: number; context: string }[] = [];
+  for (const item of gift.rewardItems) {
+    if (item.type === "service" && item.serviceId > 0) refs.push({ type: "service", refId: item.serviceId, context: "Premio" });
+    else if (item.type === "product" && item.productId > 0) refs.push({ type: "product", refId: item.productId, context: "Premio" });
+  }
+  if (gift.rule.targetServiceId > 0) refs.push({ type: "service", refId: gift.rule.targetServiceId, context: "Regola di sblocco" });
+  if (gift.rule.targetProductId > 0) refs.push({ type: "product", refId: gift.rule.targetProductId, context: "Regola di sblocco" });
+
+  const seen = new Set<string>();
+  const issues: string[] = [];
+  for (const ref of refs) {
+    const key = `${ref.type}:${ref.refId}:${ref.context}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const table = ref.type === "service" ? "services" : "products";
+    const typeLabel = ref.type === "service" ? "Servizio" : "Prodotto";
+    const rows = await tenantSelect<RowDataPacket>({ slug, table, columns: "id, name, is_active", where: "id = ?", params: [ref.refId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    if (!rows[0]) {
+      issues.push(`[${ref.context}] ${typeLabel} #${ref.refId} eliminato`);
+    } else if (Number(rows[0].is_active ?? 1) === 0) {
+      issues.push(`[${ref.context}] ${typeLabel} "${String(rows[0].name ?? `#${ref.refId}`)}" disattivato`);
+    }
+  }
+  return issues;
+}
+
+// Activate/deactivate a gift campaign (port of gifts.php toggle_active + Gifts::
+// setGiftActive): activating is refused while the reward/unlock references a
+// deleted/disabled service or product; a manual toggle clears auto_disabled.
+export async function toggleManageGift(slug: string, id: number, active: boolean, by: number): Promise<{ ok: true; active: boolean }> {
+  if (id <= 0) throw new Error("Campagna non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "gifts", columns: "id, deleted_at", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Campagna omaggio non trovata.");
+  if (rows[0].deleted_at) throw new Error("Campagna omaggio eliminata.");
+  if (active) {
+    const issues = await giftActivationContentIssues(slug, id);
+    if (issues.length > 0) {
+      throw new Error(`Non è possibile riattivare la campagna omaggio: contiene servizi o prodotti eliminati/disattivati. ${issues.join("; ")}.`);
+    }
+  }
+  await tenantUpdate({ slug, table: "gifts", id, values: { active: active ? 1 : 0, auto_disabled_by_fidelity: 0, updated_by: by > 0 ? by : null, updated_at: new Date() } });
+  return { ok: true, active };
+}
+
+// Delete a gift campaign (port of Gifts::softDeleteGift): detach the reward from any
+// still-open appointments, then hard-delete the campaign + all children, falling back
+// to a soft-delete (deleted_at + active=0) if a foreign key blocks the hard delete.
+export async function deleteManageGift(slug: string, id: number, by: number): Promise<{ ok: true; mode: "hard" | "soft" }> {
+  if (id <= 0) throw new Error("Campagna non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "gifts", columns: "id", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return { ok: true, mode: "hard" };
+
+  // Detach the campaign's issued instances from any pending/scheduled appointments,
+  // clearing the reserved gift benefit so no dangling redemption remains.
+  const instTable = await tenantTable(slug, "gift_instances");
+  const instRows = await tenantSelect<RowDataPacket>({ slug, table: "gift_instances", columns: "id", where: "gift_id = ?", params: [id] }).catch(() => [] as RowDataPacket[]);
+  const instIds = instRows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+  if (instIds.length > 0 && (await tableExists((await tenantTable(slug, "appointment_gift_items")).name))) {
+    const agiTable = await tenantTable(slug, "appointment_gift_items");
+    const placeholders = instIds.map(() => "?").join(",");
+    const apptRows = await dbQuery<RowDataPacket[]>(`SELECT DISTINCT appointment_id FROM ${quoteIdentifier(agiTable.name)} WHERE tenant_id = ? AND instance_id IN (${placeholders})`, [agiTable.tenantId ?? 0, ...instIds]).catch(() => [] as RowDataPacket[]);
+    for (const ar of apptRows) {
+      const apptId = Number(ar.appointment_id ?? 0);
+      if (apptId <= 0) continue;
+      const appt = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id, status", where: "id = ?", params: [apptId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+      if (appt[0] && ["pending", "scheduled"].includes(String(appt[0].status ?? ""))) {
+        await tenantUpdate({ slug, table: "appointments", id: apptId, values: { fidelity_gift_points_used: 0, fidelity_gift_idx: null } }).catch(() => 0);
+      }
+    }
+    await dbExecute(`DELETE FROM ${quoteIdentifier(agiTable.name)} WHERE tenant_id = ? AND instance_id IN (${placeholders})`, [agiTable.tenantId ?? 0, ...instIds]).catch(() => undefined);
+  }
+
+  const tid = instTable.tenantId ?? 0;
+  const delChild = async (table: string, whereSql: string, params: unknown[]) => {
+    if (!(await tableExists((await tenantTable(slug, table)).name))) return;
+    const t = await tenantTable(slug, table);
+    await dbExecute(`DELETE FROM ${quoteIdentifier(t.name)} WHERE tenant_id = ? AND ${whereSql}`, [t.tenantId ?? 0, ...params]).catch(() => undefined);
+  };
+  await delChild("gift_transactions", `instance_id IN (SELECT id FROM ${quoteIdentifier(instTable.name)} WHERE gift_id = ?)`, [id]);
+  await delChild("gift_progress_resets", "gift_id = ?", [id]);
+  await delChild("gift_locations", "gift_id = ?", [id]);
+  await delChild("gift_instances", "gift_id = ?", [id]);
+  const rsTable = await tenantTable(slug, "gift_rule_sets");
+  await delChild("gift_rules", `rule_set_id IN (SELECT id FROM ${quoteIdentifier(rsTable.name)} WHERE gift_id = ?)`, [id]);
+  await delChild("gift_rule_sets", "gift_id = ?", [id]);
+
+  try {
+    const giftsTable = await tenantTable(slug, "gifts");
+    await dbExecute(`DELETE FROM ${quoteIdentifier(giftsTable.name)} WHERE tenant_id = ? AND id = ?`, [tid, id]);
+    return { ok: true, mode: "hard" };
+  } catch {
+    await tenantUpdate({ slug, table: "gifts", id, values: { deleted_at: new Date(), deleted_by: by > 0 ? by : null, active: 0 } }).catch(() => 0);
+    return { ok: true, mode: "soft" };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GiftBox TEMPLATE editor (giftbox.php tab=boxes action=new|edit) — the box
 // catalog the POS giftbox-sale issues instances from. A template is a `giftboxes`

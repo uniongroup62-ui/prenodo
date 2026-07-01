@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { getManageGift, giftFormCatalog, issueDbGift, listDbGifts, redeemDbGift, saveManageGift } from "@/lib/db-repositories";
+import { deleteManageGift, getManageGift, giftFormCatalog, issueDbGift, listDbGifts, listManageGifts, redeemDbGift, saveManageGift, toggleManageGift } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -38,6 +38,12 @@ export async function GET(request: Request) {
       return Response.json({ ok: true, source: "gifts?action=get", sourceMode: "database", gift });
     }
 
+    // Gift CAMPAIGN list (port of gifts.php default view / Gifts::listGifts).
+    if (action === "campaigns") {
+      if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", campaigns: await listManageGifts(tenantSlug) });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -64,6 +70,21 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
       const gift = await saveManageGift(tenantSlug, body, parseInteger(body.id, 0));
       return Response.json({ ok: true, source: "gifts?action=save", sourceMode: "database", gift, gifts: await listDbGifts(tenantSlug) });
+    }
+
+    // Campaign activate/deactivate (port of gifts.php action=toggle_active).
+    if (action === "toggle_active" || action === "toggle") {
+      if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
+      const active = ["1", "true", "on", "yes"].includes(String(body.active ?? "").toLowerCase());
+      const result = await toggleManageGift(tenantSlug, parseInteger(body.id, 0), active, session.user.id);
+      return Response.json({ sourceMode: "database", ...result, campaigns: await listManageGifts(tenantSlug) });
+    }
+
+    // Campaign delete (port of gifts.php action=delete / Gifts::softDeleteGift).
+    if (action === "delete" || action === "delete_campaign") {
+      if (!can(session.user.perms, "gifts.manage")) return jsonError("Permesso omaggi mancante.", 403);
+      const result = await deleteManageGift(tenantSlug, parseInteger(body.id, 0), session.user.id);
+      return Response.json({ sourceMode: "database", ...result, campaigns: await listManageGifts(tenantSlug) });
     }
 
     if (action === "issue") {

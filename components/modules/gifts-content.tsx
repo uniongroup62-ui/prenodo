@@ -2,38 +2,28 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-// Faithful port of the PHP fidelity/gifts page (app/pages/gifts.php), fed by the
-// existing DB-backed /api/manage/gifts. Reproduces the original Bootstrap markup
-// (bs-page-header, gifts empty-state card) verbatim. When the API returns issued
-// gift instances, they are rendered in a simple instances table mapped from the
-// GiftReward shape exposed by the API.
+// Faithful port of the PHP fidelity/gifts page (app/pages/gifts.php): the Omaggi
+// CAMPAIGN manager. Fed by /api/manage/gifts:
+//   - GET  action=campaigns -> ManageGiftListRow[] (name, reward, validity, status, instances)
+//   - POST action=toggle_active (id, active)   — activate/deactivate (content-gated)
+//   - POST action=delete (id)                  — cascade delete
+// The create/edit editor lives in gift_form-content (router: gifts action=new|edit).
+// Deferred (documented): the accumulation/tracking engine, per-instance detail
+// (gift_instance.php), manual assignment, terms/excluded-clients, clone.
 
-type Gift = {
+type Campaign = {
   id: number;
-  clientId: number;
-  clientName: string;
-  title: string;
-  rewardType: "service" | "product" | "discount";
-  value: number;
-  status: "available" | "redeemed" | "expired" | "cancelled";
-  expiresAt: string;
-  createdAt: string;
-  redeemedAt?: string;
-};
-
-// Map of API gift status -> { label, Bootstrap badge class } used in the table.
-const STATUS_BADGES: Record<string, { label: string; cls: string }> = {
-  available: { label: "Disponibile", cls: "text-bg-success" },
-  redeemed: { label: "Riscattato", cls: "text-bg-secondary" },
-  expired: { label: "Scaduto", cls: "text-bg-warning" },
-  cancelled: { label: "Annullato", cls: "text-bg-dark" },
-};
-
-// Reward type labels (service / product / discount), reproduced from PHP wording.
-const REWARD_TYPE_LABELS: Record<string, string> = {
-  service: "Servizio",
-  product: "Prodotto",
-  discount: "Sconto",
+  name: string;
+  description: string;
+  active: boolean;
+  isCurrentlyActive: boolean;
+  autoDisabled: boolean;
+  fidelityOnly: boolean;
+  validFrom: string;
+  validTo: string;
+  instancesCount: number;
+  rewardSummary: string;
+  locationIds: number[];
 };
 
 function tenantSlug(): string {
@@ -41,39 +31,27 @@ function tenantSlug(): string {
   return window.location.pathname.split("/")[1] || "";
 }
 
-function fmtDate(iso?: string): string {
-  if (!iso) return "—";
-  const d = iso.slice(0, 10);
-  const [y, m, day] = d.split("-");
-  return day && m && y ? `${day}/${m}/${y}` : "—";
-}
-
-function statusBadge(status: string): { label: string; cls: string } {
-  return STATUS_BADGES[status] ?? { label: status || "—", cls: "text-bg-secondary" };
-}
-
-function rewardTypeLabel(type: string): string {
-  return REWARD_TYPE_LABELS[type] ?? "—";
+function fmtDate(ymd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return "";
+  const [y, m, d] = ymd.split("-");
+  return `${d}/${m}/${y}`;
 }
 
 export function GiftsContent() {
   const slug = tenantSlug();
-  const [gifts, setGifts] = useState<Gift[]>([]);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [loading, setLoading] = useState(true);
-
-  // Filter form state (legacy gifts list filters by client / status).
-  const [clientId, setClientId] = useState("0");
-  const [status, setStatus] = useState("");
-  const [applied, setApplied] = useState({ clientId: "0", status: "" });
+  const [q, setQ] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(() => {
-    setLoading(true);
-    fetch(`/api/manage/gifts?slug=${encodeURIComponent(slug)}`, {
-      headers: { "x-tenant-slug": slug },
-    })
+    return fetch(`/api/manage/gifts?slug=${encodeURIComponent(slug)}&action=campaigns`, { headers: { "x-tenant-slug": slug } })
       .then((r) => r.json())
-      .then((j) => setGifts(Array.isArray(j.gifts) ? j.gifts : []))
-      .catch(() => setGifts([]))
+      .then((j) => setCampaigns(Array.isArray(j.campaigns) ? j.campaigns : []))
+      .catch(() => setCampaigns([]))
       .finally(() => setLoading(false));
   }, [slug]);
 
@@ -81,26 +59,51 @@ export function GiftsContent() {
     load();
   }, [load]);
 
-  // Distinct client list for the filter combobox, derived from loaded gifts.
-  const clientItems = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const g of gifts) {
-      if (g.clientId > 0) map.set(String(g.clientId), g.clientName || "Cliente");
-    }
-    return Array.from(map, ([id, label]) => ({ id, label }));
-  }, [gifts]);
-
-  // Client-side filtering (the API exposes no filter params).
-  const filtered = useMemo(() => {
-    return gifts.filter((g) => {
-      if (applied.clientId && applied.clientId !== "0" && String(g.clientId) !== applied.clientId) return false;
-      if (applied.status && g.status !== applied.status) return false;
-      return true;
-    });
-  }, [gifts, applied]);
-
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`gifts${suffix}`.replace("&", "?")}`;
+  }
+
+  const filtered = useMemo(() => {
+    const term = q.trim().toLowerCase();
+    return campaigns.filter((c) => {
+      if (term !== "" && !`${c.name} ${c.description} ${c.rewardSummary}`.toLowerCase().includes(term)) return false;
+      if (statusFilter === "active" && !c.active) return false;
+      if (statusFilter === "inactive" && c.active) return false;
+      return true;
+    });
+  }, [campaigns, q, statusFilter]);
+
+  async function post(fields: Record<string, string>): Promise<Record<string, unknown> | null> {
+    setBusy(true);
+    setMsg("");
+    setErr("");
+    try {
+      const res = await fetch(`/api/manage/gifts?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify(fields),
+      });
+      const j = await res.json().catch(() => ({ ok: false }));
+      if (!res.ok || !j.ok) throw new Error(String(j.error || "Operazione non riuscita."));
+      if (Array.isArray(j.campaigns)) setCampaigns(j.campaigns as Campaign[]);
+      return j;
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Operazione non riuscita.");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggle(c: Campaign) {
+    const j = await post({ action: "toggle_active", id: String(c.id), active: c.active ? "0" : "1" });
+    if (j) setMsg(c.active ? "Campagna disattivata." : "Campagna attivata.");
+  }
+
+  async function remove(c: Campaign) {
+    if (!window.confirm(`Eliminare la campagna omaggio "${c.name}"? Le istanze accumulate e i premi collegati verranno rimossi.`)) return;
+    const j = await post({ action: "delete", id: String(c.id) });
+    if (j) setMsg("Campagna eliminata.");
   }
 
   return (
@@ -123,17 +126,17 @@ export function GiftsContent() {
         </div>
       </div>
 
-      {!loading && gifts.length === 0 ? (
+      {msg ? <div className="alert alert-success">{msg}</div> : null}
+      {err ? <div className="alert alert-danger">{err}</div> : null}
+
+      {!loading && campaigns.length === 0 ? (
         <div className="card border-0 shadow-sm gifts-empty-card">
           <div className="gifts-empty-state">
             <div className="gifts-empty-icon" aria-hidden="true">
               <i className="bi bi-gift" />
             </div>
             <h2>Nessun omaggio configurato</h2>
-            <p>
-              Crea una campagna omaggio per iniziare ad assegnare premi ai clienti e seguirne accumulo, disponibilità e
-              riscatto.
-            </p>
+            <p>Crea una campagna omaggio per iniziare ad assegnare premi ai clienti e seguirne accumulo, disponibilità e riscatto.</p>
             <div className="d-flex justify-content-center gap-2 flex-wrap">
               <a className="btn btn-primary" href={href("&action=new")}>
                 <i className="bi bi-plus-lg me-1" />
@@ -145,53 +148,18 @@ export function GiftsContent() {
       ) : (
         <>
           <div className="card p-3 mb-3">
-            <form
-              className="row g-2 align-items-end"
-              onSubmit={(e) => {
-                e.preventDefault();
-                setApplied({ clientId, status });
-              }}
-            >
-              <div className="col-lg-4">
-                <label className="form-label">Cliente</label>
-                <select className="form-select" value={clientId} onChange={(e) => setClientId(e.target.value)}>
-                  <option value="0">Tutti</option>
-                  {clientItems.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.label}
-                    </option>
-                  ))}
-                </select>
+            <form className="row g-2 align-items-end" onSubmit={(e) => e.preventDefault()}>
+              <div className="col-lg-6">
+                <label className="form-label">Cerca</label>
+                <input className="form-control" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Nome, premio o descrizione" />
               </div>
-
               <div className="col-lg-3">
                 <label className="form-label">Stato</label>
-                <select className="form-select" name="status" value={status} onChange={(e) => setStatus(e.target.value)}>
-                  <option value="">Tutti</option>
-                  <option value="available">Disponibile</option>
-                  <option value="redeemed">Riscattato</option>
-                  <option value="expired">Scaduto</option>
-                  <option value="cancelled">Annullato</option>
+                <select className="form-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+                  <option value="">Tutte</option>
+                  <option value="active">Attive</option>
+                  <option value="inactive">Disattivate</option>
                 </select>
-              </div>
-
-              <div className="col-lg-3 d-flex align-items-center gap-3 flex-wrap app-filter-actions">
-                <button className="btn btn-outline-primary app-filter-submit" type="submit">
-                  <i className="bi bi-search me-1" />
-                  Filtra
-                </button>
-                <a
-                  className="btn btn-outline-secondary app-filter-reset"
-                  href={href("")}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    setClientId("0");
-                    setStatus("");
-                    setApplied({ clientId: "0", status: "" });
-                  }}
-                >
-                  Reset
-                </a>
               </div>
             </form>
           </div>
@@ -201,41 +169,50 @@ export function GiftsContent() {
               <table className="table mb-0 align-middle">
                 <thead>
                   <tr>
-                    <th>Cliente</th>
-                    <th>Omaggio</th>
-                    <th>Tipo</th>
+                    <th>Campagna</th>
+                    <th>Premio</th>
+                    <th>Validità</th>
                     <th>Stato</th>
-                    <th>Scadenza</th>
+                    <th className="text-end">Istanze</th>
                     <th className="text-end">Azioni</th>
                   </tr>
                 </thead>
                 <tbody>
                   {filtered.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="text-muted small p-3">
-                        {loading ? "Caricamento…" : "Nessun omaggio."}
+                      <td colSpan={6} className="text-muted p-3">
+                        {loading ? "Caricamento…" : "Nessuna campagna trovata."}
                       </td>
                     </tr>
                   ) : (
-                    filtered.map((g) => {
-                      const badge = statusBadge(g.status);
-                      return (
-                        <tr key={g.id}>
-                          <td className="fw-semibold">{g.clientName || "—"}</td>
-                          <td>{g.title || "—"}</td>
-                          <td className="text-muted small">{rewardTypeLabel(g.rewardType)}</td>
-                          <td>
-                            <span className={`badge ${badge.cls}`}>{badge.label}</span>
-                          </td>
-                          <td className="text-muted small">{fmtDate(g.expiresAt)}</td>
-                          <td className="text-end">
-                            <a className="btn btn-sm btn-outline-secondary" href={href(`&action=view&id=${g.id}`)}>
-                              Apri
-                            </a>
-                          </td>
-                        </tr>
-                      );
-                    })
+                    filtered.map((c) => (
+                      <tr key={c.id}>
+                        <td>
+                          <div className="fw-semibold">{c.name}</div>
+                          {c.description ? <div className="text-muted small">{c.description}</div> : null}
+                          {c.fidelityOnly ? <span className="badge bg-info text-dark mt-1">Solo Fidelity</span> : null}
+                        </td>
+                        <td>{c.rewardSummary}</td>
+                        <td>{c.validFrom || c.validTo ? `${fmtDate(c.validFrom) || "…"} – ${fmtDate(c.validTo) || "…"}` : <span className="text-muted">Sempre</span>}</td>
+                        <td>
+                          {c.active ? <span className="badge bg-success">Attiva</span> : <span className="badge bg-secondary">Disattivata</span>}
+                          {c.active && c.isCurrentlyActive ? <span className="badge bg-primary ms-1">In corso</span> : null}
+                          {c.autoDisabled ? <span className="badge bg-warning text-dark ms-1">Auto-off</span> : null}
+                        </td>
+                        <td className="text-end">{c.instancesCount}</td>
+                        <td className="text-end">
+                          <a className="btn btn-sm btn-outline-primary me-1" href={href(`&action=edit&id=${c.id}`)}>
+                            <i className="bi bi-pencil" /> Modifica
+                          </a>
+                          <button className="btn btn-sm btn-outline-secondary me-1" type="button" onClick={() => toggle(c)} disabled={busy}>
+                            {c.active ? "Disattiva" : "Attiva"}
+                          </button>
+                          <button className="btn btn-sm btn-outline-danger" type="button" onClick={() => remove(c)} disabled={busy}>
+                            <i className="bi bi-trash" /> Elimina
+                          </button>
+                        </td>
+                      </tr>
+                    ))
                   )}
                 </tbody>
               </table>
