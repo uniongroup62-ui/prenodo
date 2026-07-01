@@ -46,8 +46,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // verbatim; a req-id guard discards stale responses (qbHistoryReqId pattern).
 //
 // TODO (deep wiring left out, matches the SCOPE note): the redeem flows
-// (giftbox/gift/package/prepaid/giftcard), the client card popup, the
-// residuals-detail popup ("Apri scheda" on residuals is a no-op for now),
+// (giftbox/gift/package/prepaid/giftcard), the client card popup
+// (the residuals-detail "Apri scheda" popup is now ported — see
+// openResidualsDetail + #qbClientResidualsModal),
 // the per-service staff/cabin picker + the multi-service summary, the
 // price-details / coupon / fidelity / discount block, hold countdown/renewal,
 // and edit/delete of an existing appointment. Their markup is present but the
@@ -213,6 +214,15 @@ function fmtDateTimeFromSql(value: string): string {
   }
 }
 
+// SQL date (YYYY-MM-DD) -> "dd/mm/yyyy", port of qbRenderClientResiduals' fmtYMD
+// (app.js ~991). Empty / unparseable -> "—" (the residuals detail expiry display).
+function fmtYMD(value: string | null | undefined): string {
+  const s = String(value ?? "").trim();
+  if (!s) return "—";
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : s;
+}
+
 // Quick-booking client-context payload (port of api_clients.php history +
 // residuals summaries; see /api/manage/clients?action=quickbook_client_context).
 type QbHistorySummary = { total?: number; last_visit?: string | null; next_visit?: string | null; sales_total?: number };
@@ -305,6 +315,55 @@ type QbClientContextResponse = {
   creditAvailable?: number;
 };
 
+// Read-only residuals DETAIL (for the "Apri scheda" #qbClientResidualsModal). Shape
+// of /api/manage/clients?action=residuals (quickBookClientResidualsDetail): the five
+// sections + a credit line, each with per-item display detail. DISPLAY-ONLY — no
+// redeem controls (the drawer form does the inline redeem SELECTION).
+type QbResidualServiceDetail = {
+  service_name: string;
+  remaining_qty: number;
+  purchased_qty: number;
+  unit_price: number;
+  sale_id: number | null;
+  expires_at: string | null;
+};
+type QbResidualGiftDetail = {
+  gift_name: string;
+  service_name: string;
+  qty_remaining: number;
+  qty_total: number;
+  expires_at: string | null;
+};
+type QbResidualGiftboxItem = { service_name: string; qty_remaining: number; qty_total: number };
+type QbResidualGiftboxDetail = {
+  giftbox_name: string;
+  code: string;
+  remaining_qty: number;
+  total_qty: number;
+  expires_at: string | null;
+  items: QbResidualGiftboxItem[];
+};
+type QbResidualGiftcardDetail = { code: string; balance: number; expires_at: string | null };
+type QbResidualPackageItem = { service_name: string; sessions_remaining: number; sessions_total: number };
+type QbResidualPackageDetail = {
+  package_name: string;
+  sessions_remaining: number;
+  sessions_total: number;
+  expires_at: string | null;
+  sale_id: number | null;
+  breakdown: string;
+  items: QbResidualPackageItem[];
+};
+type QbResidualsDetail = {
+  services: QbResidualServiceDetail[];
+  gifts: QbResidualGiftDetail[];
+  giftboxes: QbResidualGiftboxDetail[];
+  giftcards: QbResidualGiftcardDetail[];
+  packages: QbResidualPackageDetail[];
+  credit: { available: number; count: number };
+};
+type QbResidualsDetailResponse = { ok?: boolean; error?: string } & Partial<QbResidualsDetail>;
+
 // One entry written to #qb_package_redeem (assets/js/app.js qbReadPackageRedeem):
 // a per-service request to cover that service with the client's prepaid package.
 type QbPackageRedeem = { client_package_id: number; service_id: number; client_package_service_id: number | null };
@@ -384,6 +443,18 @@ export function QuickBookingDrawer() {
   const [residualsError, setResidualsError] = useState<string>("");
   const [contextLoading, setContextLoading] = useState(false);
   const contextReqRef = useRef(0);
+
+  // ---- "Apri scheda" residuals DETAIL modal (#qbClientResidualsModal) ----
+  // The read-only detail view of the selected client's residuals (five sections +
+  // a Credito line), fetched from /api/manage/clients?action=residuals on open.
+  // `residualsDetail` holds the fetched payload (null while loading / on error);
+  // `residualsDetailLoading` shows the spinner; `residualsDetailError` the error line.
+  // A monotonic req-id discards stale responses (legacy qbClientResidualsReqId).
+  // The inline redeem SELECTION stays on the drawer form — this is DISPLAY-ONLY.
+  const [residualsDetail, setResidualsDetail] = useState<QbResidualsDetail | null>(null);
+  const [residualsDetailLoading, setResidualsDetailLoading] = useState(false);
+  const [residualsDetailError, setResidualsDetailError] = useState<string>("");
+  const residualsDetailReqRef = useRef(0);
 
   // ---- PACKAGE redeem (#qb_package_redeem) ----
   // The selected client's AVAILABLE packages (covering >=1 service, with sessions
@@ -1934,11 +2005,69 @@ export function QuickBookingDrawer() {
   }, []);
 
   // The history "Apri scheda" link -> the clean client view URL (port: opens the
-  // client card). Residuals "Apri scheda" is a no-op (#) for now, matching the
-  // SCOPE note (the residuals-detail popup is not yet ported).
+  // client card). The residuals "Apri scheda" link opens the DETAIL modal below
+  // (openResidualsDetail) — the full read-only residuals view.
   const historyOpenHref = clientId
     ? `/${encodeURIComponent(slug)}/clients?action=view&id=${encodeURIComponent(clientId)}`
     : "#";
+
+  // Open the "Apri scheda" residuals DETAIL modal for the selected client (port of
+  // app.js qbOpenClientResiduals): show the modal, then fetch action=residuals and
+  // render the sections. A monotonic req-id discards stale responses. The modal is a
+  // read-only VIEWER — the inline redeem SELECTION lives on the drawer form.
+  const openResidualsDetail = useCallback(() => {
+    const id = String(clientId || "").trim();
+    if (!id) return;
+    // Show the modal immediately with a loading state (like the legacy).
+    const el = document.getElementById("qbClientResidualsModal");
+    const api = bootstrap()?.Modal;
+    if (el && api) api.getOrCreateInstance(el).show();
+
+    const myReq = ++residualsDetailReqRef.current;
+    setResidualsDetail(null);
+    setResidualsDetailError("");
+    setResidualsDetailLoading(true);
+
+    const params = new URLSearchParams({ slug, action: "residuals", client_id: id });
+    fetch(`/api/manage/clients?${params.toString()}`, { headers: { "x-tenant-slug": slug } })
+      .then((r) => r.json())
+      .then((data: QbResidualsDetailResponse) => {
+        if (myReq !== residualsDetailReqRef.current) return; // stale
+        if (!data || data.ok === false) {
+          setResidualsDetailError(data?.error || "Impossibile caricare i residui.");
+          return;
+        }
+        setResidualsDetail({
+          services: Array.isArray(data.services) ? data.services : [],
+          gifts: Array.isArray(data.gifts) ? data.gifts : [],
+          giftboxes: Array.isArray(data.giftboxes) ? data.giftboxes : [],
+          giftcards: Array.isArray(data.giftcards) ? data.giftcards : [],
+          packages: Array.isArray(data.packages) ? data.packages : [],
+          credit: data.credit && typeof data.credit === "object"
+            ? { available: Number(data.credit.available ?? 0) || 0, count: Number(data.credit.count ?? 0) || 0 }
+            : { available: 0, count: 0 },
+        });
+      })
+      .catch(() => {
+        if (myReq !== residualsDetailReqRef.current) return;
+        setResidualsDetailError("Errore di rete durante il caricamento.");
+      })
+      .finally(() => {
+        if (myReq !== residualsDetailReqRef.current) return;
+        setResidualsDetailLoading(false);
+      });
+  }, [slug, clientId]);
+
+  // Whether the fetched residuals detail has ANY content (drives the empty-state).
+  const residualsDetailHasAny = !!(
+    residualsDetail &&
+    (residualsDetail.services.length ||
+      residualsDetail.gifts.length ||
+      residualsDetail.giftboxes.length ||
+      residualsDetail.giftcards.length ||
+      residualsDetail.packages.length ||
+      residualsDetail.credit.count > 0)
+  );
 
   // Derived display state for the two boxes (no extra render-state).
   const historyLine = historySummary ? buildHistoryLine(historySummary) : "";
@@ -2446,19 +2575,20 @@ export function QuickBookingDrawer() {
           <div id="qbLoadErrorState" className="alert alert-danger qb-load-error" role="alert" hidden={!editLoadError}>
             <div className="fw-semibold mb-1">Prenotazione non caricata</div>
             <div className="small" id="qbLoadErrorText">{editLoadError || "Impossibile caricare la prenotazione."}</div>
-            {lastEditIdRef.current ? (
-              <button
-                type="button"
-                className="btn btn-sm btn-outline-danger mt-2"
-                id="qbLoadRetryBtn"
-                onClick={() => {
-                  const retryId = lastEditIdRef.current;
-                  if (retryId) openEditAppointment(retryId);
-                }}
-              >
-                Riprova
-              </button>
-            ) : null}
+            {/* This block is only visible when editLoadError is set, which only happens after an
+                edit-load attempt (which stores lastEditIdRef), so the Riprova button can always
+                render here; the ref is read in the click handler (allowed), not during render. */}
+            <button
+              type="button"
+              className="btn btn-sm btn-outline-danger mt-2"
+              id="qbLoadRetryBtn"
+              onClick={() => {
+                const retryId = lastEditIdRef.current;
+                if (retryId) openEditAppointment(retryId);
+              }}
+            >
+              Riprova
+            </button>
           </div>
 
           {/* Item 4: hide the form while loading or on a load error (qbSetFormHydrationBlocked). */}
@@ -2534,7 +2664,10 @@ export function QuickBookingDrawer() {
                   className="small text-decoration-none"
                   data-client-id={clientId || undefined}
                   style={{ display: hasResiduals ? "" : "none" }}
-                  onClick={(e) => e.preventDefault()}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    openResidualsDetail();
+                  }}
                 >
                   Apri scheda
                 </a>
@@ -3859,6 +3992,219 @@ export function QuickBookingDrawer() {
               >
                 {doneCancelTarget === "no_show" ? "Conferma No show" : "Conferma annullamento"}
               </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ===================== RESIDUALS DETAIL MODAL (port of #qbClientResidualsModal) =====================
+          Read-only "Apri scheda" viewer of the selected client's residuals: the five
+          sections (Servizi/Omaggi/GiftBox/GiftCard/Pacchetti) + a Credito line, each with
+          per-item detail (name, remaining/total, expiry, source sale #). Opened by
+          openResidualsDetail (which fetches action=residuals). INTENTIONAL DIVERGENCE from
+          the legacy modal: this is DISPLAY-ONLY — it does NOT reproduce the legacy modal's
+          checkbox-driven service-add or its in-modal credit/giftcard entry controls; the
+          drawer form already does the redeem SELECTION inline (per-service "Usa …" controls
+          + the giftcard/credit price rows), which supersedes them. Bootstrap classes/markup
+          kept close to app/lib/View.php:1683 + qbRenderClientResiduals. */}
+      <div className="modal fade" id="qbClientResidualsModal" tabIndex={-1} aria-hidden="true">
+        <div className="modal-dialog modal-lg modal-dialog-scrollable">
+          <div className="modal-content">
+            <div className="modal-header align-items-start">
+              <div>
+                <div className="small text-muted">Cliente</div>
+                <h5 className="modal-title fw-bold m-0">Residui</h5>
+              </div>
+              <div className="ms-auto d-flex flex-column align-items-end text-end">
+                {clientId ? (
+                  <a
+                    className="btn btn-sm btn-outline-secondary"
+                    id="qbClientResidualsOpenNew"
+                    href={`/${encodeURIComponent(slug)}/clients?action=view&id=${encodeURIComponent(clientId)}`}
+                    target="_blank"
+                    rel="noopener"
+                  >
+                    <i className="bi bi-box-arrow-up-right me-1" />Apri in nuova scheda
+                  </a>
+                ) : null}
+                <div className="small text-muted mt-1">Mostra solo residui attivi e non scaduti.</div>
+              </div>
+              <button type="button" className="btn-close ms-2" data-bs-dismiss="modal" aria-label="Chiudi" />
+            </div>
+            <div className="modal-body">
+              <div className="small text-muted mb-3">
+                Cliente: <strong id="qbClientResidualsClientLabel">{client?.full_name || "—"}</strong>
+              </div>
+
+              {residualsDetailLoading ? (
+                <div className="app-inline-loading text-muted small p-2" role="status" aria-live="polite">
+                  <span className="spinner-border spinner-border-sm text-primary qb-inline-loader" aria-hidden="true" />
+                  <span> Caricamento...</span>
+                </div>
+              ) : residualsDetailError ? (
+                <div className="text-danger small p-2">{residualsDetailError}</div>
+              ) : !residualsDetailHasAny ? (
+                <div className="alert alert-light border small" id="qbClientResidualsEmptyState">
+                  Nessun residuo disponibile.
+                </div>
+              ) : (
+                <div id="qbClientResidualsBody" className="p-1">
+                  {/* Credito */}
+                  {residualsDetail && residualsDetail.credit.count > 0 ? (
+                    <div className="card p-3 mb-3">
+                      <div className="fw-bold mb-1">Credito</div>
+                      <div className="d-flex justify-content-between align-items-center">
+                        <div className="text-muted small">Credito disponibile del cliente.</div>
+                        <div className="fw-semibold">{fmtEUR(residualsDetail.credit.available)}</div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {/* Servizi (prepagati) */}
+                  {residualsDetail && residualsDetail.services.length > 0 ? (
+                    <div className="card p-3 mb-3">
+                      <div className="fw-bold mb-2">Servizi</div>
+                      {residualsDetail.services.map((s, i) => (
+                        <div className="border-top pt-2 mt-2" key={`svc-${i}`}>
+                          <div className="d-flex justify-content-between align-items-start">
+                            <div className="me-3">
+                              <div className="fw-semibold">
+                                {s.service_name}
+                                {s.remaining_qty > 0 ? (
+                                  <span className="badge text-bg-secondary ms-2">{s.remaining_qty}</span>
+                                ) : null}
+                                {s.purchased_qty > 0 ? (
+                                  <span className="text-muted small ms-1">/{s.purchased_qty}</span>
+                                ) : null}
+                              </div>
+                              <div className="text-muted small">
+                                Acquistato{s.sale_id ? ` con vendita #${s.sale_id}` : ""} • Scade: {fmtYMD(s.expires_at)}
+                              </div>
+                            </div>
+                            <div className="text-end">
+                              <div className="fw-semibold">{fmtEUR(s.unit_price)}</div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {/* Omaggi */}
+                  {residualsDetail && residualsDetail.gifts.length > 0 ? (
+                    <div className="card p-3 mb-3">
+                      <div className="fw-bold mb-2">Omaggi</div>
+                      {residualsDetail.gifts.map((g, i) => (
+                        <div className="border-top pt-2 mt-2" key={`gift-${i}`}>
+                          <div className="small text-muted mb-1">{g.gift_name}</div>
+                          <div className="fw-semibold">
+                            {g.service_name}
+                            {g.qty_remaining > 0 ? (
+                              <span className="badge text-bg-secondary ms-2">{g.qty_remaining}</span>
+                            ) : null}
+                            {g.qty_total > 0 ? <span className="text-muted small ms-1">/{g.qty_total}</span> : null}
+                          </div>
+                          <div className="text-muted small">Scade: {fmtYMD(g.expires_at)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {/* GiftBox */}
+                  {residualsDetail && residualsDetail.giftboxes.length > 0 ? (
+                    <div className="card p-3 mb-3">
+                      <div className="fw-bold mb-2">GiftBox</div>
+                      {residualsDetail.giftboxes.map((gb, i) => (
+                        <div className="border-top pt-2 mt-2" key={`gb-${i}`}>
+                          <div className="fw-semibold">
+                            {gb.giftbox_name}{" "}
+                            {gb.code ? (
+                              <span className="text-muted small">
+                                <code>{gb.code}</code>
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="text-muted small">
+                            Residuo: {gb.remaining_qty}
+                            {gb.total_qty ? ` / ${gb.total_qty}` : ""} • Scade: {fmtYMD(gb.expires_at)}
+                          </div>
+                          {gb.items.length > 0 ? (
+                            <div className="mt-2">
+                              <div className="small text-muted mb-1">Servizi residui:</div>
+                              {gb.items.map((it, j) => (
+                                <div className="small" key={`gb-${i}-it-${j}`}>
+                                  {it.service_name}
+                                  {it.qty_remaining > 0 ? (
+                                    <span className="badge text-bg-secondary ms-2">{it.qty_remaining}</span>
+                                  ) : null}
+                                  {it.qty_total ? <span className="text-muted small ms-1">/{it.qty_total}</span> : null}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {/* GiftCard */}
+                  {residualsDetail && residualsDetail.giftcards.length > 0 ? (
+                    <div className="card p-3 mb-3">
+                      <div className="fw-bold mb-2">GiftCard</div>
+                      {residualsDetail.giftcards.map((gc, i) => (
+                        <div className="border-top pt-2 mt-2" key={`gc-${i}`}>
+                          <div className="d-flex justify-content-between align-items-start">
+                            <div className="me-3">
+                              <div className="fw-semibold">
+                                <code>{gc.code}</code>
+                              </div>
+                              <div className="text-muted small">Scade: {fmtYMD(gc.expires_at)}</div>
+                            </div>
+                            <div className="text-end">
+                              <div className="fw-semibold">{fmtEUR(gc.balance)}</div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {/* Pacchetti */}
+                  {residualsDetail && residualsDetail.packages.length > 0 ? (
+                    <div className="card p-3 mb-3">
+                      <div className="fw-bold mb-2">Pacchetti</div>
+                      {residualsDetail.packages.map((p, i) => (
+                        <div className="border-top pt-2 mt-2" key={`pkg-${i}`}>
+                          <div className="fw-semibold">{p.package_name}</div>
+                          <div className="text-muted small">
+                            Residuo: {p.sessions_remaining}
+                            {p.sessions_total ? ` / ${p.sessions_total}` : ""} • Scade: {fmtYMD(p.expires_at)}
+                            {p.sale_id ? ` • Vendita #${p.sale_id}` : ""}
+                          </div>
+                          {p.items.length > 0 ? (
+                            <div className="mt-2">
+                              <div className="small text-muted mb-1">Sedute residue:</div>
+                              {p.items.map((it, j) => (
+                                <div className="small" key={`pkg-${i}-it-${j}`}>
+                                  {it.service_name}
+                                  {it.sessions_remaining > 0 ? (
+                                    <span className="badge text-bg-secondary ms-2">{it.sessions_remaining}</span>
+                                  ) : null}
+                                  {it.sessions_total ? (
+                                    <span className="text-muted small ms-1">/{it.sessions_total}</span>
+                                  ) : null}
+                                </div>
+                              ))}
+                            </div>
+                          ) : p.breakdown ? (
+                            <div className="mt-2 text-muted small">{p.breakdown}</div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              )}
             </div>
           </div>
         </div>

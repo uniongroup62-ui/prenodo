@@ -8075,6 +8075,74 @@ export type QuickBookClientContext = {
   fidelity: QuickBookClientFidelity;
 };
 
+// ---------------------------------------------------------------------------
+// Quick-booking "Apri scheda" residuals DETAIL (read-only view).
+//
+// Port of api_clients.php action=residuals's per-item payload, but DISPLAY-ONLY:
+// the quick-booking drawer already does the redeem SELECTION inline (per-service
+// "Usa pacchetto/prepagato/GiftBox/Omaggio" controls + the giftcard/credit price
+// rows), so this feeds the `#qbClientResidualsModal` detail viewer only. It does
+// NOT carry the legacy modal's checkbox/data-* redeem attributes, nor its in-modal
+// credit/giftcard entry controls — the inline UX supersedes those (intentional
+// divergence). Each section carries the fields the modal renders: name, remaining
+// (+ total where meaningful), expiry, and the source sale # where available.
+export type QuickBookResidualServiceDetail = {
+  service_name: string;
+  remaining_qty: number;
+  purchased_qty: number;
+  unit_price: number;
+  sale_id: number | null;
+  expires_at: string | null;
+};
+export type QuickBookResidualGiftDetail = {
+  gift_name: string;
+  service_name: string;
+  qty_remaining: number;
+  qty_total: number;
+  expires_at: string | null;
+};
+export type QuickBookResidualGiftboxItem = {
+  service_name: string;
+  qty_remaining: number;
+  qty_total: number;
+};
+export type QuickBookResidualGiftboxDetail = {
+  giftbox_name: string;
+  code: string;
+  remaining_qty: number;
+  total_qty: number;
+  expires_at: string | null;
+  items: QuickBookResidualGiftboxItem[];
+};
+export type QuickBookResidualGiftcardDetail = {
+  code: string;
+  balance: number;
+  expires_at: string | null;
+};
+export type QuickBookResidualPackageItem = {
+  service_name: string;
+  sessions_remaining: number;
+  sessions_total: number;
+};
+export type QuickBookResidualPackageDetail = {
+  package_name: string;
+  sessions_remaining: number;
+  sessions_total: number;
+  expires_at: string | null;
+  sale_id: number | null;
+  breakdown: string;
+  items: QuickBookResidualPackageItem[];
+};
+export type QuickBookClientResidualsDetail = {
+  services: QuickBookResidualServiceDetail[];
+  gifts: QuickBookResidualGiftDetail[];
+  giftboxes: QuickBookResidualGiftboxDetail[];
+  giftcards: QuickBookResidualGiftcardDetail[];
+  packages: QuickBookResidualPackageDetail[];
+  // Credit line (clients.credit_balance): available > 0 -> shown as a "Credito" row.
+  credit: { available: number; count: number };
+};
+
 // Port of Fidelity::settings() redeem block (app/lib/Fidelity.php ~610-620): the redeem
 // config off the single `businesses` row, with the legacy defaults + clamps. Duplicated
 // here (rather than imported from manage-pos) to avoid a manage-pos -> db-repositories
@@ -8756,4 +8824,307 @@ async function quickBookClientGifts(slug: string, clientId: number): Promise<Qui
     }
   }
   return out;
+}
+
+// Read-only residuals DETAIL for the quick-booking "Apri scheda" modal
+// (#qbClientResidualsModal). Port of api_clients.php action=residuals's per-item
+// payload, DISPLAY-ONLY (see QuickBookClientResidualsDetail): it returns the five
+// sections (Servizi/Omaggi/GiftBox/GiftCard/Pacchetti) with per-item detail (name,
+// remaining, total, expiry, source sale #) plus a Credito line. Every "available"
+// WHERE mirrors the corresponding summary/helper EXACTLY so the modal's items line
+// up 1:1 with the drawer's soft badges. Tenant-scoped via tenantSelect; each read
+// is guarded so a missing table/column degrades to an empty section (never throws).
+export async function quickBookClientResidualsDetail(
+  slug: string,
+  clientId: number,
+): Promise<QuickBookClientResidualsDetail> {
+  const out: QuickBookClientResidualsDetail = {
+    services: [],
+    gifts: [],
+    giftboxes: [],
+    giftcards: [],
+    packages: [],
+    credit: { available: 0, count: 0 },
+  };
+  if (clientId <= 0) return out;
+
+  // --- Credito (clients.credit_balance) — same source as the summary badge. ---
+  try {
+    const { credit } = await dbWalletBalance(clientId, slug);
+    const available = roundMoney(Math.max(0, credit));
+    out.credit = { available, count: available > 0.00001 ? 1 : 0 };
+  } catch {
+    out.credit = { available: 0, count: 0 };
+  }
+
+  // --- Servizi prepagati (client_prepaid_services) — same WHERE as
+  //     quickBookClientPrepaids / the summary, with the display columns. ---
+  try {
+    const prepaidTable = await tenantTable(slug, "client_prepaid_services");
+    const hasExpiry = await columnExists(prepaidTable.name, "expires_at");
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_prepaid_services",
+      columns: "id, service_id, service_name, purchased_qty, remaining_qty, unit_price, sale_id, expires_at",
+      where: `client_id = ? AND status = 'active' AND remaining_qty > 0${expiry}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 100,
+    });
+    for (const row of rows) {
+      const serviceId = Number(row.service_id ?? 0);
+      const saleId = Number(row.sale_id ?? 0);
+      out.services.push({
+        service_name: String(row.service_name ?? "") || (serviceId > 0 ? `Servizio #${serviceId}` : "Servizio"),
+        remaining_qty: Math.max(0, Number(row.remaining_qty ?? 0)),
+        purchased_qty: Math.max(0, Number(row.purchased_qty ?? 0)),
+        unit_price: roundMoney(Math.max(0, Number(row.unit_price ?? 0))),
+        sale_id: saleId > 0 ? saleId : null,
+        expires_at: row.expires_at ? String(row.expires_at).slice(0, 10) : null,
+      });
+    }
+  } catch {
+    out.services = [];
+  }
+
+  // --- GiftCard (giftcards) — same WHERE as quickBookClientGiftcards / the summary. ---
+  try {
+    const giftcardTable = await tenantTable(slug, "giftcards");
+    const hasRecipient = await columnExists(giftcardTable.name, "recipient_client_id");
+    const hasExpiry = await columnExists(giftcardTable.name, "expires_at");
+    const target = hasRecipient ? "recipient_client_id = ?" : "client_id = ?";
+    const expiryClause = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftcards",
+      columns: "id, code, balance, expires_at",
+      where: `${target} AND status = 'active' AND balance > 0${expiryClause}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 50,
+    });
+    for (const row of rows) {
+      const balance = roundMoney(Math.max(0, Number(row.balance ?? 0)));
+      if (balance <= 0) continue;
+      out.giftcards.push({
+        code: String(row.code ?? ""),
+        balance,
+        expires_at: row.expires_at ? String(row.expires_at).slice(0, 10) : null,
+      });
+    }
+  } catch {
+    out.giftcards = [];
+  }
+
+  // --- Pacchetti (client_packages) — same WHERE as quickBookClientPackages / the
+  //     summary; breakdown built from client_package_services (name: rem/tot). ---
+  try {
+    const packageTable = await tenantTable(slug, "client_packages");
+    const hasExpiry = await columnExists(packageTable.name, "expires_at");
+    const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)" : "";
+    const packageRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_packages",
+      columns: "id, package_name, sessions_total, sessions_remaining, sale_id, expires_at",
+      where: `client_id = ? AND status = 'active' AND sessions_remaining > 0${expiry}`,
+      params: [clientId],
+      orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+      limit: 50,
+    });
+    const ids = packageRows.map((row) => Number(row.id ?? 0)).filter((id) => id > 0);
+    const itemsByPackage = new Map<number, QuickBookResidualPackageItem[]>();
+    if (ids.length > 0) {
+      try {
+        const placeholders = ids.map(() => "?").join(",");
+        const itemRows = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "client_package_services",
+          columns: "client_package_id, service_id, sessions_total, sessions_remaining",
+          where: `client_package_id IN (${placeholders})`,
+          params: ids,
+          orderBy: "client_package_id ASC, sort_order ASC, id ASC",
+        });
+        for (const row of itemRows) {
+          const packageId = Number(row.client_package_id ?? 0);
+          const serviceId = Number(row.service_id ?? 0);
+          if (packageId <= 0) continue;
+          const list = itemsByPackage.get(packageId) ?? [];
+          list.push({
+            service_name: await serviceNameById(slug, serviceId, serviceId > 0 ? `Servizio #${serviceId}` : "Servizio"),
+            sessions_remaining: Math.max(0, Number(row.sessions_remaining ?? 0)),
+            sessions_total: Math.max(0, Number(row.sessions_total ?? 0)),
+          });
+          itemsByPackage.set(packageId, list);
+        }
+      } catch {
+        // client_package_services may be absent (legacy single-service packages).
+      }
+    }
+    for (const row of packageRows) {
+      const id = Number(row.id ?? 0);
+      if (id <= 0) continue;
+      const items = itemsByPackage.get(id) ?? [];
+      const saleId = Number(row.sale_id ?? 0);
+      const breakdown = items
+        .map((it) => `${it.service_name}: ${it.sessions_remaining}/${it.sessions_total}`)
+        .join(" • ");
+      out.packages.push({
+        package_name: String(row.package_name ?? "") || "Pacchetto",
+        sessions_remaining: Math.max(0, Number(row.sessions_remaining ?? 0)),
+        sessions_total: Math.max(0, Number(row.sessions_total ?? 0)),
+        expires_at: row.expires_at ? String(row.expires_at).slice(0, 10) : null,
+        sale_id: saleId > 0 ? saleId : null,
+        breakdown,
+        items,
+      });
+    }
+  } catch {
+    out.packages = [];
+  }
+
+  // --- GiftBox (giftbox_instances + items) — same availability rule as the summary
+  //     (issued, not expired, residual (qty - redeemed) > 0), one entry per instance
+  //     with its non-exhausted SERVICE items. ---
+  try {
+    if (await tableExists((await tenantTable(slug, "giftbox_instances")).name)) {
+      const instanceTable = await tenantTable(slug, "giftbox_instances");
+      const hasRecipient = await columnExists(instanceTable.name, "recipient_client_id");
+      const hasExpiry = await columnExists(instanceTable.name, "expires_at");
+      const target = hasRecipient
+        ? "(recipient_client_id = ? OR (recipient_client_id IS NULL AND client_id = ?))"
+        : "client_id = ?";
+      const params = hasRecipient ? [clientId, clientId] : [clientId];
+      const expiry = hasExpiry ? " AND (expires_at IS NULL OR expires_at >= NOW())" : "";
+      const instances = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instances",
+        columns: "id, giftbox_id, code, expires_at",
+        where: `${target} AND status = 'issued'${expiry}`,
+        params,
+        orderBy: "(expires_at IS NULL) DESC, expires_at ASC, id DESC",
+        limit: 100,
+      });
+      for (const inst of instances) {
+        const instanceId = Number(inst.id ?? 0);
+        if (instanceId <= 0) continue;
+        try {
+          const itemRows = await tenantSelect<RowDataPacket>({
+            slug,
+            table: "giftbox_instance_items",
+            columns: "giftbox_item_id, item_type, service_id, qty, custom_label",
+            where: "instance_id = ?",
+            params: [instanceId],
+            orderBy: "sort_order ASC, giftbox_item_id ASC",
+          });
+          const totalQty = itemRows.reduce((sum, it) => sum + Math.max(0, Number(it.qty ?? 0)), 0);
+          const redeemedTotal = await giftBoxRedeemedUnits(slug, instanceId);
+          const remaining = totalQty - redeemedTotal;
+          if (remaining <= 0) continue; // not offerable / exhausted -> skip (parity with summary)
+
+          const items: QuickBookResidualGiftboxItem[] = [];
+          for (const it of itemRows) {
+            if (String(it.item_type ?? "service") !== "service") continue;
+            const giftboxItemId = Number(it.giftbox_item_id ?? 0);
+            const serviceId = Number(it.service_id ?? 0);
+            if (giftboxItemId <= 0 || serviceId <= 0) continue;
+            const itemTotal = Math.max(0, Number(it.qty ?? 0));
+            const itemRedeemed = await giftBoxItemRedeemedUnits(slug, instanceId, giftboxItemId);
+            const itemRemaining = itemTotal - itemRedeemed;
+            if (itemRemaining <= 0) continue;
+            const label = String(it.custom_label ?? "") || (await serviceNameById(slug, serviceId, "Servizio"));
+            items.push({ service_name: label, qty_remaining: itemRemaining, qty_total: itemTotal });
+          }
+
+          const giftboxId = Number(inst.giftbox_id ?? 0);
+          const giftboxName = giftboxId > 0 ? await giftboxNameById(slug, giftboxId, "GiftBox") : "GiftBox";
+          out.giftboxes.push({
+            giftbox_name: giftboxName,
+            code: String(inst.code ?? ""),
+            remaining_qty: Math.max(0, remaining),
+            total_qty: Math.max(0, totalQty),
+            expires_at: inst.expires_at ? String(inst.expires_at).slice(0, 10) : null,
+            items,
+          });
+        } catch {
+          // tolerate the item/redemption tables being absent for this instance
+        }
+      }
+    }
+  } catch {
+    out.giftboxes = [];
+  }
+
+  // --- Omaggi (gift service rewards) — reuse quickBookClientGifts (the exact
+  //     available-instance + per-reward residual rule the summary counts), then
+  //     enrich each entry with the gift name + a per-reward remaining/total. ---
+  try {
+    const gifts = await quickBookClientGifts(slug, clientId);
+    for (const g of gifts) {
+      const giftName = await giftNameByInstanceId(slug, g.instance_id, "Omaggio");
+      out.gifts.push({
+        gift_name: giftName,
+        service_name: g.name,
+        // quickBookClientGifts only returns still-available rewards; expose the
+        // residual as >= 1 (the modal shows it as a soft badge). A precise
+        // qty_total per reward isn't threaded by the redeem helper — 0 hides the "/n".
+        qty_remaining: 1,
+        qty_total: 0,
+        expires_at: null,
+      });
+    }
+  } catch {
+    out.gifts = [];
+  }
+
+  return out;
+}
+
+// GiftBox definition name by id (giftboxes.name), tenant-scoped + schema-guarded.
+async function giftboxNameById(slug: string, giftboxId: number, fallback: string): Promise<string> {
+  if (giftboxId <= 0) return fallback;
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftboxes",
+      columns: "name",
+      where: "id = ?",
+      params: [giftboxId],
+      limit: 1,
+    });
+    const name = String(rows[0]?.name ?? "").trim();
+    return name || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// Gift definition name for a gift INSTANCE (gift_instances.gift_id -> gifts.name),
+// tenant-scoped + schema-guarded. Used to label the "Omaggi" residuals section.
+async function giftNameByInstanceId(slug: string, instanceId: number, fallback: string): Promise<string> {
+  if (instanceId <= 0) return fallback;
+  try {
+    const instRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "gift_instances",
+      columns: "gift_id",
+      where: "id = ?",
+      params: [instanceId],
+      limit: 1,
+    });
+    const giftId = Number(instRows[0]?.gift_id ?? 0);
+    if (giftId <= 0) return fallback;
+    const giftRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "gifts",
+      columns: "name",
+      where: "id = ?",
+      params: [giftId],
+      limit: 1,
+    });
+    const name = String(giftRows[0]?.name ?? "").trim();
+    return name || fallback;
+  } catch {
+    return fallback;
+  }
 }

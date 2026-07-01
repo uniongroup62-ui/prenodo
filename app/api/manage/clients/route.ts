@@ -10,6 +10,7 @@ import {
   getManageClientDetail,
   listDbClients,
   quickBookClientContext,
+  quickBookClientResidualsDetail,
   unblockDbClient,
   updateDbClient,
 } from "@/lib/db-repositories";
@@ -81,6 +82,26 @@ export async function GET(request: Request) {
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");
+    }
+  }
+
+  // Quick-booking "Apri scheda" residuals DETAIL (read-only). Port of
+  // api_clients.php action=residuals's per-item payload, DISPLAY-ONLY: it feeds the
+  // drawer's #qbClientResidualsModal detail viewer with the five sections
+  // (Servizi/Omaggi/GiftBox/GiftCard/Pacchetti) + a Credito line, each with per-item
+  // detail (name, remaining, expiry, source sale #). The inline redeem SELECTION
+  // (per-service controls + giftcard/credit rows) lives on the drawer form, so this
+  // does NOT return the legacy modal's checkbox/data-* redeem attributes or its
+  // in-modal credit/giftcard entry controls (intentional divergence). An empty client
+  // returns empty sections + credit {available:0,count:0} — the modal's empty-state.
+  if (url.searchParams.get("action") === "residuals") {
+    const clientId = parseInteger(url.searchParams.get("client_id"));
+    if (clientId <= 0) return jsonError("client_id mancante.");
+    try {
+      const residuals = await quickBookClientResidualsDetail(tenantSlug, clientId);
+      return Response.json({ ok: true, sourceMode: "database", ...residuals });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore residui cliente.");
     }
   }
 
