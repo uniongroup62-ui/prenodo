@@ -24,6 +24,7 @@ import {
   dbWalletBalance,
   getDbAppointmentForEdit,
   listDbQuotes,
+  listFidelityCampaigns,
   previewDbCoupon,
   redeemDbGiftCard,
   refundDbGiftCard,
@@ -532,7 +533,11 @@ export async function checkoutManageSale(
   // Earn base = net after residui (see the fidelity-earn note above): the total minus the client's
   // own credit + GiftCard redeemed, so redeemed residui never generate fresh points.
   const earnBase = roundMoney(Math.max(0, total - residui.creditUsed - residui.giftcardUsed));
-  const pointsEarned = earnSettings.enabled && client.id > 0 ? earnFidelityPoints(earnBase, earnSettings.earnStep) : 0;
+  // Campaign-aware earn: points accrue only under the ACTIVE campaign for the sale date
+  // (no campaign => 0), using its step/tiers + min_spend + level eligibility; the
+  // campaign id is stamped on the sale (sales.fidelity_campaign_id).
+  const campaignEarn = earnSettings.enabled && client.id > 0 ? await computeCampaignEarn(slug, earnBase, client.id, earnSettings.earnStep) : { points: 0, campaignId: 0 };
+  const pointsEarned = campaignEarn.points;
 
   for (const item of items) {
     if (item.type === "product" && item.refId > 0 && item.status !== "ordered") {
@@ -568,6 +573,8 @@ export async function checkoutManageSale(
     fidelity_discount: redemption.discount,
     // Persist the points EARNED so a later void can reverse them (schema-guarded).
     fidelity_points_earned: pointsEarned,
+    // Stamp the campaign that produced the earn (schema-guarded).
+    fidelity_campaign_id: campaignEarn.campaignId > 0 ? campaignEarn.campaignId : null,
     // Persist the faithful base payment method. Schema-guarded: a no-op on installs
     // without the column (the notes marker keeps derivePayments correct regardless).
     payment_methods: JSON.stringify({ base: baseMethod }),
@@ -4224,6 +4231,44 @@ function earnFidelityPoints(amount: number, earnStep: number): number {
   const step = Number(earnStep) || 0;
   if (step <= 0 || value <= 0) return 0;
   return normalizePoints(value / step);
+}
+
+// Points for a tiered campaign: the highest tier whose min_spend <= amount.
+function tierPointsForSpend(amount: number, tiers: Array<{ minSpend: number; points: number }>): number {
+  let best = 0;
+  for (const t of tiers) if (amount + 0.0000001 >= Number(t.minSpend ?? 0)) best = Math.max(best, Number(t.points ?? 0));
+  return best;
+}
+
+// Campaign-aware earn (port of Fidelity::calcEarnPointsForAmountWithCampaign): when
+// the campaign module is present, points accrue ONLY under an ACTIVE campaign valid
+// for the sale date — no active campaign => 0 points. Applies the campaign's earn
+// step (amount mode) or tiers, its min_spend gate, and its card-level eligibility
+// (clients.fidelity_level). Returns the campaign id so the caller stamps
+// sales.fidelity_campaign_id. earnStepFallback is the businesses default step used
+// when the campaign leaves earn_step_euro at 0.
+async function computeCampaignEarn(slug: string, amount: number, clientId: number, earnStepFallback: number): Promise<{ points: number; campaignId: number }> {
+  if (amount <= 0.0000001) return { points: 0, campaignId: 0 };
+  const today = todayIso();
+  const campaign = (await listFidelityCampaigns(slug)).find(
+    (c) => c.active && (c.startsAt === "" || c.startsAt <= today) && (c.endsAt === "" || c.endsAt >= today),
+  );
+  if (!campaign) return { points: 0, campaignId: 0 };
+  if (campaign.eligibleLevels.length > 0) {
+    if (clientId <= 0) return { points: 0, campaignId: campaign.id };
+    const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "fidelity_level", where: "id = ?", params: [clientId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    const level = (String(rows[0]?.fidelity_level ?? "").trim().toLowerCase()) || "base";
+    if (!campaign.eligibleLevels.includes(level)) return { points: 0, campaignId: campaign.id };
+  }
+  if (campaign.minSpend > 0.0000001 && amount + 0.0000001 < campaign.minSpend) return { points: 0, campaignId: campaign.id };
+  let points = 0;
+  if (campaign.earnMode === "tiers") {
+    points = tierPointsForSpend(amount, campaign.tiers);
+  } else {
+    const step = campaign.earnStepEuro > 0 ? campaign.earnStepEuro : earnStepFallback;
+    points = step > 0 ? amount / step : 0;
+  }
+  return { points: normalizePoints(points), campaignId: campaign.id };
 }
 
 // SETTLE the fidelity for an appointment that just transitioned to 'done' — faithful port
