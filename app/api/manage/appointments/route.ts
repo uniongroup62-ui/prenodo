@@ -591,6 +591,9 @@ export async function POST(request: Request) {
 
     const dbAppointmentInput = {
       slug: tenantSlug,
+      // Prefer the drawer's selected client id (#qb_client_id) over the name so the save
+      // binds to the exact client — name resolution alone mis-binds when clients share a name.
+      clientId: parseOptionalId(body.client_id),
       clientName: String(body.client_name ?? body.client ?? ""),
       serviceName,
       serviceNames,

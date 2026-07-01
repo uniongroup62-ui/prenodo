@@ -1389,6 +1389,7 @@ function extractCouponMetaFromNotes(notes: unknown): { code: string; discount: n
 
 export async function createDbAppointment({
   slug,
+  clientId,
   clientName,
   serviceName,
   operator,
@@ -1421,6 +1422,9 @@ export async function createDbAppointment({
   couponDiscount,
 }: {
   slug: string;
+  // The SELECTED client id (#qb_client_id from the drawer). Preferred over clientName so a
+  // save binds to the exact client chosen, not the first name match (clients can share a name).
+  clientId?: number | null;
   clientName: string;
   serviceName: string;
   operator: string;
@@ -1441,7 +1445,7 @@ export async function createDbAppointment({
   couponCode?: string;
   couponDiscount?: number;
 } & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
-  const client = await resolveClientForAppointment(slug, clientName, locationId);
+  const client = await resolveClientForAppointment(slug, clientName, locationId, clientId);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
   const operatorStaffId = staff ? Number(staff.id ?? 0) : null;
   const normalizedTime = normalizeTime(time);
@@ -1648,6 +1652,7 @@ export async function createDbAppointment({
 export async function updateDbAppointment({
   slug,
   id,
+  clientId,
   clientName,
   serviceName,
   operator,
@@ -1670,6 +1675,7 @@ export async function updateDbAppointment({
 }: {
   slug: string;
   id: number;
+  clientId?: number | null;
   clientName: string;
   serviceName: string;
   operator: string;
@@ -1696,7 +1702,7 @@ export async function updateDbAppointment({
   const existingRows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id", where: "id = ?", params: [id], limit: 1 });
   if (!existingRows[0]) throw new Error("Appuntamento non trovato.");
 
-  const client = await resolveClientForAppointment(slug, clientName, locationId);
+  const client = await resolveClientForAppointment(slug, clientName, locationId, clientId);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
   const operatorStaffId = staff ? Number(staff.id ?? 0) : null;
   const normalizedTime = normalizeTime(time);
@@ -7239,7 +7245,14 @@ async function appointmentStaffName(slug: string, appointmentId: number): Promis
   }
 }
 
-async function resolveClientForAppointment(slug: string, clientName: string, locationId: number | null): Promise<{ id: number; name: string }> {
+async function resolveClientForAppointment(slug: string, clientName: string, locationId: number | null, clientId?: number | null): Promise<{ id: number; name: string }> {
+  // Prefer the SELECTED client id (the drawer posts #qb_client_id) so the save binds to the
+  // exact client chosen — resolving by name alone binds to the FIRST match, which is wrong
+  // when clients share a name (and would also create a duplicate when the name doesn't exist).
+  if (clientId && clientId > 0) {
+    const byId = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id,full_name", where: "id = ?", params: [clientId], limit: 1 });
+    if (byId[0]) return { id: Number(byId[0].id), name: String(byId[0].full_name) };
+  }
   const normalized = normalizeName(clientName, "Cliente");
   const existing = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id,full_name", where: "LOWER(full_name) = ?", params: [normalized.toLowerCase()], limit: 1 });
   if (existing[0]) return { id: Number(existing[0].id), name: String(existing[0].full_name) };
