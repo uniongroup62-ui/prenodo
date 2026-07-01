@@ -134,6 +134,7 @@ export function StockMovesContent() {
   const slug = tenantSlug();
   const [ctx, setCtx] = useState<ProductsContext | null>(null);
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(0);
 
   // Filter form state
   const [productId, setProductId] = useState(0);
@@ -176,6 +177,26 @@ export function StockMovesContent() {
   }, [load]);
 
   const activeLocationId = ctx?.activeLocationId ?? 0;
+
+  // Cancel ("Annulla movimento"): reverses the stock delta + recomputes incoming server-side
+  // (cancelStockDocument), then reloads the list. Confirm-gated.
+  async function cancelDoc(id: number) {
+    if (busyId) return;
+    if (typeof window !== "undefined" && !window.confirm("Annullare questo movimento? La giacenza verra stornata.")) return;
+    setBusyId(id);
+    try {
+      await fetch(`/api/manage/products?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "stock_doc_cancel", id }),
+      });
+      load(activeLocationId || undefined);
+    } catch {
+      // leave the list as-is on failure
+    } finally {
+      setBusyId(0);
+    }
+  }
   const categories: Category[] = useMemo(
     () => (ctx?.categories ?? []).map((c) => ({ id: Number(c.id), name: String(c.name ?? "") })),
     [ctx],
@@ -195,6 +216,29 @@ export function StockMovesContent() {
   );
   const supplierOptions = useMemo(() => suppliers.map((s) => ({ id: s.id, label: s.name })), [suppliers]);
 
+  // productId -> { categoryId, supplierName } from the global product list, so the doc rows can be
+  // filtered by category/supplier and can aggregate the categories/suppliers columns from their items.
+  const productMeta = useMemo(() => {
+    const m = new Map<number, { categoryId: number; supplierName: string }>();
+    for (const p of ctx?.products ?? []) m.set(Number(p.id), { categoryId: Number(p.categoryId ?? 0) || 0, supplierName: String(p.supplierName ?? "").trim() });
+    return m;
+  }, [ctx]);
+  const categoryNameById = useMemo(() => new Map(categories.map((c) => [c.id, c.name])), [categories]);
+  const supplierNameById = useMemo(() => new Map(suppliers.map((s) => [s.id, s.name])), [suppliers]);
+
+  // Distinct category / supplier names for a doc, derived from its items' products (the "Categorie"
+  // and "Fornitori" columns — faithful to the legacy GROUP_CONCAT DISTINCT aggregation).
+  const docCategories = useCallback((d: StockDocument): string[] => {
+    const set = new Set<string>();
+    for (const it of d.items) { const name = categoryNameById.get(productMeta.get(it.productId)?.categoryId ?? 0); if (name) set.add(name); }
+    return [...set];
+  }, [productMeta, categoryNameById]);
+  const docSuppliers = useCallback((d: StockDocument): string[] => {
+    const set = new Set<string>();
+    for (const it of d.items) { const s = productMeta.get(it.productId)?.supplierName ?? ""; if (s) set.add(s); }
+    return [...set];
+  }, [productMeta]);
+
   const docs: StockDocument[] = useMemo(() => ctx?.stockDocuments ?? [], [ctx]);
 
   // Client-side filtering driven by the applied filter state.
@@ -206,6 +250,15 @@ export function StockMovesContent() {
         const needle = applied.sku.trim().toLowerCase();
         if (!d.items.some((it) => (it.productSku ?? "").toLowerCase().includes(needle))) return false;
       }
+      // Category filter: keep the doc when any of its lines' products belong to the chosen category.
+      if (applied.categoryId) {
+        if (!d.items.some((it) => (productMeta.get(it.productId)?.categoryId ?? 0) === applied.categoryId)) return false;
+      }
+      // Supplier filter (the combobox value is a supplier id → match the product's supplier NAME).
+      if (applied.supplier) {
+        const supName = supplierNameById.get(applied.supplier) ?? "";
+        if (supName && !d.items.some((it) => (productMeta.get(it.productId)?.supplierName ?? "") === supName)) return false;
+      }
       if (applied.documentNumber.trim()) {
         if (!(d.documentNumber ?? "").toLowerCase().includes(applied.documentNumber.trim().toLowerCase())) return false;
       }
@@ -214,7 +267,7 @@ export function StockMovesContent() {
       }
       return true;
     });
-  }, [docs, applied]);
+  }, [docs, applied, productMeta, supplierNameById]);
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -403,14 +456,16 @@ export function StockMovesContent() {
                   filteredDocs.map((d) => {
                     const totalQty = d.items.reduce((acc, it) => acc + Number(it.qty || 0), 0);
                     const prodNames = d.items.map((it) => it.productName).filter(Boolean);
+                    const cats = docCategories(d);
+                    const sups = docSuppliers(d);
                     return (
                       <tr key={d.id} className={d.isCanceled ? "text-muted" : undefined}>
                         <td>{fmtDate(d.moveDate)}</td>
                         <td>{d.cause === "carico" ? "Carico" : "Scarico"}</td>
                         <td>{d.documentNumber || "—"}</td>
                         <td>{d.operatorName || "—"}</td>
-                        <td className="text-muted small">—</td>
-                        <td className="text-muted small">—</td>
+                        <td className="text-muted small">{cats.length ? cats.join(", ") : "—"}</td>
+                        <td className="text-muted small">{sups.length ? sups.join(", ") : "—"}</td>
                         <td className="text-muted small">{prodNames.length ? prodNames.join(", ") : "—"}</td>
                         <td>{totalQty}</td>
                         <td>
@@ -420,10 +475,23 @@ export function StockMovesContent() {
                             <span className="badge bg-success-subtle text-success">Attivo</span>
                           )}
                         </td>
-                        <td className="text-end">
+                        <td className="text-end costs-nowrap">
                           <a className="btn btn-sm btn-outline-secondary" href={href(`&action=view&id=${d.id}`)}>
                             Apri
                           </a>
+                          {!d.isCanceled ? (
+                            <>
+                              {" "}
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-outline-danger"
+                                disabled={busyId === d.id}
+                                onClick={() => cancelDoc(d.id)}
+                              >
+                                Annulla
+                              </button>
+                            </>
+                          ) : null}
                         </td>
                       </tr>
                     );
