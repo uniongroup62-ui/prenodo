@@ -8,6 +8,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 // pickup. Fed by the existing DB-backed /api/manage/preorders, plus the
 // locations and clients lists for the filter rail.
 
+type PreorderKind = "sale" | "package" | "giftbox";
+type PreorderStockStatus = "ready" | "partial" | "insufficient" | "expired";
+
 type Preorder = {
   id: number;
   clientId: number;
@@ -20,6 +23,19 @@ type Preorder = {
   status: "open" | "collected";
   createdAt?: string;
   collectedAt?: string;
+  // Multi-source fields from listDbPreorders (pos_preorders.php merge of
+  // sale_items ordered / client_packages products / giftbox products).
+  kind?: PreorderKind;
+  saleId?: number;
+  stock?: number;
+  stockStatus?: PreorderStockStatus;
+  sourceRef?: string;
+  sourceName?: string;
+  sourceCode?: string;
+  saleDate?: string;
+  expiresAt?: string;
+  expiryApplies?: boolean;
+  isExpired?: boolean;
 };
 
 type LocationItem = { id: number; name?: string };
@@ -35,6 +51,24 @@ function fmtDate(iso?: string): string {
   const d = iso.slice(0, 10);
   const [y, m, day] = d.split("-");
   return day && m && y ? `${day}/${m}/${y}` : "—";
+}
+
+// Tipo badge (source kind), mirroring pos_preorders.php $sourceBadge*.
+function kindBadge(kind?: PreorderKind): { cls: string; label: string } {
+  if (kind === "package") return { cls: "text-bg-primary", label: "Pacchetto" };
+  if (kind === "giftbox") return { cls: "text-bg-warning", label: "GiftBox" };
+  return { cls: "text-bg-warning", label: "Ordinato" };
+}
+
+// Stato badge from the computed stock status (pos_preorders.php $statusBadge*).
+function statusBadge(p: Preorder): { cls: string; label: string } {
+  if (p.isExpired || p.stockStatus === "expired") return { cls: "text-bg-danger", label: "Scaduto" };
+  const qty = Math.max(1, p.quantity || 1);
+  const stock = Math.max(0, p.stock ?? 0);
+  if (p.stockStatus === "ready" || stock >= qty) return { cls: "text-bg-success", label: "Pronto al ritiro" };
+  const collectMax = Math.max(0, Math.min(qty, stock));
+  if (collectMax > 0) return { cls: "text-bg-warning", label: `Ritiro parziale ${collectMax}/${qty}` };
+  return { cls: "text-bg-danger", label: "Stock insufficiente" };
 }
 
 export function PosPreordersContent() {
@@ -53,17 +87,21 @@ export function PosPreordersContent() {
   const [clientFilter, setClientFilter] = useState("");
   const [selectedClients, setSelectedClients] = useState<Record<number, boolean>>({});
   const [view, setView] = useState("active");
+  const [page, setPage] = useState(1);
+  const perPage = 50;
 
   const load = useCallback(() => {
     setLoading(true);
-    fetch(`/api/manage/preorders?slug=${encodeURIComponent(slug)}`, {
+    // Forward the selected location so the product stock is location-aware
+    // (mirrors pos_preorders.php app_product_stock_row). "0" = Tutte = base stock.
+    fetch(`/api/manage/preorders?slug=${encodeURIComponent(slug)}&location_id=${encodeURIComponent(locationId)}`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
       .then((j) => setPreorders(Array.isArray(j.preorders) ? j.preorders : []))
       .catch(() => setPreorders([]))
       .finally(() => setLoading(false));
-  }, [slug]);
+  }, [slug, locationId]);
 
   useEffect(() => {
     load();
@@ -77,31 +115,70 @@ export function PosPreordersContent() {
       .catch(() => {});
   }, [load, slug]);
 
-  // Apply the filter rail to the loaded preorders.
+  // Apply the filter rail to the loaded preorders. Mirrors _pos_pre_row_match:
+  // the period filter tests the SALE date, and the 8 views have the semantics of
+  // ready / not_ready / expired / sale|package|giftbox (source kind) / all|active.
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
     const clientIds = Object.entries(selectedClients)
       .filter(([, v]) => v)
       .map(([k]) => Number(k));
     return preorders.filter((p) => {
-      if (view === "active" && p.status !== "open") return false;
-      if (view === "ready" && p.status !== "open") return false;
-      if (from && p.dueDate && p.dueDate < from) return false;
-      if (to && p.dueDate && p.dueDate > to) return false;
+      // Client filter.
       if (clientIds.length > 0 && !clientIds.includes(p.clientId)) return false;
+
+      // Period filter on the SALE date (falls back to createdAt).
+      const saleDay = (p.saleDate || p.createdAt || "").slice(0, 10);
+      if (from && (!saleDay || saleDay < from)) return false;
+      if (to && (!saleDay || saleDay > to)) return false;
+
+      // View semantics.
+      const kind = p.kind ?? "sale";
+      const isExpired = !!p.isExpired;
+      const isReady = p.stockStatus === "ready";
+      const v = view;
+      if (v === "expired") {
+        if (!isExpired) return false;
+      } else if (v !== "all" && isExpired) {
+        // Non-"all"/"expired" views hide expired rows (like the PHP page).
+        return false;
+      }
+      if (v === "ready" && !isReady) return false;
+      if (v === "not_ready" && isReady) return false;
+      if ((v === "sale" || v === "package" || v === "giftbox") && kind !== v) return false;
+
+      // Free-text search across client, product, source and ids.
       if (term) {
-        const hay = `${p.clientName} ${p.productName} ${p.id}`.toLowerCase();
+        const hay = `${p.clientName} ${p.productName} ${p.sourceRef ?? ""} ${p.sourceName ?? ""} ${p.sourceCode ?? ""} ${p.saleId ?? ""} ${p.productId} ${p.clientId}`.toLowerCase();
         if (!hay.includes(term)) return false;
       }
       return true;
     });
   }, [preorders, view, from, to, selectedClients, q]);
 
-  // KPIs derived from the full preorders set (mirrors the PHP summary tiles).
-  const openCount = useMemo(() => preorders.filter((p) => p.status === "open").length, [preorders]);
+  // KPIs derived from the FILTERED set (mirrors the PHP summary tiles, which are
+  // computed over $filteredRows): open rows, pieces, ready and insufficient.
+  const openCount = filtered.length;
   const pieces = useMemo(
-    () => preorders.filter((p) => p.status === "open").reduce((sum, p) => sum + (p.quantity || 0), 0),
-    [preorders],
+    () => filtered.reduce((sum, p) => sum + (p.quantity || 0), 0),
+    [filtered],
+  );
+  const readyCount = useMemo(
+    () => filtered.filter((p) => p.stockStatus === "ready").length,
+    [filtered],
+  );
+  const notReadyCount = useMemo(
+    () => filtered.filter((p) => p.stockStatus !== "ready").length,
+    [filtered],
+  );
+
+  // 50/page pagination over the filtered set (pos_preorders.php $perPage = 50).
+  const totalRows = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / perPage));
+  const currentPage = Math.min(Math.max(1, page), totalPages);
+  const paged = useMemo(
+    () => filtered.slice((currentPage - 1) * perPage, currentPage * perPage),
+    [filtered, currentPage],
   );
 
   const selectedLocationName =
@@ -121,6 +198,7 @@ export function PosPreordersContent() {
     setClientFilter("");
     setSelectedClients({});
     setView("active");
+    setPage(1);
   }
 
   return (
@@ -161,13 +239,13 @@ export function PosPreordersContent() {
         <div className="col-12 col-sm-6 col-xl-3">
           <div className="card p-3 h-100">
             <div className="small text-muted">Pronti al ritiro</div>
-            <div className="h3 fw-semibold mb-0 text-success">0</div>
+            <div className="h3 fw-semibold mb-0 text-success">{readyCount}</div>
           </div>
         </div>
         <div className="col-12 col-sm-6 col-xl-3">
           <div className="card p-3 h-100">
             <div className="small text-muted">Con stock insufficiente</div>
-            <div className="h3 fw-semibold mb-0 ">0</div>
+            <div className={`h3 fw-semibold mb-0 ${notReadyCount > 0 ? "text-danger" : ""}`}>{notReadyCount}</div>
           </div>
         </div>
       </div>
@@ -210,7 +288,10 @@ export function PosPreordersContent() {
                     className="form-control form-control-sm"
                     name="from"
                     value={from}
-                    onChange={(e) => setFrom(e.target.value)}
+                    onChange={(e) => {
+                      setFrom(e.target.value);
+                      setPage(1);
+                    }}
                   />
                 </div>
                 <div className="col-6">
@@ -220,7 +301,10 @@ export function PosPreordersContent() {
                     className="form-control form-control-sm"
                     name="to"
                     value={to}
-                    onChange={(e) => setTo(e.target.value)}
+                    onChange={(e) => {
+                      setTo(e.target.value);
+                      setPage(1);
+                    }}
                   />
                 </div>
               </div>
@@ -254,7 +338,10 @@ export function PosPreordersContent() {
                 className="form-control form-control-sm"
                 name="q"
                 value={q}
-                onChange={(e) => setQ(e.target.value)}
+                onChange={(e) => {
+                  setQ(e.target.value);
+                  setPage(1);
+                }}
                 placeholder="Cliente, prodotto, SKU, vendita..."
               />
             </div>
@@ -299,9 +386,11 @@ export function PosPreordersContent() {
                         name="client_id[]"
                         value={String(c.id)}
                         checked={!!selectedClients[c.id]}
-                        onChange={(e) =>
-                          setSelectedClients((prev) => ({ ...prev, [c.id]: e.target.checked }))
-                        }
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setSelectedClients((prev) => ({ ...prev, [c.id]: checked }));
+                          setPage(1);
+                        }}
                       />
                       <span>{c.name}</span>
                     </label>
@@ -342,7 +431,10 @@ export function PosPreordersContent() {
                         name="view"
                         value={opt.value}
                         checked={view === opt.value}
-                        onChange={() => setView(opt.value)}
+                        onChange={() => {
+                          setView(opt.value);
+                          setPage(1);
+                        }}
                       />
                       <span>{opt.label}</span>
                     </label>
@@ -386,41 +478,133 @@ export function PosPreordersContent() {
                       </td>
                     </tr>
                   ) : (
-                    filtered.map((p) => (
-                      <tr key={p.id}>
-                        <td className="pos-preorders-col-purchase">{fmtDate(p.createdAt)}</td>
-                        <td className="pos-preorders-col-sale">
-                          <a href={`/${encodeURIComponent(slug)}/pos_sales?action=view&id=${p.id}`}>
-                            #{p.id}
-                          </a>
-                        </td>
-                        <td className="pos-preorders-col-type">—</td>
-                        <td className="pos-preorders-col-client">{p.clientName || "—"}</td>
-                        <td>{p.productName}</td>
-                        <td className="text-end pos-preorders-col-qty">{p.quantity}</td>
-                        <td className="text-end pos-preorders-col-stock">—</td>
-                        <td className="pos-preorders-col-status">
-                          {p.status === "collected" ? (
-                            <span className="badge text-bg-success">Ritirato</span>
-                          ) : (
-                            <span className="badge text-bg-warning text-dark">Ordinato</span>
-                          )}
-                        </td>
-                        <td className="text-end pos-preorders-col-actions">
-                          <a
-                            className="btn btn-sm btn-outline-secondary"
-                            href={`/${encodeURIComponent(slug)}/pos_sales?action=view&id=${p.id}`}
-                          >
-                            Dettaglio
-                          </a>
-                        </td>
-                      </tr>
-                    ))
+                    paged.map((p) => {
+                      const kb = kindBadge(p.kind);
+                      const sb = statusBadge(p);
+                      const qty = Math.max(1, p.quantity || 1);
+                      const stock = Math.max(0, p.stock ?? 0);
+                      const stockShort = stock < qty;
+                      const sourceDetail =
+                        p.sourceRef ||
+                        (p.kind === "package"
+                          ? "Pacchetto"
+                          : p.kind === "giftbox"
+                            ? "GiftBox"
+                            : `Vendita #${p.saleId ?? 0}`);
+                      const clientLabel =
+                        p.clientName ||
+                        (p.clientId > 0 ? `Cliente #${p.clientId}` : "Cliente non associato");
+                      const saleHref =
+                        p.saleId && p.saleId > 0
+                          ? `/${encodeURIComponent(slug)}/pos_sale_detail?id=${p.saleId}&back=preorders`
+                          : null;
+                      return (
+                        <tr key={p.id}>
+                          <td className="pos-preorders-col-purchase">
+                            <div className="fw-semibold">{fmtDate(p.saleDate || p.createdAt)}</div>
+                            {p.expiresAt && p.expiryApplies ? (
+                              <div className={`small ${p.isExpired ? "text-danger fw-semibold" : "text-muted"}`}>
+                                Scadenza: {fmtDate(p.expiresAt)}
+                              </div>
+                            ) : null}
+                          </td>
+                          <td className="pos-preorders-col-sale">
+                            <div className="fw-semibold">{p.saleId && p.saleId > 0 ? `#${p.saleId}` : "—"}</div>
+                          </td>
+                          <td className="pos-preorders-col-type">
+                            <div className="small mt-1">
+                              <span className={`badge ${kb.cls}`}>{kb.label}</span>
+                            </div>
+                            <div className="small text-muted">{sourceDetail}</div>
+                            {p.sourceName ? <div className="small text-muted">{p.sourceName}</div> : null}
+                          </td>
+                          <td className="pos-preorders-col-client">{clientLabel}</td>
+                          <td>
+                            <div className="fw-semibold">{p.productName}</div>
+                          </td>
+                          <td className="text-end pos-preorders-col-qty fw-semibold">{qty}</td>
+                          <td className={`text-end pos-preorders-col-stock ${stockShort ? "text-danger fw-semibold" : ""}`}>
+                            {stock}
+                          </td>
+                          <td className="pos-preorders-col-status">
+                            <div className="d-flex flex-column gap-1">
+                              <span className={`badge ${sb.cls}`}>{sb.label}</span>
+                            </div>
+                          </td>
+                          <td className="text-end pos-preorders-col-actions">
+                            <div className="d-flex justify-content-end gap-2 flex-wrap">
+                              {saleHref ? (
+                                <a className="btn btn-sm btn-outline-primary" href={saleHref}>
+                                  Dettaglio vendita
+                                </a>
+                              ) : (
+                                <span className="text-muted small">Nessuna vendita collegata</span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>
             </div>
           </div>
+
+          {totalRows > perPage ? (
+            <>
+              <nav className="mt-3" aria-label="Paginazione preordini">
+                <ul className="pagination mb-0 flex-wrap">
+                  <li className={`page-item ${currentPage <= 1 ? "disabled" : ""}`}>
+                    <a
+                      className="page-link"
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setPage(Math.max(1, currentPage - 1));
+                      }}
+                    >
+                      &laquo;
+                    </a>
+                  </li>
+                  {Array.from(
+                    { length: Math.min(totalPages, currentPage + 2) - Math.max(1, currentPage - 2) + 1 },
+                    (_, i) => Math.max(1, currentPage - 2) + i,
+                  ).map((i) => (
+                    <li className={`page-item ${i === currentPage ? "active" : ""}`} key={i}>
+                      <a
+                        className="page-link"
+                        href="#"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setPage(i);
+                        }}
+                      >
+                        {i}
+                      </a>
+                    </li>
+                  ))}
+                  <li className={`page-item ${currentPage >= totalPages ? "disabled" : ""}`}>
+                    <a
+                      className="page-link"
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setPage(Math.min(totalPages, currentPage + 1));
+                      }}
+                    >
+                      &raquo;
+                    </a>
+                  </li>
+                </ul>
+              </nav>
+              <div className="text-muted small mt-2">
+                Pagina {currentPage} di {totalPages} • {totalRows} preordini totali
+              </div>
+            </>
+          ) : totalRows > 0 ? (
+            <div className="text-muted small mt-2">{totalRows} preordini trovati.</div>
+          ) : null}
         </section>
       </div>
     </div>

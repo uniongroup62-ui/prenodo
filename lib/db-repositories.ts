@@ -36,6 +36,7 @@ import type {
   PosCheckoutInput,
   PosSaleItemInput,
   Preorder,
+  PreorderStockStatus,
   PosSale,
   PosSaleItem,
   PosSummary,
@@ -5387,14 +5388,441 @@ export async function consumeDbPrepaid(id: number, quantity: number, slug: strin
   return getSinglePrepaid(slug, id);
 }
 
-export async function listDbPreorders(slug: string): Promise<Preorder[]> {
-  const rows = await tenantSelect<RowDataPacket>({
-    slug,
-    table: "sale_items",
-    where: "item_type = 'product' AND (item_status = 'ordered' OR preorder_expires_at IS NOT NULL)",
-    orderBy: "id DESC",
+// Faithful port of app/pages/pos_preorders.php: the preorders list merges THREE
+// sources into one set of rows — sale_items with item_status='ordered'
+// (kind 'sale'), PRODUCT lines inside active client_packages (kind 'package'),
+// and PRODUCT lines inside issued/active giftbox instances (kind 'giftbox').
+// Each row carries the source SALE id (for the "Dettaglio vendita" link), a
+// location-aware product stock, and a computed stock status badge. All reads are
+// tenant-scoped (tenantSelect), schema-guarded, and cross-table linkage (sale id
+// for packages/giftboxes) is joined in memory to avoid cross-tenant raw joins.
+export async function listDbPreorders(slug: string, options: { locationId?: number } = {}): Promise<Preorder[]> {
+  const locationFilterId = Math.max(0, Number(options.locationId ?? 0));
+  const rows: Preorder[] = [];
+
+  // Whether preorder expiry actually applies to sale rows (PHP: PosSettings::preordersExpiryEnabled()).
+  let preordersExpiryEnabled = false;
+  try {
+    const settingsTable = await tenantTable(slug, "pos_settings").catch(() => null);
+    if (settingsTable) {
+      const settingRows = await tenantSelect<RowDataPacket>({ slug, table: "pos_settings", columns: "preorders_expiry_enabled", where: "id=1", limit: 1 }).catch(() => [] as RowDataPacket[]);
+      preordersExpiryEnabled = Number(settingRows[0]?.preorders_expiry_enabled ?? 0) === 1;
+    }
+  } catch {
+    preordersExpiryEnabled = false;
+  }
+
+  // Location-aware stock reader (mirrors app_product_stock_row): when a location
+  // is selected AND product_stocks exists, read that location's row; otherwise
+  // fall back to products.stock. Cached per (productId, locationId) within the call.
+  const stockCache = new Map<string, number>();
+  const hasProductStocks = locationFilterId > 0 && (await tenantTable(slug, "product_stocks").then(() => true).catch(() => false));
+  const productStockFor = async (productId: number, fallbackStock: number): Promise<number> => {
+    if (productId <= 0) return Math.max(0, fallbackStock);
+    if (locationFilterId <= 0 || !hasProductStocks) return Math.max(0, fallbackStock);
+    const key = `${productId}:${locationFilterId}`;
+    const cached = stockCache.get(key);
+    if (cached !== undefined) return cached;
+    const psRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "product_stocks",
+      columns: "stock",
+      where: "product_id=? AND location_id=?",
+      params: [productId, locationFilterId],
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    const value = Math.max(0, Number(psRows[0]?.stock ?? fallbackStock));
+    stockCache.set(key, value);
+    return value;
+  };
+
+  // Product metadata (name + base stock) for a set of product ids, tenant-scoped.
+  const productMetaFor = async (productIds: number[]): Promise<Map<number, { name: string; stock: number }>> => {
+    const map = new Map<number, { name: string; stock: number }>();
+    const ids = Array.from(new Set(productIds.filter((id) => id > 0)));
+    if (ids.length === 0) return map;
+    const metaRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "products",
+      columns: "id, name, stock",
+      where: `id IN (${ids.map(() => "?").join(",")})`,
+      params: ids,
+    }).catch(() => [] as RowDataPacket[]);
+    for (const meta of metaRows) {
+      const pid = Number(meta.id ?? 0);
+      if (pid > 0) map.set(pid, { name: String(meta.name ?? ""), stock: Number(meta.stock ?? 0) });
+    }
+    return map;
+  };
+
+  // Sales metadata: map sale id -> { date, locationId, cancelled }. Read for the
+  // sale ids referenced by any source so links/dates/location filters resolve in
+  // memory (no cross-tenant raw joins).
+  const saleMetaFor = async (saleIds: number[]): Promise<Map<number, { date: string; locationId: number; cancelled: boolean }>> => {
+    const map = new Map<number, { date: string; locationId: number; cancelled: boolean }>();
+    const ids = Array.from(new Set(saleIds.filter((id) => id > 0)));
+    if (ids.length === 0) return map;
+    const salesRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "sales",
+      columns: "id, sale_date, created_at, location_id, status",
+      where: `id IN (${ids.map(() => "?").join(",")})`,
+      params: ids,
+    }).catch(() => [] as RowDataPacket[]);
+    for (const s of salesRows) {
+      const sid = Number(s.id ?? 0);
+      if (sid <= 0) continue;
+      const cancelled = ["cancelled", "canceled", "annullata", "annullato"].includes(String(s.status ?? "").trim().toLowerCase());
+      map.set(sid, {
+        date: toIso(s.sale_date ?? s.created_at),
+        locationId: Number(s.location_id ?? 0),
+        cancelled,
+      });
+    }
+    return map;
+  };
+
+  const clientNameCache = new Map<number, string>();
+  const clientNameFor = async (clientId: number): Promise<string> => {
+    if (clientId <= 0) return "";
+    const cached = clientNameCache.get(clientId);
+    if (cached !== undefined) return cached;
+    const name = await appointmentClientName(slug, clientId);
+    const resolved = name === "Cliente" ? "" : name;
+    clientNameCache.set(clientId, resolved);
+    return resolved;
+  };
+
+  const stockStatusFor = (qty: number, stock: number, isExpired: boolean): PreorderStockStatus => {
+    if (isExpired) return "expired";
+    if (stock >= qty) return "ready";
+    if (stock > 0) return "partial";
+    return "insufficient";
+  };
+
+  const isRowExpired = (expiryApplies: boolean, expiresAt: string): boolean => {
+    if (!expiryApplies) return false;
+    const raw = String(expiresAt ?? "").trim();
+    if (raw === "") return false;
+    const ts = new Date(raw).getTime();
+    return !Number.isNaN(ts) && ts < Date.now();
+  };
+
+  // ---- Source 1: sale_items with item_status = 'ordered' ----
+  const saleItemsTable = await tenantTable(slug, "sale_items").catch(() => null);
+  const salesTable = await tenantTable(slug, "sales").catch(() => null);
+  const productsTable = await tenantTable(slug, "products").catch(() => null);
+  if (saleItemsTable && salesTable && productsTable) {
+    const hasItemStatus = await columnExists(saleItemsTable.name, "item_status");
+    if (hasItemStatus) {
+      const siRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "sale_items",
+        columns: "id, sale_id, item_id, item_name, qty, item_status, preorder_expires_at",
+        where: "item_type='product' AND COALESCE(item_id,0) > 0 AND LOWER(TRIM(COALESCE(item_status,''))) IN ('ordered','ordinato')",
+        orderBy: "id DESC",
+      }).catch(() => [] as RowDataPacket[]);
+
+      const saleMeta = await saleMetaFor(siRows.map((r) => Number(r.sale_id ?? 0)));
+      const productMeta = await productMetaFor(siRows.map((r) => Number(r.item_id ?? 0)));
+      // Client id comes from the sale (PHP joins sales.client_id); resolve in memory.
+      const saleClientMap = new Map<number, number>();
+      const saleIdsForClients = Array.from(new Set(siRows.map((r) => Number(r.sale_id ?? 0)).filter((id) => id > 0)));
+      if (saleIdsForClients.length > 0) {
+        const saleClientRows = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "sales",
+          columns: "id, client_id",
+          where: `id IN (${saleIdsForClients.map(() => "?").join(",")})`,
+          params: saleIdsForClients,
+        }).catch(() => [] as RowDataPacket[]);
+        for (const s of saleClientRows) saleClientMap.set(Number(s.id ?? 0), Number(s.client_id ?? 0));
+      }
+
+      for (const row of siRows) {
+        const saleId = Number(row.sale_id ?? 0);
+        const productId = Number(row.item_id ?? 0);
+        if (productId <= 0) continue;
+        const meta = saleMeta.get(saleId);
+        if (meta?.cancelled) continue;
+        if (locationFilterId > 0 && (meta?.locationId ?? 0) !== locationFilterId) continue;
+        const pMeta = productMeta.get(productId);
+        const productName = (pMeta?.name || String(row.item_name ?? "")).trim() || `Prodotto #${productId}`;
+        const qty = Math.max(1, Number(row.qty ?? 1));
+        const stock = await productStockFor(productId, Number(pMeta?.stock ?? 0));
+        const clientId = saleClientMap.get(saleId) ?? 0;
+        const expiresAt = String(row.preorder_expires_at ?? "").slice(0, 10);
+        const isExpired = isRowExpired(preordersExpiryEnabled, String(row.preorder_expires_at ?? ""));
+        rows.push({
+          id: Number(row.id ?? 0),
+          clientId,
+          clientName: await clientNameFor(clientId),
+          productId,
+          productName,
+          quantity: qty,
+          deposit: 0,
+          dueDate: expiresAt || "",
+          status: String(row.item_status ?? "") === "collected" ? "collected" : "open",
+          createdAt: meta?.date ?? toIso(null),
+          kind: "sale",
+          saleId: saleId > 0 ? saleId : undefined,
+          stock,
+          stockStatus: stockStatusFor(qty, stock, isExpired),
+          sourceRef: `Vendita #${saleId}`,
+          sourceName: "",
+          sourceCode: "",
+          saleDate: meta?.date ?? "",
+          expiresAt: expiresAt || undefined,
+          expiryApplies: preordersExpiryEnabled,
+          isExpired,
+        });
+      }
+    }
+  }
+
+  // ---- Source 2: PRODUCT lines inside active client packages ----
+  const cpTable = await tenantTable(slug, "client_packages").catch(() => null);
+  const cpItemsTable = await tenantTable(slug, "client_package_items").catch(() => null);
+  if (cpTable && cpItemsTable && productsTable) {
+    const cpRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_packages",
+      columns: "id, client_id, package_id, package_name, purchase_date, start_date, created_at, expires_at, status, location_id, sale_id",
+      orderBy: "id DESC",
+    }).catch(() => [] as RowDataPacket[]);
+
+    const activeCps = cpRows.filter((cp) => {
+      const status = String(cp.status ?? "active").trim().toLowerCase();
+      if (status !== "active") return false;
+      const expiresAt = String(cp.expires_at ?? "").trim();
+      if (/^\d{4}-\d{2}-\d{2}/.test(expiresAt) && expiresAt.slice(0, 10) < todayIso()) return false;
+      return true;
+    });
+
+    if (activeCps.length > 0) {
+      const cpById = new Map<number, RowDataPacket>();
+      for (const cp of activeCps) cpById.set(Number(cp.id ?? 0), cp);
+      const cpIds = Array.from(cpById.keys());
+      const cpItemRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "client_package_items",
+        columns: "id, client_package_id, item_type, item_id, qty, item_name_snapshot",
+        where: `client_package_id IN (${cpIds.map(() => "?").join(",")}) AND item_type='product' AND COALESCE(item_id,0) > 0`,
+        params: cpIds,
+      }).catch(() => [] as RowDataPacket[]);
+
+      const productMeta = await productMetaFor(cpItemRows.map((r) => Number(r.item_id ?? 0)));
+      const saleMeta = await saleMetaFor(activeCps.map((cp) => Number(cp.sale_id ?? 0)));
+
+      for (const item of cpItemRows) {
+        const cp = cpById.get(Number(item.client_package_id ?? 0));
+        if (!cp) continue;
+        const productId = Number(item.item_id ?? 0);
+        if (productId <= 0) continue;
+        // Package location gate (PHP _pos_pre_client_package_allowed_for_location).
+        if (locationFilterId > 0) {
+          const pkgLocationId = Number(cp.location_id ?? 0);
+          const saleId0 = Number(cp.sale_id ?? 0);
+          const saleLocationId = saleId0 > 0 ? saleMeta.get(saleId0)?.locationId ?? 0 : 0;
+          const effectiveLoc = pkgLocationId > 0 ? pkgLocationId : saleLocationId;
+          if (effectiveLoc > 0 && effectiveLoc !== locationFilterId) continue;
+        }
+        const pMeta = productMeta.get(productId);
+        const productName = (String(item.item_name_snapshot ?? "").trim() || pMeta?.name || "").trim() || `Prodotto #${productId}`;
+        const qty = Math.max(1, Number(item.qty ?? 1));
+        const stock = await productStockFor(productId, Number(pMeta?.stock ?? 0));
+        const clientId = Number(cp.client_id ?? 0);
+        const pkgId = Number(cp.id ?? 0);
+        const saleId = Number(cp.sale_id ?? 0);
+        const expiresAt = String(cp.expires_at ?? "").slice(0, 10);
+        const isExpired = isRowExpired(true, String(cp.expires_at ?? ""));
+        const saleDt = toIso(cp.purchase_date ?? cp.start_date ?? cp.created_at);
+        rows.push({
+          // Encode source in the id so merged keys stay unique across kinds.
+          id: 2_000_000_000 + pkgId * 1000 + Number(item.id ?? 0) % 1000,
+          clientId,
+          clientName: await clientNameFor(clientId),
+          productId,
+          productName,
+          quantity: qty,
+          deposit: 0,
+          dueDate: expiresAt || "",
+          status: "open",
+          createdAt: saleDt,
+          kind: "package",
+          saleId: saleId > 0 ? saleId : undefined,
+          stock,
+          stockStatus: stockStatusFor(qty, stock, isExpired),
+          sourceRef: `Pacchetto CP#${pkgId}`,
+          sourceName: String(cp.package_name ?? ""),
+          sourceCode: `CP#${pkgId}`,
+          saleDate: saleDt,
+          expiresAt: expiresAt || undefined,
+          expiryApplies: true,
+          isExpired,
+        });
+      }
+    }
+  }
+
+  // ---- Source 3: PRODUCT lines inside issued/active giftbox instances ----
+  const gbInstTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
+  const gbItemsTable = await tenantTable(slug, "giftbox_instance_items").catch(() => null);
+  if (gbInstTable && gbItemsTable && productsTable) {
+    const gbRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftbox_instances",
+      columns: "id, giftbox_id, code, client_id, recipient_client_id, status, issued_at, expires_at, updated_at",
+      orderBy: "id DESC",
+    }).catch(() => [] as RowDataPacket[]);
+
+    const activeInstances = gbRows.filter((gi) => {
+      const status = String(gi.status ?? "issued").trim().toLowerCase();
+      if (!["issued", "active"].includes(status)) return false;
+      const expiresAt = String(gi.expires_at ?? "").trim();
+      if (expiresAt !== "") {
+        const ts = new Date(expiresAt).getTime();
+        if (!Number.isNaN(ts) && ts < Date.now()) return false;
+      }
+      return true;
+    });
+
+    if (activeInstances.length > 0) {
+      const instById = new Map<number, RowDataPacket>();
+      for (const gi of activeInstances) instById.set(Number(gi.id ?? 0), gi);
+      const instIds = Array.from(instById.keys());
+      const gbItemRows = await tenantSelect<RowDataPacket>({
+        slug,
+        table: "giftbox_instance_items",
+        columns: "id, instance_id, giftbox_item_id, item_type, product_id, qty",
+        where: `instance_id IN (${instIds.map(() => "?").join(",")}) AND item_type='product' AND COALESCE(product_id,0) > 0`,
+        params: instIds,
+      }).catch(() => [] as RowDataPacket[]);
+
+      // Redeemed qty per (instance, giftbox_item), tenant-scoped, joined in memory.
+      const redeemMap = new Map<string, number>();
+      const gbRedTable = await tenantTable(slug, "giftbox_redemptions").catch(() => null);
+      const gbRedItemsTable = await tenantTable(slug, "giftbox_redemption_items").catch(() => null);
+      if (gbRedTable && gbRedItemsTable && instIds.length > 0) {
+        const redRows = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "giftbox_redemptions",
+          columns: "id, instance_id",
+          where: `instance_id IN (${instIds.map(() => "?").join(",")})`,
+          params: instIds,
+        }).catch(() => [] as RowDataPacket[]);
+        const redIdToInstance = new Map<number, number>();
+        for (const rr of redRows) redIdToInstance.set(Number(rr.id ?? 0), Number(rr.instance_id ?? 0));
+        const redIds = Array.from(redIdToInstance.keys());
+        if (redIds.length > 0) {
+          const redItemRows = await tenantSelect<RowDataPacket>({
+            slug,
+            table: "giftbox_redemption_items",
+            columns: "redemption_id, giftbox_item_id, qty",
+            where: `redemption_id IN (${redIds.map(() => "?").join(",")})`,
+            params: redIds,
+          }).catch(() => [] as RowDataPacket[]);
+          for (const ri of redItemRows) {
+            const instanceId = redIdToInstance.get(Number(ri.redemption_id ?? 0)) ?? 0;
+            const gbItemId = Number(ri.giftbox_item_id ?? 0);
+            if (instanceId <= 0 || gbItemId <= 0) continue;
+            const key = `${instanceId}:${gbItemId}`;
+            redeemMap.set(key, (redeemMap.get(key) ?? 0) + Math.max(0, Number(ri.qty ?? 0)));
+          }
+        }
+      }
+
+      const productMeta = await productMetaFor(gbItemRows.map((r) => Number(r.product_id ?? 0)));
+      // Resolve source sale ids for giftboxes by code (notes/item_name LIKE '%CODE%'), in memory.
+      const codeToSaleId = new Map<string, number>();
+      const codes = Array.from(new Set(activeInstances.map((gi) => String(gi.code ?? "").trim().toUpperCase()).filter((c) => c !== "")));
+      if (codes.length > 0 && saleItemsTable) {
+        const gbSaleItemRows = await tenantSelect<RowDataPacket>({
+          slug,
+          table: "sale_items",
+          columns: "sale_id, item_name",
+          where: `(${codes.map(() => "UPPER(item_name) LIKE ?").join(" OR ")})`,
+          params: codes.map((code) => `%${code}%`),
+          orderBy: "sale_id DESC",
+        }).catch(() => [] as RowDataPacket[]);
+        for (const gsi of gbSaleItemRows) {
+          const name = String(gsi.item_name ?? "").toUpperCase();
+          const saleId = Number(gsi.sale_id ?? 0);
+          if (saleId <= 0) continue;
+          for (const code of codes) {
+            if (!codeToSaleId.has(code) && name.includes(code)) codeToSaleId.set(code, saleId);
+          }
+        }
+      }
+
+      for (const item of gbItemRows) {
+        const gi = instById.get(Number(item.instance_id ?? 0));
+        if (!gi) continue;
+        const productId = Number(item.product_id ?? 0);
+        const instanceId = Number(item.instance_id ?? 0);
+        const gbItemId = Number(item.giftbox_item_id ?? 0);
+        if (productId <= 0 || instanceId <= 0 || gbItemId <= 0) continue;
+        const qtyTotal = Math.max(1, Number(item.qty ?? 1));
+        const qtyRedeemed = Math.max(0, redeemMap.get(`${instanceId}:${gbItemId}`) ?? 0);
+        const qtyRemaining = Math.max(0, qtyTotal - qtyRedeemed);
+        if (qtyRemaining <= 0) continue;
+        const pMeta = productMeta.get(productId);
+        const productName = (pMeta?.name || "").trim() || `Prodotto #${productId}`;
+        const stock = await productStockFor(productId, Number(pMeta?.stock ?? 0));
+        const clientId = Math.max(0, Number(gi.recipient_client_id ?? 0)) || Math.max(0, Number(gi.client_id ?? 0));
+        const code = String(gi.code ?? "").trim();
+        const saleId = codeToSaleId.get(code.toUpperCase()) ?? 0;
+        // Giftbox location filter: gate by the resolved source-sale's location.
+        if (locationFilterId > 0) {
+          const saleLoc = saleId > 0 ? (await saleMetaFor([saleId])).get(saleId)?.locationId ?? 0 : 0;
+          if (saleLoc > 0 && saleLoc !== locationFilterId) continue;
+        }
+        const expiresAt = String(gi.expires_at ?? "").slice(0, 10);
+        const isExpired = isRowExpired(true, String(gi.expires_at ?? ""));
+        const saleDt = toIso(gi.issued_at ?? gi.updated_at);
+        rows.push({
+          id: 3_000_000_000 + instanceId * 1000 + Number(item.id ?? 0) % 1000,
+          clientId,
+          clientName: await clientNameFor(clientId),
+          productId,
+          productName,
+          quantity: qtyRemaining,
+          deposit: 0,
+          dueDate: expiresAt || "",
+          status: "open",
+          createdAt: saleDt,
+          kind: "giftbox",
+          saleId: saleId > 0 ? saleId : undefined,
+          stock,
+          stockStatus: stockStatusFor(qtyRemaining, stock, isExpired),
+          sourceRef: `GiftBox ${code !== "" ? code : `#${instanceId}`}`,
+          sourceName: "",
+          sourceCode: code,
+          saleDate: saleDt,
+          expiresAt: expiresAt || undefined,
+          expiryApplies: true,
+          isExpired,
+        });
+      }
+    }
+  }
+
+  // Sort by sale date ASC, then kind, then sale id, then id (PHP _pos_pre_sort_rows).
+  const kindRank = (k?: string): number => (k === "sale" ? 0 : k === "package" ? 1 : k === "giftbox" ? 2 : 3);
+  rows.sort((a, b) => {
+    const ta = a.saleDate ? new Date(a.saleDate).getTime() : Number.MAX_SAFE_INTEGER;
+    const tb = b.saleDate ? new Date(b.saleDate).getTime() : Number.MAX_SAFE_INTEGER;
+    if (ta !== tb) return ta - tb;
+    const ra = kindRank(a.kind);
+    const rb = kindRank(b.kind);
+    if (ra !== rb) return ra - rb;
+    const sa = a.saleId ?? 0;
+    const sb = b.saleId ?? 0;
+    if (sa !== sb) return sa - sb;
+    return a.id - b.id;
   });
-  return Promise.all(rows.map((row) => mapPreorder(slug, row)));
+
+  return rows;
 }
 
 export async function createDbPreorder(

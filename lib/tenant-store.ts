@@ -401,6 +401,12 @@ export type ClientPrepaid = {
 
 export type PreorderStatus = "open" | "collected" | "cancelled";
 
+// Row-level fulfilment kind and stock status, mirroring the legacy pos_preorders.php
+// which merges three sources (sale_items ordered / client_packages products /
+// giftbox_instance_items products) and computes a per-row stock badge.
+export type PreorderKind = "sale" | "package" | "giftbox";
+export type PreorderStockStatus = "ready" | "partial" | "insufficient" | "expired";
+
 export type Preorder = {
   id: number;
   clientId: number;
@@ -413,6 +419,19 @@ export type Preorder = {
   status: PreorderStatus;
   createdAt: string;
   collectedAt?: string;
+  // Optional multi-source fields (populated by listDbPreorders; the legacy
+  // create/collect paths leave them undefined and keep the classic shape).
+  kind?: PreorderKind;
+  saleId?: number;
+  stock?: number;
+  stockStatus?: PreorderStockStatus;
+  sourceRef?: string;
+  sourceName?: string;
+  sourceCode?: string;
+  saleDate?: string;
+  expiresAt?: string;
+  expiryApplies?: boolean;
+  isExpired?: boolean;
 };
 
 export type CouponType = "fixed" | "percent";
