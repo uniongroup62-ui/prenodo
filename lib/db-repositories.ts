@@ -2056,7 +2056,10 @@ export type AppointmentEditPayload = {
   clientEmail: string;
   clientPhone: string;
   locationId: number | null;
-  services: Array<{ serviceId: number; name: string }>;
+  // Item D: `price` is the BOOKED per-service price (appointment_services.price snapshot), so the
+  // drawer's price panel restores each existing line at the price it was booked at instead of the
+  // current catalog price. Optional (older single-service rows without a snapshot omit it).
+  services: Array<{ serviceId: number; name: string; price?: number }>;
   staffMap: Record<number, number>;
   cabinMap: Record<number, number>;
   primaryCabinId: number | null;
@@ -2219,7 +2222,8 @@ export async function getDbAppointmentForEdit(slug: string, id: number): Promise
   const serviceLines = await appointmentServiceLines(slug, row);
   const services = serviceLines
     .filter((line) => line.serviceId > 0)
-    .map((line) => ({ serviceId: line.serviceId, name: line.name }));
+    // Item D: carry the BOOKED price snapshot so the drawer restores it (see the type note).
+    .map((line) => ({ serviceId: line.serviceId, name: line.name, price: roundMoney(Number(line.price ?? 0)) }));
 
   // Per-service operator + cabin maps from appointment_segments (the only place the
   // per-service staff/cabin assignment is persisted; rebuilt on every save). Keyed by
@@ -5030,12 +5034,42 @@ export async function createDbCoupon(input: Partial<CouponRule>, slug: string): 
   return getSingleCoupon(slug, id);
 }
 
-export async function previewDbCoupon(code: string, subtotal: number, slug: string): Promise<{ valid: boolean; discount: number; reason: string; coupon?: CouponRule }> {
+// Optional booking context forwarded from the quick-booking drawer's coupon preview
+// (port of the legacy api_appointments action=coupon_preview inputs). Every field is
+// optional so the plain (code, subtotal, slug) call from the POS still works unchanged.
+// Currently only `apptDate` affects the outcome — the coupon active-window is validated
+// AS OF the appointment date (like the legacy coupon_validate_row($appt_date)) instead of
+// today, so a coupon that is valid on the booked day previews correctly. The remaining
+// fields (serviceIds, locationId, clientId, appointmentId) are accepted for forward-compat
+// (the migrated Postgres coupons have no per-scope / per-client / per-location restriction
+// columns, so they do not yet change the result — see the TODO).
+export type CouponPreviewContext = {
+  serviceIds?: number[];
+  locationId?: number | null;
+  clientId?: number | null;
+  appointmentId?: number | null;
+  apptDate?: string | null;
+  apptTime?: string | null;
+};
+
+export async function previewDbCoupon(
+  code: string,
+  subtotal: number,
+  slug: string,
+  context?: CouponPreviewContext,
+): Promise<{ valid: boolean; discount: number; reason: string; coupon?: CouponRule }> {
   const coupon = await getCouponByCode(slug, code);
   if (!coupon) return { valid: false, discount: 0, reason: "Coupon non trovato." };
-  if (!coupon.active || !activeWindow(coupon.startsAt, coupon.endsAt)) return { valid: false, discount: 0, reason: "Coupon non attivo.", coupon };
+  // Validate the active window AS OF the appointment date when supplied (legacy parity);
+  // fall back to today otherwise. A malformed date is ignored (uses today).
+  const rawDate = String(context?.apptDate ?? "").trim();
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : undefined;
+  if (!coupon.active || !activeWindow(coupon.startsAt, coupon.endsAt, asOf)) return { valid: false, discount: 0, reason: "Coupon non attivo.", coupon };
   if (coupon.usageLimit > 0 && coupon.usedCount >= coupon.usageLimit) return { valid: false, discount: 0, reason: "Coupon esaurito.", coupon };
   if (subtotal < coupon.minSubtotal) return { valid: false, discount: 0, reason: "Minimo carrello non raggiunto.", coupon };
+  // TODO(coupon apply_scope): the legacy also honours the coupon's apply_scope (restricting
+  // the eligible subtotal to a service/product allow-list) and per-location/per-client rules.
+  // The migrated coupons table has no such columns yet, so the whole payable subtotal is used.
   return { valid: true, discount: discountValue(coupon.type, coupon.value, subtotal), reason: "Coupon valido.", coupon };
 }
 
@@ -7837,9 +7871,9 @@ function normalizeCouponCode(value: string): string {
   return value.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
 }
 
-function activeWindow(startsAt: string, endsAt: string): boolean {
-  const today = todayIso();
-  return (!startsAt || startsAt <= today) && (!endsAt || endsAt >= today);
+function activeWindow(startsAt: string, endsAt: string, asOf?: string): boolean {
+  const day = asOf && /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? asOf : todayIso();
+  return (!startsAt || startsAt <= day) && (!endsAt || endsAt >= day);
 }
 
 function discountValue(type: CouponType, value: number, subtotal: number): number {

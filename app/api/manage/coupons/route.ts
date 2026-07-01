@@ -87,7 +87,23 @@ export async function POST(request: Request) {
 
     const code = body.code ?? "";
     const subtotal = parseNumber(body.subtotal, 0);
-    const preview = await previewDbCoupon(code, subtotal, tenantSlug);
+    // Booking context forwarded by the quick-booking drawer (port of the legacy
+    // action=coupon_preview inputs): service ids, location, appointment date/time, client id
+    // and the editing appointment id. All optional + backward-compatible — the POS preview
+    // (which posts only { code, subtotal }) is unchanged. Currently only appt_date changes the
+    // outcome (active-window validated as of the booked day); see previewDbCoupon.
+    const serviceIds = String(body.service_ids ?? "")
+      .split(",")
+      .map((v) => parseInteger(v, 0))
+      .filter((n) => n > 0);
+    const preview = await previewDbCoupon(code, subtotal, tenantSlug, {
+      serviceIds,
+      locationId: parseInteger(body.location_id, 0) || null,
+      clientId: parseInteger(body.client_id, 0) || null,
+      appointmentId: parseInteger(body.appointment_id, 0) || null,
+      apptDate: typeof body.appt_date === "string" ? body.appt_date : null,
+      apptTime: typeof body.appt_time === "string" ? body.appt_time : null,
+    });
     return Response.json({ ok: true, source: "coupons?action=preview", sourceMode: "database", preview, coupons: await listDbCoupons(tenantSlug) });
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore coupon.");

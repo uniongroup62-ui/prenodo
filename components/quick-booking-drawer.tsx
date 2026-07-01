@@ -93,7 +93,10 @@ type AppointmentEditPayload = {
   clientEmail: string;
   clientPhone: string;
   locationId: number | null;
-  services: Array<{ serviceId: number; name: string }>;
+  // Item D: each line carries its BOOKED per-service price (appointment_services.price) so the
+  // price panel restores the price as booked, not the current catalog price (which may have
+  // changed since). `price` is optional for backward-compat (older payloads omitted it).
+  services: Array<{ serviceId: number; name: string; price?: number }>;
   staffMap: Record<number, number>;
   cabinMap: Record<number, number>;
   primaryCabinId: number | null;
@@ -175,6 +178,32 @@ function minToTime(min: number): string {
 
 function lower(value: string): string {
   return value.trim().toLowerCase();
+}
+
+// Item C: normalize + map an appointment status to a Bootstrap badge (port of
+// qbNormalizeAppointmentStatus + qbBadgeForStatus, app.js ~3634-3651). Same colour classes
+// (warning/primary/success/secondary/dark) + Italian labels the legacy uses.
+function normalizeApptStatus(status: string): string {
+  const s = lower(status);
+  if (s === "rejected" || s === "rifiutato" || s === "rifiutata") return "canceled";
+  if (s === "no show" || s === "no-show" || s === "noshow" || s === "non presentato" || s === "non presentata") return "no_show";
+  return s;
+}
+function badgeForStatus(status: string): { cls: string; label: string } {
+  switch (normalizeApptStatus(status)) {
+    case "pending":
+      return { cls: "warning", label: "In attesa" };
+    case "scheduled":
+      return { cls: "primary", label: "Prenotato" };
+    case "done":
+      return { cls: "success", label: "Eseguito" };
+    case "canceled":
+      return { cls: "secondary", label: "Annullato" };
+    case "no_show":
+      return { cls: "dark", label: "No show" };
+    default:
+      return { cls: "secondary", label: status || "—" };
+  }
 }
 
 // EUR formatting, faithful to app.js fmtEUR ("€ 1.234,56", it-IT).
@@ -496,6 +525,15 @@ export function QuickBookingDrawer() {
   const [discountType, setDiscountType] = useState<string>("");
   const [discountValue, setDiscountValue] = useState<string>("");
 
+  // ---- Item D: BOOKED per-service prices (port of qbApplyServiceSnapshotLine ~6466) ----
+  // On edit, the price panel recomputes each line from the CURRENT catalog price. To show the
+  // prices AS BOOKED (which diverge only when a service price changed since booking), this maps
+  // serviceId -> the booked price snapshot (appointment_services.price) from the action=get
+  // payload. The recompute prefers this over the catalog price for lines that were part of the
+  // original booking; a service ADDED during the edit has no entry and uses its current price.
+  // Reset by resetForm / on a new open; populated only from the edit-load payload.
+  const [bookedPriceByService, setBookedPriceByService] = useState<Record<number, number>>({});
+
   // ---- COUPON (#qbCouponToggle / #qbCouponBox / #qb_coupon_code / #qb_coupon_discount) ----
   // Port of app.js qbApplyCouponPreview + the coupon Apply/Remove buttons. `couponBoxOpen`
   // reveals #qbCouponBox; `couponInput` is the text the staff types; `couponCode` +
@@ -510,6 +548,10 @@ export function QuickBookingDrawer() {
   const [couponMsg, setCouponMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [couponApplying, setCouponApplying] = useState(false);
   const couponReqRef = useRef(0);
+  // The payable-service signature the currently applied coupon was validated against, so the
+  // revalidation effect (port of qbRevalidateCouponIfNeeded) only re-runs the preview when the
+  // service selection ACTUALLY changes — never on every render (guards against a re-render loop).
+  const couponValidatedSigRef = useRef<string>("");
 
   // ---- FIDELITY points use (#qbFidelityBox / #qb_fidelity_points_use) — Block 4 ----
   // The client's redeem context (from quickbook_client_context): whether redeem is enabled,
@@ -522,6 +564,15 @@ export function QuickBookingDrawer() {
   const [fidelityMinPoints, setFidelityMinPoints] = useState<number>(0);
   const [fidelityPointsAvailable, setFidelityPointsAvailable] = useState<number>(0);
   const [fidelityInput, setFidelityInput] = useState<string>("");
+  // Item E: the "Usa sconto Punti Fidelity" toggle (#qbFidelityToggle / View.php:1433). When OFF
+  // (the default) the points input is collapsed and NO fidelity discount is applied, regardless
+  // of a stale points figure; turning it ON reveals the input. Reset OFF by resetForm / on client
+  // change; turned ON automatically on edit when the loaded appointment already used points.
+  // TODO(fidelity choice): the legacy also has the advanced "Scelta cliente" radios
+  // (qbApplyFidelityChoice — discount vs GIFT-reward vs redeem-later, gated by the business
+  // conflict_policy='choice') + the separate gift-points-use field. That fidelity-gift redeem is
+  // an advanced feature and is intentionally NOT ported here — only the simple on/off toggle is.
+  const [fidelityUseOn, setFidelityUseOn] = useState<boolean>(false);
 
   // ---- CREDIT use (#qbCreditRow / #qb_credit_use) — Block 4 ----
   // The client's spendable credit balance (clients.credit_balance) + the raw amount text the
@@ -709,6 +760,13 @@ export function QuickBookingDrawer() {
     holdTokenRef.current = holdToken;
   }, [holdToken]);
 
+  // Item B (port of qbApplyPendingCalendarSlot ~9841): when the drawer is opened from a
+  // calendar empty-cell (data-qb-date/time seeded), the availability hold should auto-run once
+  // a service + operator are resolvable — the operator no longer has to click "Disponibilità".
+  // This ref is armed in the open handler for a valid calendar-slot prefill and CONSUMED (set
+  // false) the moment the auto-hold effect fires, so it runs at most once per calendar open.
+  const pendingCalendarSlotRef = useRef<boolean>(false);
+
   // Item 1: drop the local held token AND release it on the server in one place, so every
   // caller that invalidates a held slot (close/reset, operator/cabin/location/service/date/
   // time change) both clears the input and frees the technical hold. Reads the latest token
@@ -722,6 +780,7 @@ export function QuickBookingDrawer() {
 
   // Reset the whole form to "new appointment" defaults (port of qbResetForm).
   const resetForm = useCallback(() => {
+    pendingCalendarSlotRef.current = false; // disarm any calendar-slot auto-hold (Item B)
     setClient(null);
     // Hide + reset the client history/residuals boxes and drop any in-flight
     // context fetch (port: the boxes only show for a selected client).
@@ -736,6 +795,7 @@ export function QuickBookingDrawer() {
     setClientPrepaids([]);
     setPrepaidRedeems({});
     setSelectedServiceIds([]);
+    setBookedPriceByService({}); // Item D: drop the edit-only booked-price snapshot
     setStaffPicks({});
     setCabinPicks({});
     setMsOpen(false);
@@ -766,6 +826,7 @@ export function QuickBookingDrawer() {
     setCouponApplying(false);
     // Block 4: drop the price-panel deduction context + the staff's points/credit inputs.
     setFidelityRedeemEnabled(false);
+    setFidelityUseOn(false); // Item E: the fidelity toggle defaults OFF on a fresh form
     setFidelityEuroPerPoint(0.1);
     setFidelityMinPoints(0);
     setFidelityPointsAvailable(0);
@@ -810,10 +871,16 @@ export function QuickBookingDrawer() {
       // Calendar DRAG-SELECT end (data-qb-endtime, HH:MM): seeds the end time so the
       // dragged DURATION is honored until a service is picked (services then drive it).
       const prefEnd = btn.getAttribute("data-qb-endtime") ?? "";
-      if (/^\d{4}-\d{2}-\d{2}$/.test(prefDate)) setDate(prefDate);
-      if (/^\d{1,2}:\d{2}$/.test(prefTime)) setStartTime(prefTime);
+      const hasCalDate = /^\d{4}-\d{2}-\d{2}$/.test(prefDate);
+      const hasCalTime = /^\d{1,2}:\d{2}$/.test(prefTime);
+      if (hasCalDate) setDate(prefDate);
+      if (hasCalTime) setStartTime(prefTime);
       setPrefillEndTime(/^\d{1,2}:\d{2}$/.test(prefEnd) ? prefEnd : "");
       if (prefStaff && Number.parseInt(prefStaff, 10) > 0) setStaffId(prefStaff);
+      // Item B: arm the calendar-slot auto-hold ONLY when the cell seeded a concrete date+time
+      // (the empty-cell quick-book case). The auto-hold effect fires it once a service+operator
+      // are set; a plain "+ Prenotazione" open (no date/time) leaves it disarmed.
+      pendingCalendarSlotRef.current = hasCalDate && hasCalTime;
       const el = document.getElementById("quickBooking");
       const api = bootstrap()?.Offcanvas;
       if (el && api) api.getOrCreateInstance(el).show();
@@ -947,6 +1014,26 @@ export function QuickBookingDrawer() {
     }
     return Object.keys(out).length ? JSON.stringify(out) : "";
   }, [staffMap]);
+
+  // Item B: whether the operator selection is complete enough to hold the slot (port of
+  // qbIsOperatorSelectionComplete). Multi-service: every non-noOperator row that has eligible
+  // staff must have a chosen operator. Single-service: either an operator is picked (staffId) or
+  // the (single) service has eligible operators (the "(qualsiasi)" case — the hold auto-assigns
+  // the first free one). Used only to gate the calendar-slot auto-hold; the manual button stays.
+  const operatorSelectionComplete = useMemo(() => {
+    if (!selectedServiceIds.length) return false;
+    if (isMultiService) {
+      for (const row of staffPickerRows) {
+        if (row.noOperator || row.eligible.length === 0) continue;
+        const v = String(staffMap[row.id] ?? "").trim();
+        if (!v) return false;
+      }
+      return true;
+    }
+    if (staffId.trim()) return true;
+    const row = staffPickerRows[0];
+    return !!row && !row.noOperator && row.eligible.length > 0;
+  }, [selectedServiceIds, isMultiService, staffPickerRows, staffMap, staffId]);
 
   // Summary box text: the distinct chosen operator names (port: names.join(', ')).
   const staffSummaryText = useMemo(() => {
@@ -1445,7 +1532,12 @@ export function QuickBookingDrawer() {
     // struck through + the redeem badge; an uncovered service shows its plain price.
     const lines = selectedServiceIds.map((id) => {
       const svc = services.find((s) => s.id === id);
-      const listPrice = Math.max(0, Number(svc?.price ?? 0));
+      // Item D: prefer the BOOKED price snapshot for a line that was part of the original booking
+      // (port of qbApplyServiceSnapshotLine restoring dataset.bookedPrice), so an edited
+      // appointment shows the price as booked; a newly-added service has no snapshot and falls
+      // back to the current catalog price.
+      const booked = bookedPriceByService[id];
+      const listPrice = Number.isFinite(booked) ? Math.max(0, Number(booked)) : Math.max(0, Number(svc?.price ?? 0));
       const badge = redeemBadgeByService[id] ?? "";
       const covered = badge !== "";
       return {
@@ -1500,7 +1592,9 @@ export function QuickBookingDrawer() {
     const euroPerPoint = Number.isFinite(fidelityEuroPerPoint) && fidelityEuroPerPoint > 0 ? fidelityEuroPerPoint : 0.1;
     let fidelityPointsUsed = 0;
     let fidelity = 0;
-    if (fidelityRedeemEnabled) {
+    // Item E: the discount only applies when the tenant enables redeem AND the operator flipped
+    // the "Usa sconto Punti Fidelity" toggle on (off -> the points input is collapsed, no discount).
+    if (fidelityRedeemEnabled && fidelityUseOn) {
       const maxByTotal = Math.floor((afterCoupon + 1e-9) / euroPerPoint);
       const maxPoints = Math.max(0, Math.min(Math.max(0, Math.floor(fidelityPointsAvailable)), maxByTotal));
       let pts = Number.parseInt(String(fidelityInput).replace(/[^0-9]/g, ""), 10);
@@ -1538,12 +1632,14 @@ export function QuickBookingDrawer() {
   }, [
     selectedServiceIds,
     services,
+    bookedPriceByService,
     redeemBadgeByService,
     discountType,
     discountValue,
     couponDiscount,
     couponCode,
     fidelityRedeemEnabled,
+    fidelityUseOn,
     fidelityEuroPerPoint,
     fidelityMinPoints,
     fidelityPointsAvailable,
@@ -1584,6 +1680,7 @@ export function QuickBookingDrawer() {
 
   const clearCouponState = useCallback(() => {
     couponReqRef.current += 1; // invalidate any in-flight preview
+    couponValidatedSigRef.current = ""; // no coupon applied -> nothing to revalidate
     setCouponCode("");
     setCouponDiscount(0);
   }, []);
@@ -1598,8 +1695,11 @@ export function QuickBookingDrawer() {
   // (/api/manage/coupons action=preview -> {ok, preview:{valid, discount, reason}}),
   // faithful to qbApplyCouponPreview. On success set #qb_coupon_code + #qb_coupon_discount
   // (so the recompute reveals #qbCouponRow and SAVE posts them); on failure show the reason.
-  const applyCoupon = useCallback(async () => {
-    const code = couponInput.trim().toUpperCase();
+  const applyCoupon = useCallback(async (opts?: { codeOverride?: string }) => {
+    // codeOverride (port of qbApplyCouponPreview's codeOverride): re-validate a specific applied
+    // code (the revalidation effect passes the currently applied couponCode, not the raw input).
+    const rawCode = opts?.codeOverride !== undefined ? opts.codeOverride : couponInput;
+    const code = rawCode.trim().toUpperCase();
     setCouponBoxOpen(true);
     if (!code) {
       clearCouponState();
@@ -1625,10 +1725,23 @@ export function QuickBookingDrawer() {
     const myReq = ++couponReqRef.current;
     setCouponApplying(true);
     try {
+      // Full server context (port of qbApplyCouponPreview ~4080): the payable service ids, the
+      // location, the appointment date/time, the selected client and — on edit — the editing
+      // appointment id, so the server validates the coupon against the SAME context the booking
+      // will use (e.g. the active-window is checked as of the booked day). All are optional and
+      // ignored server-side when empty, so the preview is backward-compatible.
+      const t0 = startTime.trim();
+      const previewBody: Record<string, string> = { action: "preview", code, subtotal: String(subtotal) };
+      if (payableServiceIds.length) previewBody.service_ids = payableServiceIds.join(",");
+      if (locationId && Number(locationId) > 0) previewBody.location_id = String(locationId);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(date)) previewBody.appt_date = date;
+      if (/^\d{1,2}:\d{2}/.test(t0)) previewBody.appt_time = t0.substring(0, 5);
+      if (client?.id) previewBody.client_id = String(client.id);
+      if (apptId.trim()) previewBody.appointment_id = apptId.trim();
       const res = await fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
-        body: JSON.stringify({ action: "preview", code, subtotal }),
+        body: JSON.stringify(previewBody),
       });
       const data: { ok?: boolean; error?: string; preview?: { valid?: boolean; discount?: number; reason?: string } } =
         await res.json().catch(() => ({}));
@@ -1640,6 +1753,9 @@ export function QuickBookingDrawer() {
         setCouponDiscount(disc);
         setCouponInput(code);
         setCouponMsg({ text: "Coupon applicato.", ok: true });
+        // Record the payable-service signature this validation covers, so the revalidation
+        // effect won't re-fire until the selection actually changes again.
+        couponValidatedSigRef.current = payableServiceIds.join(",");
       } else {
         clearCouponState();
         setCouponInput(code);
@@ -1653,7 +1769,7 @@ export function QuickBookingDrawer() {
     } finally {
       if (myReq === couponReqRef.current) setCouponApplying(false);
     }
-  }, [couponInput, couponCode, payableServiceIds, priceDetails.subtotal, slug, clearCouponState]);
+  }, [couponInput, couponCode, payableServiceIds, priceDetails.subtotal, slug, clearCouponState, date, startTime, locationId, client, apptId]);
 
   // Remove: clear the applied coupon + collapse the box (port of qbCouponRemoveBtn).
   const removeCoupon = useCallback(() => {
@@ -1662,6 +1778,34 @@ export function QuickBookingDrawer() {
     setCouponMsg(null);
     setCouponBoxOpen(false);
   }, [clearCouponState]);
+
+  // Revalidate the applied coupon when the service selection changes (port of
+  // qbRevalidateCouponIfNeeded, called after every service toggle). Only runs while a coupon is
+  // applied AND the payable-service set actually differs from what it was validated against (the
+  // signature ref guards against a re-render loop). If no payable service remains, the coupon is
+  // cleared with a notice; otherwise the preview is re-run so the discount/eligibility reflect
+  // the new selection (a coupon that no longer qualifies is cleared inside applyCoupon).
+  useEffect(() => {
+    if (!couponCode.trim()) return; // nothing applied -> nothing to revalidate
+    const sig = payableServiceIds.join(",");
+    if (sig === couponValidatedSigRef.current) return; // selection unchanged since validation
+    // Adopt the new signature immediately so this effect fires once per real change, not per
+    // render (applyCoupon overwrites it on success; clearCouponState resets it on clear).
+    couponValidatedSigRef.current = sig;
+    const emptied = !payableServiceIds.length;
+    const appliedCode = couponCode;
+    // Defer the state-mutating revalidation to a macrotask so no setState runs synchronously in
+    // this effect's render (the file deliberately avoids cascading-render setState).
+    const t = setTimeout(() => {
+      if (emptied) {
+        clearCouponState();
+        setCouponMsg({ text: "Coupon rimosso: nessun servizio selezionato.", ok: false });
+        return;
+      }
+      void applyCoupon({ codeOverride: appliedCode });
+    }, 0);
+    return () => clearTimeout(t);
+  }, [payableServiceIds, couponCode, applyCoupon, clearCouponState]);
 
   // ---- Client HISTORY + RESIDUALS fetch (port of qbLoadClientHistory + qbLoadClientResiduals) ----
   // Driven from the client select/clear flow (NOT an effect) so it never calls
@@ -1698,6 +1842,7 @@ export function QuickBookingDrawer() {
     // Block 4: the fidelity-redeem context + credit balance belong to the client; reset the
     // settings/availability AND the staff's points/credit inputs so they don't leak.
     setFidelityRedeemEnabled(false);
+    setFidelityUseOn(false); // Item E: reset the fidelity toggle OFF on client change
     setFidelityEuroPerPoint(0.1);
     setFidelityMinPoints(0);
     setFidelityPointsAvailable(0);
@@ -1732,6 +1877,7 @@ export function QuickBookingDrawer() {
       setGiftRedeems({});
       // ...and any previous Block 4 fidelity/credit context + the staff's points/credit inputs.
       setFidelityRedeemEnabled(false);
+      setFidelityUseOn(false); // Item E: reset the fidelity toggle OFF on client change
       setFidelityEuroPerPoint(0.1);
       setFidelityMinPoints(0);
       setFidelityPointsAvailable(0);
@@ -1897,6 +2043,18 @@ export function QuickBookingDrawer() {
           // Services multiselect: select each service in the payload's order.
           setSelectedServiceIds(Array.isArray(a.services) ? a.services.map((s) => s.serviceId) : []);
 
+          // Item D: capture the BOOKED per-service price snapshot so the price panel restores each
+          // existing line at the price it was booked at (only entries with a defined price count).
+          const bookedPrices: Record<number, number> = {};
+          if (Array.isArray(a.services)) {
+            for (const s of a.services) {
+              if (s.serviceId > 0 && typeof s.price === "number" && Number.isFinite(s.price)) {
+                bookedPrices[s.serviceId] = Math.max(0, Number(s.price));
+              }
+            }
+          }
+          setBookedPriceByService(bookedPrices);
+
           // Per-service operator + cabin picks from the maps (serviceId -> id). These
           // feed the same staffPicks/cabinPicks the multi-service picker uses; for a
           // single service the derived single operator/cabin select reads them too via
@@ -1943,6 +2101,9 @@ export function QuickBookingDrawer() {
           // credit balance > 0), so a stale figure without context simply shows no row.
           const editPoints = Math.max(0, Math.round(Number(a.fidelityPointsUsed ?? 0) || 0));
           setFidelityInput(editPoints > 0 ? String(editPoints) : "");
+          // Item E: if the loaded appointment already redeemed points, flip the toggle ON so the
+          // restored figure applies (and the input reveals once the client context confirms redeem).
+          setFidelityUseOn(editPoints > 0);
           const editCredit = Math.max(0, Number(a.creditUsed ?? 0) || 0);
           setCreditInput(editCredit > 0 ? String(editCredit) : "");
           if (a.coupon && a.coupon.code && Number(a.coupon.discount ?? 0) > 0) {
@@ -2194,6 +2355,29 @@ export function QuickBookingDrawer() {
       setAvailLoading(false);
     }
   }, [selectedServiceNames, date, startTime, staffId, staff, slug, locationId]);
+
+  // Item B: calendar-slot auto-hold (port of qbApplyPendingCalendarSlot ~9841). When the drawer
+  // was opened from a calendar empty-cell (date+time seeded — pendingCalendarSlotRef armed), fire
+  // the availability hold ONCE as soon as a service is selected AND the operator selection is
+  // resolvable — so the operator no longer has to click "Disponibilità". Guards: only while the
+  // ref is armed, no hold yet, not already checking; the ref is CONSUMED before firing so it runs
+  // at most once. If the cell had no service (the common empty-cell case), nothing happens until a
+  // service is picked — the effect just waits (the ref stays armed).
+  useEffect(() => {
+    if (!pendingCalendarSlotRef.current) return;
+    if (holdToken || availLoading) return;
+    if (!selectedServiceIds.length || !date || !startTime) return;
+    if (!operatorSelectionComplete) return;
+    // Defer the hold to a macrotask (like the legacy qbSchedulePendingCalendarSlotApply) so the
+    // setState inside runAvailability runs outside this effect's render (no cascading-render). The
+    // pending ref is CONSUMED inside the timeout (not synchronously), so if the effect re-runs and
+    // its cleanup cancels this timer before it fires, the still-armed ref lets it reschedule.
+    const t = setTimeout(() => {
+      pendingCalendarSlotRef.current = false; // consume: auto-hold fires once per calendar open
+      void runAvailability();
+    }, 0);
+    return () => clearTimeout(t);
+  }, [selectedServiceIds, date, startTime, operatorSelectionComplete, holdToken, availLoading, runAvailability]);
 
   // ---- Submit ("Crea prenotazione" -> action=save) ----
   // Close/abort the cancel-done modal. Resolves the pending save() promise with `result`
@@ -3412,7 +3596,16 @@ export function QuickBookingDrawer() {
 
             <div className="row g-2 mt-1">
               <div className="col-6">
-                <label className="form-label">Stato</label>
+                <label className="form-label d-flex align-items-center gap-2">
+                  <span>Stato</span>
+                  {/* Item C: read-only status badge reflecting the loaded originalStatus
+                      (port of qbBadgeForStatus). Only shown in EDIT mode once a status is loaded. */}
+                  {isEditMode && originalStatus ? (
+                    <span className={`badge text-bg-${badgeForStatus(originalStatus).cls}`} id="qbStatusBadge">
+                      {badgeForStatus(originalStatus).label}
+                    </span>
+                  ) : null}
+                </label>
                 <select
                   className="form-select"
                   name="status"
@@ -3601,31 +3794,55 @@ export function QuickBookingDrawer() {
                     </div>
 
                     <div className="mt-2">
-                      <div className="d-flex align-items-center gap-2">
-                        <div className="input-group input-group-sm" style={{ maxWidth: 220 }}>
+                      {/* Item E: "Usa sconto Punti Fidelity" toggle (#qbFidelityToggle). OFF collapses
+                          the points input + applies no discount; ON reveals the input. Turning it off
+                          clears the typed points so no stale figure lingers. */}
+                      <div className="d-flex align-items-center" id="qbFidelityToggleRow">
+                        <div className="form-check form-switch m-0">
                           <input
-                            className="form-control"
-                            type="number"
-                            step="1"
-                            min="0"
-                            inputMode="numeric"
-                            id="qbFidelityAmountInput"
-                            placeholder="0"
-                            value={fidelityInput}
-                            onChange={(e) => setFidelityInput(e.target.value)}
+                            className="form-check-input"
+                            type="checkbox"
+                            id="qbFidelityToggle"
+                            checked={fidelityUseOn}
+                            onChange={(e) => {
+                              const on = e.target.checked;
+                              setFidelityUseOn(on);
+                              if (!on) setFidelityInput("");
+                            }}
                           />
-                          <span className="input-group-text" id="qbFidelityAmountSuffix">Punti</span>
+                          <label className="form-check-label" htmlFor="qbFidelityToggle">Usa sconto Punti Fidelity</label>
                         </div>
-                        <button type="button" className="btn btn-sm btn-outline-secondary" id="qbFidelityMaxBtn" onClick={() => setFidelityInput(String(fidelityMaxUsablePoints))}>Max</button>
-                        {fidelityInput.trim() !== "" ? (
-                          <button type="button" className="btn btn-sm btn-link text-danger p-0" id="qbFidelityClearBtn" onClick={() => setFidelityInput("")} title="Rimuovi punti"><i className="bi bi-x-circle" /></button>
-                        ) : null}
                       </div>
 
-                      <div className="small text-muted mt-2" id="qbFidelityHint">
-                        {fidelityMinPoints > 0 ? `Minimo ${fidelityMinPoints} punti • ` : ""}
-                        {`1 punto = ${fmtEUR(fidelityEuroPerPoint)} • Usabili: ${fidelityMaxUsablePoints} punti`}
-                      </div>
+                      {fidelityUseOn ? (
+                        <div className="mt-2" id="qbFidelityAmountWrap">
+                          <div className="d-flex align-items-center gap-2">
+                            <div className="input-group input-group-sm" style={{ maxWidth: 220 }}>
+                              <input
+                                className="form-control"
+                                type="number"
+                                step="1"
+                                min="0"
+                                inputMode="numeric"
+                                id="qbFidelityAmountInput"
+                                placeholder="0"
+                                value={fidelityInput}
+                                onChange={(e) => setFidelityInput(e.target.value)}
+                              />
+                              <span className="input-group-text" id="qbFidelityAmountSuffix">Punti</span>
+                            </div>
+                            <button type="button" className="btn btn-sm btn-outline-secondary" id="qbFidelityMaxBtn" onClick={() => setFidelityInput(String(fidelityMaxUsablePoints))}>Max</button>
+                            {fidelityInput.trim() !== "" ? (
+                              <button type="button" className="btn btn-sm btn-link text-danger p-0" id="qbFidelityClearBtn" onClick={() => setFidelityInput("")} title="Rimuovi punti"><i className="bi bi-x-circle" /></button>
+                            ) : null}
+                          </div>
+
+                          <div className="small text-muted mt-2" id="qbFidelityHint">
+                            {fidelityMinPoints > 0 ? `Minimo ${fidelityMinPoints} punti • ` : ""}
+                            {`1 punto = ${fmtEUR(fidelityEuroPerPoint)} • Usabili: ${fidelityMaxUsablePoints} punti`}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                 ) : null}
