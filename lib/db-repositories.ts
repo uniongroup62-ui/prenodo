@@ -1912,6 +1912,20 @@ export async function getDbAppointmentMoveSnapshot(slug: string, id: number): Pr
 // with the trailing segment extended to the new end, excluding THIS appointment.
 // Returns null when the appointment is not the tenant's / does not exist or is not
 // resizable; throws (caught by the route) on a real overlap.
+// Number of appointment_segments rows for an appointment (tenant-scoped). >1 means a
+// multi-service (segmented) booking, which the legacy forbids operator-changing via drag or
+// resizing from the calendar (calendar.js:4961 / :5016). Best-effort: a missing table -> 0.
+export async function getDbAppointmentSegmentCount(slug: string, id: number): Promise<number> {
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointment_segments",
+    columns: "id",
+    where: "appointment_id = ?",
+    params: [id],
+  }).catch(() => [] as RowDataPacket[]);
+  return rows.length;
+}
+
 export async function resizeDbAppointmentEnd(slug: string, id: number, newEndTime: string): Promise<AppointmentWithMeta | null> {
   // Tenant-scoped read: only returns the row when it belongs to this tenant.
   const rows = await tenantSelect<RowDataPacket>({

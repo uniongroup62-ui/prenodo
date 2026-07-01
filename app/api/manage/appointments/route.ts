@@ -12,6 +12,7 @@ import {
   getDbAppointmentForEdit,
   getDbAppointmentMoveSnapshot,
   getDbAppointmentPhpStatus,
+  getDbAppointmentSegmentCount,
   listDbAppointments,
   resizeDbAppointmentEnd,
   restoreAppointmentRedeems,
@@ -439,6 +440,12 @@ export async function POST(request: Request) {
       const hasStaffParam = body.staff_name !== undefined || body.operator !== undefined;
       const operator = hasStaffParam ? String(body.staff_name ?? body.operator ?? "") : snapshot.operator;
 
+      // Legacy guard (calendar.js:4961): a multi-service (segmented) booking's operator
+      // cannot be changed via drag & drop — it must be edited from the appointment form.
+      if (hasStaffParam && operator !== snapshot.operator && (await getDbAppointmentSegmentCount(tenantSlug, id)) > 1) {
+        return Response.json({ ok: false, error: "Per cambiare operatore su prenotazioni multi-servizio, modifica l'appuntamento (non tramite drag & drop)." });
+      }
+
       // Location: an explicit location_id resolves to the tenant location; otherwise
       // keep the appointment's current location.
       const locationId = body.location_id === undefined
@@ -495,6 +502,12 @@ export async function POST(request: Request) {
       const endTime = String(body.end_time ?? body.time ?? parseStartsAt(endsAt).time ?? "");
       if (!endTime) {
         return Response.json({ ok: false, error: "Ora di fine non valida" }, { status: 400 });
+      }
+
+      // Legacy guard (calendar.js:5016): a multi-service (segmented) booking cannot be
+      // resized from the calendar — its duration is governed by the per-service segments.
+      if ((await getDbAppointmentSegmentCount(tenantSlug, id)) > 1) {
+        return Response.json({ ok: false, error: "Ridimensionamento non supportato per prenotazioni multi-servizio (segmentate)." });
       }
 
       const appointment = await resizeDbAppointmentEnd(tenantSlug, id, endTime);
