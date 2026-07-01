@@ -17,6 +17,9 @@ type StockItem = {
   productName: string;
   productSku: string;
   qty: number;
+  incomingFlag?: boolean;
+  incomingQty?: number;
+  incomingEta?: string;
 };
 
 type StockDocument = {
@@ -135,6 +138,7 @@ export function StockMovesContent() {
   const [ctx, setCtx] = useState<ProductsContext | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(0);
+  const [detailDoc, setDetailDoc] = useState<StockDocument | null>(null);
 
   // Filter form state
   const [productId, setProductId] = useState(0);
@@ -276,6 +280,39 @@ export function StockMovesContent() {
 
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`stock_moves${suffix}`.replace("&", "?")}`;
+  }
+
+  // Client-side CSV export of the (filtered) movements — one row per document line, semicolon-delimited
+  // + UTF-8 BOM (Excel it-IT), faithful to the legacy export columns. No server round-trip. Defined
+  // after filteredDocs/docCategories/docSuppliers so it closes over already-declared values.
+  function exportCsv() {
+    const sep = ";";
+    const esc = (v: unknown) => { const s = String(v ?? ""); return /[";\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    const header = ["Data movimento", "Causale", "Tipo documento", "Numero documento", "Data documento", "Operatore", "Categorie", "Fornitori", "Prodotto", "SKU", "Quantita", "In arrivo", "Qta in arrivo", "ETA arrivo", "Stato", "Note"];
+    const csvRows: string[] = [header.join(sep)];
+    for (const d of filteredDocs) {
+      const cats = docCategories(d).join(", ");
+      const sups = docSuppliers(d).join(", ");
+      const causale = d.cause === "carico" ? "Carico" : "Scarico";
+      const stato = d.isCanceled ? "Annullato" : "Attivo";
+      const base = [fmtDate(d.moveDate), causale, d.documentType, d.documentNumber, fmtDate(d.documentDate), d.operatorName, cats, sups];
+      if (d.items.length === 0) {
+        csvRows.push([...base, "", "", "", "", "", "", stato, d.notes].map(esc).join(sep));
+      } else {
+        for (const it of d.items) {
+          csvRows.push([...base, it.productName, it.productSku, it.qty, it.incomingFlag ? "SI" : "NO", it.incomingQty ?? "", it.incomingEta ? fmtDate(it.incomingEta) : "", stato, d.notes].map(esc).join(sep));
+        }
+      }
+    }
+    const blob = new Blob(["﻿" + csvRows.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `movimenti_magazzino_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   const locParam = activeLocationId ? `&location_id=${activeLocationId}` : "";
@@ -421,9 +458,9 @@ export function StockMovesContent() {
             </div>
 
             <div className="col-12 d-flex justify-content-end">
-              <a className="btn btn-outline-secondary" href={href(`${locParam}&action=export`)}>
+              <button type="button" className="btn btn-outline-secondary" onClick={exportCsv}>
                 <i className="bi bi-download" /> Esporta CSV
-              </a>
+              </button>
             </div>
           </form>
         </div>
@@ -476,9 +513,9 @@ export function StockMovesContent() {
                           )}
                         </td>
                         <td className="text-end costs-nowrap">
-                          <a className="btn btn-sm btn-outline-secondary" href={href(`&action=view&id=${d.id}`)}>
+                          <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setDetailDoc(d)}>
                             Apri
-                          </a>
+                          </button>
                           {!d.isCanceled ? (
                             <>
                               {" "}
@@ -502,6 +539,115 @@ export function StockMovesContent() {
           </div>
         </div>
       </div>
+
+      {/* Document DETAIL modal (faithful to the legacy ?action=view): the full stock document header +
+          items (with the "In arrivo" column for carico) + notes + status + the Annulla action. */}
+      {detailDoc ? (
+        <>
+          <div className="modal fade show" style={{ display: "block" }} tabIndex={-1} role="dialog" aria-modal="true">
+            <div className="modal-dialog modal-dialog-centered modal-dialog-scrollable modal-lg">
+              <div className="modal-content">
+                <div className="modal-header">
+                  <h5 className="modal-title">
+                    Movimento {detailDoc.cause === "carico" ? "Carico" : "Scarico"}
+                    {detailDoc.documentNumber ? ` — ${detailDoc.documentNumber}` : ""}
+                  </h5>
+                  <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => setDetailDoc(null)} />
+                </div>
+                <div className="modal-body">
+                  <dl className="row mb-3 small">
+                    <dt className="col-sm-3">Data movimento</dt>
+                    <dd className="col-sm-3">{fmtDate(detailDoc.moveDate)}</dd>
+                    <dt className="col-sm-3">Operatore</dt>
+                    <dd className="col-sm-3">{detailDoc.operatorName || "—"}</dd>
+                    <dt className="col-sm-3">Tipo documento</dt>
+                    <dd className="col-sm-3">{detailDoc.documentType || "—"}</dd>
+                    <dt className="col-sm-3">Numero</dt>
+                    <dd className="col-sm-3">{detailDoc.documentNumber || "—"}</dd>
+                    <dt className="col-sm-3">Data documento</dt>
+                    <dd className="col-sm-3">{fmtDate(detailDoc.documentDate)}</dd>
+                    <dt className="col-sm-3">Stato</dt>
+                    <dd className="col-sm-3">
+                      {detailDoc.isCanceled ? (
+                        <span className="badge bg-light text-dark">Annullato</span>
+                      ) : (
+                        <span className="badge bg-success-subtle text-success">Attivo</span>
+                      )}
+                    </dd>
+                  </dl>
+
+                  <div className="table-responsive">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>Prodotto</th>
+                          <th>SKU</th>
+                          <th className="text-end">Quantita</th>
+                          {detailDoc.cause === "carico" ? <th>In arrivo</th> : null}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {detailDoc.items.length === 0 ? (
+                          <tr>
+                            <td colSpan={detailDoc.cause === "carico" ? 4 : 3} className="text-muted">Nessuna riga.</td>
+                          </tr>
+                        ) : (
+                          detailDoc.items.map((it) => (
+                            <tr key={it.id}>
+                              <td>{it.productName || "—"}</td>
+                              <td className="text-muted small">{it.productSku || "—"}</td>
+                              <td className="text-end">{it.qty}</td>
+                              {detailDoc.cause === "carico" ? (
+                                <td className="small">
+                                  {it.incomingFlag ? (
+                                    <span>
+                                      <span className="badge text-bg-info">{it.incomingQty ?? 0}</span>
+                                      {it.incomingEta ? ` entro ${fmtDate(it.incomingEta)}` : ""}
+                                    </span>
+                                  ) : (
+                                    <span className="text-muted">—</span>
+                                  )}
+                                </td>
+                              ) : null}
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {detailDoc.notes && detailDoc.notes.trim() ? (
+                    <div className="alert alert-light border small mt-3 mb-0">
+                      <strong>Note:</strong> <span style={{ whiteSpace: "pre-line" }}>{detailDoc.notes}</span>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="modal-footer">
+                  {!detailDoc.isCanceled ? (
+                    <button
+                      type="button"
+                      className="btn btn-outline-danger"
+                      disabled={busyId === detailDoc.id}
+                      onClick={() => {
+                        const id = detailDoc.id;
+                        setDetailDoc(null);
+                        cancelDoc(id);
+                      }}
+                    >
+                      <i className="bi bi-x-circle me-1" />
+                      Annulla movimento
+                    </button>
+                  ) : null}
+                  <button type="button" className="btn btn-secondary" onClick={() => setDetailDoc(null)}>
+                    Chiudi
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="modal-backdrop fade show" onClick={() => setDetailDoc(null)} />
+        </>
+      ) : null}
     </main>
   );
 }
