@@ -25,6 +25,8 @@ type RechargeTemplate = {
 type RechargesResponse = {
   ok?: boolean;
   fidelityEnabled?: boolean;
+  activeCampaignName?: string;
+  earnStep?: number;
   templates?: RechargeTemplate[];
 };
 
@@ -71,6 +73,7 @@ export function RechargesContent() {
   const slug = tenantSlug();
   const [templates, setTemplates] = useState<RechargeTemplate[]>([]);
   const [fidelityEnabled, setFidelityEnabled] = useState(true);
+  const [activeCampaignName, setActiveCampaignName] = useState("");
   const [loading, setLoading] = useState(true);
 
   const [modalOpen, setModalOpen] = useState(false);
@@ -80,7 +83,6 @@ export function RechargesContent() {
   const [error, setError] = useState("");
 
   const load = useCallback(() => {
-    setLoading(true);
     fetch(`/api/manage/recharges?slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
     })
@@ -88,6 +90,7 @@ export function RechargesContent() {
       .then((j: RechargesResponse) => {
         setTemplates(Array.isArray(j.templates) ? j.templates : []);
         setFidelityEnabled(j.fidelityEnabled !== false);
+        setActiveCampaignName(String(j.activeCampaignName ?? ""));
       })
       .catch(() => setTemplates([]))
       .finally(() => setLoading(false));
@@ -201,7 +204,17 @@ export function RechargesContent() {
           <div className="bs-page-subtitle">Gestisci credito prepagato, bonus e campagne punti.</div>
         </div>
         <div className="bs-page-actions">
-          <div className="text-muted small">Nessuna campagna punti attiva oggi</div>
+          <div className="text-muted small">
+            {!fidelityEnabled ? (
+              "Punti disattivati"
+            ) : activeCampaignName ? (
+              <>
+                Campagna attiva: <strong>{activeCampaignName}</strong>
+              </>
+            ) : (
+              "Nessuna campagna punti attiva oggi"
+            )}
+          </div>
         </div>
       </div>
 

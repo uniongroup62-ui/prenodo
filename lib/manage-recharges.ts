@@ -3,6 +3,7 @@ import "server-only";
 import type { RowDataPacket } from "@/lib/tenant-db";
 import { parseInteger } from "@/lib/api-utils";
 import { columnExists, tenantDelete, tenantInsert, tenantSelect, tenantTable, tenantUpdate } from "@/lib/tenant-db";
+import { getFidelityPointsSettings, listFidelityCampaigns } from "@/lib/db-repositories";
 
 // DB-backed port of the recharge_templates CRUD in app/pages/recharges.php
 // (_mode=create_template|update_template|delete_template). These are the
@@ -30,6 +31,10 @@ export type ManageRechargesContext = {
   ok: true;
   sourceMode: "database";
   fidelityEnabled: boolean;
+  // Header status (port of the recharges.php $rechargesHeaderActions block):
+  // the active fidelity points campaign for today, if any, plus the flat earn step.
+  activeCampaignName: string;
+  earnStep: number;
   templates: RechargeTemplateRow[];
 };
 
@@ -104,19 +109,32 @@ async function isFidelityEnabled(slug: string): Promise<boolean> {
 }
 
 export async function getManageRechargesContext(slug: string): Promise<ManageRechargesContext> {
-  const [rows, fidelityEnabled] = await Promise.all([
+  const [rows, settings, campaigns] = await Promise.all([
     tenantSelect<RowDataPacket>({
       slug,
       table: "recharge_templates",
       columns: "*",
       orderBy: "is_active DESC, sort_order ASC, id DESC",
     }).catch(() => []),
-    isFidelityEnabled(slug),
+    getFidelityPointsSettings(slug).catch(() => null),
+    listFidelityCampaigns(slug).catch(() => []),
   ]);
+  const fidelityEnabled = settings ? settings.globalEnabled : await isFidelityEnabled(slug);
+  const earnStep = settings && settings.earnStepEuro > 0 ? settings.earnStepEuro : 10;
+
+  // Active fidelity points campaign for today (same rule as the POS campaign earn):
+  // active + today within [starts_at, ends_at] (empty bounds = open-ended).
+  const today = new Date().toISOString().slice(0, 10);
+  const activeCampaign = fidelityEnabled
+    ? campaigns.find((c) => c.active && (c.startsAt === "" || c.startsAt <= today) && (c.endsAt === "" || c.endsAt >= today))
+    : undefined;
+
   return {
     ok: true,
     sourceMode: "database",
     fidelityEnabled,
+    activeCampaignName: activeCampaign ? activeCampaign.name : "",
+    earnStep,
     templates: rows.map(mapTemplate),
   };
 }
