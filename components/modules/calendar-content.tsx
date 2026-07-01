@@ -186,6 +186,24 @@ function longTitle(iso: string): string {
   return `${capFirst(IT_WEEKDAYS[d.getDay()] ?? "")} ${d.getDate()} ${IT_MONTHS[d.getMonth()] ?? ""} ${d.getFullYear()}`;
 }
 
+// Group calendar notes by their date (preserving the list's note_date ASC order) so the
+// notes modal renders one .calendar-note-day-group per day with a header + count badge,
+// faithful to the legacy renderCalendarNotesList (calendar.js:708-746).
+function groupNotesByDate<T extends { noteDate: string }>(items: T[]): Array<{ date: string; items: T[] }> {
+  const byDate = new Map<string, T[]>();
+  const groups: Array<{ date: string; items: T[] }> = [];
+  for (const item of items) {
+    let bucket = byDate.get(item.noteDate);
+    if (!bucket) {
+      bucket = [];
+      byDate.set(item.noteDate, bucket);
+      groups.push({ date: item.noteDate, items: bucket });
+    }
+    bucket.push(item);
+  }
+  return groups.sort((a, b) => a.date.localeCompare(b.date));
+}
+
 // Monday-first IT short weekday headers (Lun..Dom), matching itShortWeekdayLabel
 // in calendar.js (index 0 == Monday).
 const IT_SHORT_WEEKDAYS_MON = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"];
@@ -3501,15 +3519,21 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
                         <div className="small">Crea una nota dal modulo a sinistra.</div>
                       </div>
                     ) : (
-                      notes.map((n) => (
-                        <div className="calendar-note-card" key={n.id} data-note-id={n.id}>
-                          {n.title ? <div className="calendar-note-card-title">{n.title}</div> : null}
-                          <div className="calendar-note-card-text">{n.noteText}</div>
-                          <div className="calendar-note-card-meta">
-                            {n.noteDate}
-                            {n.updatedAtLabel ? ` • ${n.updatedAtLabel}` : ""}
-                            {n.updatedByName ? ` • ${n.updatedByName}` : ""}
+                      groupNotesByDate(notes).map((group) => (
+                        <div className="calendar-note-day-group" data-note-group-date={group.date} key={group.date}>
+                          <div className="calendar-note-day-head">
+                            <div className="fw-semibold">{longTitle(group.date)}</div>
+                            <span className="badge text-bg-light">{group.items.length}</span>
                           </div>
+                          {group.items.map((n) => (
+                            <button type="button" className="calendar-note-card" key={n.id} data-note-id={n.id}>
+                              <div className="calendar-note-card-title">{n.title || "Nota senza titolo"}</div>
+                              <div className="calendar-note-card-text" style={{ whiteSpace: "pre-wrap" }}>{n.noteText}</div>
+                              <div className="calendar-note-card-meta">
+                                {[n.updatedAtLabel, n.updatedByName].filter(Boolean).join(" - ")}
+                              </div>
+                            </button>
+                          ))}
                         </div>
                       ))
                     )}

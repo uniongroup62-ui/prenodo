@@ -323,17 +323,27 @@ async function calendarStaff(slug: string): Promise<ManageCalendarStaff[]> {
 
 async function fetchCalendarNote(slug: string, id: number): Promise<ManageCalendarNote> {
   const notesTable = await ensureCalendarNotesTable(slug);
+  const usersTable = await tenantTable(slug, "users").catch(() => null);
   const clauses = ["n.id = ?"];
   const params: unknown[] = [id];
   if (notesTable.mode === "shared" && await columnExists(notesTable.name, "tenant_id")) {
     clauses.push("n.tenant_id = ?");
     params.push(notesTable.tenantId ?? 0);
   }
+  // Join users like listCalendarNotes so the note returned right after a save carries the
+  // author name (created_by_name / updated_by_name) instead of NULL — the card meta shows
+  // the author without a reload (port of api_calendar_notes.php calendar_notes_fetch_row).
+  const userJoin = usersTable
+    ? `LEFT JOIN ${quoteIdentifier(usersTable.name)} cu ON cu.id = n.created_by ${userTenantJoin("cu", usersTable)}
+       LEFT JOIN ${quoteIdentifier(usersTable.name)} uu ON uu.id = n.updated_by ${userTenantJoin("uu", usersTable)}`
+    : "";
+  const userSelect = usersTable
+    ? "cu.name AS created_by_name, uu.name AS updated_by_name"
+    : "NULL AS created_by_name, NULL AS updated_by_name";
   const rows = await dbQuery<RowDataPacket[]>(
-    `SELECT n.id,n.note_date,n.title,n.note_text,n.created_at,n.updated_at,
-            NULL AS created_by_name,
-            NULL AS updated_by_name
+    `SELECT n.id,n.note_date,n.title,n.note_text,n.created_at,n.updated_at,${userSelect}
        FROM ${quoteIdentifier(notesTable.name)} n
+       ${userJoin}
       WHERE ${clauses.join(" AND ")}
       LIMIT 1`,
     params,
