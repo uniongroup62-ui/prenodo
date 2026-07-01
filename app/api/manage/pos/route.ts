@@ -2,7 +2,7 @@ import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/ap
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelManageSale, checkoutManageSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected } from "@/lib/manage-pos";
+import { cancelManageSale, checkoutManageSale, deleteCancelledSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
@@ -115,6 +115,24 @@ export async function POST(request: Request) {
       });
       return Response.json({
         ...payload,
+      });
+    }
+
+    // DELETE ("Elimina vendita"): permanently remove an ALREADY-CANCELLED sale + its child
+    // rows. Faithful to pos_sale_detail.php's delete_cancelled_sale — gated by the same
+    // Auth::canAny(['pos.manage','pos.movements']) permission; the per-sale location access +
+    // status=cancelled + appointment-cleanup checks live in deleteCancelledSale.
+    if (action === "delete_sale") {
+      if (!canAny(session.user.perms, ["pos.manage", "pos.movements"])) return jsonError("Non hai i permessi per eliminare vendite annullate.", 403);
+      const saleId = parseInteger(body.id ?? body.sale_id);
+      if (saleId <= 0) return jsonError("ID vendita mancante.");
+      const payload = await deleteCancelledSale(tenantSlug, {
+        saleId,
+        userId: session.user.id,
+      });
+      return Response.json({
+        ...payload,
+        deleted: true,
       });
     }
 

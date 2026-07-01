@@ -66,6 +66,38 @@ type CancelSummary = {
   blockers: string[];
 };
 
+type ReductionLine = { label: string; amount: number | null };
+
+type InstallmentPlanView = {
+  id: number;
+  paymentTypeLabel: string;
+  statusKey: string;
+  statusLabel: string;
+  statusBadge: string;
+  downPayment: number;
+  financed: number;
+  remaining: number;
+  saleTotal: number;
+  installmentsCount: number;
+  frequencyLabel: string;
+  paidCount: number;
+  pendingCount: number;
+  overdueCount: number;
+  nextDueDate: string;
+  notes: string;
+  rows: Array<{
+    installmentNo: number;
+    dueDate: string;
+    amount: number;
+    paidAmount: number | null;
+    statusKey: string;
+    statusLabel: string;
+    statusBadge: string;
+  }>;
+};
+
+type QuoteRef = { id: number; number: string; status: string; effectiveStatus: string; exists: boolean };
+
 type SaleDetail = {
   ok: boolean;
   sale: PosSale;
@@ -74,6 +106,11 @@ type SaleDetail = {
   cancelSummary: CancelSummary;
   canCancel: boolean;
   canMarkCollected: boolean;
+  reductions: ReductionLine[];
+  notesClean: string;
+  installmentPlan: InstallmentPlanView | null;
+  quoteRef: QuoteRef | null;
+  canDelete: boolean;
 };
 
 type BusinessHeader = { name: string; legalVatNumber: string; address: string; logoPath: string };
@@ -101,6 +138,13 @@ function fmtDateTime(value?: string): string {
   const d = value.slice(0, 10);
   const [y, mo, day] = d.split("-");
   return day && mo && y ? `${day}/${mo}/${y}` : value;
+}
+
+// Format a YYYY-MM-DD date as dd/mm/yyyy (installment schedule + next-due). "—" when empty.
+function fmtDateOnly(value?: string): string {
+  if (!value) return "—";
+  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : value;
 }
 
 const PAYMENT_LABELS: Record<string, string> = {
@@ -178,6 +222,10 @@ export function PosSaleDetailContent() {
   const [stockMode, setStockMode] = useState<"restore" | "no_restore">("restore");
   const [busy, setBusy] = useState(false);
 
+  // Delete modal state (hard-delete of an already-cancelled sale).
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleted, setDeleted] = useState(false);
+
   // Receipt overlay.
   const [receiptOpen, setReceiptOpen] = useState(false);
 
@@ -230,6 +278,7 @@ export function PosSaleDetailContent() {
 
   const sale = detail?.sale ?? null;
   const summary = detail?.cancelSummary ?? null;
+  const reductionLines = detail?.reductions ?? [];
   const isCancelled = sale?.status === "cancelled";
   const groupedItems = useMemo(() => (sale ? groupSaleItems(sale.items) : []), [sale]);
   const clientLabel = sale && sale.clientName && sale.clientName.trim() && sale.clientName.trim() !== "Cliente banco" ? sale.clientName : "Cliente occasionale";
@@ -300,6 +349,26 @@ export function PosSaleDetailContent() {
     }
   }
 
+  async function confirmDelete() {
+    if (!sale) return;
+    setBusy(true);
+    setError("");
+    try {
+      const json = await postAction({ action: "delete_sale", sale_id: String(sale.id) });
+      if (json?.error) {
+        setError(json.error);
+      } else {
+        setDeleteOpen(false);
+        setDeleted(true);
+        setFlash("Vendita annullata eliminata definitivamente.");
+      }
+    } catch {
+      setError("Errore durante l'eliminazione della vendita.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function printReceipt() {
     try {
       window.print();
@@ -315,6 +384,15 @@ export function PosSaleDetailContent() {
 
       {loading ? (
         <div className="text-muted py-4">Caricamento…</div>
+      ) : deleted ? (
+        <div className="card p-3">
+          <div className="alert alert-success mb-0">Vendita annullata eliminata definitivamente.</div>
+          <div className="mt-3">
+            <a className="btn btn-sm btn-outline-primary" href={backUrl}>
+              <i className="bi bi-x-lg me-1"></i>Torna ai movimenti
+            </a>
+          </div>
+        </div>
       ) : !sale ? (
         <div className="card p-3">
           <div className="alert alert-danger mb-0">{error || "Vendita non trovata."}</div>
@@ -348,10 +426,23 @@ export function PosSaleDetailContent() {
                       {" • "}Operatore: <strong>{detail.operatorName}</strong>
                     </>
                   ) : null}
+                  {detail?.quoteRef && detail.quoteRef.id > 0 ? (
+                    <>
+                      {" • "}Preventivo: <strong>#{detail.quoteRef.number || String(detail.quoteRef.id)}</strong>
+                    </>
+                  ) : null}
                 </div>
               </div>
               <div className="d-flex align-items-center gap-2 flex-wrap">
                 {isCancelled ? <span className="badge text-bg-danger">Annullata</span> : <span className="badge text-bg-success">Attiva</span>}
+                {detail?.quoteRef && detail.quoteRef.id > 0 && detail.quoteRef.exists ? (
+                  <a
+                    className="btn btn-sm btn-outline-success"
+                    href={`/${encodeURIComponent(slug)}/quotes?action=view&id=${detail.quoteRef.id}`}
+                  >
+                    <i className="bi bi-file-earmark-text me-1"></i>Preventivo
+                  </a>
+                ) : null}
                 <a className="btn btn-sm btn-outline-primary" href={backUrl}>
                   <i className="bi bi-x-lg me-1"></i>Chiudi
                 </a>
@@ -368,6 +459,20 @@ export function PosSaleDetailContent() {
                     }}
                   >
                     <i className="bi bi-x-circle me-1"></i>Annulla vendita
+                  </button>
+                ) : null}
+                {/* "Elimina vendita": permanent hard-delete, shown ONLY when the sale is
+                    already cancelled (faithful to the legacy delete_cancelled_sale button). */}
+                {isCancelled && detail?.canDelete ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-danger"
+                    onClick={() => {
+                      setDeleteOpen(true);
+                      setError("");
+                    }}
+                  >
+                    <i className="bi bi-trash me-1"></i>Elimina vendita
                   </button>
                 ) : null}
               </div>
@@ -390,6 +495,95 @@ export function PosSaleDetailContent() {
               </div>
             ) : null}
           </div>
+
+          {/* "Gestione Rate": the installment plan attached to this sale — payment type,
+              acconto (down payment), financed residuo, paid/open/overdue counts, next due,
+              and the schedule rows. Faithful to pos_sale_detail.php ~4882-4941. */}
+          {detail?.installmentPlan ? (
+            <div className="card p-3 mb-3">
+              <div className="border rounded p-3 pos-sale-installment-card">
+                <div className="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+                  <div>
+                    <div className="fw-semibold">Gestione Rate</div>
+                    <div className="small text-muted">Piano rate collegato a questa vendita.</div>
+                  </div>
+                  <span className={`badge ${detail.installmentPlan.statusBadge || "text-bg-primary"}`}>
+                    {detail.installmentPlan.statusLabel || "Attivo"}
+                  </span>
+                </div>
+                <div className="row g-3">
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Pagamento</div>
+                    <div className="fw-semibold">{detail.installmentPlan.paymentTypeLabel || "—"}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Acconto incassato</div>
+                    <div className="fw-semibold">€ {fmtMoney(detail.installmentPlan.downPayment)}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Residuo</div>
+                    <div className="fw-semibold">€ {fmtMoney(detail.installmentPlan.remaining)}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Frequenza</div>
+                    <div className="fw-semibold">{detail.installmentPlan.frequencyLabel || "—"}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Rate pagate</div>
+                    <div className="fw-semibold">{detail.installmentPlan.paidCount}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Rate aperte</div>
+                    <div className="fw-semibold">{detail.installmentPlan.pendingCount}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Rate scadute</div>
+                    <div className="fw-semibold">{detail.installmentPlan.overdueCount}</div>
+                  </div>
+                  <div className="col-12 col-md-3">
+                    <div className="small text-muted">Prossima scadenza</div>
+                    <div className="fw-semibold">{fmtDateOnly(detail.installmentPlan.nextDueDate)}</div>
+                  </div>
+                  {detail.installmentPlan.notes.trim() ? (
+                    <div className="col-12">
+                      <div className="small text-muted">Note piano</div>
+                      <div className="fw-semibold" style={{ whiteSpace: "pre-line" }}>
+                        {detail.installmentPlan.notes}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                {detail.installmentPlan.rows.length > 0 ? (
+                  <div className="table-responsive mt-3">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Scadenza</th>
+                          <th className="text-end">Importo</th>
+                          <th className="text-end">Incassato</th>
+                          <th>Stato</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {detail.installmentPlan.rows.map((r) => (
+                          <tr key={r.installmentNo}>
+                            <td>{r.installmentNo}</td>
+                            <td>{fmtDateOnly(r.dueDate)}</td>
+                            <td className="text-end">€ {fmtMoney(r.amount)}</td>
+                            <td className="text-end">{r.paidAmount !== null ? `€ ${fmtMoney(r.paidAmount)}` : "—"}</td>
+                            <td>
+                              <span className={`badge ${r.statusBadge || "text-bg-warning"}`}>{r.statusLabel}</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
 
           {/* "Segna ritirato": ordered product lines awaiting pickup. */}
           {collectableItems.length > 0 ? (
@@ -466,7 +660,17 @@ export function PosSaleDetailContent() {
                       <span>Subtotale</span>
                       <strong>€ {fmtMoney(sale.subtotal)}</strong>
                     </div>
-                    {sale.discount > 0.00001 ? (
+                    {/* Itemized reductions (promo/coupon/manual/fidelity/giftcard/credit/…),
+                        each with its € amount. Faithful to the legacy totals breakdown; falls
+                        back to a single "Riduzioni" line when no itemized data is available. */}
+                    {reductionLines.length > 0 ? (
+                      reductionLines.map((red, i) => (
+                        <div className="d-flex justify-content-between gap-3 text-muted" key={i}>
+                          <span>{red.label || "Riduzione"}</span>
+                          <span>{red.amount !== null ? `- € ${fmtMoney(red.amount)}` : "—"}</span>
+                        </div>
+                      ))
+                    ) : sale.discount > 0.00001 ? (
                       <div className="d-flex justify-content-between gap-3 text-muted">
                         <span>Riduzioni</span>
                         <span>- € {fmtMoney(sale.discount)}</span>
@@ -609,6 +813,51 @@ export function PosSaleDetailContent() {
             </div>
           ) : null}
 
+          {/* Delete confirm modal: permanent hard-delete of an already-cancelled sale.
+              Faithful to the legacy deleteCancelledSaleModal — a clear irreversible warning
+              + what gets removed (sale + installment plan/rows + audit). */}
+          {deleteOpen ? (
+            <div className="pos-sale-cancel-overlay" role="dialog" aria-modal="true" aria-label="Elimina vendita">
+              <style>{`
+                .pos-sale-cancel-overlay { position: fixed; inset: 0; z-index: 1080; display: flex; align-items: flex-start; justify-content: center; overflow: auto; padding: 1.5rem; background: rgba(15,23,42,.55); }
+                .pos-sale-cancel-dialog { width: 100%; max-width: 560px; margin: auto; }
+              `}</style>
+              <div className="pos-sale-cancel-dialog card p-3">
+                <div className="d-flex align-items-center justify-content-between mb-2">
+                  <div className="h6 fw-semibold mb-0">Elimina vendita #{sale.id}</div>
+                  <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => setDeleteOpen(false)}></button>
+                </div>
+                <div className="alert alert-danger">
+                  <div className="fw-semibold mb-1">Operazione irreversibile</div>
+                  <div className="small">
+                    La vendita annullata verrà eliminata definitivamente insieme alle sue righe.
+                  </div>
+                </div>
+                <div className="mb-2">
+                  <div className="small text-muted mb-1">Verranno rimossi:</div>
+                  <ul className="small mb-0 ps-3">
+                    <li>La vendita #{sale.id} e le sue righe.</li>
+                    {detail?.installmentPlan ? (
+                      <li>
+                        Il piano rate collegato ({detail.installmentPlan.paymentTypeLabel || "Pagamento"} • residuo € {fmtMoney(detail.installmentPlan.remaining)}
+                        {detail.installmentPlan.paidCount > 0 ? ` • rate incassate: ${detail.installmentPlan.paidCount}` : ""}).
+                      </li>
+                    ) : null}
+                    <li>Le scelte magazzino e gli eventi collegati.</li>
+                  </ul>
+                </div>
+                <div className="d-flex justify-content-end gap-2">
+                  <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setDeleteOpen(false)}>
+                    Indietro
+                  </button>
+                  <button type="button" className="btn btn-sm btn-danger" disabled={busy} onClick={confirmDelete}>
+                    <i className="bi bi-trash me-1"></i>Elimina definitivamente
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {/* Printable receipt (scontrino): reuses the pos-content approach — a scoped @media
               print rule isolates the receipt so only it prints. */}
           {receiptOpen ? (
@@ -672,7 +921,14 @@ export function PosSaleDetailContent() {
                   <span className="text-muted">Subtotale</span>
                   <span>€ {fmtMoney(sale.subtotal)}</span>
                 </div>
-                {sale.discount > 0.00001 ? (
+                {reductionLines.length > 0 ? (
+                  reductionLines.map((red, i) => (
+                    <div className="d-flex justify-content-between text-muted small mt-1" key={`rr-${i}`}>
+                      <span>{red.label || "Riduzione"}</span>
+                      <span className="text-danger">{red.amount !== null ? `- € ${fmtMoney(red.amount)}` : "—"}</span>
+                    </div>
+                  ))
+                ) : sale.discount > 0.00001 ? (
                   <div className="d-flex justify-content-between text-muted small mt-1">
                     <span>Riduzioni</span>
                     <span className="text-danger">- € {fmtMoney(sale.discount)}</span>

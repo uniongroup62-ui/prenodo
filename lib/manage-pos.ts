@@ -36,6 +36,7 @@ import {
   tenantSelect,
   tenantTable,
   tenantUpdate,
+  withTenantTransaction,
 } from "@/lib/tenant-db";
 
 type TenantTarget = Awaited<ReturnType<typeof tenantTable>>;
@@ -779,6 +780,8 @@ export async function cancelManageSale(
 ): Promise<ManagePosContext & { sale: PosSale }> {
   if (input.saleId <= 0) throw new Error("Vendita non valida.");
   const saleRow = await getSaleRow(slug, input.saleId);
+  // Per-sale location access guard (port of _pos_hist_assert_sale_location_access).
+  await assertSaleLocationAccess(slug, Number(saleRow.location_id ?? 0) || 0);
   if (isCancelledStatus(saleRow.status)) throw new Error("Vendita gia annullata.");
   const reason = clean(input.reason, 255);
   if (!reason) throw new Error("La motivazione e obbligatoria per annullare una vendita.");
@@ -826,6 +829,92 @@ export async function cancelManageSale(
   };
 }
 
+// HARD-DELETE an ALREADY-CANCELLED sale (port of pos_sale_detail.php's
+// delete_cancelled_sale action ~2753-3128). This is the SEPARATE permanent removal of a sale
+// that was already voided — NOT the void/cancel (that is cancelManageSale). Gated by: the
+// sale must exist, be status=cancelled, and be at a location the user can access; plus an
+// appointment-cleanup blocker (a sale still tied to an appointment refuses, telling the
+// operator to detach the booking first). The residui/voucher reversals already happened at
+// cancel time, so the delete only removes the sale + its OWN child rows: the installment plan
+// + its installments, the linked 'sale' events, the stock-cancel audit rows, the sale_items,
+// and finally the sales row. Runs as ONE atomic transaction so a failure never leaves a
+// half-deleted sale. Returns the refreshed POS context (the sale is gone from the list).
+//
+// TODO(parity): the legacy delete ALSO hard-deletes the issued GiftCard/GiftBox/package/
+// prepaid/recharge artifacts (only when each is already cancelled/void, else it refuses) and
+// the Commissions movements, with per-artifact appointment/other-sale link blockers. That
+// deep artifact cascade is intentionally out of scope here: the Next void already CANCELS
+// those artifacts (cancelLinkedSaleResidues), so they survive as cancelled rows rather than
+// being purged — the sale itself is removed. Porting the full artifact purge + its blockers
+// is a later pass.
+export async function deleteCancelledSale(
+  slug: string,
+  input: { saleId: number; userId: number | null },
+): Promise<ManagePosContext> {
+  if (input.saleId <= 0) throw new Error("Vendita non valida.");
+  const saleRow = await getSaleRow(slug, input.saleId);
+  const locationId = Number(saleRow.location_id ?? 0) || 0;
+  // Per-sale location access guard (port of _pos_hist_assert_sale_location_access).
+  await assertSaleLocationAccess(slug, locationId);
+  if (!isCancelledStatus(saleRow.status)) {
+    throw new Error("È possibile eliminare solo vendite già annullate.");
+  }
+
+  // Appointment-cleanup blocker (faithful minimal port of the legacy
+  // appt_lifecycle_preview_sale_delete_appointment_cleanup gate): a sale still tied to an
+  // appointment cannot be purged automatically — the operator must detach/clean the booking
+  // first. The Next POS links a sale to its appointment via the "Appuntamento #id" notes
+  // marker (checkout also sets the appointment 'done'); an appointment_id column is honoured
+  // too when present.
+  const linkedAppointmentId = await saleLinkedAppointmentId(slug, saleRow);
+  if (linkedAppointmentId > 0) {
+    throw new Error(
+      `La vendita ha ancora una prenotazione collegata (#${linkedAppointmentId}) non eliminabile automaticamente. Rimuovi prima i collegamenti/residui dalla prenotazione e poi ripeti l'eliminazione.`,
+    );
+  }
+
+  // Resolve the child-table names ONCE (schema-guarded) so the transaction only touches
+  // tables that exist. Each delete is tenant-scoped via tenantScope.
+  const salesTable = await tenantTable(slug, "sales");
+  const saleItemsTable = await tenantTable(slug, "sale_items").catch(() => null);
+  const plansTable = await tenantTable(slug, "sale_installment_plans").catch(() => null);
+  const installmentsTable = await tenantTable(slug, "sale_installments").catch(() => null);
+  const eventsTable = await tenantTable(slug, "events").catch(() => null);
+  const stockAuditTable = await tenantTable(slug, "pos_sale_stock_cancel_actions").catch(() => null);
+
+  await withTenantTransaction(slug, async (q) => {
+    const del = async (table: TenantTarget | null, clauses: string[], params: unknown[]) => {
+      if (!table) return;
+      const scope = await tenantScope(table, clauses, params);
+      await q(`DELETE FROM ${quoteIdentifier(table.name)}${scope.where}`, scope.params);
+    };
+    // Installments first (children of the plan), then the plan, then the rest.
+    await del(installmentsTable, ["sale_id=?"], [input.saleId]);
+    await del(plansTable, ["sale_id=?"], [input.saleId]);
+    if (eventsTable && (await columnExists(eventsTable.name, "source_type")) && (await columnExists(eventsTable.name, "source_id"))) {
+      await del(eventsTable, ["source_type='sale'", "source_id=?"], [input.saleId]);
+    }
+    await del(stockAuditTable, ["sale_id=?"], [input.saleId]);
+    await del(saleItemsTable, ["sale_id=?"], [input.saleId]);
+    await del(salesTable, ["id=?"], [input.saleId]);
+  });
+
+  return getManagePosContext(slug, { locationId, includeCancelled: true });
+}
+
+// Best-effort: the appointment id a sale is tied to — the sales.appointment_id column when it
+// exists, else the "Appuntamento #id" notes marker (written by saleNotes at checkout). 0 when
+// the sale is not tied to any appointment. Used by deleteCancelledSale's booking blocker.
+async function saleLinkedAppointmentId(slug: string, saleRow: RowDataPacket): Promise<number> {
+  const salesTable = await tenantTable(slug, "sales").catch(() => null);
+  if (salesTable && (await columnExists(salesTable.name, "appointment_id"))) {
+    const id = Math.max(0, Number(saleRow.appointment_id ?? 0) || 0);
+    if (id > 0) return id;
+  }
+  const m = String(saleRow.notes ?? "").match(/Appuntamento\s*#\s*(\d+)/i);
+  return m ? Math.max(0, Number(m[1]) || 0) : 0;
+}
+
 // ---------------------------------------------------------------------------
 // POS "Dettaglio vendita" (pos_sale_detail.php) — single sale view + actions.
 // ---------------------------------------------------------------------------
@@ -858,6 +947,56 @@ export type PosCancelSummary = {
   blockers: string[];
 };
 
+// One "riduzione" line in the totals breakdown (port of pos_sale_detail.php
+// $summaryReductionLines ~5066-5110): a label ("Sconto manuale", "Coupon: ABC", "Punti
+// Fidelity (12 pt)", "GiftCard utilizzata (GC-...)", "Credito utilizzato", ...) and the €
+// amount subtracted from the subtotale. `amount` is null when the source is known but the
+// figure isn't (e.g. a bare coupon_code with no tracked amount) — rendered as "—".
+export type PosReductionLine = { label: string; amount: number | null };
+
+// The installment plan attached to a sale (port of SaleInstallments::loadPlanBySaleId +
+// hydratePlan, surfaced in the "Gestione Rate" panel). Present only when the sale has a
+// sale_installment_plans row. Amounts are money-rounded; the counts + next due are derived
+// from the sale_installments rows exactly like hydratePlan.
+export type PosInstallmentPlanView = {
+  id: number;
+  paymentTypeLabel: string;
+  statusKey: string;
+  statusLabel: string;
+  statusBadge: string;
+  downPayment: number;
+  financed: number;
+  remaining: number;
+  saleTotal: number;
+  installmentsCount: number;
+  frequencyLabel: string;
+  paidCount: number;
+  pendingCount: number;
+  overdueCount: number;
+  nextDueDate: string;
+  notes: string;
+  rows: Array<{
+    installmentNo: number;
+    dueDate: string;
+    amount: number;
+    paidAmount: number | null;
+    statusKey: string;
+    statusLabel: string;
+    statusBadge: string;
+  }>;
+};
+
+// The quote a sale originated from (port of quote_sale_load_quote_reference_for_sale): the
+// quote id (sales.source_quote_id, else the notes marker), plus its number/status/effective
+// status when the quotes row resolves. Rendered as the "Preventivo #id" badge/reference.
+export type PosQuoteRef = {
+  id: number;
+  number: string;
+  status: string;
+  effectiveStatus: string;
+  exists: boolean;
+};
+
 export type PosSaleDetail = {
   ok: true;
   source?: string;
@@ -867,6 +1006,17 @@ export type PosSaleDetail = {
   cancelSummary: PosCancelSummary;
   canCancel: boolean;
   canMarkCollected: boolean;
+  // Itemized "riduzioni" lines for the totals panel (promo/coupon/manual/fidelity/giftcard/
+  // credit/…), and the cleaned notes (technical discount lines stripped). Faithful to
+  // pos_sale_detail.php's totals breakdown (~4964-5110) + $displayNotes.
+  reductions: PosReductionLine[];
+  notesClean: string;
+  // The installment plan ("Gestione Rate" panel) — null when the sale has no plan.
+  installmentPlan: PosInstallmentPlanView | null;
+  // The quote reference ("Preventivo #id" badge) — null when the sale has no source quote.
+  quoteRef: PosQuoteRef | null;
+  // Whether the sale is already cancelled (drives the "Elimina vendita" hard-delete button).
+  canDelete: boolean;
 };
 
 // Build the full POS "Dettaglio vendita" payload for one sale: the mapped PosSale (header,
@@ -877,10 +1027,18 @@ export type PosSaleDetail = {
 export async function getManageSaleDetail(slug: string, id: number): Promise<PosSaleDetail> {
   if (id <= 0) throw new Error("Vendita non valida.");
   const row = await getSaleRow(slug, id);
+  // Per-sale location access guard (port of _pos_hist_assert_sale_location_access ~51-77):
+  // every sale-detail view + action re-checks the user can access the sale's location.
+  await assertSaleLocationAccess(slug, Number(row.location_id ?? 0) || 0);
   const sale = await mapSale(slug, row);
   const operatorName = clean(row.operator_name, 120) || (await operatorNameFromUserId(slug, Number(row.created_by ?? 0))) || "—";
   const locationName = sale.locationId > 0 ? await saleLocationName(slug, sale.locationId) : "";
   const cancelSummary = await buildCancelSummary(slug, id, row, sale);
+  // Itemized reductions + cleaned notes (totals breakdown), the installment plan, and the
+  // quote reference — the three read-only panels ported here.
+  const { reductions, notesClean } = await buildSaleReductions(slug, row, sale);
+  const installmentPlan = await loadSaleInstallmentPlan(slug, id).catch(() => null);
+  const quoteRef = await loadSaleQuoteRef(slug, row).catch(() => null);
   return {
     ok: true,
     sale,
@@ -889,7 +1047,26 @@ export async function getManageSaleDetail(slug: string, id: number): Promise<Pos
     cancelSummary,
     canCancel: sale.status !== "cancelled" && cancelSummary.blockers.length === 0,
     canMarkCollected: sale.status !== "cancelled",
+    reductions,
+    notesClean,
+    installmentPlan,
+    quoteRef,
+    canDelete: sale.status === "cancelled",
   };
+}
+
+// Per-sale location access guard — faithful to _pos_hist_sale_location_access_error /
+// _pos_hist_assert_sale_location_access (pos_sale_detail.php ~51-77). A sale with no
+// location (locationId <= 0) is always allowed (the legacy returns "" when location_id<=0);
+// otherwise the sale's location must be in the user's allowed locations (the session-filtered
+// tenant locations — the same source app_location_allowed_for_user consults). Throws the
+// legacy Italian message when the sale belongs to a location the user cannot access.
+async function assertSaleLocationAccess(slug: string, locationId: number): Promise<void> {
+  if (locationId <= 0) return;
+  const context = await getManageLocationContext(slug);
+  if (!context.locations.some((location) => location.id === locationId)) {
+    throw new Error("Non hai accesso alla sede di questa vendita.");
+  }
 }
 
 async function operatorNameFromUserId(slug: string, userId: number): Promise<string> {
@@ -1000,6 +1177,448 @@ async function buildCancelSummary(slug: string, saleId: number, row: RowDataPack
     warnings,
     blockers,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Read-only detail PANELS: itemized reductions, installment plan, quote ref.
+// ---------------------------------------------------------------------------
+
+// Build the itemized "riduzioni" lines for the totals panel + the cleaned notes. Faithful
+// (best-effort) to pos_sale_detail.php's totals breakdown (~4964-5110): the total reduction
+// is subtotal - total, decomposed into the per-source lines that apply — the base
+// promo/coupon/manual discount (sales.discount, less the fidelity part if bundled in), a
+// per-source coupon/promo/manual line parsed from the notes, the Punti Fidelity discount
+// (sales.fidelity_discount + fidelity_points_used), the GiftCard residui used
+// (sales.giftcard_used + code), the wallet Credito used (sales.credit_used), and any
+// leftover "Altre riduzioni" difference. `notesClean` is the notes with the technical
+// discount/credit/system lines stripped (the legacy $displayNotes).
+async function buildSaleReductions(
+  slug: string,
+  row: RowDataPacket,
+  sale: PosSale,
+): Promise<{ reductions: PosReductionLine[]; notesClean: string }> {
+  const subtotal = roundMoney(Number(row.subtotal ?? sale.subtotal ?? 0) || 0);
+  const total = roundMoney(Number(row.total ?? sale.total ?? 0) || 0);
+  const discount = roundMoney(Number(row.discount ?? 0) || 0);
+
+  // Parse the technical discount/credit lines out of the notes (best-effort — the Next POS
+  // records structured columns, but migrated/legacy rows may carry the note markers).
+  const parsed = extractDiscountsFromNotes(String(row.notes ?? ""));
+  const notesClean = parsed.notesClean;
+
+  // Riduzioni complessive = quanto è stato "scalato" dal subtotale per arrivare al totale.
+  const reductionsTotal = roundMoney(Math.max(0, subtotal - total));
+
+  // Punti Fidelity (structured columns).
+  let fidDisc = 0;
+  const fidRaw = roundMoney(Number(row.fidelity_discount ?? 0) || 0);
+  if (fidRaw > 0.00001) fidDisc = fidRaw;
+  const fidPtsRaw = normalizePoints(Number(row.fidelity_points_used ?? 0) || 0);
+  const fidPts = fidPtsRaw > 0 ? fidPtsRaw : null;
+
+  // GiftCard residui used (prefer the structured column, fall back to the note figure) + code.
+  let giftcardUsedEff: number | null = null;
+  const giftcardUsedCol = roundMoney(Number(row.giftcard_used ?? 0) || 0);
+  if (giftcardUsedCol > 0.00001) giftcardUsedEff = giftcardUsedCol;
+  let giftcardCodeEff = parsed.giftcardCode;
+  const giftcardId = Math.max(0, Number(row.giftcard_id ?? 0) || 0);
+  if (giftcardId > 0) {
+    const cardRows = await tenantSelect<RowDataPacket>({ slug, table: "giftcards", columns: "code", where: "id=?", params: [giftcardId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    const codeDb = clean(cardRows[0]?.code, 40);
+    if (codeDb) giftcardCodeEff = codeDb;
+  }
+  if (giftcardUsedEff === null && parsed.giftcardUsed !== null && parsed.giftcardUsed > 0.00001) {
+    giftcardUsedEff = roundMoney(parsed.giftcardUsed);
+  }
+
+  // Credito wallet used (structured column, fallback to the note figure).
+  let creditUsedEff: number | null = null;
+  const creditUsedCol = roundMoney(Number(row.credit_used ?? 0) || 0);
+  if (creditUsedCol > 0.00001) creditUsedEff = creditUsedCol;
+  if (creditUsedEff === null && parsed.creditUsed !== null && parsed.creditUsed > 0.00001) {
+    creditUsedEff = roundMoney(parsed.creditUsed);
+  }
+
+  // "Sconti classici" = promo/coupon/manuali. In some installs sales.discount also bundles
+  // the fidelity part: subtract it so it isn't double-counted in the UI.
+  let baseDiscount = discount;
+  if (fidDisc > 0.00001 && baseDiscount + 0.00001 >= fidDisc) {
+    baseDiscount = roundMoney(Math.max(0, baseDiscount - fidDisc));
+  }
+  const knownReductions = roundMoney(baseDiscount + fidDisc + (giftcardUsedEff ?? 0) + (creditUsedEff ?? 0));
+  const diffRed = roundMoney(Math.max(0, reductionsTotal - knownReductions));
+
+  // Structured detail lines from the parsed notes (promo/coupon/manual).
+  const discountDetails = [...parsed.discounts];
+  const couponCode = clean(row.coupon_code, 40).toUpperCase();
+  const hasCouponInDetails = discountDetails.some((dd) => dd.kind === "coupon");
+  // A promotion_applied_name (structured column) surfaces the promo even without a note line.
+  const promoName = clean(row.promotion_applied_name, 190);
+  const promoAmount = roundMoney(Number(row.promotion_applied_discount ?? 0) || 0);
+  const hasPromoInDetails = discountDetails.some((dd) => dd.kind === "promotion");
+  if (promoName && !hasPromoInDetails) {
+    discountDetails.push({ kind: "promotion", label: `Promozione: ${promoName}`, amount: promoAmount > 0.00001 ? promoAmount : null });
+  }
+  if (couponCode && !hasCouponInDetails) {
+    discountDetails.push({ kind: "coupon", label: `Coupon: ${couponCode}`, amount: null });
+  }
+
+  const discountDetailsKnownTotal = roundMoney(
+    discountDetails.reduce((sum, dd) => sum + (dd.amount === null ? 0 : Math.max(0, roundMoney(dd.amount))), 0),
+  );
+
+  // Residual base discount not attributed to a detail line.
+  let baseDiscountResidual = baseDiscount;
+  if (baseDiscountResidual > 0.00001 && discountDetailsKnownTotal > 0.00001) {
+    baseDiscountResidual = roundMoney(Math.max(0, baseDiscountResidual - Math.min(baseDiscountResidual, discountDetailsKnownTotal)));
+  }
+
+  let showBaseDiscountLine = false;
+  let baseDiscountLabel = "Buoni / promozioni / sconti";
+  if (baseDiscount > 0.00001) {
+    if (discountDetails.length) {
+      if (baseDiscountResidual > 0.00001) {
+        showBaseDiscountLine = true;
+        baseDiscountLabel = "Altri sconti / promozioni";
+      }
+    } else {
+      showBaseDiscountLine = true;
+    }
+  }
+
+  const reductions: PosReductionLine[] = [];
+  if (showBaseDiscountLine) reductions.push({ label: baseDiscountLabel, amount: baseDiscountResidual });
+  for (const dd of discountDetails) {
+    const label = dd.label.trim();
+    if (!label) continue;
+    reductions.push({ label, amount: dd.amount });
+  }
+  if (fidDisc > 0.00001) {
+    let fidLabel = "Punti Fidelity";
+    if (fidPts !== null && fidPts > 0.00001) fidLabel += ` (${fidPts} pt)`;
+    reductions.push({ label: fidLabel, amount: fidDisc });
+  }
+  if (giftcardUsedEff !== null && giftcardUsedEff > 0.00001) {
+    reductions.push({ label: `GiftCard utilizzata${giftcardCodeEff ? ` (${giftcardCodeEff})` : ""}`, amount: giftcardUsedEff });
+  }
+  if (creditUsedEff !== null && creditUsedEff > 0.00001) {
+    reductions.push({ label: "Credito utilizzato", amount: creditUsedEff });
+  }
+  if (diffRed > 0.00001) reductions.push({ label: "Altre riduzioni", amount: diffRed });
+
+  return { reductions, notesClean };
+}
+
+type ParsedDiscount = { kind: string; label: string; amount: number | null };
+type ParsedNotes = {
+  discounts: ParsedDiscount[];
+  giftcardUsed: number | null;
+  giftcardCode: string;
+  creditUsed: number | null;
+  paymentTypeLabel: string;
+  notesClean: string;
+};
+
+// Port of _pos_sale_extract_discounts_from_notes (pos_sale_detail.php ~1386-1503): pull the
+// technical discount/credit lines out of the sale notes (Promozione / Coupon / Sconto
+// manuale / Sconto / GiftCard utilizzata / Credito utilizzato / Tipo pagamento) into a
+// structured breakdown, and return the remaining lines as the cleaned notes (system lines
+// stripped). Best-effort: the Next POS records these as columns, but migrated rows may carry
+// the note markers so this keeps parity.
+function extractDiscountsFromNotes(notes: string): ParsedNotes {
+  const lines = String(notes ?? "").split(/\r\n|\r|\n/);
+  const discounts: ParsedDiscount[] = [];
+  const other: string[] = [];
+  let couponCode = "";
+  let couponAmount: number | null = null;
+  let giftcardUsed: number | null = null;
+  let giftcardCode = "";
+  let creditUsed: number | null = null;
+  let paymentTypeLabel = "";
+
+  for (const rawLn of lines) {
+    const ln = rawLn.trim();
+    if (!ln) continue;
+
+    let m: RegExpMatchArray | null;
+    if ((m = ln.match(/^Promozione\s*:\s*(.+)$/iu))) {
+      const rest = (m[1] ?? "").trim();
+      let title = rest;
+      let amount: number | null = null;
+      const mm = rest.match(/^(.*)\s+-\s*([0-9][0-9.,]*)$/u);
+      if (mm) {
+        title = (mm[1] ?? "").trim();
+        amount = parseItMoney(mm[2] ?? "");
+      }
+      discounts.push({ kind: "promotion", label: `Promozione: ${title || "PROMO"}`, amount });
+      continue;
+    }
+    if ((m = ln.match(/^Coupon\s*:\s*([A-Za-z0-9-]+)\s*$/iu))) {
+      couponCode = (m[1] ?? "").trim().toUpperCase();
+      continue;
+    }
+    if ((m = ln.match(/^Sconto\s*coupon\s*:\s*-\s*€?\s*([0-9][0-9.,]*)/iu))) {
+      couponAmount = parseItMoney(m[1] ?? "");
+      continue;
+    }
+    if ((m = ln.match(/^Sconto\s*manuale\s*:\s*-\s*€?\s*([0-9][0-9.,]*)/iu))) {
+      discounts.push({ kind: "manual", label: "Sconto manuale", amount: parseItMoney(m[1] ?? "") });
+      continue;
+    }
+    if ((m = ln.match(/^Sconto\s*:\s*-\s*€?\s*([0-9][0-9.,]*)/iu))) {
+      discounts.push({ kind: "discount", label: "Sconto", amount: parseItMoney(m[1] ?? "") });
+      continue;
+    }
+    if ((m = ln.match(/^GiftCard\s+utilizzata(?:\s*\(([^)]+)\))?\s*:\s*-\s*€?\s*([0-9][0-9.,]*)/iu))) {
+      const v = parseItMoney(m[2] ?? "");
+      if (v > 0.00001) {
+        giftcardUsed = v;
+        giftcardCode = (m[1] ?? "").trim();
+      }
+      continue;
+    }
+    if ((m = ln.match(/^Credito\s+utilizzato\s*:\s*-\s*€?\s*([0-9][0-9.,]*)/iu))) {
+      const v = parseItMoney(m[1] ?? "");
+      if (v > 0.00001) creditUsed = v;
+      continue;
+    }
+    if ((m = ln.match(/^(?:Tipo|Metodo(?:\s+di)?)\s+pagamento\s*:\s*(.+)$/iu))) {
+      paymentTypeLabel = (m[1] ?? "").trim();
+      continue;
+    }
+    if (isSystemNoteLine(ln)) continue;
+    other.push(ln);
+  }
+
+  if (couponCode || couponAmount !== null) {
+    discounts.push({ kind: "coupon", label: `Coupon${couponCode ? `: ${couponCode}` : ""}`, amount: couponAmount });
+  }
+
+  return { discounts, giftcardUsed, giftcardCode, creditUsed, paymentTypeLabel, notesClean: other.join("\n") };
+}
+
+// Port of _pos_parse_it_money: parse an it-IT money token ("1.234,50" / "12,00" / "12.00")
+// into a positive number, ignoring currency symbols. 0 on any non-numeric input.
+function parseItMoney(input: string): number {
+  let s = String(input ?? "").trim();
+  if (!s) return 0;
+  s = s.replace(/EUR/gi, "").replace(/€/g, "").replace(/\s+/g, "").replace(/[^0-9,.\-]/g, "");
+  if (s === "" || s === "-" || s === "." || s === ",") return 0;
+  if (s.includes(",") && s.includes(".")) s = s.replace(/\./g, "").replace(",", ".");
+  else if (s.includes(",") && !s.includes(".")) s = s.replace(",", ".");
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 0;
+  return roundMoney(Math.abs(n));
+}
+
+// Port of _pos_sale_is_system_note_line: recognise auto-generated note lines that must NOT
+// appear in the visible "Note" block. Also strips the Next-specific markers (Appuntamento #id,
+// the [posmethod:...] base-method marker) so the cleaned notes never leak internal tags.
+function isSystemNoteLine(line: string): boolean {
+  const ln = String(line ?? "").trim();
+  if (!ln) return false;
+  const patterns = [
+    /^\[PREORDINE\s+RITIRATO\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]/iu,
+    /^Pacchetti\s*:\s*(?:CP#\d+\s*(?:,\s*CP#\d+\s*)*)$/iu,
+    /^Ricariche\s*:\s*(?:R#\d+\s*(?:,\s*R#\d+\s*)*)$/iu,
+    /^gift\s+riscattato\s*:/iu,
+    // Next-specific system markers (written by saleNotes / markSaleCancelled).
+    /^Appuntamento\s+#\d+\s*$/iu,
+    /\[posmethod:/i,
+    /^\[ANNULLATA\s/iu,
+    /^Motivo:\s/iu,
+    /^Magazzino prodotti (?:non )?ripristinato/iu,
+  ];
+  return patterns.some((rx) => rx.test(ln));
+}
+
+// Load the installment plan attached to a sale (port of SaleInstallments::loadPlanBySaleId +
+// hydratePlan). Reads the sale_installment_plans row for this sale + its sale_installments
+// rows, then derives paid/pending/overdue counts, next due, remaining, and the status meta —
+// exactly like hydratePlan. Returns null when the sale has no plan (or the tables are absent).
+async function loadSaleInstallmentPlan(slug: string, saleId: number): Promise<PosInstallmentPlanView | null> {
+  const plansTable = await tenantTable(slug, "sale_installment_plans").catch(() => null);
+  if (!plansTable) return null;
+  const planRows = await tenantSelect<RowDataPacket>({ slug, table: "sale_installment_plans", where: "sale_id=?", params: [saleId], orderBy: "id DESC", limit: 1 }).catch(() => [] as RowDataPacket[]);
+  const plan = planRows[0];
+  if (!plan) return null;
+
+  const planId = Number(plan.id ?? 0) || 0;
+  const installmentRows = planId > 0
+    ? await tenantSelect<RowDataPacket>({ slug, table: "sale_installments", where: "plan_id=?", params: [planId], orderBy: "installment_no ASC" }).catch(() => [] as RowDataPacket[])
+    : [];
+
+  const today = todayIso();
+  let paidAmountTotal = 0;
+  let pendingAmount = 0;
+  let cancelledPaidAmount = 0;
+  let paidCount = 0;
+  let pendingCount = 0;
+  let overdueCount = 0;
+  let nextDueDate: string | null = null;
+
+  const rows: PosInstallmentPlanView["rows"] = [];
+  for (const r of installmentRows) {
+    const status = String(r.status ?? "pending").trim().toLowerCase();
+    const dueDate = clean(dateOnly(r.due_date), 10);
+    const amount = roundMoney(Number(r.amount ?? 0) || 0);
+    const paidAmountRow = roundMoney(Number(r.paid_amount ?? 0) || 0);
+    let effective = status;
+    if (status === "pending" && dueDate !== "" && dueDate < today) effective = "overdue";
+    const meta = installmentStatusMeta(status, dueDate, today);
+    rows.push({
+      installmentNo: Math.max(0, Number(r.installment_no ?? 0) || 0),
+      dueDate,
+      amount,
+      paidAmount: paidAmountRow > 0.00001 ? paidAmountRow : null,
+      statusKey: meta.key,
+      statusLabel: meta.label,
+      statusBadge: meta.badge,
+    });
+
+    if (status === "paid") {
+      paidCount += 1;
+      paidAmountTotal += paidAmountRow > 0.00001 ? paidAmountRow : amount;
+      continue;
+    }
+    if (status === "cancelled" || status === "canceled") {
+      if (paidAmountRow > 0.00001 || clean(r.paid_at, 40) !== "") {
+        cancelledPaidAmount += paidAmountRow > 0.00001 ? paidAmountRow : amount;
+      }
+      continue;
+    }
+    pendingCount += 1;
+    pendingAmount += amount;
+    if (effective === "overdue") overdueCount += 1;
+    if (nextDueDate === null || (dueDate !== "" && dueDate < nextDueDate)) nextDueDate = dueDate;
+  }
+
+  const downPayment = roundMoney(Number(plan.down_payment_amount ?? 0) || 0);
+  const financed = roundMoney(Number(plan.financed_amount ?? 0) || 0);
+  const saleTotal = roundMoney(Number(plan.sale_total ?? 0) || 0);
+  const intervalUnit = String(plan.interval_unit ?? "month").trim().toLowerCase();
+  const intervalValue = Math.max(1, Number(plan.interval_value ?? 1) || 1);
+  const remaining = roundMoney(pendingAmount);
+  void paidAmountTotal;
+  void cancelledPaidAmount;
+  const planStatus = String(plan.status ?? "active").trim().toLowerCase();
+  const statusMeta = planStatusMeta(planStatus, overdueCount, remaining);
+
+  return {
+    id: planId,
+    paymentTypeLabel: installmentPaymentTypeLabel(String(plan.payment_type ?? "")),
+    statusKey: statusMeta.key,
+    statusLabel: statusMeta.label,
+    statusBadge: statusMeta.badge,
+    downPayment,
+    financed,
+    remaining,
+    saleTotal,
+    installmentsCount: Math.max(0, Number(plan.installments_count ?? installmentRows.length) || 0),
+    frequencyLabel: intervalLabel(intervalUnit, intervalValue),
+    paidCount,
+    pendingCount,
+    overdueCount,
+    nextDueDate: nextDueDate ?? "",
+    notes: clean(plan.notes, 1000),
+    rows,
+  };
+}
+
+// Port of SaleInstallments::paymentTypeLabel(normalizePaymentType(...)).
+function installmentPaymentTypeLabel(raw: string): string {
+  const v = String(raw ?? "").trim().toLowerCase();
+  const map: Record<string, string> = {
+    cash: "cash", contanti: "cash", contante: "cash",
+    card: "card", carta: "card", credit_card: "card", carta_credito: "card", "carta di credito": "card", "carta-di-credito": "card",
+    check: "check", assegno: "check",
+    bank: "bank", bank_transfer: "bank", "bank transfer": "bank", bonifico: "bank", "bonifico bancario": "bank", wire: "bank", transfer: "bank",
+  };
+  const norm = map[v] ?? "";
+  if (norm === "cash") return "Contanti";
+  if (norm === "card") return "Carta di Credito";
+  if (norm === "check") return "Assegno";
+  if (norm === "bank") return "Bonifico";
+  return "";
+}
+
+// Port of SaleInstallments::intervalLabel.
+function intervalLabel(unit: string, value: number): string {
+  const u = String(unit ?? "").trim().toLowerCase();
+  const v = Math.max(1, Number(value) || 1);
+  if (u === "day") return `${v} ${v === 1 ? "giorno" : "giorni"}`;
+  if (u === "week") return `${v} ${v === 1 ? "settimana" : "settimane"}`;
+  return `${v} ${v === 1 ? "mese" : "mesi"}`;
+}
+
+// Port of SaleInstallments::planStatusMeta.
+function planStatusMeta(status: string, overdueCount: number, remainingAmount: number): { key: string; label: string; badge: string } {
+  const s = String(status ?? "").trim().toLowerCase();
+  if (s === "cancelled" || s === "canceled") return { key: "cancelled", label: "Annullato", badge: "text-bg-secondary" };
+  if (remainingAmount <= 0.00001) return { key: "completed", label: "Completato", badge: "text-bg-success" };
+  if (overdueCount > 0) return { key: "overdue", label: "Scaduto", badge: "text-bg-danger" };
+  return { key: "active", label: "Attivo", badge: "text-bg-primary" };
+}
+
+// Port of SaleInstallments::installmentStatusMeta.
+function installmentStatusMeta(status: string, dueDate: string, today: string): { key: string; label: string; badge: string } {
+  const s = String(status ?? "pending").trim().toLowerCase();
+  if (s === "paid") return { key: "paid", label: "Pagata", badge: "text-bg-success" };
+  if (s === "cancelled" || s === "canceled") return { key: "cancelled", label: "Annullata", badge: "text-bg-secondary" };
+  if (dueDate !== "" && dueDate < today) return { key: "overdue", label: "Scaduta", badge: "text-bg-danger" };
+  return { key: "pending", label: "Da incassare", badge: "text-bg-warning" };
+}
+
+// The quote a sale originated from (port of quote_sale_load_quote_reference_for_sale): read
+// sales.source_quote_id (else the "Preventivo #id" note marker), then resolve the quotes row
+// for its number/status. Returns null when there is no source quote; returns a stub (exists
+// false) when the id is known but the quotes row is missing. Best-effort / schema-guarded.
+async function loadSaleQuoteRef(slug: string, row: RowDataPacket): Promise<PosQuoteRef | null> {
+  let quoteId = Math.max(0, Number(row.source_quote_id ?? 0) || 0);
+  if (quoteId <= 0) quoteId = extractQuoteIdFromNotes(String(row.notes ?? ""));
+  if (quoteId <= 0) return null;
+
+  const quotesTable = await tenantTable(slug, "quotes").catch(() => null);
+  if (!quotesTable) return { id: quoteId, number: "", status: "", effectiveStatus: "", exists: false };
+  const quoteRows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", columns: "id, number, status, valid_until", where: "id=?", params: [quoteId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  const quote = quoteRows[0];
+  if (!quote) return { id: quoteId, number: "", status: "", effectiveStatus: "", exists: false };
+  const status = String(quote.status ?? "").trim().toLowerCase();
+  return {
+    id: quoteId,
+    number: clean(quote.number, 60),
+    status,
+    effectiveStatus: quoteEffectiveStatus(status, quote.valid_until),
+    exists: true,
+  };
+}
+
+// Extract a quote id from the sale notes ("Preventivo #123" / "Preventivo: 123"). Mirrors
+// quote_sale_extract_quote_id_from_notes (best-effort). 0 when none.
+function extractQuoteIdFromNotes(notes: string): number {
+  const m = String(notes ?? "").match(/Preventivo\s*[#:]\s*(\d+)/i);
+  return m ? Math.max(0, Number(m[1]) || 0) : 0;
+}
+
+// Best-effort effective quote status: an accepted/sent quote past valid_until reads as
+// 'expired' (mirrors quote_sale_effective_status's expiry rule). Otherwise the raw status.
+function quoteEffectiveStatus(status: string, validUntil: unknown): string {
+  const s = String(status ?? "").trim().toLowerCase();
+  if (s === "paid" || s === "canceled" || s === "cancelled" || s === "rejected") return s;
+  const vu = clean(dateOnly(validUntil), 10);
+  if (vu && vu < todayIso() && (s === "sent" || s === "accepted" || s === "draft" || s === "")) return "expired";
+  return s;
+}
+
+// Normalize a date/datetime value to a YYYY-MM-DD string ("" when unparseable).
+function dateOnly(value: unknown): string {
+  if (!value) return "";
+  if (value instanceof Date) {
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  }
+  const s = String(value);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : "";
 }
 
 // Generic helper: load the rows of `table` linked to this sale via a sale_id column and map
@@ -1155,6 +1774,8 @@ export async function markManageSaleItemCollected(
 ): Promise<PosSaleDetail> {
   if (input.saleId <= 0 || input.saleItemId <= 0) throw new Error("Riga prodotto non valida.");
   const saleRow = await getSaleRow(slug, input.saleId);
+  // Per-sale location access guard (port of _pos_hist_assert_sale_location_access).
+  await assertSaleLocationAccess(slug, Number(saleRow.location_id ?? 0) || 0);
   if (isCancelledStatus(saleRow.status)) throw new Error("La vendita e annullata: il ritiro non puo essere registrato.");
   const locationId = Number(saleRow.location_id ?? 0) || 0;
 
