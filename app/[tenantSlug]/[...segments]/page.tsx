@@ -68,6 +68,7 @@ import { ServiceFormContent } from "@/components/modules/service_form-content";
 import { ServiceCategoriesContent } from "@/components/modules/service_categories-content";
 import { ServiceRecommendationsContent } from "@/components/modules/service_recommendations-content";
 import { PackagesContent } from "@/components/modules/packages-content";
+import { PackagesCatalogContent } from "@/components/modules/packages_catalog-content";
 import { PackageSettingsContent } from "@/components/modules/package_settings-content";
 import { MarketplaceSettingsContent } from "@/components/modules/marketplace-content";
 import { FidelityWalletContent } from "@/components/modules/fidelity_wallet-content";
@@ -146,6 +147,7 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType<{ slug?: string }>> =
   cost_categories: CostCategoriesContent,
   service_recommendations: ServiceRecommendationsContent,
   packages: PackagesContent,
+  packages_catalog: PackagesCatalogContent,
   package_settings: PackageSettingsContent,
   marketplace: MarketplaceSettingsContent,
   fidelity_wallet: FidelityWalletContent,
@@ -405,6 +407,7 @@ function faithfulKey(page: string, tab?: string): string {
   if (page === "services" && tab === "recommended") return "service_recommendations";
   if (page === "services") return "services";
   if (page === "packages" && tab === "settings") return "package_settings";
+  if (page === "packages" && tab === "catalog") return "packages_catalog";
   if (page === "packages") return "packages";
   if (page === "costs" && tab === "categories") return "cost_categories";
   if (page === "commissions" && tab === "settings") return "commissions_settings";

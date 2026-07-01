@@ -4058,6 +4058,161 @@ export async function listDbPackageState(slug: string): Promise<{ catalog: Packa
   };
 }
 
+// ---- Package CATALOG management (packages.php tab=catalog) --------------------
+export type ManagePackageCatalogRow = {
+  id: number;
+  name: string;
+  isActive: boolean;
+  contentsSummary: string;
+  locationLabel: string;
+  sessionsTotal: number;
+  price: number;
+  validityDays: number | null;
+  soldCount: number;
+};
+
+// Faithful catalog LIST (port of the packages.php tab=catalog table): one row per
+// template with the contents summary (package_items "name ×qty", falling back to
+// package_services / packages.service_id), the enabled-sedi label, total sedute,
+// price, validity + the sold count (client_packages referencing the template).
+export async function listManagePackageCatalog(slug: string): Promise<ManagePackageCatalogRow[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "packages", orderBy: "name ASC, id DESC" });
+  const ids = rows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+  if (ids.length === 0) return [];
+  const ph = ids.map(() => "?").join(",");
+
+  // package_items (rich contents) + package_services (fallback) for all templates.
+  const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "package_items", columns: "package_id, item_type, item_id, qty, sort_order", where: `package_id IN (${ph})`, params: ids, orderBy: "sort_order ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const svcRows = await tenantSelect<RowDataPacket>({ slug, table: "package_services", columns: "package_id, service_id, sessions_total, sort_order", where: `package_id IN (${ph})`, params: ids, orderBy: "sort_order ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+
+  // Resolve service + product names in batch.
+  const serviceIds = new Set<number>();
+  const productIds = new Set<number>();
+  for (const r of itemRows) {
+    const iid = Number(r.item_id ?? 0);
+    if (iid <= 0) continue;
+    if (String(r.item_type ?? "") === "product") productIds.add(iid);
+    else serviceIds.add(iid);
+  }
+  for (const r of svcRows) { const sid = Number(r.service_id ?? 0); if (sid > 0) serviceIds.add(sid); }
+  for (const r of rows) { const sid = Number(r.service_id ?? 0); if (sid > 0) serviceIds.add(sid); }
+  const serviceName = new Map<number, string>();
+  const productName = new Map<number, string>();
+  if (serviceIds.size > 0) {
+    const sids = Array.from(serviceIds);
+    const sp = sids.map(() => "?").join(",");
+    for (const r of await tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, name", where: `id IN (${sp})`, params: sids }).catch(() => [] as RowDataPacket[])) serviceName.set(Number(r.id ?? 0), String(r.name ?? ""));
+  }
+  if (productIds.size > 0) {
+    const pids = Array.from(productIds);
+    const pp = pids.map(() => "?").join(",");
+    for (const r of await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "id, name", where: `id IN (${pp})`, params: pids }).catch(() => [] as RowDataPacket[])) productName.set(Number(r.id ?? 0), String(r.name ?? ""));
+  }
+
+  const itemsByPkg = new Map<number, string[]>();
+  for (const r of itemRows) {
+    const pid = Number(r.package_id ?? 0);
+    const iid = Number(r.item_id ?? 0);
+    const qty = Math.max(1, Number(r.qty ?? 1));
+    const isProduct = String(r.item_type ?? "") === "product";
+    const nm = (isProduct ? productName.get(iid) : serviceName.get(iid)) || `${isProduct ? "Prodotto" : "Servizio"} #${iid}`;
+    const arr = itemsByPkg.get(pid) ?? [];
+    arr.push(`${nm} ×${qty}`);
+    itemsByPkg.set(pid, arr);
+  }
+  const svcByPkg = new Map<number, string[]>();
+  for (const r of svcRows) {
+    const pid = Number(r.package_id ?? 0);
+    const sid = Number(r.service_id ?? 0);
+    const sessions = Math.max(1, Number(r.sessions_total ?? 1));
+    const nm = serviceName.get(sid) || `Servizio #${sid}`;
+    const arr = svcByPkg.get(pid) ?? [];
+    arr.push(`${nm} ×${sessions}`);
+    svcByPkg.set(pid, arr);
+  }
+
+  // Enabled sedi label (package_locations join) + location names.
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "package_locations", columns: "package_id, location_id", where: `package_id IN (${ph})`, params: ids }).catch(() => [] as RowDataPacket[]);
+  const locByPkg = new Map<number, number[]>();
+  for (const r of locRows) {
+    const pid = Number(r.package_id ?? 0);
+    const lid = Number(r.location_id ?? 0);
+    if (pid > 0 && lid > 0) { const arr = locByPkg.get(pid) ?? []; arr.push(lid); locByPkg.set(pid, arr); }
+  }
+  const locName = new Map<number, string>();
+  for (const r of await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id, name" }).catch(() => [] as RowDataPacket[])) locName.set(Number(r.id ?? 0), String(r.name ?? `Sede #${r.id}`));
+
+  // Sold counts (client_packages per template).
+  const soldRows = await tenantSelect<RowDataPacket>({ slug, table: "client_packages", columns: "package_id", where: `package_id IN (${ph})`, params: ids }).catch(() => [] as RowDataPacket[]);
+  const soldByPkg = new Map<number, number>();
+  for (const r of soldRows) { const pid = Number(r.package_id ?? 0); if (pid > 0) soldByPkg.set(pid, (soldByPkg.get(pid) ?? 0) + 1); }
+
+  return rows.map((row) => {
+    const id = Number(row.id ?? 0);
+    const items = itemsByPkg.get(id);
+    const svcs = svcByPkg.get(id);
+    let contentsSummary = "—";
+    if (items && items.length > 0) contentsSummary = items.join(", ");
+    else if (svcs && svcs.length > 0) contentsSummary = svcs.join(", ");
+    else { const sid = Number(row.service_id ?? 0); if (sid > 0) contentsSummary = serviceName.get(sid) || `Servizio #${sid}`; }
+    const locIds = locByPkg.get(id) ?? [];
+    const locationLabel = locIds.length === 0 ? "Tutte" : locIds.map((lid) => locName.get(lid) ?? `Sede #${lid}`).join(", ");
+    const validity = Number(row.validity_days ?? 0);
+    return {
+      id,
+      name: String(row.name ?? "Pacchetto"),
+      isActive: Number(row.is_active ?? 1) === 1,
+      contentsSummary,
+      locationLabel,
+      sessionsTotal: Math.max(0, Number(row.sessions_total ?? 0)),
+      price: roundMoney(Number(row.price ?? 0)),
+      validityDays: validity > 0 ? validity : null,
+      soldCount: soldByPkg.get(id) ?? 0,
+    };
+  });
+}
+
+// Delete a catalog template (port of packages.php action=catalog_delete): detach
+// referencing client_packages (SET package_id=NULL, keeping the package_name
+// snapshot so the history survives), drop the template's package_services /
+// package_items / package_pricing / package_locations, then the packages row.
+export async function deleteManagePackageCatalog(slug: string, id: number): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Pacchetto catalogo non valido.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "packages", columns: "id", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Pacchetto catalogo non trovato.");
+  await tenantExecuteByColumn(slug, "client_packages", "package_id", id, { package_id: null }).catch(() => undefined);
+  for (const child of ["package_services", "package_items", "package_pricing", "package_locations"]) {
+    await deletePackageChildRows(slug, child, id).catch(() => undefined);
+  }
+  await tenantDelete({ slug, table: "packages", id });
+  return { ok: true };
+}
+
+// UPDATE <table> SET <values> WHERE <column>=<value> [AND tenant] — tenant-scoped.
+async function tenantExecuteByColumn(slug: string, table: string, column: string, value: number, values: Record<string, unknown>): Promise<void> {
+  const target = await tenantTable(slug, table).catch(() => null);
+  if (!target) return;
+  const entries = Object.entries(values);
+  if (entries.length === 0) return;
+  const assignments = entries.map(([k]) => `${quoteIdentifier(k)} = ?`).join(", ");
+  const params: unknown[] = [...entries.map(([, v]) => v), value];
+  const scoped = target.mode === "shared" && (await columnExists(target.name, "tenant_id"));
+  let sql = `UPDATE ${quoteIdentifier(target.name)} SET ${assignments} WHERE ${quoteIdentifier(column)} = ?`;
+  if (scoped) { sql += " AND tenant_id = ?"; params.push(target.tenantId ?? 0); }
+  await dbExecute(sql, params);
+}
+
+// DELETE FROM <table> WHERE package_id=<id> [AND tenant] — tenant-scoped, guarded.
+async function deletePackageChildRows(slug: string, table: string, packageId: number): Promise<void> {
+  const target = await tenantTable(slug, table).catch(() => null);
+  if (!target) return;
+  const scoped = target.mode === "shared" && (await columnExists(target.name, "tenant_id"));
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(target.name)} WHERE package_id = ?${scoped ? " AND tenant_id = ?" : ""}`,
+    scoped ? [packageId, target.tenantId ?? 0] : [packageId],
+  );
+}
+
 export async function issueDbClientPackage(
   input: { packageId?: number; clientId?: number; clientName?: string; expiresAt?: string; sourceSaleId?: number },
   slug: string,
