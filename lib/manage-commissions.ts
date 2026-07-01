@@ -184,22 +184,21 @@ export async function saveCommissionSettings(
 }
 
 // ===========================================================================
-// COMMISSION ACCRUAL ENGINE — POS path (faithful port of Commissions.php
-// buildPosEntriesFromSales / upsertEntrySnapshot / syncEntrySnapshots /
-// buildDashboard / setEntryPaidStatus, scoped to POS/sales only).
+// COMMISSION ACCRUAL ENGINE — POS + APPOINTMENT paths (faithful port of
+// Commissions.php buildPosEntriesFromSales / buildAppointmentEntries /
+// upsertEntrySnapshot / syncEntrySnapshots / buildDashboard / setEntryPaidStatus).
 //
-// On GET the engine iterates the tenant's non-cancelled SALES in [from,to],
-// computes one commission entry per (sale line x resolved operator), UPSERTs
-// each as a snapshot (preserving is_paid/paid_at/paid_by), reconciles any
-// stale POS snapshot in scope that no longer maps to a produced entry (marks it
-// 'cancelled' — never deletes), then loads the persisted entries (active +
-// cancelled) and builds the per-operator + global summaries.
-//
-// TODO(appointment-accrual): the APPOINTMENT accrual path (buildAppointmentEntries
-// + appointment stale-cancellation/reactivation reconcile, source_group='appointments')
-// is a separate later block. This block only produces/reconciles source_group='pos'
-// snapshots; appointment* summary fields are always 0 here and pre-existing
-// appointment snapshots are loaded read-only (never accrued or reconciled).
+// On GET the engine, for the requested source(s):
+//   - POS: iterates the tenant's non-cancelled SALES in [from,to], computing one
+//     commission entry per (sale line x resolved operator).
+//   - APPOINTMENTS: iterates the tenant's DONE appointments in [from,to] (by
+//     starts_at), computing one entry per (NON-redeemed service line x segment
+//     staff) — the redemption filter skips lines already paid in a prior sale.
+// Each produced entry is UPSERTed as a snapshot (preserving is_paid/paid_at/paid_by);
+// then, per source_group INDEPENDENTLY, any stale snapshot in scope that no longer
+// maps to a produced entry is marked 'cancelled' (never deleted). Finally the
+// persisted entries (active + cancelled) are loaded and the per-operator + global
+// summaries (incl. appointmentsBase/appointmentsCommission) are built.
 //
 // CAVEAT(pos_other binary model): the Next sale_items.item_type is BINARY
 // ('product' | 'service' — every non-product line is stored as 'service'), so
@@ -313,8 +312,11 @@ function nowDateTime(): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// A produced POS entry (before persistence), mirroring the buildPosEntriesFromSales row.
-type ProducedPosEntry = {
+// A produced commission entry (before persistence), shared by the POS
+// (buildPosEntriesFromSales) and the appointment (buildAppointmentEntries) paths.
+// Both feed upsertEntrySnapshot / syncEntrySnapshots; sourceGroup selects the
+// snapshot bucket a reconcile is allowed to touch.
+type ProducedEntry = {
   entryKey: string;
   datetime: string;
   staffId: number;
@@ -322,7 +324,7 @@ type ProducedPosEntry = {
   sourceId: number;
   locationId: number;
   locationName: string;
-  sourceGroup: "pos";
+  sourceGroup: "pos" | "appointments";
   sourceReference: string;
   sourceLabel: string;
   clientName: string;
@@ -377,7 +379,7 @@ async function buildPosEntriesFromSales(
   params: { from: string; to: string; staffId: number; locationId: number },
   staffByName: Map<string, CommissionStaffSetting>,
   resolveLocationName: (id: number) => Promise<string>,
-): Promise<ProducedPosEntry[]> {
+): Promise<ProducedEntry[]> {
   const { from, to, staffId, locationId } = params;
 
   const salesTable = await tenantTable(slug, "sales");
@@ -436,7 +438,7 @@ async function buildPosEntriesFromSales(
     }
   }
 
-  const entries: ProducedPosEntry[] = [];
+  const entries: ProducedEntry[] = [];
 
   for (const sale of sales) {
     const saleId = Number(sale.id ?? 0) || 0;
@@ -508,6 +510,255 @@ async function buildPosEntriesFromSales(
   return entries;
 }
 
+// looksLikeAppointmentRedemption — the appointment redemption filter. A line is a
+// redemption (already paid in a prior sale → NO new commission) when any explicit
+// redemption FK on the appointment_services row is set (>0), OR the discount_badge
+// text names a redemption source, OR the line is a zero-price line with a positive
+// list price (paid_amount 0 but a catalogue value). Faithful to
+// Commissions::looksLikeAppointmentRedemption, extended with the Next's explicit
+// redemption FKs (cleaner than the legacy badge-only heuristic).
+function looksLikeAppointmentRedemption(row: RowDataPacket, gross: number, listBase: number): boolean {
+  // Explicit redemption foreign keys / indexes on the appointment_services row.
+  const redemptionFkColumns = [
+    "client_package_id",
+    "client_package_service_id",
+    "client_prepaid_service_id",
+    "giftbox_instance_id",
+    "giftbox_item_id",
+    "gift_instance_id",
+    "reward_item_index",
+  ];
+  for (const col of redemptionFkColumns) {
+    if ((Number(row[col] ?? 0) || 0) > 0) return true;
+  }
+  const badge = String(row.discount_badge ?? "").trim().toLowerCase();
+  if (badge !== "") {
+    for (const needle of ["pacchetto", "giftbox", "gift", "giftcard", "prepag", "omaggio"]) {
+      if (badge.includes(needle)) return true;
+    }
+  }
+  return gross <= 0.00001 && listBase > 0.00001;
+}
+
+// Resolve a staff_id → its ENABLED commission staff setting (from getCommissionSettings).
+// Returns null when the staff is not a known commission operator or not enabled — the
+// appointment line is then skipped (no commission), faithful to the staffMap + settings gate.
+function resolveStaffById(
+  staffId: number,
+  staffById: Map<number, CommissionStaffSetting>,
+): CommissionStaffSetting | null {
+  if (staffId <= 0) return null;
+  const staff = staffById.get(staffId);
+  if (!staff || !staff.isEnabled) return null;
+  return staff;
+}
+
+// buildAppointmentEntries — the APPOINTMENT accrual. For each appointment with
+// status='done' and DATE(starts_at) in [from,to], load its appointment_services (in
+// order) + appointment_segments, apply the appointment discount to the eligible
+// (non-redeemed) gross to get a netFactor, then produce one entry per NON-redeemed
+// service line whose resolved segment staff is an ENABLED commission operator with
+// appointment_percent>0 (base by calculation mode; commission = base × %/100).
+// Faithful to Commissions::buildAppointmentEntries (redemption filter, segment-queue
+// staff resolution, entry_key), adapted to the Next schema's explicit redemption FKs
+// and the prompt's netFactor formula.
+async function buildAppointmentEntries(
+  slug: string,
+  params: { from: string; to: string; staffId: number; locationId: number },
+  staffById: Map<number, CommissionStaffSetting>,
+  resolveLocationName: (id: number) => Promise<string>,
+): Promise<ProducedEntry[]> {
+  const { from, to, staffId, locationId } = params;
+
+  const apptTable = await tenantTable(slug, "appointments");
+  const clientsTable = await tenantTable(slug, "clients").catch(() => null);
+  const clauses: string[] = [];
+  const queryParams: unknown[] = [];
+
+  if (apptTable.mode === "shared" && (await columnExists(apptTable.name, "tenant_id"))) {
+    clauses.push("a.tenant_id=?");
+    queryParams.push(apptTable.tenantId ?? 0);
+  }
+  // Only DONE appointments in the [from,to] day span (by starts_at).
+  clauses.push("DATE(a.starts_at) BETWEEN ? AND ?");
+  queryParams.push(from, to);
+  clauses.push("a.status='done'");
+  const hasApptLocation = await columnExists(apptTable.name, "location_id");
+  if (locationId > 0 && hasApptLocation) {
+    clauses.push("(a.location_id IS NULL OR a.location_id=?)");
+    queryParams.push(locationId);
+  }
+
+  const clientJoin = clientsTable
+    ? `LEFT JOIN ${quoteIdentifier(clientsTable.name)} c ON c.id=a.client_id${
+        clientsTable.mode === "shared" && (await columnExists(clientsTable.name, "tenant_id")) ? " AND c.tenant_id=a.tenant_id" : ""
+      }`
+    : "";
+
+  const appts = await dbQuery<RowDataPacket[]>(
+    `SELECT a.*, c.full_name AS client_name
+       FROM ${quoteIdentifier(apptTable.name)} a
+       ${clientJoin}
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY a.starts_at DESC, a.id DESC`,
+    queryParams,
+  ).catch(() => [] as RowDataPacket[]);
+
+  if (!appts.length) return [];
+
+  // Fetch all appointment_services + appointment_segments for these appointments in one
+  // pass (tenant-safe via tenantSelect scope). Services keep row order; segments are
+  // ordered by (position, id) so the per-service queue is consumed in the legacy order.
+  const apptIds = appts.map((a) => Number(a.id ?? 0) || 0).filter((id) => id > 0);
+  const servicesByAppt = new Map<number, RowDataPacket[]>();
+  const segmentsByAppt = new Map<number, RowDataPacket[]>();
+  if (apptIds.length) {
+    const placeholders = apptIds.map(() => "?").join(",");
+    const [svcRows, segRows] = await Promise.all([
+      tenantSelect<RowDataPacket>({
+        slug,
+        table: "appointment_services",
+        where: `appointment_id IN (${placeholders})`,
+        params: apptIds,
+        orderBy: "appointment_id ASC, service_id ASC",
+      }).catch(() => [] as RowDataPacket[]),
+      tenantSelect<RowDataPacket>({
+        slug,
+        table: "appointment_segments",
+        where: `appointment_id IN (${placeholders})`,
+        params: apptIds,
+        orderBy: "appointment_id ASC, position ASC, id ASC",
+      }).catch(() => [] as RowDataPacket[]),
+    ]);
+    for (const svc of svcRows) {
+      const aid = Number(svc.appointment_id ?? 0) || 0;
+      if (aid <= 0) continue;
+      if (!servicesByAppt.has(aid)) servicesByAppt.set(aid, []);
+      servicesByAppt.get(aid)!.push(svc);
+    }
+    for (const seg of segRows) {
+      const aid = Number(seg.appointment_id ?? 0) || 0;
+      if (aid <= 0) continue;
+      if (!segmentsByAppt.has(aid)) segmentsByAppt.set(aid, []);
+      segmentsByAppt.get(aid)!.push(seg);
+    }
+  }
+
+  const entries: ProducedEntry[] = [];
+
+  for (const appt of appts) {
+    const apptId = Number(appt.id ?? 0) || 0;
+    if (apptId <= 0) continue;
+
+    const serviceRows = servicesByAppt.get(apptId) ?? [];
+    if (!serviceRows.length) continue;
+
+    // Eligible GROSS = Σ over NON-redeemed lines of (price × qty). Apply the
+    // appointment discount to get NET, then netFactor = gross>0 ? net/gross : 1.
+    // Redeemed lines are excluded from BOTH gross and net (they carry no revenue).
+    let gross = 0;
+    for (const line of serviceRows) {
+      const qty = Math.max(1, Number(line.qty ?? 1) || 1);
+      const price = roundMoney(Math.max(0, Number(line.price ?? 0) || 0));
+      const listPrice = roundMoney(Math.max(0, Number(line.list_price ?? 0) || 0));
+      const lineGross = roundMoney(price * qty);
+      const listBase = roundMoney(listPrice * qty);
+      if (looksLikeAppointmentRedemption(line, lineGross, listBase)) continue;
+      if (lineGross > 0.00001) gross += lineGross;
+    }
+    gross = roundMoney(gross);
+
+    const discountType = String(appt.discount_type ?? "").trim().toLowerCase();
+    const discountValue = Number(appt.discount_value ?? 0) || 0;
+    let net = gross;
+    if (gross > 0.00001) {
+      if (discountType === "percent") {
+        const pct = Math.max(0, Math.min(100, discountValue));
+        net = roundMoney(Math.max(0, gross * (1 - pct / 100)));
+      } else if (discountType === "fixed") {
+        net = roundMoney(Math.max(0, gross - Math.max(0, discountValue)));
+      }
+    }
+    const netFactor = gross > 0.00001 ? net / gross : 1;
+
+    const apptLocationId = Number(appt.location_id ?? 0) || 0;
+    let apptLocationName = String(appt.location_name ?? "").trim();
+    if (apptLocationName === "" && apptLocationId > 0) apptLocationName = await resolveLocationName(apptLocationId);
+    const clientName = String(appt.client_name ?? "").trim();
+
+    // Per-service segment queues (staff assigned per service line), consumed in order
+    // by (position, id) — the legacy segment-queue behaviour when a service repeats.
+    const segmentQueues = new Map<number, number[]>();
+    for (const seg of segmentsByAppt.get(apptId) ?? []) {
+      const svcId = Number(seg.service_id ?? 0) || 0;
+      const sid = Number(seg.staff_id ?? 0) || 0;
+      if (svcId <= 0 || sid <= 0) continue;
+      if (!segmentQueues.has(svcId)) segmentQueues.set(svcId, []);
+      segmentQueues.get(svcId)!.push(sid);
+    }
+
+    const reference = String(appt.public_code ?? "").trim() ? `#${String(appt.public_code).trim()}` : `APP#${apptId}`;
+
+    // Per-appointment running line index so duplicate services stay distinct in the entry_key.
+    let lineIndex = 0;
+    for (const line of serviceRows) {
+      const svcId = Number(line.service_id ?? 0) || 0;
+      const qty = Math.max(1, Number(line.qty ?? 1) || 1);
+      const price = roundMoney(Math.max(0, Number(line.price ?? 0) || 0));
+      const listPrice = roundMoney(Math.max(0, Number(line.list_price ?? 0) || 0));
+      const lineGross = roundMoney(price * qty);
+      const listBase = roundMoney(listPrice * qty);
+      const currentIndex = lineIndex;
+      lineIndex += 1;
+
+      // REDEMPTION FILTER — skip (no entry) for a redeemed line.
+      if (looksLikeAppointmentRedemption(line, lineGross, listBase)) continue;
+
+      // Resolve staff: consume the per-service segment queue in order (positional).
+      const queue = segmentQueues.get(svcId);
+      let lineStaffId = 0;
+      if (queue && queue.length) {
+        lineStaffId = queue.length > 1 ? (queue.shift() ?? 0) : queue[0];
+      }
+      if (lineStaffId <= 0) continue; // no segment → no staff → no commission
+
+      const staff = resolveStaffById(lineStaffId, staffById);
+      if (!staff) continue; // staff not an enabled commission operator → no commission
+      if (!(staff.appointmentPercent > 0)) continue; // no appointment rate → no commission
+      if (staffId > 0 && staff.staffId !== staffId) continue; // per-operator filter
+
+      const base =
+        staff.calculationMode === "list_price" ? listBase : roundMoney(lineGross * netFactor);
+      if (!(base > 0)) continue;
+
+      const commission = roundMoney((base * staff.appointmentPercent) / 100);
+
+      const serviceLabel = String(line.service_name ?? "").trim() || (svcId > 0 ? `Servizio #${svcId}` : "Servizio");
+
+      entries.push({
+        entryKey: commissionEntryKey(`appointments|${apptId}|${svcId}|${currentIndex}|${staff.staffId}`),
+        datetime: normalizeDateTimeValue(appt.starts_at, ""),
+        staffId: staff.staffId,
+        operatorName: staff.name,
+        sourceId: apptId,
+        locationId: apptLocationId,
+        locationName: apptLocationName,
+        sourceGroup: "appointments",
+        sourceReference: reference,
+        sourceLabel: "Appuntamento",
+        clientName,
+        itemLabel: serviceLabel,
+        baseAmount: base,
+        percent: roundMoney(staff.appointmentPercent),
+        commissionAmount: commission,
+        note: String(line.discount_badge ?? "").trim() || "Prestazione eseguita",
+      });
+    }
+  }
+
+  return entries;
+}
+
 // upsertEntrySnapshot — idempotent per (tenant, entry_key). If a row exists →
 // UPDATE the accrual fields + re-activate (entry_status='active', clear
 // cancelled_*), PRESERVING is_paid/paid_at/paid_by. Else INSERT (is_paid=0,
@@ -516,7 +767,7 @@ async function buildPosEntriesFromSales(
 async function upsertEntrySnapshot(
   slug: string,
   table: Awaited<ReturnType<typeof tenantTable>>,
-  entry: ProducedPosEntry,
+  entry: ProducedEntry,
   existingId: number | null,
 ): Promise<void> {
   const values: Record<string, unknown> = {
@@ -569,22 +820,25 @@ async function upsertEntrySnapshot(
   }
 }
 
-// syncEntrySnapshots + POS reconcile: UPSERT every produced entry, then mark any
-// EXISTING 'pos' snapshot in [from,to] (respecting the location filter) whose
-// entry_key is NOT in the produced set as 'cancelled' (a voided/deleted sale's
-// commission stays as "Annullato" — never deleted). Faithful to syncEntrySnapshots
-// scoped to POS. is_paid is never touched by the reconcile.
-async function syncPosEntrySnapshots(
+// syncEntrySnapshots + reconcile: UPSERT every produced entry, then mark any
+// EXISTING snapshot of THIS sourceGroup in [from,to] (respecting the location
+// filter) whose entry_key is NOT in the produced set as 'cancelled' (a
+// voided/deleted sale's or a cancelled appointment's commission stays as
+// "Annullato" — never deleted). Faithful to syncEntrySnapshots. The reconcile is
+// scoped to a SINGLE source_group so a POS recompute never cancels appointment
+// entries and vice versa. is_paid is never touched by the reconcile.
+async function syncEntrySnapshots(
   slug: string,
   params: { from: string; to: string; locationId: number },
-  produced: ProducedPosEntry[],
+  produced: ProducedEntry[],
+  sourceGroup: "pos" | "appointments",
 ): Promise<void> {
   const table = await tenantTable(slug, "staff_commission_payments");
 
-  // Load existing POS snapshots in scope keyed by entry_key (id + status), so we
-  // can decide UPDATE vs INSERT and detect stale rows to cancel.
+  // Load existing snapshots of this source_group in scope keyed by entry_key
+  // (id + status), so we can decide UPDATE vs INSERT and detect stale rows to cancel.
   const scopeClauses = ["source_group=?", "DATE(COALESCE(movement_datetime, created_at)) BETWEEN ? AND ?"];
-  const scopeParams: unknown[] = ["pos", params.from, params.to];
+  const scopeParams: unknown[] = [sourceGroup, params.from, params.to];
   if (params.locationId > 0 && (await columnExists(table.name, "location_id"))) {
     scopeClauses.push("(location_id=? OR location_id IS NULL)");
     scopeParams.push(params.locationId);
@@ -623,7 +877,8 @@ async function syncPosEntrySnapshots(
     await upsertEntrySnapshot(slug, table, entry, existingId);
   }
 
-  // Reconcile: any existing in-scope POS snapshot not in the produced set → cancel.
+  // Reconcile: any existing in-scope snapshot of this source_group not in the
+  // produced set → cancel.
   const nowTs = nowDateTime();
   for (const [key, row] of existingByKey.entries()) {
     if (producedKeys.has(key)) continue;
@@ -728,10 +983,31 @@ function emptySummary(): CommissionSummary {
   };
 }
 
-// buildCommissionDashboard — the GET path. Accrue+persist POS entries in scope,
-// reconcile stale POS snapshots, then load persisted entries (active + cancelled)
-// and compute the per-operator + global summaries. When the module is disabled,
-// NO accrual happens but any pre-existing snapshots are still loaded for display.
+// Upsert a produced set WITHOUT reconciling — the per-operator (staffId>0) path,
+// where a filtered view must not cancel another operator's still-valid entries.
+async function upsertProducedEntries(slug: string, produced: ProducedEntry[]): Promise<void> {
+  if (!produced.length) return;
+  const table = await tenantTable(slug, "staff_commission_payments");
+  for (const entry of produced) {
+    const found = await tenantSelect<RowDataPacket>({
+      slug,
+      table: table.name,
+      columns: "id",
+      where: "entry_key=?",
+      params: [entry.entryKey],
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    const existingId = found[0] ? Number(found[0].id ?? 0) || 0 : null;
+    await upsertEntrySnapshot(slug, table, entry, existingId);
+  }
+}
+
+// buildCommissionDashboard — the GET path. Accrue+persist the in-scope commission
+// entries for the requested source(s) — POS (buildPosEntriesFromSales) and/or
+// APPOINTMENTS (buildAppointmentEntries) — reconciling each source_group's stale
+// snapshots independently, then load persisted entries (active + cancelled) and
+// compute the per-operator + global summaries. When the module is disabled, NO
+// accrual happens but any pre-existing snapshots are still loaded for display.
 export async function buildCommissionDashboard(slug: string, rawParams: CommissionDashboardParams): Promise<CommissionDashboard> {
   const source = ["all", "appointments", "pos"].includes(String(rawParams.source ?? "all")) ? String(rawParams.source ?? "all") : "all";
   const staffId = Math.max(0, Number(rawParams.staffId ?? 0) || 0);
@@ -741,35 +1017,37 @@ export async function buildCommissionDashboard(slug: string, rawParams: Commissi
 
   const settings = await getCommissionSettings(slug);
   const staffByName = new Map<string, CommissionStaffSetting>();
+  const staffById = new Map<number, CommissionStaffSetting>();
   for (const s of settings.staff) {
     const key = s.name.trim().toLowerCase();
     if (key) staffByName.set(key, s);
+    if (s.staffId > 0) staffById.set(s.staffId, s);
   }
 
-  // Accrue POS only when the module is enabled and the source includes POS.
-  // (TODO: appointment accrual is a separate later block — not run here.)
-  if (settings.moduleEnabled && from && to && (source === "all" || source === "pos")) {
+  // Accrue only when the module is enabled and a date range is set. POS and
+  // APPOINTMENTS are each produced + reconciled against their OWN source_group only
+  // (a POS recompute must not cancel appointment entries and vice versa). The
+  // reconcile-cancel is gated on a FULL accrual (staffId<=0), faithful to the legacy
+  // $canCancelStaleAppointments = $staffId <= 0 gate — a per-operator view only
+  // upserts its own entries (no reconcile).
+  if (settings.moduleEnabled && from && to) {
     const resolveLocationName = await locationNameResolver(slug);
-    const produced = await buildPosEntriesFromSales(slug, { from, to, staffId, locationId }, staffByName, resolveLocationName);
-    // Reconcile stale POS snapshots only for a full (unfiltered-by-staff) accrual,
-    // faithful to the legacy $canCancelStaleAppointments = $staffId <= 0 gate — a
-    // per-operator view must not cancel another operator's still-valid entries.
-    if (staffId <= 0) {
-      await syncPosEntrySnapshots(slug, { from, to, locationId }, produced);
-    } else {
-      // Per-operator view: upsert this operator's produced entries only, no reconcile.
-      const table = await tenantTable(slug, "staff_commission_payments");
-      for (const entry of produced) {
-        const found = await tenantSelect<RowDataPacket>({
-          slug,
-          table: table.name,
-          columns: "id",
-          where: "entry_key=?",
-          params: [entry.entryKey],
-          limit: 1,
-        }).catch(() => [] as RowDataPacket[]);
-        const existingId = found[0] ? Number(found[0].id ?? 0) || 0 : null;
-        await upsertEntrySnapshot(slug, table, entry, existingId);
+
+    if (source === "all" || source === "pos") {
+      const producedPos = await buildPosEntriesFromSales(slug, { from, to, staffId, locationId }, staffByName, resolveLocationName);
+      if (staffId <= 0) {
+        await syncEntrySnapshots(slug, { from, to, locationId }, producedPos, "pos");
+      } else {
+        await upsertProducedEntries(slug, producedPos);
+      }
+    }
+
+    if (source === "all" || source === "appointments") {
+      const producedAppt = await buildAppointmentEntries(slug, { from, to, staffId, locationId }, staffById, resolveLocationName);
+      if (staffId <= 0) {
+        await syncEntrySnapshots(slug, { from, to, locationId }, producedAppt, "appointments");
+      } else {
+        await upsertProducedEntries(slug, producedAppt);
       }
     }
   }
