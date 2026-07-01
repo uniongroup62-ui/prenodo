@@ -109,7 +109,7 @@ export function SuppliersContent() {
     const needle = q.trim().toLowerCase();
     return suppliers.filter((s) => {
       if (needle !== "") {
-        const hay = [s.name, s.businessName, s.city, s.phone, s.email]
+        const hay = [s.name, s.businessName, s.city, s.province, s.phone, s.email]
           .join(" ")
           .toLowerCase();
         if (!hay.includes(needle)) return false;
