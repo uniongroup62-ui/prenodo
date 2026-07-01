@@ -6215,6 +6215,68 @@ export async function cancelManageCoupon(
   return { ok: true };
 }
 
+// Human label for a coupon apply_scope (port of coupons_scope_label).
+function couponScopeLabel(scope: string): string {
+  const s = normalizeCouponScope(scope);
+  if (s === "service_categories") return "Categorie servizi";
+  if (s === "services") return "Servizi";
+  if (s === "product_categories") return "Categorie prodotti";
+  if (s === "products") return "Prodotti";
+  if (s === "all_services_products") return "Tutti servizi + prodotti";
+  return "Tutto il carrello";
+}
+
+// Enriched coupon row for the faithful management LIST (port of the coupons.php
+// list table): the base CouponRule plus the description, the apply_scope + its
+// human label (Ambito column), the enabled-sedi label (Sedi column) and the
+// active usage count (the list "Totali attivi" line). Kept separate from
+// listDbCoupons (consumed by POS/booking) so those lighter callers don't pay
+// for the per-row usage-stats + location joins.
+export type ManageCouponListRow = CouponRule & {
+  description: string;
+  applyScope: string;
+  scopeLabel: string;
+  locationLabel: string;
+  activeUsedCount: number;
+};
+
+export async function listManageCoupons(slug: string): Promise<ManageCouponListRow[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "coupons", where: "deleted_at IS NULL", orderBy: "code ASC" });
+
+  // coupon_id -> [location_id] (the enabled sedi per coupon) + location names.
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "coupon_locations", columns: "coupon_id, location_id" }).catch(() => [] as RowDataPacket[]);
+  const locByCoupon = new Map<number, number[]>();
+  for (const r of locRows) {
+    const cid = Number(r.coupon_id ?? 0);
+    const lid = Number(r.location_id ?? 0);
+    if (cid > 0 && lid > 0) {
+      const arr = locByCoupon.get(cid) ?? [];
+      arr.push(lid);
+      locByCoupon.set(cid, arr);
+    }
+  }
+  const locNameRows = await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id, name" }).catch(() => [] as RowDataPacket[]);
+  const locName = new Map<number, string>();
+  for (const r of locNameRows) locName.set(Number(r.id ?? 0), String(r.name ?? `Sede #${r.id}`));
+
+  const out: ManageCouponListRow[] = [];
+  for (const row of rows) {
+    const base = await mapCoupon(slug, row);
+    const stats = await couponUsageStats(slug, base);
+    const ids = locByCoupon.get(base.id) ?? [];
+    const locationLabel = ids.length === 0 ? "Tutte" : ids.map((lid) => locName.get(lid) ?? `Sede #${lid}`).join(", ");
+    out.push({
+      ...base,
+      description: String(row.description ?? ""),
+      applyScope: String(row.apply_scope ?? "all"),
+      scopeLabel: couponScopeLabel(String(row.apply_scope ?? "all")),
+      locationLabel,
+      activeUsedCount: stats.activeUsedCount,
+    });
+  }
+  return out;
+}
+
 export async function listDbPromotions(slug: string): Promise<PromotionRule[]> {
   const rows = await tenantSelect<RowDataPacket>({
     slug,

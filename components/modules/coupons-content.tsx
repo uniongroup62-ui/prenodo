@@ -18,6 +18,11 @@ type Coupon = {
   usageLimit: number;
   usedCount: number;
   createdAt?: string;
+  description?: string;
+  applyScope?: string;
+  scopeLabel?: string;
+  locationLabel?: string;
+  activeUsedCount?: number;
 };
 
 function tenantSlug(): string {
@@ -206,7 +211,7 @@ export function CouponsContent() {
                       return (
                         <tr key={x.id} className={active ? "" : "table-light"}>
                           <td className="fw-semibold">{x.code}</td>
-                          <td className="text-muted">—</td>
+                          <td className="text-muted">{x.description && x.description !== "" ? x.description : "—"}</td>
                           <td>
                             {x.type === "percent" ? <>{x.value}%</> : <>€ {fmtMoney(x.value)}</>}
                           </td>
@@ -215,16 +220,16 @@ export function CouponsContent() {
                             {x.usageLimit > 0 ? (
                               <>
                                 {x.usageLimit} / cliente
-                                {x.usedCount > 0 ? (
-                                  <div className="small text-muted">Totali attivi: {x.usedCount}</div>
+                                {(x.activeUsedCount ?? 0) > 0 ? (
+                                  <div className="small text-muted">Totali attivi: {x.activeUsedCount}</div>
                                 ) : null}
                               </>
                             ) : (
                               <>Illimitato</>
                             )}
                           </td>
-                          <td className="text-muted">—</td>
-                          <td className="text-muted">—</td>
+                          <td className="text-muted">{x.scopeLabel ?? "—"}</td>
+                          <td className="text-muted">{x.locationLabel ?? "—"}</td>
                           <td className="text-muted">
                             {fmtDate(x.startsAt)} → {fmtDate(x.endsAt)}
                           </td>

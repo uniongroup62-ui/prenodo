@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { cancelManageCoupon, createDbCoupon, deleteManageCoupon, getManageCoupon, listDbCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
+import { cancelManageCoupon, createDbCoupon, deleteManageCoupon, getManageCoupon, listDbCoupons, listManageCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -32,7 +32,7 @@ export async function GET(request: Request) {
     return Response.json({
       ok: true,
       sourceMode: "database",
-      coupons: await listDbCoupons(tenantSlug),
+      coupons: await listManageCoupons(tenantSlug),
     });
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore coupon.");
@@ -60,7 +60,7 @@ export async function POST(request: Request) {
         usageLimit: parseInteger(body.usage_limit, 100),
       };
       const coupon = await createDbCoupon(input, tenantSlug);
-      return Response.json({ ok: true, source: "coupons?action=create", sourceMode: "database", coupon, coupons: await listDbCoupons(tenantSlug) });
+      return Response.json({ ok: true, source: "coupons?action=create", sourceMode: "database", coupon, coupons: await listManageCoupons(tenantSlug) });
     }
 
     // Faithful coupon editor save (port of coupons.php POST action=new|edit). id=0
@@ -68,7 +68,7 @@ export async function POST(request: Request) {
     if (action === "save" || action === "new" || action === "edit" || action === "update") {
       if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
       const coupon = await saveManageCoupon(tenantSlug, body, parseInteger(body.id, 0));
-      return Response.json({ ok: true, source: "coupons?action=save", sourceMode: "database", coupon, coupons: await listDbCoupons(tenantSlug) });
+      return Response.json({ ok: true, source: "coupons?action=save", sourceMode: "database", coupon, coupons: await listManageCoupons(tenantSlug) });
     }
 
     // Delete a coupon (port of coupons.php action=delete). Refuses while open
@@ -77,14 +77,14 @@ export async function POST(request: Request) {
     if (action === "delete") {
       if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
       const result = await deleteManageCoupon(tenantSlug, parseInteger(body.id, 0), session.user.id);
-      return Response.json({ ok: true, source: "coupons?action=delete", sourceMode: "database", mode: result.mode, message: result.message, coupons: await listDbCoupons(tenantSlug) });
+      return Response.json({ ok: true, source: "coupons?action=delete", sourceMode: "database", mode: result.mode, message: result.message, coupons: await listManageCoupons(tenantSlug) });
     }
 
     // Disable a coupon (port of coupons.php action=cancel): is_active=0 + audit.
     if (action === "cancel" || action === "disable") {
       if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
       await cancelManageCoupon(tenantSlug, parseInteger(body.id, 0), String(body.cancel_reason ?? body.reason ?? ""), session.user.id);
-      return Response.json({ ok: true, source: "coupons?action=cancel", sourceMode: "database", coupons: await listDbCoupons(tenantSlug) });
+      return Response.json({ ok: true, source: "coupons?action=cancel", sourceMode: "database", coupons: await listManageCoupons(tenantSlug) });
     }
 
     // preview/redeem are also reachable from the quick-booking drawer's coupon Apply
