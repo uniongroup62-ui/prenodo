@@ -1829,24 +1829,38 @@ export function QuickBookingDrawer() {
       const first = String(fd.get("first_name") ?? "").trim();
       const last = String(fd.get("last_name") ?? "").trim();
       const name = `${first} ${last}`.trim();
-      if (!name) {
+      if (!first || !last) {
         setCreateError("Nome e cognome obbligatori.");
+        return;
+      }
+      // Email / PEC client-side validation, mirroring the legacy create_quick guards.
+      const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const emailVal = String(fd.get("email") ?? "").trim();
+      const pecVal = String(fd.get("pec") ?? "").trim();
+      if (emailVal && !emailRe.test(emailVal)) {
+        setCreateError("Email non valida.");
+        return;
+      }
+      if (pecVal && !emailRe.test(pecVal)) {
+        setCreateError("PEC non valida.");
         return;
       }
       setCreateError("");
       setCreateSaving(true);
       try {
+        // Send EVERY named field the form collects (the backend clientInputFromBody accepts
+        // all 22 anagrafica fields — first_name/last_name/gender/birth_date/address/fiscal/…),
+        // instead of hand-picking 5. Faithful port of the legacy qbSubmitClientCreate, which
+        // serializes the whole form. `name` (first+last joined) is added for the backend's
+        // name field alongside the individual first_name/last_name.
+        const body: Record<string, string> = { action: "create", name };
+        for (const [key, value] of fd.entries()) {
+          if (typeof value === "string" && key !== "action") body[key] = value;
+        }
         const res = await fetch(`/api/manage/clients?slug=${encodeURIComponent(slug)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
-          body: JSON.stringify({
-            action: "create",
-            name,
-            email: String(fd.get("email") ?? ""),
-            phone: String(fd.get("phone") ?? ""),
-            location_id: String(fd.get("location_id") ?? ""),
-            note: String(fd.get("notes") ?? ""),
-          }),
+          body: JSON.stringify(body),
         });
         const data: { ok?: boolean; error?: string; client?: { id: number; name: string; email?: string; phone?: string } } =
           await res.json().catch(() => ({}));
