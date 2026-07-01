@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { convertDbQuoteToSale, createDbQuote, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
+import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
@@ -94,6 +94,12 @@ export async function POST(request: Request) {
     if (action === "convert") {
       const result = await convertDbQuoteToSale(id, tenantSlug, parseInteger(body.location_id, 0));
       return Response.json({ ok: true, source: "quotes?action=convert", sourceMode: "database", ...result, quotes: await listDbQuotes(tenantSlug) });
+    }
+
+    // Delete a draft quote (port of quotes.php action=delete).
+    if (action === "delete") {
+      await deleteDbQuote(tenantSlug, id);
+      return Response.json({ ok: true, source: "quotes?action=delete", sourceMode: "database", quotes: await listDbQuotes(tenantSlug) });
     }
 
     return jsonError("Azione preventivi non supportata.");

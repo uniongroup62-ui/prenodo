@@ -80,6 +80,7 @@ export function QuotesContent() {
   const slug = tenantSlug();
   const [quotes, setQuotes] = useState<Quote[]>([]);
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(0);
 
   // Filter form state (legacy: GET form with client_id / status / date / number).
   const [clientId, setClientId] = useState("0");
@@ -125,6 +126,29 @@ export function QuotesContent() {
 
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`quotes${suffix}`.replace("&", "?")}`;
+  }
+
+  // Delete a DRAFT quote via POST (the server refuses sent/converted ones).
+  // Confirm-gated. Replaces the old GET ?action=delete link (Tailwind fallback).
+  async function deleteQuote(q: Quote) {
+    if (busyId) return;
+    if (typeof window !== "undefined" && !window.confirm("Eliminare questo preventivo?")) return;
+    setBusyId(q.id);
+    try {
+      const res = await fetch(`/api/manage/quotes?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "delete", id: q.id }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        if (typeof window !== "undefined") window.alert(j?.error || "Impossibile eliminare il preventivo.");
+      } else {
+        load();
+      }
+    } finally {
+      setBusyId(0);
+    }
   }
 
   return (
@@ -291,13 +315,14 @@ export function QuotesContent() {
                               </a>{" "}
                             </>
                           ) : null}
-                          <a
+                          <button
+                            type="button"
                             className="btn btn-sm btn-outline-danger"
-                            href={href(`&action=delete&id=${q.id}`)}
-                            data-confirm="Eliminare questo preventivo?"
+                            disabled={busyId === q.id}
+                            onClick={() => deleteQuote(q)}
                           >
                             Elimina
-                          </a>
+                          </button>
                         </td>
                       </tr>
                     );

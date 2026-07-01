@@ -3558,6 +3558,28 @@ export async function updateDbQuoteStatus(id: number, status: QuoteStatus, slug:
   return mapQuote(slug, rows[0]);
 }
 
+// Delete a quote (port of quotes.php action=delete): only DRAFT quotes can be
+// deleted — sent/converted/etc. must be kept for history (use the
+// Annullato/Rifiutato status instead). Drops quote_items + the quotes row.
+export async function deleteDbQuote(slug: string, id: number): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Preventivo non valido.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", columns: "id, status", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Preventivo non trovato.");
+  if (quoteStatus(String(rows[0].status ?? "draft")) !== "draft") {
+    throw new Error("Puoi eliminare solo preventivi in bozza. Per preventivi inviati o storicizzati usa lo stato Annullato/Rifiutato.");
+  }
+  const itemTable = await tenantTable(slug, "quote_items").catch(() => null);
+  if (itemTable) {
+    const scoped = itemTable.mode === "shared" && (await columnExists(itemTable.name, "tenant_id"));
+    await dbExecute(
+      `DELETE FROM ${quoteIdentifier(itemTable.name)} WHERE quote_id = ?${scoped ? " AND tenant_id = ?" : ""}`,
+      scoped ? [id, itemTable.tenantId ?? 0] : [id],
+    ).catch(() => undefined);
+  }
+  await tenantDelete({ slug, table: "quotes", id });
+  return { ok: true };
+}
+
 // Port of the quotes.php manual "Invia email" action (action=email): emails the
 // quote to the client with the public-page link and a PDF link, then marks the
 // quote sent. The Next quotes route previously only flipped the status via
