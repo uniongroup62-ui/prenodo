@@ -3067,6 +3067,7 @@ export async function posDbSummary(slug: string): Promise<PosSummary> {
   const paymentTotals: Record<PosPaymentMethod, number> = {
     cash: 0,
     card: 0,
+    check: 0,
     transfer: 0,
     giftcard: 0,
     wallet: 0,

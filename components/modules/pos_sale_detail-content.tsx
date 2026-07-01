@@ -106,6 +106,7 @@ function fmtDateTime(value?: string): string {
 const PAYMENT_LABELS: Record<string, string> = {
   cash: "Contanti",
   card: "Carta",
+  check: "Assegno",
   transfer: "Bonifico",
   giftcard: "GiftCard",
   wallet: "Credito",

@@ -697,6 +697,7 @@ async function createManageInstallmentPlan(
 // check/bank). transfer -> bank; wallet/giftcard residui tenders default to card.
 function installmentPaymentType(method: PosPaymentMethod): string {
   if (method === "cash") return "cash";
+  if (method === "check") return "check";
   if (method === "transfer") return "bank";
   return "card";
 }
@@ -1694,8 +1695,15 @@ async function insertSaleItem(slug: string, saleId: number, item: PosSaleItem): 
 
 async function resolveSaleClient(slug: string, clientId: number, clientName?: string): Promise<{ id: number; name: string }> {
   if (clientId > 0) {
-    const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id,full_name", where: "id=?", params: [clientId], limit: 1 });
-    if (rows[0]) return { id: Number(rows[0].id ?? 0), name: String(rows[0].full_name ?? "Cliente") };
+    const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id,full_name,is_blocked", where: "id=?", params: [clientId], limit: 1 });
+    if (rows[0]) {
+      // Legacy pos_client_selection_error (pos.php:495-512): a blocked client cannot be used
+      // in Pagamenti until reactivated.
+      if (Number(rows[0].is_blocked ?? 0) === 1) {
+        throw new Error("Questo cliente è disattivato e non può essere utilizzato in Pagamenti o Quick Booking finché non viene riattivato.");
+      }
+      return { id: Number(rows[0].id ?? 0), name: String(rows[0].full_name ?? "Cliente") };
+    }
     throw new Error("Cliente non valido.");
   }
   const name = clean(clientName, 190) || "Cliente banco";
@@ -2857,7 +2865,7 @@ async function serviceLocationMap(slug: string, serviceIds: number[]): Promise<M
 function summarizeSales(sales: PosSale[]): PosSummary {
   const activeSales = sales.filter((sale) => sale.status !== "cancelled");
   const cancelledSales = sales.filter((sale) => sale.status === "cancelled");
-  const paymentTotals: Record<PosPaymentMethod, number> = { cash: 0, card: 0, transfer: 0, giftcard: 0, wallet: 0 };
+  const paymentTotals: Record<PosPaymentMethod, number> = { cash: 0, card: 0, check: 0, transfer: 0, giftcard: 0, wallet: 0 };
   let serviceTotal = 0;
   let productTotal = 0;
   for (const sale of activeSales) {
@@ -3034,7 +3042,7 @@ function normalizeLocationId(value: number, locations: Array<{ id: number }>): n
 
 function normalizePaymentMethod(value: unknown): PosPaymentMethod {
   const method = String(value ?? "").toLowerCase();
-  if (method === "cash" || method === "card" || method === "transfer" || method === "giftcard" || method === "wallet") return method;
+  if (method === "cash" || method === "card" || method === "check" || method === "transfer" || method === "giftcard" || method === "wallet") return method;
   return "card";
 }
 

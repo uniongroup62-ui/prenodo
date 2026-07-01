@@ -282,8 +282,9 @@ const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
 // bank->transfer (port of normalizePaymentMethod in app/api/manage/pos/route.ts).
 function apiPaymentMethod(method: PaymentMethod): string {
   if (method === "cash") return "cash";
+  if (method === "check") return "check"; // preserve Assegno (was folded to card)
   if (method === "bank") return "transfer";
-  return "card"; // card + check
+  return "card";
 }
 
 // Label for a completed-sale payment method (PosPayment.method: cash/card/transfer/giftcard/

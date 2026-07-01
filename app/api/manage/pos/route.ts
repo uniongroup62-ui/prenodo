@@ -323,8 +323,9 @@ function normalizeItemType(value: string): PosSaleItemType | null {
 }
 
 function normalizePaymentMethod(value: string): PosPaymentMethod {
-  if (value === "cash" || value === "card" || value === "transfer" || value === "giftcard" || value === "wallet") return value;
-  if (value === "bank" || value === "bonifico" || value === "check" || value === "assegno") return "transfer";
+  if (value === "cash" || value === "card" || value === "check" || value === "transfer" || value === "giftcard" || value === "wallet") return value;
+  if (value === "assegno") return "check"; // preserve Assegno (was folded to transfer)
+  if (value === "bank" || value === "bonifico") return "transfer";
   return "card";
 }
 

@@ -76,7 +76,7 @@ export type ManagedProduct = Product & {
 
 export type PosSaleItemType = "service" | "product" | "prepaid" | "giftcard" | "package" | "giftbox" | "recharge";
 export type PosSaleItemStatus = "executed" | "prepaid" | "collected" | "ordered";
-export type PosPaymentMethod = "cash" | "card" | "transfer" | "giftcard" | "wallet";
+export type PosPaymentMethod = "cash" | "card" | "check" | "transfer" | "giftcard" | "wallet";
 export type PosSaleStatus = "active" | "cancelled";
 
 export type PosSaleItemInput = {
