@@ -31,6 +31,27 @@ type CouponForm = {
   valid_to: string;
 };
 
+type IdName = { id: number; name: string };
+type ServiceOpt = { id: number; name: string; categoryName: string };
+type ProductOpt = { id: number; name: string; sku: string };
+type CouponFormContext = {
+  locations: IdName[];
+  serviceCategories: IdName[];
+  services: ServiceOpt[];
+  productCategories: IdName[];
+  products: ProductOpt[];
+  defaultLocationIds: number[];
+};
+
+// The scope-restricted catalogs + enabled sedi selected in the editor.
+type CouponScopeSel = {
+  serviceCategoryIds: number[];
+  serviceIds: number[];
+  productCategoryIds: number[];
+  productIds: number[];
+  locationIds: number[];
+};
+
 // Edit-view audit fields shown in the legacy status card above the form.
 type CouponMeta = {
   active: boolean;
@@ -99,13 +120,29 @@ export function CouponFormContent() {
   const [showCancel, setShowCancel] = useState(false);
   const [cancelReason, setCancelReason] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [context, setContext] = useState<CouponFormContext | null>(null);
+  const [sel, setSel] = useState<CouponScopeSel>({ serviceCategoryIds: [], serviceIds: [], productCategoryIds: [], productIds: [], locationIds: [] });
 
   // On edit (action=edit&id=) prefill from coupons?action=get. On new, keep the
-  // faithful defaults (percent / 10 / scope all_services_products).
+  // faithful defaults (percent / 10 / scope all_services_products). Always load
+  // the form context (catalog options + active sedi) for the scope selects.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const act = params.get("action") === "edit" ? "edit" : "new";
     const id = Number.parseInt(params.get("id") ?? "", 10);
+
+    const ctxPromise = fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}&action=form_context`, {
+      headers: { "x-tenant-slug": slug },
+    })
+      .then((r) => r.json())
+      .then((j) => {
+        const ctx: CouponFormContext = j.context ?? { locations: [], serviceCategories: [], services: [], productCategories: [], products: [], defaultLocationIds: [] };
+        setContext(ctx);
+        // NEW default: all active sedi pre-checked (mirrors the legacy current-or-all default).
+        if (act !== "edit") setSel((prev) => ({ ...prev, locationIds: ctx.defaultLocationIds }));
+        return ctx;
+      })
+      .catch(() => setContext({ locations: [], serviceCategories: [], services: [], productCategories: [], products: [], defaultLocationIds: [] }));
 
     const editPromise =
       act === "edit" && Number.isFinite(id) && id > 0
@@ -144,12 +181,43 @@ export function CouponFormContent() {
                 cancelledReason: String(c.cancelledReason ?? ""),
                 canCancel: Boolean(c.canCancel),
               });
+              setSel({
+                serviceCategoryIds: (c.serviceCategoryIds ?? []).map(Number),
+                serviceIds: (c.serviceIds ?? []).map(Number),
+                productCategoryIds: (c.productCategoryIds ?? []).map(Number),
+                productIds: (c.productIds ?? []).map(Number),
+                locationIds: (c.locationIds ?? []).map(Number),
+              });
             })
             .catch(() => setError("Errore nel caricamento del coupon."))
         : Promise.resolve();
 
-    editPromise.finally(() => setLoading(false));
+    Promise.all([ctxPromise, editPromise]).finally(() => setLoading(false));
   }, [slug]);
+
+  function toggleId(key: keyof CouponScopeSel, id: number, checked: boolean) {
+    setSel((prev) => {
+      const cur = new Set(prev[key]);
+      if (checked) cur.add(id);
+      else cur.delete(id);
+      return { ...prev, [key]: Array.from(cur) };
+    });
+  }
+
+  function setMultiSelect(key: keyof CouponScopeSel, options: HTMLCollectionOf<HTMLOptionElement>) {
+    const ids: number[] = [];
+    for (const opt of Array.from(options)) if (opt.selected) ids.push(Number(opt.value));
+    setSel((prev) => ({ ...prev, [key]: ids }));
+  }
+
+  // Generate a random coupon code (mirrors coupons.js fallback charset); the
+  // server rejects a duplicate/promotion-clashing code on save.
+  function generateCode() {
+    const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    let out = "";
+    for (let i = 0; i < 10; i += 1) out += chars.charAt(Math.floor(Math.random() * chars.length));
+    set("code", out);
+  }
 
   function set<K extends keyof CouponForm>(key: K, value: CouponForm[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -208,6 +276,27 @@ export function CouponFormContent() {
       setError('La data "Valido al" deve essere successiva o uguale a "Valido dal".');
       return;
     }
+    // Scope + sede validation (port of coupons.php $scopeError / "almeno una sede").
+    if (form.apply_scope === "service_categories" && sel.serviceCategoryIds.length === 0) {
+      setError("Seleziona almeno una categoria di servizi.");
+      return;
+    }
+    if (form.apply_scope === "services" && sel.serviceIds.length === 0) {
+      setError("Seleziona almeno un servizio.");
+      return;
+    }
+    if (form.apply_scope === "product_categories" && sel.productCategoryIds.length === 0) {
+      setError("Seleziona almeno una categoria di prodotti.");
+      return;
+    }
+    if (form.apply_scope === "products" && sel.productIds.length === 0) {
+      setError("Seleziona almeno un prodotto.");
+      return;
+    }
+    if ((context?.locations.length ?? 0) > 0 && sel.locationIds.length === 0) {
+      setError("Seleziona almeno una sede abilitata.");
+      return;
+    }
 
     setSaving(true);
     try {
@@ -223,6 +312,12 @@ export function CouponFormContent() {
         apply_scope: form.apply_scope,
         valid_from: form.valid_from,
         valid_to: form.valid_to,
+        // Nested arrays sent as JSON strings so they survive parseRequestBody's flatten.
+        service_category_ids: JSON.stringify(sel.serviceCategoryIds),
+        service_ids: JSON.stringify(sel.serviceIds),
+        product_category_ids: JSON.stringify(sel.productCategoryIds),
+        product_ids: JSON.stringify(sel.productIds),
+        coupon_location_ids: JSON.stringify(sel.locationIds),
       };
       const res = await fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}`, {
         method: "POST",
@@ -371,13 +466,18 @@ export function CouponFormContent() {
                 <label className="form-label">Codice</label>
                 {action === "new" ? (
                   <>
-                    <input
-                      className="form-control"
-                      name="code"
-                      required
-                      value={form.code}
-                      onChange={(e) => set("code", e.target.value)}
-                    />
+                    <div className="input-group">
+                      <input
+                        className="form-control"
+                        name="code"
+                        required
+                        value={form.code}
+                        onChange={(e) => set("code", e.target.value)}
+                      />
+                      <button type="button" className="btn btn-outline-secondary" onClick={generateCode}>
+                        Genera
+                      </button>
+                    </div>
                     <div className="form-text">Max 40 caratteri. Solo lettere, numeri, - e _.</div>
                   </>
                 ) : (
@@ -492,6 +592,117 @@ export function CouponFormContent() {
                   onChange={(e) => set("valid_to", e.target.value)}
                 />
               </div>
+
+              {(context?.locations.length ?? 0) > 0 ? (
+                <div className="col-12">
+                  <label className="form-label">Sedi abilitate</label>
+                  <div className="table-responsive border rounded">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>Sede</th>
+                          <th className="text-center">Valido</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {context!.locations.map((loc) => (
+                          <tr key={loc.id}>
+                            <td className="fw-semibold">{loc.name || `Sede #${loc.id}`}</td>
+                            <td className="text-center">
+                              <input
+                                className="form-check-input"
+                                type="checkbox"
+                                checked={sel.locationIds.includes(loc.id)}
+                                onChange={(e) => toggleId("locationIds", loc.id, e.target.checked)}
+                              />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : null}
+
+              {form.apply_scope === "service_categories" ? (
+                <div className="col-md-4">
+                  <label className="form-label">Categorie di servizi</label>
+                  <select
+                    className="form-select"
+                    multiple
+                    size={6}
+                    value={sel.serviceCategoryIds.map(String)}
+                    onChange={(e) => setMultiSelect("serviceCategoryIds", e.target.options)}
+                  >
+                    {(context?.serviceCategories ?? []).map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.name || `Categoria #${o.id}`}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="form-text">Selezione multipla consentita.</div>
+                </div>
+              ) : null}
+
+              {form.apply_scope === "services" ? (
+                <div className="col-md-4">
+                  <label className="form-label">Servizi</label>
+                  <select
+                    className="form-select"
+                    multiple
+                    size={6}
+                    value={sel.serviceIds.map(String)}
+                    onChange={(e) => setMultiSelect("serviceIds", e.target.options)}
+                  >
+                    {(context?.services ?? []).map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.categoryName !== "" ? `${o.categoryName} · ${o.name}` : o.name || `Servizio #${o.id}`}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="form-text">Selezione multipla consentita.</div>
+                </div>
+              ) : null}
+
+              {form.apply_scope === "product_categories" ? (
+                <div className="col-md-4">
+                  <label className="form-label">Categorie di prodotti</label>
+                  <select
+                    className="form-select"
+                    multiple
+                    size={6}
+                    value={sel.productCategoryIds.map(String)}
+                    onChange={(e) => setMultiSelect("productCategoryIds", e.target.options)}
+                  >
+                    {(context?.productCategories ?? []).map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.name || `Categoria #${o.id}`}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="form-text">Selezione multipla consentita.</div>
+                </div>
+              ) : null}
+
+              {form.apply_scope === "products" ? (
+                <div className="col-md-4">
+                  <label className="form-label">Prodotti</label>
+                  <select
+                    className="form-select"
+                    multiple
+                    size={6}
+                    value={sel.productIds.map(String)}
+                    onChange={(e) => setMultiSelect("productIds", e.target.options)}
+                  >
+                    {(context?.products ?? []).map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.sku !== "" ? `${o.name} (${o.sku})` : o.name || `Prodotto #${o.id}`}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="form-text">Selezione multipla consentita.</div>
+                </div>
+              ) : null}
             </div>
 
             <div className="mt-3 d-flex gap-2">

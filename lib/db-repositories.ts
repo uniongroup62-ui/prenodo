@@ -5959,6 +5959,11 @@ export type ManageCouponRecord = CouponRule & {
   cancelledReason: string;
   activeUsedCount: number;
   canCancel: boolean;
+  serviceCategoryIds: number[];
+  serviceIds: number[];
+  productCategoryIds: number[];
+  productIds: number[];
+  locationIds: number[];
 };
 
 // Resolve a user id to a display label (name || email || #id), like the legacy
@@ -5997,16 +6002,124 @@ export async function getManageCoupon(slug: string, id: number): Promise<ManageC
     cancelledReason: String(row.cancelled_reason ?? ""),
     activeUsedCount: stats.activeUsedCount,
     canCancel: Number(row.is_active ?? 0) === 1 && !row.deleted_at,
+    serviceCategoryIds: decodeCouponIdsJson(row.service_category_ids_json),
+    serviceIds: decodeCouponIdsJson(row.service_ids_json),
+    productCategoryIds: decodeCouponIdsJson(row.product_category_ids_json),
+    productIds: decodeCouponIdsJson(row.product_ids_json),
+    // Edit default (legacy): the coupon's saved sedi, or ALL active sedi when none saved.
+    locationIds: await couponSelectedLocationIds(slug, id),
   };
 }
 
+// The coupon's enabled sedi (coupon_locations); when none are saved the legacy
+// edit form pre-checks ALL active sedi, so mirror that default here.
+async function couponSelectedLocationIds(slug: string, couponId: number): Promise<number[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "coupon_locations", columns: "location_id", where: "coupon_id = ?", params: [couponId] }).catch(() => [] as RowDataPacket[]);
+  const ids = rows.map((r) => Number(r.location_id ?? 0)).filter((n) => n > 0);
+  return ids.length > 0 ? ids : activeLocationIds(slug);
+}
+
+// Catalog options + active sedi for the coupon NEW/EDIT form (port of the legacy
+// $serviceCategoryOptions/$serviceOptions/$productCategoryOptions/$productOptions
+// + $couponActiveLocations). Categories are limited to those that actually have
+// services/products (like the legacy EXISTS filter).
+export type CouponFormContext = {
+  locations: { id: number; name: string }[];
+  serviceCategories: { id: number; name: string }[];
+  services: { id: number; name: string; categoryName: string }[];
+  productCategories: { id: number; name: string }[];
+  products: { id: number; name: string; sku: string }[];
+  defaultLocationIds: number[];
+};
+
+export async function getCouponFormContext(slug: string): Promise<CouponFormContext> {
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id, name", where: "COALESCE(is_active,1) = 1", orderBy: "COALESCE(sort_order,999999) ASC, name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const locations = locRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? `Sede #${r.id}`) })).filter((l) => l.id > 0);
+
+  const svcCatRows = await tenantSelect<RowDataPacket>({ slug, table: "service_categories", columns: "id, name", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const svcRows = await tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, name, category_id", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const svcCatName = new Map<number, string>();
+  for (const r of svcCatRows) svcCatName.set(Number(r.id ?? 0), String(r.name ?? ""));
+  const svcCatUsed = new Set<number>();
+  for (const r of svcRows) { const cid = Number(r.category_id ?? 0); if (cid > 0) svcCatUsed.add(cid); }
+  const serviceCategories = svcCatRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? "") })).filter((c) => c.id > 0 && svcCatUsed.has(c.id));
+  const services = svcRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? ""), categoryName: svcCatName.get(Number(r.category_id ?? 0)) ?? "" })).filter((s) => s.id > 0);
+
+  const prodCatRows = await tenantSelect<RowDataPacket>({ slug, table: "product_categories", columns: "id, name", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const prodRows = await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "id, name, sku, category_id", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const prodCatUsed = new Set<number>();
+  for (const r of prodRows) { const cid = Number(r.category_id ?? 0); if (cid > 0) prodCatUsed.add(cid); }
+  const productCategories = prodCatRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? "") })).filter((c) => c.id > 0 && prodCatUsed.has(c.id));
+  const products = prodRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? ""), sku: String(r.sku ?? "") })).filter((p) => p.id > 0);
+
+  return { locations, serviceCategories, services, productCategories, products, defaultLocationIds: locations.map((l) => l.id) };
+}
+
+// Parse a coupon scope / location id-list from a body field. Accepts a
+// JSON-array string (the form sends the nested arrays as JSON so they survive
+// parseRequestBody's top-level flatten — the [object Object] trap) or a plain
+// comma-separated list. Returns unique positive ids.
+function parseCouponIdList(raw: unknown): number[] {
+  let src: unknown = raw;
+  if (typeof src === "string") {
+    const s = src.trim();
+    if (s === "") return [];
+    if (s.startsWith("[")) {
+      try { src = JSON.parse(s); } catch { src = s.split(","); }
+    } else {
+      src = s.split(",");
+    }
+  }
+  if (!Array.isArray(src)) return [];
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const v of src) {
+    const n = Math.trunc(Number(v));
+    if (n > 0 && !seen.has(n)) { seen.add(n); out.push(n); }
+  }
+  return out;
+}
+
+// Serialize an id-list to the JSON stored in the *_ids_json columns (null when empty).
+function couponJsonIds(ids: number[]): string | null {
+  return ids.length ? JSON.stringify(ids) : null;
+}
+
+// Decode a coupon *_ids_json column back to an id-list (tolerant of JSON or CSV).
+function decodeCouponIdsJson(raw: unknown): number[] {
+  return parseCouponIdList(raw);
+}
+
+// True when a Promotion already owns this coupon_code (port of coupons_promo_code_exists).
+async function couponPromoCodeExists(slug: string, code: string): Promise<boolean> {
+  const norm = normalizeCouponCode(code);
+  if (norm === "") return false;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", columns: "id", where: "UPPER(COALESCE(coupon_code,'')) = ?", params: [norm], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  return rows.length > 0;
+}
+
+// Active location ids for the tenant (for the "almeno una sede" gate + form defaults).
+async function activeLocationIds(slug: string): Promise<number[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id", where: "COALESCE(is_active,1) = 1", orderBy: "COALESCE(sort_order,999999) ASC, name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  return rows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+}
+
+// Replace a coupon's enabled sedi (coupon_locations): clear then re-insert.
+async function syncCouponLocations(slug: string, couponId: number, locationIds: number[]): Promise<void> {
+  const table = await tenantTable(slug, "coupon_locations").catch(() => null);
+  if (!table) return;
+  await deleteCouponLocations(slug, couponId);
+  for (const lid of locationIds) {
+    await tenantInsert(table, { coupon_id: couponId, location_id: lid }).catch(() => 0);
+  }
+}
+
 // Create / update a coupon rule, faithful to coupons.php POST(action=new|edit).
-// On create the code is required + validated and must be unique; on edit the
-// code is immutable (the legacy form renders it readonly), so only the editable
-// fields (description, type, value, min_subtotal, usage_limit, apply_scope,
-// valid_from, valid_to) are written. The scope-restricted catalogs
-// (service/product id lists) and per-location toggles from the legacy form are
-// not part of the current coupon data pipeline — see the form TODO.
+// On create the code is required + validated, must be unique and must not clash
+// with a Promotion code; on edit the code is immutable (the legacy form renders
+// it readonly). Persists the scope-restricted catalogs (service/product id
+// lists) as the *_ids_json columns and syncs coupon_locations, with the legacy
+// scope + "almeno una sede" validation.
 export async function saveManageCoupon(slug: string, body: Record<string, string>, id: number): Promise<ManageCouponRecord> {
   let type = String(body.discount_type ?? "percent").trim().toLowerCase();
   if (type === "amount") type = "fixed";
@@ -6018,7 +6131,8 @@ export async function saveManageCoupon(slug: string, body: Record<string, string
 
   const minSubtotal = roundMoney(Math.max(0, Number(String(body.min_subtotal ?? "0").replace(",", ".")) || 0));
   const usageLimit = Math.max(0, Math.round(Number(body.usage_limit ?? 0) || 0));
-  const scope = normalizeCouponScope(String(body.apply_scope ?? "all_services_products"));
+  let scope = normalizeCouponScope(String(body.apply_scope ?? "all_services_products"));
+  if (scope === "all" && id <= 0) scope = "all_services_products";
   const description = String(body.description ?? "").trim();
   const from = normalizeClientDate(body.valid_from);
   const to = normalizeClientDate(body.valid_to);
@@ -6027,13 +6141,33 @@ export async function saveManageCoupon(slug: string, body: Record<string, string
   }
   if (from && to && from > to) throw new Error('La data "Valido al" deve essere successiva o uguale a "Valido dal".');
 
+  // Scope-restricted catalogs (persisted as *_ids_json) + the enabled sedi.
+  const serviceCategoryIds = parseCouponIdList(body.service_category_ids);
+  const serviceIds = parseCouponIdList(body.service_ids);
+  const productCategoryIds = parseCouponIdList(body.product_category_ids);
+  const productIds = parseCouponIdList(body.product_ids);
+  const couponLocationIds = parseCouponIdList(body.coupon_location_ids);
+
+  // Scope validation (port of coupons.php $scopeError).
+  if (scope === "service_categories" && serviceCategoryIds.length === 0) throw new Error("Seleziona almeno una categoria di servizi.");
+  if (scope === "services" && serviceIds.length === 0) throw new Error("Seleziona almeno un servizio.");
+  if (scope === "product_categories" && productCategoryIds.length === 0) throw new Error("Seleziona almeno una categoria di prodotti.");
+  if (scope === "products" && productIds.length === 0) throw new Error("Seleziona almeno un prodotto.");
+  // "Seleziona almeno una sede abilitata" when the tenant has active sedi.
+  const activeLocs = await activeLocationIds(slug);
+  if (activeLocs.length > 0 && couponLocationIds.length === 0) throw new Error("Seleziona almeno una sede abilitata.");
+
   const values: Record<string, unknown> = {
     description: description !== "" ? description : null,
     discount_type: type,
     discount_value: value,
     min_subtotal: minSubtotal,
     usage_limit: usageLimit,
-    apply_scope: scope === "all" && id <= 0 ? "all_services_products" : scope,
+    apply_scope: scope,
+    service_category_ids_json: couponJsonIds(serviceCategoryIds),
+    service_ids_json: couponJsonIds(serviceIds),
+    product_category_ids_json: couponJsonIds(productCategoryIds),
+    product_ids_json: couponJsonIds(productIds),
     valid_from: from,
     valid_to: to,
   };
@@ -6049,8 +6183,11 @@ export async function saveManageCoupon(slug: string, body: Record<string, string
     if (!/^[A-Z0-9][A-Z0-9_-]{0,39}$/.test(code)) throw new Error("Codice non valido. Usa solo lettere, numeri, - e _. (Max 40)");
     const dup = await tenantSelect<RowDataPacket>({ slug, table: "coupons", columns: "id", where: "code = ? AND deleted_at IS NULL", params: [code], limit: 1 });
     if (dup[0]) throw new Error("Esiste gia un coupon con questo codice.");
+    if (await couponPromoCodeExists(slug, code)) throw new Error("Questo codice è già utilizzato da una Promozione. Scegli un codice diverso.");
     couponId = await tenantInsert(await tenantTable(slug, "coupons"), { ...values, code, is_active: 1 });
   }
+
+  await syncCouponLocations(slug, couponId, couponLocationIds);
 
   const saved = await getManageCoupon(slug, couponId);
   if (!saved) throw new Error("Coupon non salvato.");

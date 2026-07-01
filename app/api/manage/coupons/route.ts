@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { cancelManageCoupon, createDbCoupon, deleteManageCoupon, getManageCoupon, listDbCoupons, listManageCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
+import { cancelManageCoupon, createDbCoupon, deleteManageCoupon, getCouponFormContext, getManageCoupon, listDbCoupons, listManageCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -27,6 +27,14 @@ export async function GET(request: Request) {
       const coupon = await getManageCoupon(tenantSlug, couponId);
       if (!coupon) return jsonError("Coupon non trovato.", 404);
       return Response.json({ ok: true, source: "coupons?action=get", sourceMode: "database", coupon });
+    }
+
+    // Coupon NEW/EDIT form context: catalog options (service/product categories
+    // + services + products) + active sedi, for the scope multi-selects and the
+    // Sedi abilitate table. Gated by coupons.manage like the editor.
+    if (url.searchParams.get("action") === "form_context") {
+      if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
+      return Response.json({ ok: true, source: "coupons?action=form_context", sourceMode: "database", context: await getCouponFormContext(tenantSlug) });
     }
 
     return Response.json({
