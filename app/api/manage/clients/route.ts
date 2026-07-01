@@ -1,6 +1,7 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import type { ManagedClient } from "@/lib/tenant-store";
 import {
+  addManageClientTag,
   archiveDbClient,
   blockDbClient,
   createDbClient,
@@ -11,6 +12,7 @@ import {
   listDbClients,
   quickBookClientContext,
   quickBookClientResidualsDetail,
+  removeManageClientTag,
   unblockDbClient,
   updateDbClient,
 } from "@/lib/db-repositories";
@@ -212,6 +214,19 @@ export async function POST(request: Request) {
     if (action === "unblock") {
       const client = await unblockDbClient(id, tenantSlug);
       return Response.json({ ok: true, source: "clients?action=unblock", sourceMode: "database", client, clients: await listDbClients({ slug: tenantSlug }) });
+    }
+
+    // Add a tag (port of clients.php _mode=add_tag): find-or-create the tenant tag
+    // by name, then map it to the client. Returns the refreshed tag list.
+    if (action === "add_tag") {
+      const tags = await addManageClientTag(tenantSlug, id, String(body.tag ?? body.name ?? ""));
+      return Response.json({ ok: true, source: "clients?action=add_tag", sourceMode: "database", tags });
+    }
+
+    // Remove a tag (port of clients.php do=remove_tag): drop the client<->tag map row.
+    if (action === "remove_tag") {
+      const tags = await removeManageClientTag(tenantSlug, id, parseInteger(body.tag_id, 0));
+      return Response.json({ ok: true, source: "clients?action=remove_tag", sourceMode: "database", tags });
     }
 
     if (action === "delete") {

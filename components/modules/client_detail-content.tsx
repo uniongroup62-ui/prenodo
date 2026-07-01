@@ -170,6 +170,9 @@ export function ClientDetailContent() {
     setReloadKey((k) => k + 1);
   }, []);
 
+  // Tag add input.
+  const [tagInput, setTagInput] = useState("");
+
   // Blocca modal.
   const [blockOpen, setBlockOpen] = useState(false);
   const [blockNote, setBlockNote] = useState("");
@@ -281,6 +284,57 @@ export function ClientDetailContent() {
       }
     } catch {
       setError("Errore nella riattivazione.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Add a tag (port of clients.php _mode=add_tag). Updates the tag list in place
+  // from the response so the badges refresh without a full detail reload.
+  async function addTag() {
+    const name = tagInput.trim();
+    if (busy || name === "") return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch(`/api/manage/clients?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "add_tag", id: String(clientId), tag: name }),
+      });
+      const j = await res.json();
+      if (!res.ok || !j.ok) {
+        setError(String(j.error ?? "Errore nell'aggiunta del tag."));
+      } else {
+        setData((prev) => (prev ? { ...prev, tags: Array.isArray(j.tags) ? j.tags : prev.tags } : prev));
+        setTagInput("");
+      }
+    } catch {
+      setError("Errore nell'aggiunta del tag.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Remove a tag (port of clients.php do=remove_tag).
+  async function removeTag(tagId: number) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch(`/api/manage/clients?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "remove_tag", id: String(clientId), tag_id: String(tagId) }),
+      });
+      const j = await res.json();
+      if (!res.ok || !j.ok) {
+        setError(String(j.error ?? "Errore nella rimozione del tag."));
+      } else {
+        setData((prev) => (prev ? { ...prev, tags: Array.isArray(j.tags) ? j.tags : prev.tags } : prev));
+      }
+    } catch {
+      setError("Errore nella rimozione del tag.");
     } finally {
       setBusy(false);
     }
@@ -508,17 +562,44 @@ export function ClientDetailContent() {
               <i className="bi bi-tags me-1" />
               Tag
             </div>
-            <div className="d-flex flex-wrap gap-2">
+            <div className="d-flex flex-wrap gap-2 mb-2">
               {data!.tags.length === 0 ? (
                 <span className="text-muted small">Nessun tag.</span>
               ) : (
                 data!.tags.map((t) => (
-                  <span className="badge badge-soft" key={t.id}>
+                  <span className="badge badge-soft d-inline-flex align-items-center gap-1" key={t.id}>
                     {t.name}
+                    <button
+                      type="button"
+                      className="btn-close btn-close-sm"
+                      style={{ fontSize: "0.6rem" }}
+                      aria-label={`Rimuovi ${t.name}`}
+                      title="Rimuovi tag"
+                      disabled={busy}
+                      onClick={() => removeTag(t.id)}
+                    />
                   </span>
                 ))
               )}
             </div>
+            <form
+              className="input-group input-group-sm"
+              onSubmit={(e) => {
+                e.preventDefault();
+                addTag();
+              }}
+            >
+              <input
+                className="form-control"
+                placeholder="Nuovo tag…"
+                value={tagInput}
+                maxLength={60}
+                onChange={(e) => setTagInput(e.target.value)}
+              />
+              <button className="btn btn-outline-primary" type="submit" disabled={busy || tagInput.trim() === ""}>
+                <i className="bi bi-plus-lg" />
+              </button>
+            </form>
           </div>
 
           {/* Azioni cliente */}

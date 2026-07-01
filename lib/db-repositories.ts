@@ -851,6 +851,36 @@ export async function getDbClientTags(slug: string, clientId: number): Promise<A
   }
 }
 
+// Add a tag to a client (port of clients.php _mode=add_tag): find-or-create the
+// tenant-scoped customer_tags row by name, then map it to the client (idempotent
+// — the legacy INSERT IGNORE). Returns the client's refreshed tag list.
+export async function addManageClientTag(slug: string, clientId: number, tagName: string): Promise<Array<{ id: number; name: string }>> {
+  if (clientId <= 0) throw new Error("Cliente non valido.");
+  const name = String(tagName ?? "").trim();
+  if (name === "") return getDbClientTags(slug, clientId);
+  const existing = await tenantSelect<RowDataPacket>({ slug, table: "customer_tags", columns: "id", where: "name = ?", params: [name], limit: 1 });
+  let tagId = existing[0] ? Number(existing[0].id ?? 0) : 0;
+  if (tagId <= 0) tagId = await tenantInsert(await tenantTable(slug, "customer_tags"), { name });
+  if (tagId <= 0) throw new Error("Impossibile creare il tag.");
+  const mapped = await tenantSelect<RowDataPacket>({ slug, table: "customer_tag_map", columns: "tag_id", where: "client_id = ? AND tag_id = ?", params: [clientId, tagId], limit: 1 });
+  if (!mapped[0]) await tenantInsert(await tenantTable(slug, "customer_tag_map"), { client_id: clientId, tag_id: tagId }).catch(() => 0);
+  return getDbClientTags(slug, clientId);
+}
+
+// Remove a tag from a client (port of clients.php do=remove_tag): delete the
+// customer_tag_map row (the customer_tags row is left for reuse). Returns the
+// client's refreshed tag list.
+export async function removeManageClientTag(slug: string, clientId: number, tagId: number): Promise<Array<{ id: number; name: string }>> {
+  if (clientId <= 0 || tagId <= 0) return getDbClientTags(slug, clientId);
+  const table = await tenantTable(slug, "customer_tag_map");
+  const scoped = table.mode === "shared" && (await columnExists(table.name, "tenant_id"));
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(table.name)} WHERE client_id = ? AND tag_id = ?${scoped ? " AND tenant_id = ?" : ""}`,
+    scoped ? [clientId, tagId, table.tenantId ?? 0] : [clientId, tagId],
+  ).catch(() => undefined);
+  return getDbClientTags(slug, clientId);
+}
+
 export type ManageClientDetail = {
   client: ManagedClient;
   fidelity: { points: number; creditBalance: number };
