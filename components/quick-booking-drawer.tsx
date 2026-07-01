@@ -126,6 +126,20 @@ function tenantSlug(): string {
   return window.location.pathname.split("/")[1] || "";
 }
 
+// Shape of the cancel_done_preview payload (mirrors CancelDonePreview in db-repositories).
+// Only the fields the modal renders are typed here.
+type DoneCancelPreview = {
+  ok: boolean;
+  error: string;
+  status: string;
+  targetStatus: "canceled" | "no_show";
+  summary: string[];
+  warnings: string[];
+  blockers: string[];
+  points: { used: number; earned: number };
+  restores: { credit: number; giftcard: number };
+};
+
 function pad(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -510,6 +524,23 @@ export function QuickBookingDrawer() {
   const [staffNotes, setStaffNotes] = useState<string>("");
   const [customerNotes, setCustomerNotes] = useState<string>("");
   const [holdToken, setHoldToken] = useState<string>("");
+
+  // ---- CANCEL-DONE PREVIEW MODAL (#qbDoneCancelModal) ----
+  // The rich preview-lock flow replacing the bare window.confirm on a done->canceled/
+  // no_show transition (port of app.js qbOpenDoneCancelPreview / qbBuildDoneCancelPreviewHtml
+  // / qbSubmitDoneCancel). Before applying, we fetch action=cancel_done_preview and show a
+  // Bootstrap modal (branched title, "Riepilogo:" list, warnings, a reason textarea, and a
+  // Confirm disabled when the preview has an error/blockers). The save() flow AWAITS the
+  // operator's decision via a pending-resolver promise: Confirm resolves { confirmed, reason },
+  // Cancel/close resolves null (abort — status stays Eseguito, no reload).
+  const [doneCancelTarget, setDoneCancelTarget] = useState<"canceled" | "no_show">("canceled");
+  const [doneCancelPreview, setDoneCancelPreview] = useState<DoneCancelPreview | null>(null);
+  const [doneCancelLoading, setDoneCancelLoading] = useState(false);
+  const [doneCancelError, setDoneCancelError] = useState<string>("");
+  const [doneCancelReason, setDoneCancelReason] = useState<string>("");
+  // Resolver for the in-flight save() awaiting the operator's modal decision. Set when the
+  // modal opens; called with { confirmed, reason } on Confirm or null on abort, then cleared.
+  const doneCancelResolveRef = useRef<((v: { reason: string } | null) => void) | null>(null);
 
   // ---- EDIT MODE (#qb_appt_id + header title + #qbBookingCodeRow/#qbBookingCode) ----
   // When a [data-qb-edit] click loads an existing appointment, `apptId` carries its
@@ -1935,6 +1966,76 @@ export function QuickBookingDrawer() {
   }, [selectedServiceNames, date, startTime, staffId, staff, slug, locationId]);
 
   // ---- Submit ("Crea prenotazione" -> action=save) ----
+  // Close/abort the cancel-done modal. Resolves the pending save() promise with `result`
+  // (null = abort, { reason } = confirmed) then hides the Bootstrap modal + resets state.
+  const closeDoneCancelModal = useCallback((result: { reason: string } | null) => {
+    const resolve = doneCancelResolveRef.current;
+    doneCancelResolveRef.current = null;
+    const el = document.getElementById("qbDoneCancelModal");
+    const api = bootstrap()?.Modal;
+    if (el && api) {
+      try {
+        api.getOrCreateInstance(el).hide();
+      } catch {
+        /* no-op */
+      }
+    }
+    if (resolve) resolve(result);
+  }, []);
+
+  // Open the cancel-done preview modal for a done->target transition and return a promise
+  // that resolves to { reason } on Confirm or null on abort (port of app.js
+  // qbOpenDoneCancelPreview + qbSubmitDoneCancel decision gate). Fetches
+  // action=cancel_done_preview (compute-only), renders the preview, and gates Confirm on
+  // the preview being ok with no blockers.
+  const openDoneCancelModal = useCallback(
+    (id: string, target: "canceled" | "no_show"): Promise<{ reason: string } | null> => {
+      return new Promise((resolve) => {
+        doneCancelResolveRef.current = resolve;
+        setDoneCancelTarget(target);
+        setDoneCancelReason("");
+        setDoneCancelError("");
+        setDoneCancelPreview(null);
+        setDoneCancelLoading(true);
+        // Show the Bootstrap modal.
+        const el = document.getElementById("qbDoneCancelModal");
+        const api = bootstrap()?.Modal;
+        if (el && api) {
+          try {
+            api.getOrCreateInstance(el).show();
+          } catch {
+            /* no-op */
+          }
+        }
+        // Fetch the compute-only preview (GET, gated appointments.manage).
+        void (async () => {
+          try {
+            const res = await fetch(
+              `/api/manage/appointments?slug=${encodeURIComponent(slug)}&action=cancel_done_preview&id=${encodeURIComponent(
+                id,
+              )}&target_status=${encodeURIComponent(target)}`,
+              { headers: { "x-tenant-slug": slug } },
+            );
+            const data: { ok?: boolean; error?: string; preview?: DoneCancelPreview } = await res
+              .json()
+              .catch(() => ({}));
+            if (data.preview) setDoneCancelPreview(data.preview);
+            // Error surfaces inline in the modal AND disables Confirm (matches the legacy
+            // "Annullamento non disponibile" gate).
+            if (!data.ok || data.error || data.preview?.error) {
+              setDoneCancelError(String(data.error || data.preview?.error || "Annullamento non disponibile."));
+            }
+          } catch {
+            setDoneCancelError("Errore caricamento annullamento.");
+          } finally {
+            setDoneCancelLoading(false);
+          }
+        })();
+      });
+    },
+    [slug],
+  );
+
   const submitBooking = useCallback(
     async (e: React.FormEvent<HTMLFormElement>) => {
       e.preventDefault();
@@ -2082,26 +2183,28 @@ export function QuickBookingDrawer() {
         if (apptId && originalStatus && newStatus && newStatus !== originalStatus) {
           const isCancelDone =
             originalStatus === "done" && (newStatus === "canceled" || newStatus === "no_show");
+          let cancelReason = "";
           if (isCancelDone) {
-            if (
-              typeof window !== "undefined" &&
-              !window.confirm(
-                "Annullare una prenotazione eseguita storna i punti fidelity e ripristina credito/redeem associati. Continuare?",
-              )
-            ) {
+            // Rich preview-lock modal replacing the bare confirm(): fetch the cancel_done
+            // preview, show what will be restored/reversed + a reason field, and AWAIT the
+            // operator's decision. A null result = abort (keep the appointment 'Eseguito',
+            // no reload); { reason } = confirmed, threaded into the cancel_done POST.
+            const decision = await openDoneCancelModal(apptId, newStatus === "no_show" ? "no_show" : "canceled");
+            if (!decision) {
               // Staff declined the storno: keep the appointment done. The save already
               // persisted the other fields; just stop here (no reload) so the drawer
               // stays open and the status select can be reverted.
               setFormError("Annullamento non confermato: lo stato resta 'Eseguito'.");
               return;
             }
+            cancelReason = decision.reason;
           }
           const transitionRes = await fetch(`/api/manage/appointments?slug=${encodeURIComponent(slug)}`, {
             method: "POST",
             headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
             body: JSON.stringify(
               isCancelDone
-                ? { action: "cancel_done", id: apptId, status: newStatus }
+                ? { action: "cancel_done", id: apptId, status: newStatus, reason: cancelReason }
                 : { action: "status", id: apptId, status: newStatus },
             ),
           });
@@ -2122,7 +2225,7 @@ export function QuickBookingDrawer() {
         setSubmitting(false);
       }
     },
-    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, discountType, discountValue, couponCode, priceDetails, status, originalStatus, closeOffcanvas],
+    [apptId, client, selectedServiceIds, selectedServiceNames, date, startTime, staffId, staff, slug, locationId, effectiveCabinId, staffNotes, customerNotes, holdToken, staffMapJson, cabinMapJson, packageRedeemJson, prepaidRedeemJson, giftcardRedeemJson, giftboxRedeemJson, giftRedeemJson, discountType, discountValue, couponCode, priceDetails, status, originalStatus, closeOffcanvas, openDoneCancelModal],
   );
 
   // ---- Delete (#qbDeleteBtn, edit mode only -> action=delete) ----
@@ -2155,6 +2258,30 @@ export function QuickBookingDrawer() {
   }, [apptId, slug, closeOffcanvas]);
 
   const canQuickCreateClient = true; // Quick-create is always offered (legacy gates on a permission).
+
+  // STATUS <select> constraints (port of app.js qbApplyStatusSelectConstraints): the
+  // options the status select offers depend on the appointment's ORIGINAL (as-loaded)
+  // status, so the operator can only make valid transitions from the drawer:
+  //   - originalStatus canceled|no_show : terminal — a single locked, disabled option.
+  //   - originalStatus done             : only Eseguito / Annulla / No show (the done
+  //     booking can stay done or go through the dedicated cancel-done flow).
+  //   - otherwise (create / pending / scheduled) : the full list.
+  const statusLocked = originalStatus === "canceled" || originalStatus === "no_show";
+  const statusOptions: { value: string; label: string }[] = statusLocked
+    ? [{ value: originalStatus, label: originalStatus === "no_show" ? "No show" : "Annullato" }]
+    : originalStatus === "done"
+      ? [
+          { value: "done", label: "Eseguito" },
+          { value: "canceled", label: "Annulla" },
+          { value: "no_show", label: "No show" },
+        ]
+      : [
+          { value: "pending", label: "In attesa" },
+          { value: "scheduled", label: "Prenotato" },
+          { value: "done", label: "Eseguito" },
+          { value: "canceled", label: "Annullato" },
+          { value: "no_show", label: "No show" },
+        ];
 
   return (
     <>
@@ -3006,12 +3133,18 @@ export function QuickBookingDrawer() {
             <div className="row g-2 mt-1">
               <div className="col-6">
                 <label className="form-label">Stato</label>
-                <select className="form-select" name="status" value={status} onChange={(e) => setStatus(e.target.value)}>
-                  <option value="pending">In attesa</option>
-                  <option value="scheduled">Prenotato</option>
-                  <option value="done">Eseguito</option>
-                  <option value="canceled">Annullato</option>
-                  <option value="no_show">No show</option>
+                <select
+                  className="form-select"
+                  name="status"
+                  value={status}
+                  onChange={(e) => setStatus(e.target.value)}
+                  disabled={statusLocked}
+                >
+                  {statusOptions.map((o) => (
+                    <option value={o.value} key={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
                 </select>
               </div>
               <div className="col-6">
@@ -3452,6 +3585,135 @@ export function QuickBookingDrawer() {
               </button>
             </div>
           </form>
+        </div>
+      </div>
+
+      {/* ===================== CANCEL-DONE PREVIEW MODAL (port of #qbDoneCancelModal) ===================== */}
+      {/* Preview-lock for the done->canceled/no_show storno: shows what will be restored/
+          reversed + a reason field BEFORE applying. Title branches on the target
+          ("Conferma annullamento" vs "Conferma No show"). Confirm is DISABLED while loading
+          or when the preview carries an error/blockers (legacy qbBuildDoneCancelPreviewHtml
+          + the qbSubmitDoneCancel blockers gate). Cancel/close aborts (status stays Eseguito). */}
+      <div
+        className="modal fade"
+        id="qbDoneCancelModal"
+        tabIndex={-1}
+        aria-hidden="true"
+        data-bs-backdrop="static"
+        data-bs-keyboard="false"
+      >
+        <div className="modal-dialog modal-dialog-scrollable">
+          <div className="modal-content">
+            <div className="modal-header">
+              <h5 className="modal-title fw-bold m-0">
+                {doneCancelTarget === "no_show" ? "Marca No show" : "Annulla prenotazione"}
+              </h5>
+              <button
+                type="button"
+                className="btn-close"
+                aria-label="Chiudi"
+                onClick={() => closeDoneCancelModal(null)}
+              />
+            </div>
+            <div className="modal-body">
+              {doneCancelLoading ? (
+                <div className="text-muted small py-2">Caricamento del riepilogo annullamento...</div>
+              ) : (
+                <>
+                  <div className="alert alert-warning mb-3">
+                    <div className="fw-semibold mb-1">
+                      {doneCancelTarget === "no_show" ? "Conferma No show" : "Conferma annullamento"}
+                    </div>
+                    <div className="small">
+                      {doneCancelTarget === "no_show"
+                        ? "Questa operazione marcherà come No show la prenotazione."
+                        : "Questa operazione annullerà la prenotazione."}
+                    </div>
+                    <div className="small mt-2 fw-semibold">
+                      {doneCancelTarget === "no_show"
+                        ? "Dopo il No show la prenotazione non sarà più modificabile."
+                        : "Dopo l'annullamento la prenotazione non sarà più modificabile."}
+                    </div>
+                  </div>
+
+                  {doneCancelPreview && doneCancelPreview.summary.length > 0 ? (
+                    <>
+                      <div className="small text-muted mb-1">Riepilogo:</div>
+                      <ul className="small mb-3">
+                        {doneCancelPreview.summary.map((line, i) => (
+                          <li key={i}>{line}</li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : null}
+
+                  {/* Blockers (or a load error) gate the storno — Confirm stays disabled. */}
+                  {doneCancelError || (doneCancelPreview && doneCancelPreview.blockers.length > 0) ? (
+                    <div className="alert alert-danger mb-3">
+                      <div className="fw-semibold mb-1">
+                        {doneCancelTarget === "no_show" ? "No show non disponibile" : "Annullamento non disponibile"}
+                      </div>
+                      <ul className="mb-0">
+                        {doneCancelError ? <li>{doneCancelError}</li> : null}
+                        {(doneCancelPreview?.blockers ?? []).map((b, i) => (
+                          <li key={i}>{b}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+
+                  {doneCancelPreview && doneCancelPreview.warnings.length > 0 ? (
+                    <div className="alert alert-info mb-3">
+                      <div className="fw-semibold mb-1">Attenzione</div>
+                      <ul className="mb-0">
+                        {doneCancelPreview.warnings.map((w, i) => (
+                          <li key={i}>{w}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+
+                  <div className="mb-2">
+                    <label className="form-label">Motivazione (opzionale)</label>
+                    <textarea
+                      className="form-control"
+                      id="qbDoneCancelReason"
+                      rows={3}
+                      maxLength={255}
+                      placeholder="Es. errore operatore / cliente ha cambiato idea..."
+                      value={doneCancelReason}
+                      onChange={(e) => setDoneCancelReason(e.target.value)}
+                    />
+                    <div className="form-text">Massimo 255 caratteri.</div>
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn btn-outline-secondary"
+                onClick={() => closeDoneCancelModal(null)}
+              >
+                Annulla
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                id="qbDoneCancelConfirm"
+                disabled={
+                  doneCancelLoading ||
+                  !!doneCancelError ||
+                  !doneCancelPreview ||
+                  !doneCancelPreview.ok ||
+                  doneCancelPreview.blockers.length > 0
+                }
+                onClick={() => closeDoneCancelModal({ reason: doneCancelReason.trim().slice(0, 255) })}
+              >
+                {doneCancelTarget === "no_show" ? "Conferma No show" : "Conferma annullamento"}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </>

@@ -6,6 +6,7 @@ import {
   appointmentCustomerVisibleChanged,
   appointmentPhpStatus,
   cancelDoneAppointment,
+  cancelDonePreview,
   createDbAppointment,
   deleteDbAppointment,
   getDbAppointmentCustomerVisibleSnapshot,
@@ -103,6 +104,31 @@ export async function GET(request: Request) {
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore caricamento prenotazione.");
+    }
+  }
+
+  // CANCEL-DONE PREVIEW (compute-only) — the rich preview the drawer's cancel-done
+  // modal renders BEFORE applying (port of api_appointments.php action='cancel_done_preview'
+  // -> qb_cancel_done_load_preview). Gated on appointments.manage (a storno is a
+  // management action, stricter than the umbrella view/manage/plan check above). Returns
+  // { ok:false, error } (200) when the transition is not applicable so the modal shows the
+  // message inline and disables Confirm; otherwise { ok:true, preview }. Mirrors the POST
+  // cancel_done gate; served over GET here (the modal fetches it read-only).
+  if (action === "cancel_done_preview") {
+    if (!can(session.user.perms, "appointments.manage")) {
+      return jsonError("Permesso annullamento appuntamenti mancante.", 403);
+    }
+    const id = Number.parseInt(String(url.searchParams.get("id") ?? "0"), 10);
+    if (!Number.isFinite(id) || id <= 0) return jsonError("ID mancante", 400);
+    const rawTarget = String(url.searchParams.get("target_status") ?? "canceled").trim();
+    const targetStatus = appointmentPhpStatus(rawTarget) === "no_show" ? "no_show" : "canceled";
+    try {
+      const preview = await cancelDonePreview(tenantSlug, id, targetStatus);
+      // Legacy returns { ok:false, error } when the preview carries an error, so the UI
+      // surfaces the message; keep the full preview alongside for the modal to render.
+      return Response.json({ ok: preview.ok, error: preview.error, preview });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore anteprima annullamento.");
     }
   }
 
@@ -382,8 +408,11 @@ export async function POST(request: Request) {
       // (cancelDoneAppointment re-validates this and rejects anything else).
       const rawTarget = String(body.status ?? body.target_status ?? "canceled").trim();
       const targetStatus = appointmentPhpStatus(rawTarget) === "no_show" ? "no_show" : "canceled";
+      // Operator's cancellation motivation (optional, max 255 — persisted to
+      // appointments.cancelled_reason by cancelDoneAppointment; mirrors the legacy apply).
+      const reason = String(body.reason ?? "").trim().slice(0, 255);
       try {
-        const appointment = await cancelDoneAppointment(tenantSlug, id, targetStatus, session.user.id);
+        const appointment = await cancelDoneAppointment(tenantSlug, id, targetStatus, session.user.id, reason);
         // Lifecycle email: a done->canceled crossing maps to the same 'rejected'/cancel
         // kind the status path fires; gated + error-swallowed inside the helper.
         const kind = lifecycleKindForStatusChange("done", targetStatus);
