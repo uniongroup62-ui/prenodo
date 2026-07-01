@@ -109,6 +109,10 @@ export function CostsContent() {
   const [status, setStatus] = useState("open");
   const [q, setQ] = useState("");
 
+  // Bulk selection (scadenziario): the checked cost ids for "Elimina selezionati".
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+
   const load = useCallback(
     (filters: { cat: string; from: string; to: string; status: string; q: string }) => {
       setLoading(true);
@@ -148,6 +152,38 @@ export function CostsContent() {
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`costs${suffix}`.replace("&", "?")}`;
   }
+
+  function toggleSelected(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  // Bulk-delete the checked costs (POST action=bulk_delete → reload the filtered list). Clears the
+  // selection after. Guarded by a confirm; the server tolerates missing/foreign ids.
+  async function bulkDelete() {
+    if (selected.size === 0 || bulkBusy) return;
+    if (typeof window !== "undefined" && !window.confirm(`Eliminare ${selected.size} voci selezionate?`)) return;
+    setBulkBusy(true);
+    try {
+      await fetch(`/api/manage/costs?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "bulk_delete", cost_ids: JSON.stringify([...selected]) }),
+      });
+      setSelected(new Set());
+      load({ cat, from, to, status, q });
+    } catch {
+      // leave the selection on failure so the operator can retry
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  const allSelected = costs.length > 0 && selected.size === costs.length;
 
   const showLocationCol = locations.length > 1;
   const hasAnyCosts = costs.length > 0;
@@ -317,6 +353,17 @@ export function CostsContent() {
                   <i className="bi bi-file-earmark-pdf me-1" />
                   PDF
                 </a>
+                {selected.size > 0 ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-danger"
+                    disabled={bulkBusy}
+                    onClick={bulkDelete}
+                  >
+                    <i className="bi bi-trash me-1" />
+                    Elimina selezionati ({selected.size})
+                  </button>
+                ) : null}
                 <a className="btn btn-sm btn-outline-primary" href={href("&tab=scadenziario&action=new")}>
                   <i className="bi bi-plus-lg me-1" />
                   Aggiungi costo
@@ -333,7 +380,15 @@ export function CostsContent() {
                 <table className="table align-middle mb-0">
                   <thead>
                     <tr>
-                      <th className="costs-bulk-col" />
+                      <th className="costs-bulk-col">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          aria-label="Seleziona tutti"
+                          checked={allSelected}
+                          onChange={() => setSelected(allSelected ? new Set() : new Set(costs.map((c) => c.id)))}
+                        />
+                      </th>
                       <th>Scadenza</th>
                       <th>Titolo</th>
                       <th>Categoria</th>
@@ -352,7 +407,13 @@ export function CostsContent() {
                       return (
                         <tr key={r.id} className={overdue ? "table-danger" : ""}>
                           <td>
-                            <input className="form-check-input" type="checkbox" />
+                            <input
+                              className="form-check-input"
+                              type="checkbox"
+                              aria-label={`Seleziona ${r.title}`}
+                              checked={selected.has(r.id)}
+                              onChange={() => toggleSelected(r.id)}
+                            />
                           </td>
                           <td className="costs-nowrap">
                             <div className="fw-semibold">{fmtDate(r.dueDate)}</div>

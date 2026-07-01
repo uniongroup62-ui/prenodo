@@ -185,6 +185,25 @@ export async function deleteCost(slug: string, costId: number, locationId = 0): 
   return getManageCostsContext(slug, { locationId, status: "open" });
 }
 
+// Bulk-delete costs (faithful to costs.php bulk_delete_costs ~686-715): delete every selected cost
+// that exists + is accessible; missing/foreign ids are silently skipped (the legacy tolerance), and
+// if NONE are deletable it errors like the legacy "Nessuna voce autorizzata da eliminare". Attachment
+// FILE cleanup is a no-op (the attachment subsystem is deferred). Returns the refreshed context.
+export async function deleteCostsBulk(slug: string, costIds: number[], locationId = 0): Promise<ManageCostsContext> {
+  const ids = [...new Set(costIds.filter((id) => Number.isInteger(id) && id > 0))];
+  if (ids.length === 0) throw new Error("Seleziona almeno una voce.");
+  let deleted = 0;
+  for (const id of ids) {
+    const accessible = await getCostById(slug, id).then(() => true).catch(() => false);
+    if (accessible) {
+      await tenantDelete({ slug, table: "costs", id }).catch(() => 0);
+      deleted += 1;
+    }
+  }
+  if (deleted === 0) throw new Error("Nessuna voce autorizzata da eliminare.");
+  return getManageCostsContext(slug, { locationId, status: "open" });
+}
+
 export async function toggleCostPaid(slug: string, costId: number, locationId = 0): Promise<ManageCostsContext> {
   const row = await getCostById(slug, costId);
   const isPaid = Number(row.is_paid ?? 0) === 1;

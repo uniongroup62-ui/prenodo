@@ -3,6 +3,7 @@ import { currentManageSession } from "@/lib/manage-auth";
 import {
   deleteCost,
   deleteCostCategory,
+  deleteCostsBulk,
   getManageCost,
   getManageCostsContext,
   saveCost,
@@ -18,6 +19,20 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const workPerms = ["costs.manage", "costs.items"];
+
+// Parse the bulk cost-id selection. parseRequestBody flattens body values to strings, so cost_ids
+// arrives as a JSON array string ("[1,2,3]") or a comma-separated list ("1,2,3") — accept both.
+function parseCostIds(raw: unknown): number[] {
+  if (Array.isArray(raw)) return raw.map((v) => parseInteger(v, 0)).filter((n) => n > 0);
+  const s = String(raw ?? "").trim();
+  if (!s) return [];
+  let parsed: unknown = s;
+  if (s.startsWith("[")) {
+    try { parsed = JSON.parse(s); } catch { parsed = s; }
+  }
+  if (Array.isArray(parsed)) return parsed.map((v) => parseInteger(v, 0)).filter((n) => n > 0);
+  return s.split(",").map((v) => parseInteger(v, 0)).filter((n) => n > 0);
+}
 
 export async function GET(request: Request) {
   const tenantSlug = manageTenantSlugFromRequest(request);
@@ -85,6 +100,11 @@ export async function POST(request: Request) {
       case "cost_delete":
         if (!canAny(session.user.perms, workPerms)) return jsonError("Permesso Scadenziario richiesto.", 403);
         return Response.json(await deleteCost(tenantSlug, parseInteger(body.id ?? body.cost_id, 0), locationId));
+
+      case "bulk_delete":
+      case "bulk_delete_costs":
+        if (!canAny(session.user.perms, workPerms)) return jsonError("Permesso Scadenziario richiesto.", 403);
+        return Response.json(await deleteCostsBulk(tenantSlug, parseCostIds(body.cost_ids ?? body.ids), locationId));
 
       case "pay":
       case "toggle_paid":
