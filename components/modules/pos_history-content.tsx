@@ -1,32 +1,46 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 // Faithful port of the PHP movements page (app/pages/pos_history.php), fed by
 // the existing DB-backed /api/manage/pos context (sales + catalog + locations).
 
-type PosSale = {
+// One "Movimenti" row (mirror of the backend PosMovement): a sale, a standalone recharge,
+// or a standalone giftbox/giftcard voucher. The content flags let the sidebar Servizi/Prodotti/
+// Pacchetti + Tipologia filters narrow the list client-side.
+type PosMovement = {
+  kind: "sale" | "recharge" | "giftbox" | "giftcard";
+  kindLabel: string;
   id: number;
-  code: string;
+  saleNumber: number;
+  numberLabel: string;
+  locationId: number;
   clientId: number;
   clientName: string;
-  locationId: number;
-  total: number;
-  status: "active" | "cancelled";
-  createdAt: string;
-  cancelledAt?: string;
-  cancelReason?: string;
+  amount: number | null;
+  status: string;
+  operator: string;
+  date: string;
+  hasService: boolean;
+  hasProduct: boolean;
+  hasPackage: boolean;
+  serviceIds: number[];
+  productIds: number[];
+  hasGiftcardLine: boolean;
+  hasGiftboxLine: boolean;
+  hasRechargeLine: boolean;
 };
 
 type CatalogItem = { id: number; name: string };
 
 type PosContext = {
   activeLocationId?: number;
-  sales?: PosSale[];
+  movements?: PosMovement[];
   catalog?: {
     clients?: CatalogItem[];
     services?: CatalogItem[];
     products?: CatalogItem[];
+    packages?: CatalogItem[];
   };
   locations?: Array<{ id: number; name: string }>;
 };
@@ -55,18 +69,54 @@ function fmtMoney(value: number): string {
   return `${value.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
 }
 
+// Per-kind action link (faithful to pos_history.php ~3808-3818): a sale opens "Dettaglio
+// vendita"; a giftbox/giftcard opens its "Voucher"; a standalone recharge opens "Apri" ->
+// the client's credit movements.
+function renderMovementAction(mv: PosMovement, slug: string): ReactNode {
+  const base = `/${encodeURIComponent(slug)}`;
+  if (mv.kind === "sale") {
+    return (
+      <a className="btn btn-sm btn-outline-primary" href={`${base}/pos_sale_detail?id=${mv.id}`}>
+        Dettaglio vendita
+      </a>
+    );
+  }
+  if (mv.kind === "giftbox") {
+    return (
+      <a className="btn btn-sm btn-outline-primary" href={`${base}/giftbox_voucher?id=${mv.id}&embed=1`} target="_blank" rel="noopener">
+        Voucher
+      </a>
+    );
+  }
+  if (mv.kind === "giftcard") {
+    return (
+      <a className="btn btn-sm btn-outline-primary" href={`${base}/giftcard_voucher?id=${mv.id}&embed=1`} target="_blank" rel="noopener">
+        Voucher
+      </a>
+    );
+  }
+  // recharge
+  return (
+    <a className="btn btn-sm btn-outline-primary" href={`${base}/credit_movements?client_id=${mv.clientId}`}>
+      Apri
+    </a>
+  );
+}
+
 export function PosHistoryContent() {
   const slug = tenantSlug();
 
   const [ctx, setCtx] = useState<PosContext | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Filter state (kept working client-side over the loaded sales).
+  // Filter state (kept working client-side over the loaded movements).
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [saleNumber, setSaleNumber] = useState("");
   const [clientIds, setClientIds] = useState<Set<string>>(new Set());
   const [serviceIds, setServiceIds] = useState<Set<string>>(new Set());
+  const [productIds, setProductIds] = useState<Set<string>>(new Set());
+  const [packageIds, setPackageIds] = useState<Set<string>>(new Set());
   const [movementTypes, setMovementTypes] = useState<Set<string>>(new Set());
   const [clientSearch, setClientSearch] = useState("");
   const [serviceSearch, setServiceSearch] = useState("");
@@ -83,8 +133,9 @@ export function PosHistoryContent() {
   const clients = ctx?.catalog?.clients ?? [];
   const services = ctx?.catalog?.services ?? [];
   const products = ctx?.catalog?.products ?? [];
+  const packages = ctx?.catalog?.packages ?? [];
   const locations = ctx?.locations ?? [];
-  const sales = useMemo(() => ctx?.sales ?? [], [ctx]);
+  const movements = useMemo(() => ctx?.movements ?? [], [ctx]);
 
   const activeLocationName = useMemo(() => {
     const id = ctx?.activeLocationId;
@@ -104,20 +155,57 @@ export function PosHistoryContent() {
     setter(next);
   }
 
-  const filteredSales = useMemo(() => {
-    return sales.filter((sale) => {
-      if (saleNumber.trim()) {
-        if (String(sale.id) !== saleNumber.trim()) return false;
+  const filteredMovements = useMemo(() => {
+    // Mutually-exclusive filter precedence (faithful to pos_history.php ~1904-1913): a Tipologia
+    // filter disables Servizi/Prodotti/Pacchetti; Servizi disables Prodotti/Pacchetti; Prodotti
+    // disables Pacchetti. So at most one content dimension is active at a time.
+    const hasMovementType = movementTypes.size > 0;
+    const useServices = !hasMovementType && serviceIds.size > 0;
+    const useProducts = !hasMovementType && !useServices && productIds.size > 0;
+    const usePackages = !hasMovementType && !useServices && !useProducts && packageIds.size > 0;
+    const saleNumberTrim = saleNumber.trim();
+
+    return movements.filter((mv) => {
+      // A specific sale-number filter isolates that single sale (standalone rows are hidden,
+      // matching the legacy $saleNumberFilter branch which skips sections 2-4).
+      if (saleNumberTrim) {
+        if (mv.kind !== "sale" || String(mv.saleNumber) !== saleNumberTrim) return false;
       }
-      if (clientIds.size > 0 && !clientIds.has(String(sale.clientId))) return false;
-      const day = sale.createdAt?.slice(0, 10) ?? "";
+      if (clientIds.size > 0 && !clientIds.has(String(mv.clientId))) return false;
+      const day = mv.date?.slice(0, 10) ?? "";
       if (from && day && day < from) return false;
       if (to && day && day > to) return false;
+
+      // Tipologia gating: keep only the selected movement kinds. A sale matches if it CONTAINS a
+      // line of that kind (composite label), a standalone voucher/recharge matches its own kind.
+      if (hasMovementType) {
+        const matches =
+          (movementTypes.has("giftcard") && (mv.kind === "giftcard" || mv.hasGiftcardLine)) ||
+          (movementTypes.has("giftbox") && (mv.kind === "giftbox" || mv.hasGiftboxLine)) ||
+          (movementTypes.has("recharge") && (mv.kind === "recharge" || mv.hasRechargeLine));
+        if (!matches) return false;
+      }
+
+      // Servizi/Prodotti/Pacchetti: the sale must CONTAIN a matching line (standalone rows have
+      // no such lines, so they drop out — faithful to the sale-only EXISTS filters ~2223-2276).
+      if (useServices) {
+        if (mv.kind !== "sale") return false;
+        if (![...serviceIds].some((id) => mv.serviceIds.includes(Number(id)))) return false;
+      }
+      if (useProducts) {
+        if (mv.kind !== "sale") return false;
+        if (![...productIds].some((id) => mv.productIds.includes(Number(id)))) return false;
+      }
+      if (usePackages) {
+        // No per-package id on the movement (packages issue no id-bearing line here), so match
+        // any sale that contains a package line when a package filter is active.
+        if (mv.kind !== "sale" || !mv.hasPackage) return false;
+      }
       return true;
     });
-  }, [sales, saleNumber, clientIds, from, to]);
+  }, [movements, saleNumber, clientIds, serviceIds, productIds, packageIds, movementTypes, from, to]);
 
-  const visibleSales = filteredSales.slice(0, 200);
+  const visibleMovements = filteredMovements.slice(0, 200);
 
   const clientFilterText = clientSearch.trim().toLowerCase();
   const serviceFilterText = serviceSearch.trim().toLowerCase();
@@ -328,7 +416,14 @@ export function PosHistoryContent() {
                         data-filter-text={p.name.toLowerCase()}
                         key={p.id}
                       >
-                        <input className="form-check-input" type="checkbox" name="product_id[]" value={p.id} />
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          name="product_id[]"
+                          value={p.id}
+                          checked={productIds.has(String(p.id))}
+                          onChange={() => toggle(productIds, String(p.id), setProductIds)}
+                        />
                         <span>{p.name}</span>
                       </label>
                     ))}
@@ -343,7 +438,30 @@ export function PosHistoryContent() {
               </summary>
               <div className="pos-filter-group-body">
                 <div className="text-muted small mb-2">Vendite che includono i pacchetti selezionati.</div>
-                <div className="text-muted small">Nessun pacchetto disponibile.</div>
+                {packages.length === 0 ? (
+                  <div className="text-muted small">Nessun pacchetto disponibile.</div>
+                ) : (
+                  <div className="pos-filter-check-list" id="posMovPackageList">
+                    {packages.map((pk) => (
+                      <label
+                        className="pos-filter-check"
+                        data-filter-option
+                        data-filter-text={pk.name.toLowerCase()}
+                        key={pk.id}
+                      >
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          name="package_id[]"
+                          value={pk.id}
+                          checked={packageIds.has(String(pk.id))}
+                          onChange={() => toggle(packageIds, String(pk.id), setPackageIds)}
+                        />
+                        <span>{pk.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
               </div>
             </details>
 
@@ -481,38 +599,42 @@ export function PosHistoryContent() {
                     </tr>
                   </thead>
                   <tbody>
-                    {visibleSales.length === 0 ? (
+                    {visibleMovements.length === 0 ? (
                       <tr>
                         <td colSpan={8} className="text-center text-muted py-4">
                           {loading ? "Caricamento…" : "Nessun risultato."}
                         </td>
                       </tr>
                     ) : (
-                      visibleSales.map((sale) => (
-                        <tr key={sale.id}>
-                          <td className="pos-cronologia-sale-number-col">{sale.code || `#${sale.id}`}</td>
-                          <td>{sale.clientName || "—"}</td>
-                          <td className="pos-cronologia-location-col">{locationById[sale.locationId] ?? "—"}</td>
-                          <td className="pos-cronologia-date-col">{fmtDateTime(sale.createdAt)}</td>
-                          <td>—</td>
-                          <td className="text-end pos-cronologia-amount-col">{fmtMoney(sale.total)}</td>
-                          <td className="pos-cronologia-status-col">
-                            {sale.status === "cancelled" ? (
-                              <span className="badge text-bg-danger">Annullata</span>
-                            ) : (
-                              <span className="badge text-bg-success">Completata</span>
-                            )}
-                          </td>
-                          <td className="text-end pos-cronologia-actions-col">
-                            <a
-                              className="btn btn-sm btn-outline-secondary"
-                              href={`/${encodeURIComponent(slug)}/pos_sale_detail?id=${sale.id}`}
-                            >
-                              Dettaglio
-                            </a>
-                          </td>
-                        </tr>
-                      ))
+                      visibleMovements.map((mv) => {
+                        const numberStr = mv.numberLabel || (mv.saleNumber > 0 ? String(mv.saleNumber) : "—");
+                        const statusKey = mv.status.toLowerCase();
+                        let badgeClass = "text-bg-secondary";
+                        if (statusKey === "attiva") badgeClass = "text-bg-success";
+                        else if (statusKey === "annullata" || statusKey === "stornata") badgeClass = "text-bg-danger";
+                        return (
+                          <tr key={`${mv.kind}-${mv.id}`}>
+                            <td className="pos-cronologia-sale-number-col text-muted small">{numberStr}</td>
+                            <td>{mv.clientName || "—"}</td>
+                            <td className="pos-cronologia-location-col text-muted small">
+                              {locationById[mv.locationId] ?? "—"}
+                            </td>
+                            <td className="pos-cronologia-date-col text-muted small">{fmtDateTime(mv.date)}</td>
+                            <td className="text-muted small">{mv.operator || "—"}</td>
+                            <td className="text-end pos-cronologia-amount-col fw-semibold">
+                              {mv.amount === null ? "—" : fmtMoney(mv.amount)}
+                            </td>
+                            <td className="pos-cronologia-status-col">
+                              {mv.status ? (
+                                <span className={`badge ${badgeClass}`}>{mv.status}</span>
+                              ) : (
+                                <span className="text-muted small">—</span>
+                              )}
+                            </td>
+                            <td className="text-end pos-cronologia-actions-col">{renderMovementAction(mv, slug)}</td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>

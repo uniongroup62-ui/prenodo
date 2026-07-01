@@ -7110,6 +7110,7 @@ async function mapSale(slug: string, row: RowDataPacket): Promise<PosSale> {
     clientName,
     appointmentId: undefined,
     locationId: Number(row.location_id ?? 0),
+    operatorName: String(row.operator_name ?? "").trim(),
     items,
     payments: [{ id: 1, method: "card", amount: total }],
     subtotal: Number(row.subtotal ?? total),

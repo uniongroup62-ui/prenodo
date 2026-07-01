@@ -183,6 +183,9 @@ export type PosSale = {
   clientName: string;
   appointmentId?: number;
   locationId: number;
+  // The staff member who rang the sale (sales.operator_name, else the users lookup for
+  // sales.created_by). Surfaced in the Movimenti "Operatore" column. "" when unknown.
+  operatorName: string;
   items: PosSaleItem[];
   payments: PosPayment[];
   subtotal: number;

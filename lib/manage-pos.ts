@@ -62,6 +62,10 @@ export type ManagePosContext = {
   business: PosBusinessHeader;
   summary: PosSummary;
   sales: PosSale[];
+  // Unified "Movimenti" list (port of pos_history.php's $events): sales PLUS standalone
+  // recharges + giftbox instances + giftcards (deduped against the sale that issued them),
+  // newest-first, 200 cap. Feeds the Movimenti page; the sidebar filters are applied over it.
+  movements: PosMovement[];
   catalog: {
     clients: ManagedClient[];
     services: ManagedService[];
@@ -79,6 +83,45 @@ export type ManagePosContext = {
     rechargeTemplates: SellableRecharge[];
   };
   locations: Array<{ id: number; name: string }>;
+};
+
+// A single row of the "Movimenti" list (port of pos_history.php's $events entry). One of four
+// kinds: a POS 'sale' (with a composite "Vendita (GiftCard, Ricarica)" label when it issued
+// vouchers/recharges), a standalone 'recharge' (R#id, "Apri" -> credit movements), a standalone
+// 'giftbox' or 'giftcard' voucher ("Voucher"). "Standalone" = NOT created through a POS sale
+// (a sale-linked recharge/giftbox/giftcard is already represented by its sale row and is skipped
+// here to avoid double-counting). `amount` is null when unknown (rendered as "—"). The
+// hasService/hasProduct/hasPackage + serviceIds/productIds flags let the client-side Servizi/
+// Prodotti/Pacchetti filters narrow the list without a round-trip.
+export type PosMovementKind = "sale" | "recharge" | "giftbox" | "giftcard";
+export type PosMovement = {
+  kind: PosMovementKind;
+  // Composite type label for a sale ("Vendita", "Vendita (GiftCard, Ricarica)", ...); the
+  // fixed "Ricarica"/"GiftBox"/"GiftCard" label for a standalone movement.
+  kindLabel: string;
+  // Underlying row id (sales.id / recharges.id / giftbox_instances.id / giftcards.id).
+  id: number;
+  // The sale number for a 'sale' (0 for standalone); numberLabel is the "R#12"-style badge.
+  saleNumber: number;
+  numberLabel: string;
+  locationId: number;
+  clientId: number;
+  clientName: string;
+  amount: number | null;
+  // Localized status label ("Attiva" / "Annullata" / "Stornata" / the giftbox/giftcard status).
+  status: string;
+  operator: string;
+  date: string;
+  // Sale content flags for the sidebar Servizi/Prodotti/Pacchetti filters (sale kind only).
+  hasService: boolean;
+  hasProduct: boolean;
+  hasPackage: boolean;
+  serviceIds: number[];
+  productIds: number[];
+  // Whether the sale issued a voucher/recharge line — powers the Tipologia filter for sales.
+  hasGiftcardLine: boolean;
+  hasGiftboxLine: boolean;
+  hasRechargeLine: boolean;
 };
 
 // A voucher ISSUED by a sale at checkout — the generated GiftCard (GC-XXXX-XXXX-XXXX) or
@@ -168,6 +211,8 @@ export async function getManagePosContext(
     getPosBusinessHeader(slug, activeLocationId),
   ]);
 
+  const movements = await buildPosMovements(slug, sales, { locationId: activeLocationId });
+
   return {
     ok: true,
     sourceMode: "database",
@@ -175,6 +220,7 @@ export async function getManagePosContext(
     business,
     summary: summarizeSales(sales),
     sales,
+    movements,
     catalog: { clients, services, products, packages, giftboxes, rechargeTemplates },
     locations: locationContext.locations.map((location) => ({ id: location.id, name: location.name })),
   };
@@ -1221,6 +1267,270 @@ async function listPosSales(slug: string, options: { locationId: number; include
   return Promise.all(rows.map((row) => mapSale(slug, row)));
 }
 
+// Build the unified "Movimenti" list (port of pos_history.php's $events): the sales already
+// fetched for the context, PLUS standalone recharges + giftbox instances + giftcards that were
+// NOT created through a POS sale (a sale-linked one is already represented by its sale row and
+// is deduped out here). Newest-first, capped at 200. Each sale carries the composite type label
+// + content flags the sidebar filters use; the standalone rows are location-scoped like sales.
+async function buildPosMovements(
+  slug: string,
+  sales: PosSale[],
+  ctx: { locationId: number },
+): Promise<PosMovement[]> {
+  const movements: PosMovement[] = sales.map((sale) => saleToMovement(sale));
+
+  const standalone = await listPosStandaloneMovements(slug, ctx.locationId).catch(() => [] as PosMovement[]);
+  movements.push(...standalone);
+
+  // Newest-first by date (fallback to id), then cap at 200 (faithful to the legacy usort + slice).
+  movements.sort((a, b) => {
+    const cmp = movementTimestamp(b.date) - movementTimestamp(a.date);
+    if (cmp !== 0) return cmp;
+    return b.id - a.id;
+  });
+  return movements.slice(0, POS_MOVEMENTS_LIMIT);
+}
+
+const POS_MOVEMENTS_LIMIT = 200;
+
+function movementTimestamp(date: string): number {
+  if (!date) return 0;
+  const parsed = Date.parse(date.includes("T") ? date : date.replace(" ", "T"));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// Derive a sale MOVEMENT row from an already-mapped PosSale. The composite type label mirrors
+// pos_history.php (~2374-2378): "Vendita (GiftCard, GiftBox, Ricarica)" listing whichever of
+// those line kinds the sale contains, in that fixed order; otherwise plain "Vendita". The
+// content flags power the sidebar Servizi/Prodotti/Pacchetti + Tipologia filters.
+function saleToMovement(sale: PosSale): PosMovement {
+  const hasGiftcardLine = sale.items.some((item) => item.type === "giftcard" || /giftcard/i.test(item.name));
+  const hasGiftboxLine = sale.items.some((item) => item.type === "giftbox" || /giftbox/i.test(item.name));
+  const hasRechargeLine = sale.items.some((item) => item.type === "recharge" || /ricarica/i.test(item.name));
+  const giftLabels: string[] = [];
+  if (hasGiftcardLine) giftLabels.push("GiftCard");
+  if (hasGiftboxLine) giftLabels.push("GiftBox");
+  if (hasRechargeLine) giftLabels.push("Ricarica");
+  const kindLabel = giftLabels.length ? `Vendita (${giftLabels.join(", ")})` : "Vendita";
+
+  const serviceIds = sale.items.filter((item) => item.type === "service" && item.refId > 0).map((item) => item.refId);
+  const productIds = sale.items.filter((item) => item.type === "product" && item.refId > 0).map((item) => item.refId);
+
+  return {
+    kind: "sale",
+    kindLabel,
+    id: sale.id,
+    saleNumber: sale.id,
+    numberLabel: "",
+    locationId: sale.locationId,
+    clientId: sale.clientId,
+    clientName: sale.clientName || "—",
+    amount: sale.total,
+    status: sale.status === "cancelled" ? "Annullata" : "Attiva",
+    operator: sale.operatorName || "",
+    date: sale.createdAt,
+    hasService: sale.items.some((item) => item.type === "service"),
+    hasProduct: sale.items.some((item) => item.type === "product"),
+    hasPackage: sale.items.some((item) => item.type === "package"),
+    serviceIds,
+    productIds,
+    hasGiftcardLine,
+    hasGiftboxLine,
+    hasRechargeLine,
+  };
+}
+
+// The 3 STANDALONE movement sources (port of pos_history.php sections 2-4): recharges NOT tied
+// to a sale, and giftbox/giftcard vouchers NOT issued by a sale (deduped via the same linkage
+// the sale rows already represent). Location-scoped like the sales query. Every read is
+// best-effort — a missing table/column simply yields no rows of that kind.
+async function listPosStandaloneMovements(slug: string, locationId: number): Promise<PosMovement[]> {
+  const [recharges, giftboxes, giftcards] = await Promise.all([
+    listStandaloneRecharges(slug, locationId).catch(() => [] as PosMovement[]),
+    listStandaloneGiftboxes(slug, locationId).catch(() => [] as PosMovement[]),
+    listStandaloneGiftcards(slug, locationId).catch(() => [] as PosMovement[]),
+  ]);
+  return [...recharges, ...giftboxes, ...giftcards];
+}
+
+// Standalone RECHARGES (pos_history.php section 2, ~2455-2524): a recharge row with no sale_id
+// (a sale-linked one is already shown as its sale). Row label "R#id", "Apri" -> credit movements.
+async function listStandaloneRecharges(slug: string, locationId: number): Promise<PosMovement[]> {
+  const table = await tenantTable(slug, "recharges").catch(() => null);
+  if (!table) return [];
+  const clientsTable = await tenantTable(slug, "clients").catch(() => null);
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
+    clauses.push("r.tenant_id=?");
+    params.push(table.tenantId ?? 0);
+  }
+  if (locationId > 0 && await columnExists(table.name, "location_id")) {
+    clauses.push("(r.location_id IS NULL OR r.location_id=?)");
+    params.push(locationId);
+  }
+  if (await columnExists(table.name, "sale_id")) clauses.push("(r.sale_id IS NULL OR r.sale_id<=0)");
+  const hasVoid = await columnExists(table.name, "is_void");
+  const clientJoin = clientsTable
+    ? `LEFT JOIN ${quoteIdentifier(clientsTable.name)} c ON c.id=r.client_id${clientsTable.mode === "shared" && await columnExists(clientsTable.name, "tenant_id") ? " AND c.tenant_id=r.tenant_id" : ""}`
+    : "";
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT r.id, r.client_id, r.total_amount AS amount, r.created_at AS dt, r.note,
+            ${await columnExists(table.name, "location_id") ? "r.location_id" : "NULL"} AS location_id,
+            ${hasVoid ? "r.is_void" : "0"} AS is_void,
+            ${await columnExists(table.name, "created_by") ? "r.created_by" : "0"} AS created_by,
+            c.full_name AS client_name
+       FROM ${quoteIdentifier(table.name)} r
+       ${clientJoin}
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY r.id DESC
+      LIMIT ${POS_MOVEMENTS_LIMIT}`,
+    params,
+  ).catch(() => [] as RowDataPacket[]);
+  return Promise.all(rows.map(async (row): Promise<PosMovement> => {
+    const id = Number(row.id ?? 0) || 0;
+    return {
+      kind: "recharge",
+      kindLabel: "Ricarica",
+      id,
+      saleNumber: 0,
+      numberLabel: `R#${id}`,
+      locationId: Number(row.location_id ?? 0) || 0,
+      clientId: Number(row.client_id ?? 0) || 0,
+      clientName: clean(row.client_name, 190) || "—",
+      amount: roundMoney(Number(row.amount ?? 0) || 0),
+      status: Number(row.is_void ?? 0) ? "Stornata" : "Attiva",
+      operator: await movementOperator(slug, row),
+      date: dateTimeString(row.dt),
+      hasService: false,
+      hasProduct: false,
+      hasPackage: false,
+      serviceIds: [],
+      productIds: [],
+      hasGiftcardLine: false,
+      hasGiftboxLine: false,
+      hasRechargeLine: true,
+    };
+  }));
+}
+
+// Standalone GIFTBOX instances (pos_history.php section 3, ~2526-2669): a giftbox_instances row
+// NOT already shown by a sale (a sale-issued box has a sale_items line containing its code).
+async function listStandaloneGiftboxes(slug: string, locationId: number): Promise<PosMovement[]> {
+  const table = await tenantTable(slug, "giftbox_instances").catch(() => null);
+  if (!table) return [];
+  const clientsTable = await tenantTable(slug, "clients").catch(() => null);
+  const saleItemsTable = await tenantTable(slug, "sale_items").catch(() => null);
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
+    clauses.push("gi.tenant_id=?");
+    params.push(table.tenantId ?? 0);
+  }
+  if (locationId > 0 && await columnExists(table.name, "location_id")) {
+    clauses.push("(gi.location_id IS NULL OR gi.location_id=?)");
+    params.push(locationId);
+  }
+  // Dedupe: hide a giftbox already shown by the sale that issued it (sale_items line w/ its code).
+  if (saleItemsTable && await columnExists(saleItemsTable.name, "item_name")) {
+    const tenantClause = saleItemsTable.mode === "shared" && await columnExists(saleItemsTable.name, "tenant_id") ? " AND si.tenant_id=gi.tenant_id" : "";
+    clauses.push(`NOT EXISTS (SELECT 1 FROM ${quoteIdentifier(saleItemsTable.name)} si WHERE si.item_name LIKE '%' || gi.code || '%'${tenantClause})`);
+  }
+  const clientJoin = clientsTable
+    ? `LEFT JOIN ${quoteIdentifier(clientsTable.name)} c ON c.id=gi.client_id${clientsTable.mode === "shared" && await columnExists(clientsTable.name, "tenant_id") ? " AND c.tenant_id=gi.tenant_id" : ""}`
+    : "";
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT gi.id, gi.client_id, gi.status, gi.issued_at AS dt,
+            ${await columnExists(table.name, "location_id") ? "gi.location_id" : "NULL"} AS location_id,
+            ${await columnExists(table.name, "created_by") ? "gi.created_by" : "0"} AS created_by,
+            c.full_name AS client_name
+       FROM ${quoteIdentifier(table.name)} gi
+       ${clientJoin}
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY gi.id DESC
+      LIMIT ${POS_MOVEMENTS_LIMIT}`,
+    params,
+  ).catch(() => [] as RowDataPacket[]);
+  return Promise.all(rows.map(async (row) => voucherMovement(slug, row, "giftbox", "GiftBox")));
+}
+
+// Standalone GIFTCARDS (pos_history.php section 4, ~2671-2746): a giftcards row NOT already
+// shown by the sale that issued it (sale_items line w/ its code). Amount = initial_amount.
+async function listStandaloneGiftcards(slug: string, locationId: number): Promise<PosMovement[]> {
+  const table = await tenantTable(slug, "giftcards").catch(() => null);
+  if (!table) return [];
+  const clientsTable = await tenantTable(slug, "clients").catch(() => null);
+  const saleItemsTable = await tenantTable(slug, "sale_items").catch(() => null);
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (table.mode === "shared" && await columnExists(table.name, "tenant_id")) {
+    clauses.push("gc.tenant_id=?");
+    params.push(table.tenantId ?? 0);
+  }
+  if (locationId > 0 && await columnExists(table.name, "location_id")) {
+    clauses.push("(gc.location_id IS NULL OR gc.location_id=?)");
+    params.push(locationId);
+  }
+  if (saleItemsTable && await columnExists(saleItemsTable.name, "item_name")) {
+    const tenantClause = saleItemsTable.mode === "shared" && await columnExists(saleItemsTable.name, "tenant_id") ? " AND si.tenant_id=gc.tenant_id" : "";
+    clauses.push(`NOT EXISTS (SELECT 1 FROM ${quoteIdentifier(saleItemsTable.name)} si WHERE si.item_name LIKE '%' || gc.code || '%'${tenantClause})`);
+  }
+  const clientJoin = clientsTable
+    ? `LEFT JOIN ${quoteIdentifier(clientsTable.name)} c ON c.id=gc.client_id${clientsTable.mode === "shared" && await columnExists(clientsTable.name, "tenant_id") ? " AND c.tenant_id=gc.tenant_id" : ""}`
+    : "";
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT gc.id, gc.client_id, gc.initial_amount AS amount, gc.status, gc.issued_at AS dt,
+            ${await columnExists(table.name, "location_id") ? "gc.location_id" : "NULL"} AS location_id,
+            ${await columnExists(table.name, "created_by") ? "gc.created_by" : "0"} AS created_by,
+            c.full_name AS client_name
+       FROM ${quoteIdentifier(table.name)} gc
+       ${clientJoin}
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY gc.id DESC
+      LIMIT ${POS_MOVEMENTS_LIMIT}`,
+    params,
+  ).catch(() => [] as RowDataPacket[]);
+  return Promise.all(rows.map(async (row) => voucherMovement(slug, row, "giftcard", "GiftCard", roundMoney(Number(row.amount ?? 0) || 0))));
+}
+
+// Build a giftbox/giftcard MOVEMENT row (both are "Voucher"-kind rows with the raw table status).
+async function voucherMovement(
+  slug: string,
+  row: RowDataPacket,
+  kind: "giftbox" | "giftcard",
+  kindLabel: string,
+  amount: number | null = null,
+): Promise<PosMovement> {
+  return {
+    kind,
+    kindLabel,
+    id: Number(row.id ?? 0) || 0,
+    saleNumber: 0,
+    numberLabel: "",
+    locationId: Number(row.location_id ?? 0) || 0,
+    clientId: Number(row.client_id ?? 0) || 0,
+    clientName: clean(row.client_name, 190) || "—",
+    amount,
+    status: clean(row.status, 40),
+    operator: await movementOperator(slug, row),
+    date: dateTimeString(row.dt),
+    hasService: false,
+    hasProduct: false,
+    hasPackage: false,
+    serviceIds: [],
+    productIds: [],
+    hasGiftcardLine: kind === "giftcard",
+    hasGiftboxLine: kind === "giftbox",
+    hasRechargeLine: false,
+  };
+}
+
+// Operator display for a standalone movement (faithful to _pos_hist_operator_display): the
+// row has no operator_name, so resolve the users lookup for created_by. "" when unresolved.
+async function movementOperator(slug: string, row: RowDataPacket): Promise<string> {
+  return (await operatorNameFromUserId(slug, Number(row.created_by ?? 0))) || "";
+}
+
 async function listPosClients(slug: string): Promise<ManagedClient[]> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", orderBy: "full_name ASC, id ASC", limit: 500 }).catch(() => []);
   return rows.map((row) => ({
@@ -1533,12 +1843,16 @@ async function mapSale(slug: string, row: RowDataPacket): Promise<PosSale> {
   const total = roundMoney(Number(row.total ?? 0) || 0);
   const payments = derivePayments(row, total);
   const paidAmount = roundMoney(payments.reduce((sum, payment) => sum + payment.amount, 0));
+  // Operator display (faithful to _pos_hist_operator_display): sales.operator_name, else the
+  // users lookup for sales.created_by. Left "" when neither resolves (rendered as "—").
+  const operatorName = clean(row.operator_name, 120) || (await operatorNameFromUserId(slug, Number(row.created_by ?? 0))) || "";
   return {
     id,
     code: `S-${String(id).padStart(5, "0")}`,
     clientId: Number(row.client_id ?? 0) || 0,
     clientName: String(row.client_name ?? "") || await clientName(slug, Number(row.client_id ?? 0)),
     locationId: Number(row.location_id ?? 0) || 0,
+    operatorName,
     items,
     payments,
     subtotal: roundMoney(Number(row.subtotal ?? total) || 0),
