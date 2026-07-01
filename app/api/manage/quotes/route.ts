@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, getManageQuoteDetail, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
+import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, getManageQuoteDetail, getManageQuoteForEdit, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuote, updateDbQuoteStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
@@ -26,6 +26,13 @@ export async function GET(request: Request) {
       const detail = await getManageQuoteDetail(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
       if (!detail) return jsonError("Preventivo non trovato.", 404);
       return Response.json({ ok: true, sourceMode: "database", detail });
+    }
+
+    // Edit-form prefill (action=edit): the quote in the CORE editor's shape.
+    if (url.searchParams.get("action") === "edit_get") {
+      const quote = await getManageQuoteForEdit(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
+      if (!quote) return jsonError("Preventivo non trovato.", 404);
+      return Response.json({ ok: true, sourceMode: "database", quote });
     }
 
     if (url.searchParams.get("action") === "context") {
@@ -83,6 +90,17 @@ export async function POST(request: Request) {
 
     const id = parseInteger(body.id);
     if (id <= 0) return jsonError("ID preventivo mancante.");
+
+    // Update an existing quote (port of quotes.php action=edit save).
+    if (action === "update") {
+      const quote = await updateDbQuote(id, {
+        clientId: parseInteger(body.client_id, 0),
+        clientName: body.client_name,
+        discount: parseNumber(body.discount, 0),
+        lines: quoteLinesFromBody(body),
+      }, tenantSlug);
+      return Response.json({ ok: true, source: "quotes?action=update", sourceMode: "database", quote, quotes: await listDbQuotes(tenantSlug) });
+    }
 
     if (action === "send") {
       // Port of quotes.php action=email: email the quote to the client (public +

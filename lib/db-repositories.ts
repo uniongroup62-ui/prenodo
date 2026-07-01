@@ -3545,6 +3545,87 @@ export async function createDbQuote(
   return mapQuote(slug, rows[0]);
 }
 
+// Edit-form prefill: return an existing quote in the CORE editor's shape
+// (client + discount + lines) so QuoteFormContent can prefill it. Port of
+// quotes.php action=edit load.
+export type ManageQuoteEdit = { id: number; clientId: number; clientName: string; discount: number; lines: Array<{ type: "service" | "product"; refId: number; name: string; quantity: number; unitPrice: number }> };
+export async function getManageQuoteForEdit(slug: string, id: number): Promise<ManageQuoteEdit | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const qrow = rows[0];
+  const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "quote_items", where: "quote_id = ?", params: [id], orderBy: "position ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  return {
+    id,
+    clientId: Number(qrow.client_id ?? 0) || 0,
+    clientName: String(qrow.client_name ?? ""),
+    discount: roundMoney(Number(qrow.discount_total ?? 0)),
+    lines: itemRows.map((r) => ({
+      type: String(r.item_type ?? "") === "product" ? "product" : "service",
+      refId: Number(r.item_id ?? 0) || 0,
+      name: String(r.description ?? ""),
+      quantity: Math.max(1, Number(r.qty ?? 1)),
+      unitPrice: roundMoney(Number(r.unit_price ?? 0)),
+    })),
+  };
+}
+
+// Update an existing quote (port of quotes.php action=edit save). Only DRAFT/SENT
+// quotes are editable (converted/accepted ones are locked). Recomputes the
+// client + lines + subtotal/discount/total, keeps the number/status/dates, and
+// rebuilds quote_items.
+export async function updateDbQuote(
+  id: number,
+  input: { clientId?: number; clientName?: string; lines: PosSaleItemInput[]; discount?: number },
+  slug: string,
+): Promise<Quote> {
+  if (id <= 0) throw new Error("ID preventivo mancante.");
+  if (!input.lines.length) throw new Error("Aggiungi almeno una voce al preventivo.");
+  const existing = await tenantSelect<RowDataPacket>({ slug, table: "quotes", columns: "id, status", where: "id = ?", params: [id], limit: 1 });
+  if (!existing[0]) throw new Error("Preventivo non trovato.");
+  const status = quoteStatus(String(existing[0].status ?? "draft"));
+  if (status !== "draft" && status !== "sent") throw new Error("Questo preventivo non è modificabile.");
+
+  const client = await resolveSaleClientForDb(slug, input.clientId ?? 0, input.clientName);
+  const items = await Promise.all(input.lines.map((line, index) => buildDbSaleItem(slug, line, index + 1)));
+  const subtotal = roundMoney(items.reduce((total, item) => total + item.total, 0));
+  const discount = roundMoney(Math.min(subtotal, Math.max(0, input.discount ?? 0)));
+  const total = roundMoney(Math.max(0, subtotal - discount));
+
+  await tenantUpdate({ slug, table: "quotes", id, values: {
+    client_id: client.id > 0 ? client.id : null,
+    client_name: client.name,
+    subtotal,
+    discount_total: discount,
+    total,
+    updated_at: new Date(),
+  } });
+
+  // Rebuild quote_items.
+  const itemTable = await tenantTable(slug, "quote_items");
+  const scoped = itemTable.mode === "shared" && (await columnExists(itemTable.name, "tenant_id"));
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(itemTable.name)} WHERE quote_id = ?${scoped ? " AND tenant_id = ?" : ""}`,
+    scoped ? [id, itemTable.tenantId ?? 0] : [id],
+  ).catch(() => undefined);
+  for (const [index, item] of items.entries()) {
+    await tenantInsert(itemTable, {
+      quote_id: id,
+      item_type: item.type === "product" ? "product" : "service",
+      item_id: item.refId > 0 ? item.refId : null,
+      description: item.name,
+      qty: item.quantity,
+      unit_price: item.unitPrice,
+      line_total: item.total,
+      position: index + 1,
+    });
+  }
+
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Preventivo non trovato.");
+  return mapQuote(slug, rows[0]);
+}
+
 export async function updateDbQuoteStatus(id: number, status: QuoteStatus, slug: string): Promise<Quote> {
   const values: Record<string, unknown> = { status };
   if (status === "sent") values.sent_at = new Date();

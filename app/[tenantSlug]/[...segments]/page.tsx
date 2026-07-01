@@ -277,7 +277,7 @@ export default async function TenantPage({
   // faithful CORE editor (client + line items + discount + totals + save). The
   // action=view/edit detail stays on the existing fallback for now (TODO in the
   // form component).
-  if (page === "quotes" && query.action === "new") {
+  if (page === "quotes" && (query.action === "new" || query.action === "edit")) {
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <QuoteFormContent />

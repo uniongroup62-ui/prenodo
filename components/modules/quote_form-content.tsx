@@ -41,6 +41,12 @@ function tenantSlug(): string {
   return window.location.pathname.split("/")[1] || "";
 }
 
+// Resolve the legacy-style ?action=new|edit once, synchronously from the URL.
+function resolveAction(): "new" | "edit" {
+  if (typeof window === "undefined") return "new";
+  return new URLSearchParams(window.location.search).get("action") === "edit" ? "edit" : "new";
+}
+
 function fmtEuro(n: number): string {
   return `€ ${(Number.isFinite(n) ? n : 0).toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
@@ -51,6 +57,8 @@ function roundMoney(n: number): number {
 
 export function QuoteFormContent() {
   const slug = tenantSlug();
+  const [action] = useState<"new" | "edit">(resolveAction);
+  const [quoteId, setQuoteId] = useState(0);
   const [clients, setClients] = useState<ClientLite[]>([]);
   const [services, setServices] = useState<CatalogItem[]>([]);
   const [products, setProducts] = useState<CatalogItem[]>([]);
@@ -69,7 +77,11 @@ export function QuoteFormContent() {
   const [pickQty, setPickQty] = useState(1);
 
   useEffect(() => {
-    fetch(`/api/manage/quotes?slug=${encodeURIComponent(slug)}&action=context`, {
+    const params = new URLSearchParams(window.location.search);
+    const act = params.get("action") === "edit" ? "edit" : "new";
+    const editId = Number.parseInt(params.get("id") ?? "", 10);
+
+    const ctxPromise = fetch(`/api/manage/quotes?slug=${encodeURIComponent(slug)}&action=context`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
@@ -78,8 +90,36 @@ export function QuoteFormContent() {
         setServices((Array.isArray(j.services) ? j.services : []).map((s: Record<string, unknown>) => ({ id: Number(s.id ?? 0), name: String(s.name ?? ""), price: Number(s.price ?? 0) || 0 })));
         setProducts((Array.isArray(j.products) ? j.products : []).map((p: Record<string, unknown>) => ({ id: Number(p.id ?? 0), name: String(p.name ?? ""), price: Number(p.price ?? 0) || 0 })));
       })
-      .catch(() => setError("Errore nel caricamento del catalogo."))
-      .finally(() => setLoading(false));
+      .catch(() => setError("Errore nel caricamento del catalogo."));
+
+    const editPromise =
+      act === "edit" && Number.isFinite(editId) && editId > 0
+        ? fetch(`/api/manage/quotes?slug=${encodeURIComponent(slug)}&action=edit_get&id=${editId}`, { headers: { "x-tenant-slug": slug } })
+            .then((r) => r.json())
+            .then((j) => {
+              if (!j.ok || !j.quote) {
+                setError(String(j.error ?? "Preventivo non trovato."));
+                return;
+              }
+              const qd = j.quote;
+              setQuoteId(Number(qd.id ?? editId));
+              setClientId(Number(qd.clientId ?? 0) || 0);
+              setClientName(String(qd.clientName ?? ""));
+              setDiscount(String(qd.discount ?? 0));
+              setLines(
+                (qd.lines ?? []).map((l: Record<string, unknown>) => ({
+                  type: l.type === "product" ? "product" : "service",
+                  refId: Number(l.refId ?? 0) || 0,
+                  name: String(l.name ?? ""),
+                  quantity: Math.max(1, Number(l.quantity ?? 1)),
+                  unitPrice: Number(l.unitPrice ?? 0) || 0,
+                })),
+              );
+            })
+            .catch(() => setError("Errore nel caricamento del preventivo."))
+        : Promise.resolve();
+
+    Promise.all([ctxPromise, editPromise]).finally(() => setLoading(false));
   }, [slug]);
 
   const catalog = pickType === "service" ? services : products;
@@ -136,7 +176,8 @@ export function QuoteFormContent() {
         unitPrice: l.unitPrice,
       }));
       const payload: Record<string, unknown> = {
-        action: "create",
+        action: action === "edit" ? "update" : "create",
+        id: String(quoteId),
         client_id: String(clientId || 0),
         client_name: clientId > 0 ? "" : clientName,
         discount: String(discountValue),
@@ -167,7 +208,7 @@ export function QuoteFormContent() {
       <div className="bs-page-header">
         <div className="bs-page-heading">
           <div className="bs-page-kicker">Vendite</div>
-          <h1 className="bs-page-title">Nuovo preventivo</h1>
+          <h1 className="bs-page-title">{action === "edit" ? "Modifica preventivo" : "Nuovo preventivo"}</h1>
           <div className="bs-page-subtitle">Crea e gestisci preventivi per i tuoi clienti.</div>
         </div>
         <div className="bs-page-actions">
