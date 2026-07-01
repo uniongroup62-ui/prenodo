@@ -692,6 +692,9 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
   const [staff, setStaff] = useState<CalendarStaff[]>([]);
   const [services, setServices] = useState<CalendarService[]>([]);
   const [notes, setNotes] = useState<CalendarNote[]>([]);
+  // GAP 5: when a day's note marker is clicked (week view) the notes modal filters to just
+  // that day ("Giorno selezionato"); null = show the whole visible period ("Periodo visibile").
+  const [notesFilterDate, setNotesFilterDate] = useState<string | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [businessHours, setBusinessHours] = useState<CalendarBusinessHour[]>([]);
   // Date-level overrides used to shade the grid: closures (fully closed dates) and
@@ -1107,6 +1110,9 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
   }, [view, visibleAppts, rangeApptsByDate, date]);
   const totalLabel = totalAppts === 1 ? "appuntamento totale" : "appuntamenti totali";
   const notesCount = notes.length;
+  // GAP 5: the notes actually shown in the modal — all visible-period notes, or just the
+  // single selected day when a marker was clicked.
+  const displayNotes = notesFilterDate ? notes.filter((n) => n.noteDate === notesFilterDate) : notes;
   const gridHeight = (rows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
   const weekGridHeight = (weekRows.length - 1) * ROW_HEIGHT + ROW_HEIGHT;
   // The 7 Week column dates (Mon..Sun) + today, lifted to component scope so the Week
@@ -1891,6 +1897,16 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
 
   // Open the notes modal from the header button, starting in "new note" mode.
   const openNotesModal = useCallback(() => {
+    setNotesFilterDate(null);
+    resetNotesForm();
+    setNotesError("");
+    showNotesModal();
+  }, [resetNotesForm]);
+
+  // GAP 5: open the notes modal filtered to a single day (clicking a day's note marker in
+  // the week view), switching the caption to "Giorno selezionato".
+  const openNotesModalForDate = useCallback((iso: string) => {
+    setNotesFilterDate(iso);
     resetNotesForm();
     setNotesError("");
     showNotesModal();
@@ -2201,12 +2217,18 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
                       <span className="calendar-weekday-date">{`${pad(d.getDate())}/${pad(d.getMonth() + 1)}`}</span>
                     </span>
                     {noteCount > 0 ? (
-                      <span className="calendar-note-marker-wrap">
-                        <span className="calendar-note-marker" role="img" aria-label={`${noteCount} note`}>
+                      <button
+                        type="button"
+                        className="calendar-note-marker-wrap"
+                        onClick={() => openNotesModalForDate(iso)}
+                        title={`${noteCount} note — apri il giorno selezionato`}
+                        style={{ background: "transparent", border: "none", padding: 0, cursor: "pointer" }}
+                      >
+                        <span className="calendar-note-marker" aria-label={`${noteCount} note`}>
                           <i className="bi bi-stickies" aria-hidden="true" />
                           <span>{noteCount}</span>
                         </span>
-                      </span>
+                      </button>
                     ) : null}
                   </span>
                 </div>
@@ -3498,13 +3520,19 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
                   <div className="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
                     <div>
                       <div className="small-muted" id="calendarNotesRangeCaption">
-                        Periodo visibile
+                        {notesFilterDate ? "Giorno selezionato" : "Periodo visibile"}
                       </div>
                       <div className="fw-semibold" id="calendarNotesRangeLabel">
-                        {longTitle(date)}
+                        {longTitle(notesFilterDate ?? date)}
                       </div>
                       <div className="small text-muted" id="calendarNotesRangeHint">
-                        {notesCount === 1 ? "1 nota nel periodo visibile" : `${notesCount} note nel periodo visibile`}
+                        {notesFilterDate
+                          ? displayNotes.length === 1
+                            ? "1 nota del giorno selezionato"
+                            : `${displayNotes.length} note del giorno selezionato`
+                          : notesCount === 1
+                            ? "1 nota nel periodo visibile"
+                            : `${notesCount} note nel periodo visibile`}
                       </div>
                     </div>
                     <button type="button" className="btn btn-sm btn-outline-secondary" id="calendarNotesNewBtn">
@@ -3513,13 +3541,15 @@ export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
                     </button>
                   </div>
                   <div id="calendarNotesList" className="calendar-notes-list">
-                    {notes.length === 0 ? (
+                    {displayNotes.length === 0 ? (
                       <div className="calendar-note-empty">
-                        <div className="fw-semibold mb-1">Nessuna nota nel periodo visibile</div>
+                        <div className="fw-semibold mb-1">
+                          {notesFilterDate ? "Nessuna nota nel giorno selezionato" : "Nessuna nota nel periodo visibile"}
+                        </div>
                         <div className="small">Crea una nota dal modulo a sinistra.</div>
                       </div>
                     ) : (
-                      groupNotesByDate(notes).map((group) => (
+                      groupNotesByDate(displayNotes).map((group) => (
                         <div className="calendar-note-day-group" data-note-group-date={group.date} key={group.date}>
                           <div className="calendar-note-day-head">
                             <div className="fw-semibold">{longTitle(group.date)}</div>
