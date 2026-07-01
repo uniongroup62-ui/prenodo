@@ -402,19 +402,57 @@ export async function saveStockMovement(slug: string, body: Record<string, strin
   return getManageProductsContext(slug, { locationId, includeInactive: true });
 }
 
+// recomputeIncoming — faithful port of stock_moves.php recomputeIncoming (~212-243): a product's
+// incoming_qty/eta is whatever the LAST still-active carico with incoming_flag=1 declares (else 0/null).
+// Called after a doc is canceled so a stale incoming falls back to the previous pending carico instead
+// of being blindly zeroed. Tenant-safe (two scoped tenantSelects, no raw cross-tenant join); the just-
+// canceled doc is excluded because each candidate's stock_docs row is checked for is_canceled here.
+async function recomputeIncoming(slug: string, productId: number, locationId: number): Promise<{ qty: number; eta: string | null }> {
+  if (productId <= 0) return { qty: 0, eta: null };
+  const items = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "stock_doc_items",
+    columns: "stock_doc_id, incoming_qty, incoming_eta",
+    where: "product_id=? AND incoming_flag=1",
+    params: [productId],
+    orderBy: "stock_doc_id DESC, id DESC",
+  }).catch(() => [] as RowDataPacket[]);
+  for (const it of items) {
+    const docId = Number(it.stock_doc_id ?? 0) || 0;
+    if (docId <= 0) continue;
+    const docs = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "stock_docs",
+      columns: "id, cause, is_canceled, location_id",
+      where: "id=?",
+      params: [docId],
+      limit: 1,
+    }).catch(() => [] as RowDataPacket[]);
+    const d = docs[0];
+    if (!d || Number(d.is_canceled ?? 0) === 1) continue;
+    if (normalizeStockCause(d.cause) !== "carico") continue;
+    if (locationId > 0 && Number(d.location_id ?? 0) > 0 && Number(d.location_id) !== locationId) continue;
+    return { qty: Math.max(0, Number(it.incoming_qty ?? 0) || 0), eta: it.incoming_eta ? String(it.incoming_eta).slice(0, 10) : null };
+  }
+  return { qty: 0, eta: null };
+}
+
 export async function cancelStockDocument(slug: string, documentId: number, userName = "Operatore", userId: number | null = null): Promise<ManageProductsContext> {
   const doc = await getStockDocumentById(slug, documentId);
   if (Number(doc.is_canceled ?? 0) === 1) return getManageProductsContext(slug, { locationId: Number(doc.location_id ?? 0), includeInactive: true });
   const cause = normalizeStockCause(doc.cause);
   const locationId = Number(doc.location_id ?? 0) || 0;
   const items = await tenantSelect<RowDataPacket>({ slug, table: "stock_doc_items", where: "stock_doc_id=?", params: [documentId] }).catch(() => []);
+  // Reverse the stock delta for each line.
+  const touchedProducts = new Set<number>();
   for (const item of items) {
     const productId = Number(item.product_id ?? 0);
     const qty = Number(item.qty ?? 0);
     if (productId <= 0 || qty <= 0) continue;
     await adjustProductStock(slug, productId, locationId, cause === "carico" ? -qty : qty);
-    await setProductIncoming(slug, productId, locationId, 0, null);
+    touchedProducts.add(productId);
   }
+  // Mark canceled FIRST so this doc is excluded from the incoming recompute below.
   await tenantUpdate({
     slug,
     table: "stock_docs",
@@ -426,6 +464,12 @@ export async function cancelStockDocument(slug: string, documentId: number, user
       canceled_by_name: clean(userName, 190) || "Operatore",
     },
   });
+  // Recompute each touched product's incoming from the previous still-active carico (else 0) —
+  // faithful to recomputeIncoming, instead of blindly zeroing.
+  for (const productId of touchedProducts) {
+    const incoming = await recomputeIncoming(slug, productId, locationId);
+    await setProductIncoming(slug, productId, locationId, incoming.qty, incoming.eta);
+  }
   return getManageProductsContext(slug, { locationId, includeInactive: true });
 }
 
