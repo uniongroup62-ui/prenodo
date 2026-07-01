@@ -6030,6 +6030,191 @@ function normalizeCouponScope(value: string): string {
   return allowed.includes(scope) ? scope : "all_services_products";
 }
 
+// Usage stats for a coupon code (port of coupons.php coupons_usage_stats). Counts
+// sales (matched by coupon_code OR the "Coupon: CODE" notes marker) + appointments
+// (matched by the notes marker only — the migrated appointments table has no
+// coupon_code column), how many of those appointments are still OPEN
+// (pending/scheduled), and for a fixed-amount coupon the consumed amount + residual.
+// Drives the delete guard (open appts block deletion; any usage forces a
+// history-preserving soft-delete) and the list/edit "Utilizzi" display.
+export type CouponUsageStats = {
+  salesCount: number;
+  appointmentsCount: number;
+  openAppointmentsCount: number;
+  usedCount: number;
+  activeUsedCount: number;
+  hasUsage: boolean;
+  usedAmount: number;
+  residual: number | null;
+  fullyUsed: boolean;
+  partial: boolean;
+};
+
+async function couponUsageStats(
+  slug: string,
+  coupon: { code: string; type: "fixed" | "percent"; value: number },
+): Promise<CouponUsageStats> {
+  const code = normalizeCouponCode(coupon.code);
+  const residualBase = coupon.type === "fixed" ? roundMoney(Math.max(0, coupon.value)) : null;
+  if (code === "") {
+    return { salesCount: 0, appointmentsCount: 0, openAppointmentsCount: 0, usedCount: 0, activeUsedCount: 0, hasUsage: false, usedAmount: 0, residual: residualBase, fullyUsed: false, partial: false };
+  }
+  const likeNeedle = `%${`Coupon: ${code}`.toUpperCase()}%`;
+
+  let salesCount = 0;
+  let appointmentsCount = 0;
+  let openAppointmentsCount = 0;
+  let activeSales = 0;
+  let activeAppts = 0;
+  let usedAmount = 0;
+
+  // Sales history: prefer coupon_code, fall back to the notes marker (like the legacy).
+  const salesRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "sales",
+    columns: "id, subtotal, discount, coupon_code, notes, status",
+    where: "UPPER(COALESCE(coupon_code,'')) = ? OR UPPER(COALESCE(notes,'')) LIKE ?",
+    params: [code, likeNeedle],
+  }).catch(() => [] as RowDataPacket[]);
+  for (const r of salesRows) {
+    const meta = extractCouponMetaFromNotes(r.notes);
+    const storedCode = normalizeCouponCode(String(r.coupon_code ?? ""));
+    const rowCode = storedCode !== "" ? storedCode : normalizeCouponCode(meta.code);
+    if (rowCode !== code) continue;
+    salesCount++;
+    const isCancelled = String(r.status ?? "").trim().toLowerCase() === "cancelled";
+    if (!isCancelled) activeSales++;
+    const subtotal = Math.max(0, Number(r.subtotal ?? 0));
+    let disc: number | null = null;
+    if (meta.discount > 0) disc = meta.discount;
+    else if (r.discount !== null && r.discount !== undefined && String(r.discount) !== "") disc = Number(r.discount);
+    if (disc !== null && !isCancelled) {
+      disc = Math.max(0, disc);
+      if (disc > subtotal && subtotal > 0) disc = subtotal;
+      usedAmount += disc;
+    }
+  }
+
+  // Appointment history: the coupon snapshot lives in the notes marker only.
+  const apptRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, notes, status",
+    where: "UPPER(COALESCE(notes,'')) LIKE ?",
+    params: [likeNeedle],
+  }).catch(() => [] as RowDataPacket[]);
+  for (const r of apptRows) {
+    const meta = extractCouponMetaFromNotes(r.notes);
+    if (normalizeCouponCode(meta.code) !== code) continue;
+    appointmentsCount++;
+    const st = String(r.status ?? "").trim().toLowerCase();
+    if (st === "pending" || st === "scheduled") openAppointmentsCount++;
+    const isCancelled = st === "canceled" || st === "cancelled" || st === "no_show";
+    if (!isCancelled) activeAppts++;
+    if (meta.discount > 0 && !isCancelled) usedAmount += Math.max(0, meta.discount);
+  }
+
+  usedAmount = roundMoney(Math.max(0, usedAmount));
+  const usedCount = salesCount + appointmentsCount;
+  const hasUsage = usedCount > 0;
+  let residual = residualBase;
+  let fullyUsed = false;
+  let partial = false;
+  if (coupon.type === "fixed") {
+    const total = Math.max(0, coupon.value);
+    residual = roundMoney(Math.max(0, total - usedAmount));
+    fullyUsed = hasUsage && residual <= 0.00001;
+    partial = hasUsage && usedAmount > 0.00001 && residual > 0.00001;
+  } else {
+    partial = hasUsage;
+  }
+  return { salesCount, appointmentsCount, openAppointmentsCount, usedCount, activeUsedCount: activeSales + activeAppts, hasUsage, usedAmount, residual, fullyUsed, partial };
+}
+
+// Remove a coupon's coupon_locations rows (tenant-scoped), before a hard delete.
+async function deleteCouponLocations(slug: string, couponId: number): Promise<void> {
+  const table = await tenantTable(slug, "coupon_locations").catch(() => null);
+  if (!table) return;
+  const scoped = table.mode === "shared" && (await columnExists(table.name, "tenant_id"));
+  await dbExecute(
+    `DELETE FROM ${quoteIdentifier(table.name)} WHERE coupon_id = ?${scoped ? " AND tenant_id = ?" : ""}`,
+    scoped ? [couponId, table.tenantId ?? 0] : [couponId],
+  ).catch(() => undefined);
+}
+
+// Delete a coupon (port of coupons.php action=delete). Refuses while OPEN
+// appointments still reference it; soft-deletes (deleted_at + is_active=0, so the
+// sales/appointment history is preserved) when it has any usage; hard-deletes
+// (with its coupon_locations) only when entirely unused.
+export async function deleteManageCoupon(
+  slug: string,
+  id: number,
+  by: number,
+): Promise<{ ok: true; mode: "hard" | "soft"; message: string }> {
+  if (id <= 0) throw new Error("ID coupon mancante.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "coupons", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Coupon non trovato.");
+  if (rows[0].deleted_at) throw new Error("Coupon gia eliminato dalla gestione.");
+  const coupon = await mapCoupon(slug, rows[0]);
+  const stats = await couponUsageStats(slug, coupon);
+  if (stats.openAppointmentsCount > 0) {
+    throw new Error("Coupon associato a prenotazioni in sospeso/prenotate: non puo essere eliminato finche restano aperte.");
+  }
+  const byId = by > 0 ? by : null;
+  if (stats.hasUsage) {
+    const note = "Eliminato dalla gestione: storico vendite/prenotazioni conservato.";
+    await tenantUpdate({
+      slug,
+      table: "coupons",
+      id,
+      values: {
+        is_active: 0,
+        deleted_at: new Date(),
+        deleted_by: byId,
+        deleted_reason: note,
+        cancelled_at: rows[0].cancelled_at ?? new Date(),
+        cancelled_by: rows[0].cancelled_by ?? byId,
+        cancelled_reason: (rows[0].cancelled_reason as string) || note,
+      },
+    });
+    return { ok: true, mode: "soft", message: "Coupon eliminato dalla gestione. Lo storico vendite/prenotazioni resta invariato." };
+  }
+  await deleteCouponLocations(slug, id);
+  await tenantDelete({ slug, table: "coupons", id });
+  return { ok: true, mode: "hard", message: "Coupon eliminato." };
+}
+
+// Disable a coupon (port of coupons.php action=cancel): is_active=0 + audit
+// (cancelled_at/by/reason). Already-associated sales/appointments keep the
+// historical coupon snapshot. Refuses when the coupon is already disabled.
+export async function cancelManageCoupon(
+  slug: string,
+  id: number,
+  reason: string,
+  by: number,
+): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("ID coupon mancante.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "coupons", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Coupon non trovato.");
+  if (rows[0].deleted_at) throw new Error("Coupon gia eliminato dalla gestione.");
+  if (Number(rows[0].is_active ?? 0) !== 1) throw new Error("Coupon gia disattivato.");
+  let clean = String(reason ?? "").trim();
+  if (clean.length > 255) clean = clean.slice(0, 255);
+  const byId = by > 0 ? by : null;
+  await tenantUpdate({
+    slug,
+    table: "coupons",
+    id,
+    values: {
+      is_active: 0,
+      cancelled_at: rows[0].cancelled_at ?? new Date(),
+      cancelled_by: rows[0].cancelled_by ?? byId,
+      cancelled_reason: (rows[0].cancelled_reason as string) || (clean !== "" ? clean : null),
+    },
+  });
+  return { ok: true };
+}
+
 export async function listDbPromotions(slug: string): Promise<PromotionRule[]> {
   const rows = await tenantSelect<RowDataPacket>({
     slug,

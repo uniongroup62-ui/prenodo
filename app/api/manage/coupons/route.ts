@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { createDbCoupon, getManageCoupon, listDbCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
+import { cancelManageCoupon, createDbCoupon, deleteManageCoupon, getManageCoupon, listDbCoupons, previewDbCoupon, redeemDbCoupon, saveManageCoupon } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -69,6 +69,22 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
       const coupon = await saveManageCoupon(tenantSlug, body, parseInteger(body.id, 0));
       return Response.json({ ok: true, source: "coupons?action=save", sourceMode: "database", coupon, coupons: await listDbCoupons(tenantSlug) });
+    }
+
+    // Delete a coupon (port of coupons.php action=delete). Refuses while open
+    // appointments reference it; soft-deletes when used (history preserved),
+    // hard-deletes when unused.
+    if (action === "delete") {
+      if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
+      const result = await deleteManageCoupon(tenantSlug, parseInteger(body.id, 0), session.user.id);
+      return Response.json({ ok: true, source: "coupons?action=delete", sourceMode: "database", mode: result.mode, message: result.message, coupons: await listDbCoupons(tenantSlug) });
+    }
+
+    // Disable a coupon (port of coupons.php action=cancel): is_active=0 + audit.
+    if (action === "cancel" || action === "disable") {
+      if (!can(session.user.perms, "coupons.manage")) return jsonError("Permesso buoni mancante.", 403);
+      await cancelManageCoupon(tenantSlug, parseInteger(body.id, 0), String(body.cancel_reason ?? body.reason ?? ""), session.user.id);
+      return Response.json({ ok: true, source: "coupons?action=cancel", sourceMode: "database", coupons: await listDbCoupons(tenantSlug) });
     }
 
     // preview/redeem are also reachable from the quick-booking drawer's coupon Apply

@@ -50,6 +50,7 @@ export function CouponsContent() {
   const [coupons, setCoupons] = useState<Coupon[]>([]);
   const [allLocations, setAllLocations] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(0);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -68,6 +69,32 @@ export function CouponsContent() {
 
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`coupons${suffix}`.replace("&", "?")}`;
+  }
+
+  // Delete a coupon via POST (port of coupons.php action=delete). The server
+  // refuses while open appointments reference it, soft-deletes when the coupon
+  // has usage (history preserved), and hard-deletes when unused. Confirm-gated.
+  // Replaces the old GET ?action=delete link (which fell to the Tailwind app).
+  async function deleteCoupon(c: Coupon) {
+    if (busyId) return;
+    if (typeof window !== "undefined" && !window.confirm("Eliminare questo coupon?")) return;
+    setBusyId(c.id);
+    try {
+      const res = await fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "delete", id: c.id }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        if (typeof window !== "undefined") window.alert(j?.error || "Impossibile eliminare il coupon.");
+      } else {
+        if (typeof window !== "undefined" && j?.message) window.alert(j.message);
+        load();
+      }
+    } finally {
+      setBusyId(0);
+    }
   }
 
   const hasAnyCoupons = coupons.length > 0;
@@ -208,13 +235,14 @@ export function CouponsContent() {
                             <a className="btn btn-sm btn-outline-secondary" href={href(`&action=edit&id=${x.id}`)}>
                               Apri
                             </a>{" "}
-                            <a
+                            <button
+                              type="button"
                               className="btn btn-sm btn-outline-danger"
-                              href={href(`&action=delete&id=${x.id}`)}
-                              data-coupons-confirm="Eliminare questo coupon?"
+                              disabled={busyId === x.id}
+                              onClick={() => deleteCoupon(x)}
                             >
                               Elimina
-                            </a>
+                            </button>
                           </td>
                         </tr>
                       );
