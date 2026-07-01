@@ -9499,6 +9499,207 @@ export async function deleteFidelityCard(slug: string, cardId: number): Promise<
   return { ok: true, removedGifts, releasedAppointments };
 }
 
+// ---- Fidelity WALLET / points ledger (fidelity_wallet.php) --------------------
+export type FidelityWalletMovement = { id: number; kind: string; deltaPoints: number; note: string; sourceType: string; createdAt: string };
+export type FidelityWalletPending = { id: number; publicCode: string; startsAt: string; status: string; discountPoints: number; giftPoints: number };
+export type FidelityWalletDetail = {
+  clientId: number;
+  clientName: string;
+  clientEmail: string;
+  adhering: boolean;
+  pointsBalance: number;
+  reserved: number;
+  available: number;
+  movements: FidelityWalletMovement[];
+  pending: FidelityWalletPending[];
+};
+export type FidelityWalletClient = { id: number; name: string; email: string; points: number };
+export type FidelityWalletData = {
+  fidelityEnabled: boolean;
+  pointsEnabled: boolean;
+  clients: FidelityWalletClient[];
+  detail: FidelityWalletDetail | null;
+};
+
+// Fidelity points are always integers (port of Fidelity::normalizePoints).
+function normalizeFidelityPoints(n: unknown): number {
+  const v = Number(String(n ?? "").toString().replace(",", "."));
+  return Number.isFinite(v) ? Math.round(v) : 0;
+}
+
+// A client "adheres" to Fidelity when they hold an active, non-expired card
+// (port of Fidelity::isClientAdhering — cards.status='active' + expires_at NULL/>=today).
+async function fidelityIsClientAdhering(slug: string, clientId: number): Promise<boolean> {
+  if (clientId <= 0) return false;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id", where: "client_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at >= ?)", params: [clientId, todayIso()], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  return rows.length > 0;
+}
+
+// Points reserved on a client's still-open appointments (port of Fidelity::reservedPoints:
+// SUM(fidelity_points_used + fidelity_gift_points_used) over pending/scheduled appts).
+async function fidelityReservedPoints(slug: string, clientId: number): Promise<number> {
+  if (clientId <= 0) return 0;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "COALESCE(SUM(COALESCE(fidelity_points_used,0) + COALESCE(fidelity_gift_points_used,0)),0) AS s",
+    where: "client_id = ? AND status IN ('pending','scheduled')",
+    params: [clientId],
+  }).catch(() => [] as RowDataPacket[]);
+  return Math.max(0, normalizeFidelityPoints(rows[0]?.s ?? 0));
+}
+
+async function getFidelityWalletDetail(slug: string, clientId: number): Promise<FidelityWalletDetail | null> {
+  const clientRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, full_name, email, points", where: "id = ?", params: [clientId], limit: 1 });
+  if (!clientRows[0]) return null;
+  const pointsBalance = normalizeFidelityPoints(clientRows[0].points ?? 0);
+  const reserved = Math.min(await fidelityReservedPoints(slug, clientId), Math.max(0, pointsBalance));
+  const available = normalizeFidelityPoints(pointsBalance - reserved);
+
+  const txRows = await tenantSelect<RowDataPacket>({ slug, table: "transactions", columns: "id, kind, source_type, delta_points, note, created_at", where: "client_id = ?", params: [clientId], orderBy: "id DESC", limit: 100 }).catch(() => [] as RowDataPacket[]);
+  const movements: FidelityWalletMovement[] = txRows.map((r) => ({
+    id: Number(r.id ?? 0),
+    kind: String(r.kind ?? "manual"),
+    deltaPoints: normalizeFidelityPoints(r.delta_points ?? 0),
+    note: String(r.note ?? ""),
+    sourceType: String(r.source_type ?? ""),
+    createdAt: toIso(r.created_at),
+  }));
+
+  const pendRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, public_code, starts_at, status, COALESCE(fidelity_points_used,0) AS discount_points, COALESCE(fidelity_gift_points_used,0) AS gift_points",
+    where: "client_id = ? AND status IN ('pending','scheduled') AND (COALESCE(fidelity_points_used,0) > 0 OR COALESCE(fidelity_gift_points_used,0) > 0)",
+    params: [clientId],
+    orderBy: "starts_at ASC, id ASC",
+    limit: 200,
+  }).catch(() => [] as RowDataPacket[]);
+  const pending: FidelityWalletPending[] = pendRows.map((r) => ({
+    id: Number(r.id ?? 0),
+    publicCode: String(r.public_code ?? ""),
+    startsAt: r.starts_at ? toIso(r.starts_at) : "",
+    status: String(r.status ?? ""),
+    discountPoints: normalizeFidelityPoints(r.discount_points ?? 0),
+    giftPoints: normalizeFidelityPoints(r.gift_points ?? 0),
+  }));
+
+  return {
+    clientId,
+    clientName: String(clientRows[0].full_name ?? ""),
+    clientEmail: String(clientRows[0].email ?? ""),
+    adhering: await fidelityIsClientAdhering(slug, clientId),
+    pointsBalance,
+    reserved,
+    available,
+    movements,
+    pending,
+  };
+}
+
+// List the Fidelity points wallet (port of fidelity_wallet.php): the client list is
+// scoped to CARD HOLDERS (clients with a tessera, active or not), plus the optional
+// per-client detail (balance / reserved / available / movements / pending appts).
+// NB: the legacy point_lots expiry schedule is omitted — the Next never writes lots.
+export async function getFidelityWallet(slug: string, clientId: number): Promise<FidelityWalletData> {
+  const settings = await getFidelityPointsSettings(slug);
+  const cardRows = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "DISTINCT client_id", where: "client_id > 0" }).catch(() => [] as RowDataPacket[]);
+  const clientIds = [...new Set(cardRows.map((r) => Number(r.client_id ?? 0)).filter((n) => n > 0))];
+  let clients: FidelityWalletClient[] = [];
+  if (clientIds.length > 0) {
+    const placeholders = clientIds.map(() => "?").join(",");
+    const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, full_name, email, points", where: `id IN (${placeholders})`, params: clientIds, orderBy: "full_name ASC" }).catch(() => [] as RowDataPacket[]);
+    clients = rows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.full_name ?? ""), email: String(r.email ?? ""), points: normalizeFidelityPoints(r.points ?? 0) }));
+  }
+
+  return {
+    fidelityEnabled: settings.globalEnabled,
+    pointsEnabled: settings.pointsEnabled,
+    clients,
+    detail: clientId > 0 ? await getFidelityWalletDetail(slug, clientId) : null,
+  };
+}
+
+// Manual points movement (port of fidelity_wallet.php manual_move_points): integer
+// points, adhesion-gated, and on REMOVE it protects points already reserved on
+// pending/scheduled appointments (removes only the free balance; reports the locked
+// reserved + missing remainder). kind 'manual' for add, 'adjust' for remove.
+export async function fidelityWalletManualMove(
+  slug: string,
+  clientId: number,
+  opRaw: string,
+  pointsRaw: unknown,
+  note: string,
+  by: number,
+): Promise<{ ok: true; message: string; removed: number; lockedReserved: number; missing: number; detail: FidelityWalletDetail | null }> {
+  const settings = await getFidelityPointsSettings(slug);
+  if (!settings.globalEnabled) throw new Error('Fidelity è disattivata. Attiva la funzione in "Impostazione generale" per utilizzare il Portafoglio.');
+  if (!settings.pointsEnabled) throw new Error('Punti Fidelity sono disattivati. Attiva "Abilita Punti Fidelity" per utilizzare il Portafoglio punti.');
+
+  let op = String(opRaw ?? "add").trim().toLowerCase();
+  if (!["add", "remove"].includes(op)) op = "add";
+
+  let pts = normalizeFidelityPoints(pointsRaw);
+  if (pts < 1) throw new Error("Inserisci un numero intero di punti valido.");
+  if (pts > 100000000) pts = 100000000;
+
+  const cleanNote = String(note ?? "").trim().slice(0, 255);
+  if (clientId <= 0) throw new Error("Seleziona un cliente.");
+  if (!(await fidelityIsClientAdhering(slug, clientId))) throw new Error("Cliente non aderisce alla Fidelity (tessera non attiva/scaduta).");
+
+  const clientRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, points", where: "id = ?", params: [clientId], limit: 1 });
+  if (!clientRows[0]) throw new Error("Cliente non trovato.");
+  const curPts = normalizeFidelityPoints(clientRows[0].points ?? 0);
+
+  let lockedReserved = 0;
+  let missing = 0;
+  const reqPts = pts;
+  if (op === "remove") {
+    let reserved = await fidelityReservedPoints(slug, clientId);
+    if (reserved < 0) reserved = 0;
+    const maxReservable = Math.max(0, curPts);
+    if (reserved > maxReservable) reserved = maxReservable;
+
+    const free = Math.max(0, normalizeFidelityPoints(curPts - reserved));
+    const removable = Math.max(0, normalizeFidelityPoints(Math.min(reqPts, free)));
+    const remainder = Math.max(0, normalizeFidelityPoints(reqPts - removable));
+    lockedReserved = Math.max(0, normalizeFidelityPoints(Math.min(reserved, remainder)));
+    missing = Math.max(0, normalizeFidelityPoints(remainder - lockedReserved));
+    pts = removable;
+
+    if (pts <= 0) {
+      if (curPts <= 0) throw new Error(`Impossibile rimuovere ${reqPts} Punti: saldo insufficiente (disponibili 0).`);
+      if (free <= 0 && reserved > 0) throw new Error(`Impossibile rimuovere ${reqPts} Punti: i punti disponibili sono già prenotati su appuntamenti in sospeso/prenotati.`);
+      throw new Error(`Impossibile rimuovere ${reqPts} Punti: saldo insufficiente (disponibili ${free}).`);
+    }
+  }
+
+  const delta = op === "remove" ? -pts : pts;
+  const nextPoints = normalizeFidelityPoints(curPts + delta);
+  if (delta < 0 && nextPoints < 0) throw new Error("Operazione non riuscita (punti insufficienti).");
+
+  await tenantInsert(await tenantTable(slug, "transactions"), {
+    client_id: clientId,
+    kind: delta < 0 ? "adjust" : "manual",
+    source_type: "manual",
+    delta_points: delta,
+    note: cleanNote === "" ? null : cleanNote,
+    created_by: by > 0 ? by : null,
+    created_at: new Date(),
+  });
+  await tenantUpdate({ slug, table: "clients", id: clientId, values: { points: nextPoints } });
+
+  let message = delta > 0 ? `Aggiunti ${pts} Punti` : `Rimossi ${pts} Punti`;
+  if (op === "remove") {
+    const parts: string[] = [];
+    if (lockedReserved > 0) parts.push(`${lockedReserved} Punti non rimossi perché prenotati su appuntamenti in sospeso/prenotati.`);
+    if (missing > 0) parts.push(`${missing} Punti non rimossi per saldo insufficiente.`);
+    if (parts.length > 0) message += `. ${parts.join(" ")}`;
+  }
+
+  return { ok: true, message, removed: op === "remove" ? pts : 0, lockedReserved, missing, detail: await getFidelityWalletDetail(slug, clientId) };
+}
+
 async function getSingleClient(slug: string, id: number): Promise<ManagedClient> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Cliente non trovato.");

@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, deleteFidelityCard, getFidelityEnabled, getFidelityLevelsSettings, getFidelityMembership, getFidelityPointsSettings, issueFidelityCard, listDbClients, listDbWalletMovements, listFidelityCampaigns, reactivateFidelityCard, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign, updateFidelityCardStatus } from "@/lib/db-repositories";
+import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, deleteFidelityCard, fidelityWalletManualMove, getFidelityEnabled, getFidelityLevelsSettings, getFidelityMembership, getFidelityPointsSettings, getFidelityWallet, issueFidelityCard, listDbClients, listDbWalletMovements, listFidelityCampaigns, reactivateFidelityCard, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign, updateFidelityCardStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -45,6 +45,12 @@ export async function GET(request: Request) {
       return Response.json({ ok: true, sourceMode: "database", membership: await getFidelityMembership(tenantSlug, url.searchParams.get("q") ?? "") });
     }
 
+    // Fidelity WALLET / points ledger (fidelity_wallet.php "Portafoglio").
+    if (url.searchParams.get("action") === "wallet") {
+      if (!can(session.user.perms, "fidelity.wallet") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso portafoglio fidelity mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", wallet: await getFidelityWallet(tenantSlug, parseInteger(url.searchParams.get("client_id"), 0)) });
+    }
+
     const clients = await listDbClients({ slug: tenantSlug });
     return Response.json({
       ok: true,
@@ -86,6 +92,13 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "fidelity.levels") && !can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso livelli fidelity mancante.", 403);
       const levels = await saveFidelityLevels(tenantSlug, body);
       return Response.json({ ok: true, sourceMode: "database", levels });
+    }
+
+    // Fidelity WALLET manual points movement (port of manual_move_points).
+    if (body.action === "wallet_move" || body._mode === "manual_move_points") {
+      if (!can(session.user.perms, "fidelity.wallet") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso portafoglio fidelity mancante.", 403);
+      const result = await fidelityWalletManualMove(tenantSlug, parseInteger(body.client_id, 0), String(body.op ?? "add"), body.points, String(body.note ?? ""), session.user.id);
+      return Response.json({ sourceMode: "database", ...result });
     }
 
     // Fidelity MEMBERSHIP / card actions (port of create/update/reactivate/delete_card).
