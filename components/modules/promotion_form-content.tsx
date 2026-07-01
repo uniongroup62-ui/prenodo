@@ -88,6 +88,19 @@ function resolveAction(): "new" | "edit" {
   return new URLSearchParams(window.location.search).get("action") === "edit" ? "edit" : "new";
 }
 
+type ItemRow = { id: number; discountType: DiscountType; discountValue: string; minQty: string };
+type TimeWindow = { day: number; start: string; end: string };
+type CatItem = { id: number; name: string; price?: number; sku?: string };
+type FormContext = {
+  services: CatItem[];
+  products: CatItem[];
+  locations: { id: number; name: string }[];
+  fidelityLevels: { key: string; name: string }[];
+  clients: { id: number; name: string }[];
+};
+
+const DAY_LABELS = ["", "Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"];
+
 export function PromotionFormContent() {
   const slug = tenantSlug();
   const [action] = useState<"new" | "edit">(resolveAction);
@@ -95,6 +108,29 @@ export function PromotionFormContent() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  // Advanced sub-tables (Block 2): selected-scope items, sedi, windows, blackouts,
+  // stackable mask, marketplace visibility, fidelity-level targeting, exclusions.
+  const [ctx, setCtx] = useState<FormContext>({ services: [], products: [], locations: [], fidelityLevels: [], clients: [] });
+  const [services, setServices] = useState<ItemRow[]>([]);
+  const [products, setProducts] = useState<ItemRow[]>([]);
+  const [locationIds, setLocationIds] = useState<number[]>([]);
+  const [timeWindows, setTimeWindows] = useState<TimeWindow[]>([]);
+  const [blackoutDates, setBlackoutDates] = useState<string[]>([]);
+  const [fidelityLevels, setFidelityLevels] = useState<string[]>([]);
+  const [excludedClients, setExcludedClients] = useState<number[]>([]);
+  const [stackableFidelity, setStackableFidelity] = useState(false);
+  const [stackableCoupon, setStackableCoupon] = useState(false);
+  const [marketplaceVisibility, setMarketplaceVisibility] = useState<"auto" | "hidden">("auto");
+
+  useEffect(() => {
+    fetch(`/api/manage/promotions?slug=${encodeURIComponent(slug)}&action=context`, { headers: { "x-tenant-slug": slug } })
+      .then((r) => r.json())
+      .then((j) => {
+        if (j?.ok) setCtx({ services: j.services ?? [], products: j.products ?? [], locations: j.locations ?? [], fidelityLevels: j.fidelityLevels ?? [], clients: j.clients ?? [] });
+      })
+      .catch(() => undefined);
+  }, [slug]);
 
   // On edit (action=edit&id=) prefill from promotions?action=get. On new, keep
   // the faithful defaults (all services / percent / active).
@@ -126,10 +162,10 @@ export function PromotionFormContent() {
                 apply_products_mode: (p.applyProductsMode ?? "none") as ApplyMode,
                 discount_type: p.discountType === "fixed" ? "fixed" : "percent",
                 discount_value: String(p.discountValue ?? 0),
-                min_qty: "1",
-                products_discount_type: p.discountType === "fixed" ? "fixed" : "percent",
-                products_discount_value: String(p.discountValue ?? 0),
-                products_min_qty: "1",
+                min_qty: String(p.minQty ?? "1"),
+                products_discount_type: p.productsDiscountType === "fixed" ? "fixed" : "percent",
+                products_discount_value: String(p.productsDiscountValue ?? p.discountValue ?? 0),
+                products_min_qty: String(p.minQty ?? "1"),
                 starts_at: String(p.startsAt ?? "").slice(0, 10),
                 ends_at: String(p.endsAt ?? "").slice(0, 10),
                 target_type: (p.target === "new_clients" ? "new" : p.target ?? "all") as TargetType,
@@ -138,6 +174,17 @@ export function PromotionFormContent() {
                 birthday_window_days: String(p.birthdayWindowDays ?? ""),
                 per_customer_limit: String(p.perCustomerLimit ?? ""),
               });
+              const toRows = (arr: unknown): ItemRow[] => (Array.isArray(arr) ? arr : []).map((it) => ({ id: Number((it as ItemRow).id), discountType: (it as ItemRow).discountType === "fixed" ? "fixed" : "percent", discountValue: String((it as ItemRow).discountValue ?? 0), minQty: String((it as ItemRow).minQty ?? 1) }));
+              setServices(toRows(p.selectedServices));
+              setProducts(toRows(p.selectedProducts));
+              setLocationIds(Array.isArray(p.locationIds) ? p.locationIds.map(Number) : []);
+              setTimeWindows(Array.isArray(p.timeWindows) ? p.timeWindows.map((w: TimeWindow) => ({ day: Number(w.day), start: String(w.start), end: String(w.end) })) : []);
+              setBlackoutDates(Array.isArray(p.blackoutDates) ? p.blackoutDates.map(String) : []);
+              setFidelityLevels(Array.isArray(p.targetFidelityLevels) ? p.targetFidelityLevels.map(String) : []);
+              setExcludedClients(Array.isArray(p.excludedClientIds) ? p.excludedClientIds.map(Number) : []);
+              setStackableFidelity(Boolean(p.stackableFidelity));
+              setStackableCoupon(Boolean(p.stackableCoupon));
+              setMarketplaceVisibility(p.marketplaceVisibility === "hidden" ? "hidden" : "auto");
             })
             .catch(() => setError("Errore nel caricamento della promozione."))
         : Promise.resolve();
@@ -151,6 +198,25 @@ export function PromotionFormContent() {
 
   function backToList() {
     window.location.href = `/${encodeURIComponent(slug)}/promotions`;
+  }
+
+  // --- Selected-scope item helpers (services/products) ---
+  function toggleItem(kind: "svc" | "prd", id: number) {
+    const [list, setList] = kind === "svc" ? [services, setServices] : [products, setProducts];
+    setList(list.some((r) => r.id === id) ? list.filter((r) => r.id !== id) : [...list, { id, discountType: "percent", discountValue: "0", minQty: "1" }]);
+  }
+  function updateItem(kind: "svc" | "prd", id: number, patch: Partial<ItemRow>) {
+    const [list, setList] = kind === "svc" ? [services, setServices] : [products, setProducts];
+    setList(list.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  }
+  function toggleLocation(id: number) {
+    setLocationIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+  function toggleLevel(key: string) {
+    setFidelityLevels((prev) => (prev.includes(key) ? prev.filter((x) => x !== key) : [...prev, key]));
+  }
+  function toggleExcluded(id: number) {
+    setExcludedClients((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -186,6 +252,14 @@ export function PromotionFormContent() {
       setError("Inserisci il testo delle condizioni promozionali oppure disattiva il flag.");
       return;
     }
+    if (form.apply_services_mode === "selected" && services.length === 0) {
+      setError("Seleziona almeno un servizio per la promozione.");
+      return;
+    }
+    if (form.apply_products_mode === "selected" && products.length === 0) {
+      setError("Seleziona almeno un prodotto per la promozione.");
+      return;
+    }
 
     setSaving(true);
     try {
@@ -212,6 +286,17 @@ export function PromotionFormContent() {
         inactive_days: form.inactive_days,
         birthday_window_days: form.birthday_window_days,
         per_customer_limit: form.per_customer_limit,
+        // Block 2 sub-tables (JSON strings — parseRequestBody flattens objects).
+        service_ids_json: JSON.stringify(services),
+        product_ids_json: JSON.stringify(products),
+        location_ids_json: JSON.stringify(locationIds),
+        time_windows_json: JSON.stringify(timeWindows),
+        blackout_dates_json: JSON.stringify(blackoutDates),
+        target_fidelity_levels_json: JSON.stringify(fidelityLevels),
+        excluded_client_ids_json: JSON.stringify(excludedClients),
+        stackable_fidelity: stackableFidelity ? "1" : "0",
+        stackable_coupon: stackableCoupon ? "1" : "0",
+        marketplace_visibility: marketplaceVisibility,
       };
       const res = await fetch(`/api/manage/promotions?slug=${encodeURIComponent(slug)}`, {
         method: "POST",
@@ -459,6 +544,179 @@ export function PromotionFormContent() {
                       </div>
                     </div>
                   ) : null}
+
+                  {form.apply_services_mode === "selected" ? (
+                    <div className="border rounded p-3 mt-3">
+                      <div className="fw-semibold mb-2">Servizi selezionati + sconto per voce</div>
+                      <div style={{ maxHeight: 260, overflowY: "auto" }}>
+                        {ctx.services.length === 0 ? (
+                          <div className="text-muted small">Nessun servizio attivo.</div>
+                        ) : (
+                          ctx.services.map((s) => {
+                            const row = services.find((r) => r.id === s.id);
+                            return (
+                              <div className="row g-2 align-items-center mb-2" key={s.id}>
+                                <div className="col-md-5">
+                                  <div className="form-check">
+                                    <input className="form-check-input" type="checkbox" id={`svc-${s.id}`} checked={!!row} onChange={() => toggleItem("svc", s.id)} />
+                                    <label className="form-check-label" htmlFor={`svc-${s.id}`}>{s.name}</label>
+                                  </div>
+                                </div>
+                                {row ? (
+                                  <>
+                                    <div className="col-md-3">
+                                      <select className="form-select form-select-sm" value={row.discountType} onChange={(e) => updateItem("svc", s.id, { discountType: e.target.value as DiscountType })}>
+                                        <option value="percent">%</option>
+                                        <option value="fixed">€</option>
+                                      </select>
+                                    </div>
+                                    <div className="col-md-2">
+                                      <input className="form-control form-control-sm" type="number" step="0.01" min="0" placeholder="Val." value={row.discountValue} onChange={(e) => updateItem("svc", s.id, { discountValue: e.target.value })} />
+                                    </div>
+                                    <div className="col-md-2">
+                                      <input className="form-control form-control-sm" type="number" min="1" placeholder="Qtà" value={row.minQty} onChange={(e) => updateItem("svc", s.id, { minQty: e.target.value })} />
+                                    </div>
+                                  </>
+                                ) : null}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {form.apply_products_mode === "selected" ? (
+                    <div className="border rounded p-3 mt-3">
+                      <div className="fw-semibold mb-2">Prodotti selezionati + sconto per voce</div>
+                      <div style={{ maxHeight: 260, overflowY: "auto" }}>
+                        {ctx.products.length === 0 ? (
+                          <div className="text-muted small">Nessun prodotto attivo.</div>
+                        ) : (
+                          ctx.products.map((s) => {
+                            const row = products.find((r) => r.id === s.id);
+                            return (
+                              <div className="row g-2 align-items-center mb-2" key={s.id}>
+                                <div className="col-md-5">
+                                  <div className="form-check">
+                                    <input className="form-check-input" type="checkbox" id={`prd-${s.id}`} checked={!!row} onChange={() => toggleItem("prd", s.id)} />
+                                    <label className="form-check-label" htmlFor={`prd-${s.id}`}>{s.name}{s.sku ? ` (${s.sku})` : ""}</label>
+                                  </div>
+                                </div>
+                                {row ? (
+                                  <>
+                                    <div className="col-md-3">
+                                      <select className="form-select form-select-sm" value={row.discountType} onChange={(e) => updateItem("prd", s.id, { discountType: e.target.value as DiscountType })}>
+                                        <option value="percent">%</option>
+                                        <option value="fixed">€</option>
+                                      </select>
+                                    </div>
+                                    <div className="col-md-2">
+                                      <input className="form-control form-control-sm" type="number" step="0.01" min="0" placeholder="Val." value={row.discountValue} onChange={(e) => updateItem("prd", s.id, { discountValue: e.target.value })} />
+                                    </div>
+                                    <div className="col-md-2">
+                                      <input className="form-control form-control-sm" type="number" min="1" placeholder="Qtà" value={row.minQty} onChange={(e) => updateItem("prd", s.id, { minQty: e.target.value })} />
+                                    </div>
+                                  </>
+                                ) : null}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {ctx.locations.length > 0 ? (
+                    <div className="border rounded p-3 mt-3">
+                      <div className="fw-semibold mb-2">Sedi abilitate</div>
+                      <div className="text-muted small mb-2">Se non selezioni nessuna sede la promozione vale ovunque.</div>
+                      <div className="d-flex flex-wrap gap-3">
+                        {ctx.locations.map((l) => (
+                          <div className="form-check" key={l.id}>
+                            <input className="form-check-input" type="checkbox" id={`loc-${l.id}`} checked={locationIds.includes(l.id)} onChange={() => toggleLocation(l.id)} />
+                            <label className="form-check-label" htmlFor={`loc-${l.id}`}>{l.name}</label>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="border rounded p-3 mt-3">
+                    <div className="fw-semibold mb-2">Fasce orarie (opzionale)</div>
+                    {timeWindows.map((w, i) => (
+                      <div className="row g-2 align-items-center mb-2" key={i}>
+                        <div className="col-md-4">
+                          <select className="form-select form-select-sm" value={w.day} onChange={(e) => setTimeWindows(timeWindows.map((x, j) => (j === i ? { ...x, day: Number(e.target.value) } : x)))}>
+                            {[1, 2, 3, 4, 5, 6, 7].map((d) => <option key={d} value={d}>{DAY_LABELS[d]}</option>)}
+                          </select>
+                        </div>
+                        <div className="col-md-3"><input className="form-control form-control-sm" type="time" value={w.start} onChange={(e) => setTimeWindows(timeWindows.map((x, j) => (j === i ? { ...x, start: e.target.value } : x)))} /></div>
+                        <div className="col-md-3"><input className="form-control form-control-sm" type="time" value={w.end} onChange={(e) => setTimeWindows(timeWindows.map((x, j) => (j === i ? { ...x, end: e.target.value } : x)))} /></div>
+                        <div className="col-md-2"><button type="button" className="btn btn-outline-danger btn-sm" onClick={() => setTimeWindows(timeWindows.filter((_, j) => j !== i))}><i className="bi bi-x-lg" /></button></div>
+                      </div>
+                    ))}
+                    <button type="button" className="btn btn-outline-primary btn-sm" onClick={() => setTimeWindows([...timeWindows, { day: 1, start: "09:00", end: "18:00" }])}><i className="bi bi-plus-lg me-1" />Aggiungi fascia</button>
+                  </div>
+
+                  <div className="border rounded p-3 mt-3">
+                    <div className="fw-semibold mb-2">Date escluse (blackout)</div>
+                    {blackoutDates.map((d, i) => (
+                      <div className="row g-2 align-items-center mb-2" key={i}>
+                        <div className="col-md-6"><input className="form-control form-control-sm" type="date" value={d} onChange={(e) => setBlackoutDates(blackoutDates.map((x, j) => (j === i ? e.target.value : x)))} /></div>
+                        <div className="col-md-2"><button type="button" className="btn btn-outline-danger btn-sm" onClick={() => setBlackoutDates(blackoutDates.filter((_, j) => j !== i))}><i className="bi bi-x-lg" /></button></div>
+                      </div>
+                    ))}
+                    <button type="button" className="btn btn-outline-primary btn-sm" onClick={() => setBlackoutDates([...blackoutDates, ""])}><i className="bi bi-plus-lg me-1" />Aggiungi data</button>
+                  </div>
+
+                  {form.target_type === "fidelity" && ctx.fidelityLevels.length > 0 ? (
+                    <div className="border rounded p-3 mt-3">
+                      <div className="fw-semibold mb-2">Livelli Fidelity idonei</div>
+                      <div className="d-flex flex-wrap gap-3">
+                        {ctx.fidelityLevels.map((l) => (
+                          <div className="form-check" key={l.key}>
+                            <input className="form-check-input" type="checkbox" id={`lvl-${l.key}`} checked={fidelityLevels.includes(l.key)} onChange={() => toggleLevel(l.key)} />
+                            <label className="form-check-label" htmlFor={`lvl-${l.key}`}>{l.name}</label>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {ctx.clients.length > 0 ? (
+                    <div className="border rounded p-3 mt-3">
+                      <div className="fw-semibold mb-2">Clienti esclusi (opzionale)</div>
+                      <div style={{ maxHeight: 180, overflowY: "auto" }} className="border rounded p-2">
+                        {ctx.clients.map((c) => (
+                          <div className="form-check" key={c.id}>
+                            <input className="form-check-input" type="checkbox" id={`exc-${c.id}`} checked={excludedClients.includes(c.id)} onChange={() => toggleExcluded(c.id)} />
+                            <label className="form-check-label" htmlFor={`exc-${c.id}`}>{c.name}</label>
+                          </div>
+                        ))}
+                      </div>
+                      {excludedClients.length > 0 ? <div className="text-muted small mt-1">{excludedClients.length} clienti esclusi.</div> : null}
+                    </div>
+                  ) : null}
+
+                  <div className="border rounded p-3 mt-3">
+                    <div className="fw-semibold mb-2">Cumulabilità e visibilità</div>
+                    <div className="d-flex flex-wrap gap-3 mb-2">
+                      <div className="form-check">
+                        <input className="form-check-input" type="checkbox" id="stk-fid" checked={stackableFidelity} onChange={(e) => setStackableFidelity(e.target.checked)} />
+                        <label className="form-check-label" htmlFor="stk-fid">Cumulabile con Sconto punti Fidelity</label>
+                      </div>
+                      <div className="form-check">
+                        <input className="form-check-input" type="checkbox" id="stk-cpn" checked={stackableCoupon} onChange={(e) => setStackableCoupon(e.target.checked)} />
+                        <label className="form-check-label" htmlFor="stk-cpn">Cumulabile con Coupon</label>
+                      </div>
+                    </div>
+                    <label className="form-label">Visibilità marketplace</label>
+                    <select className="form-select" value={marketplaceVisibility} onChange={(e) => setMarketplaceVisibility(e.target.value as "auto" | "hidden")}>
+                      <option value="auto">Automatica</option>
+                      <option value="hidden">Nascosta</option>
+                    </select>
+                  </div>
                 </div>
               </div>
             </div>

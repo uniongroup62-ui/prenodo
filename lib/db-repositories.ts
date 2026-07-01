@@ -7817,16 +7817,30 @@ export async function previewDbPromotion(id: number, subtotal: number, slug: str
 // PromotionRule with the extra columns the promotions.php editor posts
 // (description, target windows, apply modes, conditions) that the dashboard list
 // does not surface.
+export type PromoItemRow = { id: number; discountType: "percent" | "fixed"; discountValue: number; minQty: number };
 export type ManagePromotionRecord = PromotionRule & {
   description: string;
   applyServicesMode: "none" | "all" | "selected";
   applyProductsMode: "none" | "all" | "selected";
+  minQty: string;
+  productsDiscountType: "percent" | "fixed";
+  productsDiscountValue: string;
   newWithinDays: string;
   inactiveDays: string;
   birthdayWindowDays: string;
   perCustomerLimit: string;
   promoConditionsEnabled: boolean;
   promoConditions: string;
+  marketplaceVisibility: "auto" | "hidden";
+  stackableFidelity: boolean;
+  stackableCoupon: boolean;
+  selectedServices: PromoItemRow[];
+  selectedProducts: PromoItemRow[];
+  locationIds: number[];
+  timeWindows: { day: number; start: string; end: string }[];
+  blackoutDates: string[];
+  targetFidelityLevels: string[];
+  excludedClientIds: number[];
 };
 
 // Edit-form prefill: return ONE promotion's editable fields for one id. Port of
@@ -7837,31 +7851,127 @@ export async function getManagePromotion(slug: string, id: number): Promise<Mana
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) return null;
   const row = rows[0];
+
+  const mapItems = (childRows: RowDataPacket[], refCol: string): PromoItemRow[] =>
+    childRows.map((r) => {
+      let dt = String(r.discount_type ?? "").toLowerCase();
+      if (dt !== "percent" && dt !== "fixed") dt = "percent";
+      return { id: Number(r[refCol] ?? 0), discountType: dt as "percent" | "fixed", discountValue: roundMoney(Number(r.discount_value ?? 0)), minQty: Math.max(1, Number(r.min_qty ?? 1) || 1) };
+    });
+  const [svcRows, prdRows, locRows, twRows, boRows] = await Promise.all([
+    tenantSelect<RowDataPacket>({ slug, table: "promotion_services", columns: "service_id, discount_type, discount_value, min_qty", where: "promotion_id = ?", params: [id], orderBy: "service_id ASC" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "promotion_products", columns: "product_id, discount_type, discount_value, min_qty", where: "promotion_id = ?", params: [id], orderBy: "product_id ASC" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "promotion_locations", columns: "location_id", where: "promotion_id = ?", params: [id] }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "promotion_time_windows", columns: "day_of_week, start_time, end_time", where: "promotion_id = ?", params: [id], orderBy: "day_of_week ASC, start_time ASC" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "promotion_blackout_dates", columns: "blackout_date", where: "promotion_id = ?", params: [id], orderBy: "blackout_date ASC" }).catch(() => [] as RowDataPacket[]),
+  ]);
+
+  const parseJsonList = (raw: unknown): unknown[] => { try { const p = JSON.parse(String(raw ?? "[]")); return Array.isArray(p) ? p : []; } catch { return []; } };
+  const stackable = Number(row.stackable ?? 0);
+
   return {
     ...mapPromotion(row),
     description: String(row.description ?? ""),
     applyServicesMode: normalizePromoMode(String(row.apply_services_mode ?? "all"), "all"),
     applyProductsMode: normalizePromoMode(String(row.apply_products_mode ?? "none"), "none"),
+    minQty: row.min_qty == null ? "1" : String(row.min_qty),
+    productsDiscountType: String(row.products_discount_type ?? "percent").toLowerCase() === "fixed" ? "fixed" : "percent",
+    productsDiscountValue: row.products_discount_value == null ? "" : String(roundMoney(Number(row.products_discount_value))),
     newWithinDays: row.new_within_days == null ? "" : String(row.new_within_days),
     inactiveDays: row.inactive_days == null ? "" : String(row.inactive_days),
     birthdayWindowDays: row.birthday_window_days == null ? "" : String(row.birthday_window_days),
     perCustomerLimit: row.per_customer_limit == null ? "" : String(row.per_customer_limit),
     promoConditionsEnabled: Number(row.promo_conditions_enabled ?? 0) === 1,
     promoConditions: String(row.promo_conditions ?? ""),
+    marketplaceVisibility: String(row.marketplace_visibility ?? "auto").toLowerCase() === "hidden" ? "hidden" : "auto",
+    stackableFidelity: (stackable & 4) === 4,
+    stackableCoupon: (stackable & 8) === 8,
+    selectedServices: mapItems(svcRows, "service_id"),
+    selectedProducts: mapItems(prdRows, "product_id"),
+    locationIds: locRows.map((r) => Number(r.location_id ?? 0)).filter((n) => n > 0),
+    timeWindows: twRows.map((r) => ({ day: Number(r.day_of_week ?? 0), start: String(r.start_time ?? "").slice(0, 5), end: String(r.end_time ?? "").slice(0, 5) })),
+    blackoutDates: boRows.map((r) => (typeof r.blackout_date === "string" ? r.blackout_date.slice(0, 10) : r.blackout_date ? dateIsoLocal(new Date(String(r.blackout_date))) : "")).filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
+    targetFidelityLevels: parseJsonList(row.target_fidelity_levels).map((v) => String(v ?? "").trim()).filter((s) => s !== ""),
+    excludedClientIds: parseJsonList(row.excluded_client_ids).map((v) => Math.trunc(Number(v)) || 0).filter((n) => n > 0),
   };
 }
 
-// Create / update the core promotion record, faithful to promotions.php POST
-// (action=new|edit). Validation mirrors the legacy required fields: title is
-// required, dates must be valid YYYY-MM-DD with start <= end, target_type is
-// constrained to the legacy enum, and a positive value is required when a
-// services/products scope is "all".
-//
-// The legacy editor also persists per-service/per-product discount rows,
-// promotion_locations, time windows, blackout dates, fidelity-level targeting
-// and client exclusions via Promotions::saveAdvanced. Those sub-tables are not
-// part of the current promotions data pipeline (listDbPromotions / mapPromotion)
-// — see the form TODO. This save writes only the main promotions row.
+// Per-item promotion discount row parsed from the editor payload.
+type PromoDiscountItem = { id: number; discountType: "percent" | "fixed"; discountValue: number; minQty: number };
+
+function parsePromoDiscountItems(raw: unknown): PromoDiscountItem[] {
+  let arr: unknown = raw;
+  if (typeof raw === "string") { try { arr = JSON.parse(raw); } catch { arr = []; } }
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set<number>();
+  const out: PromoDiscountItem[] = [];
+  for (const it of arr) {
+    const o = it as Record<string, unknown>;
+    const idv = Math.trunc(Number(o.id ?? o.service_id ?? o.product_id ?? 0)) || 0;
+    if (idv <= 0 || seen.has(idv)) continue;
+    seen.add(idv);
+    let dt = String(o.discountType ?? o.discount_type ?? "percent").toLowerCase();
+    if (dt !== "percent" && dt !== "fixed") dt = "percent";
+    let dv = Math.max(0, Number(String(o.discountValue ?? o.discount_value ?? 0).replace(",", ".")) || 0);
+    if (dt === "percent" && dv > 100) dv = 100;
+    const mq = Math.max(1, Math.trunc(Number(o.minQty ?? o.min_qty ?? 1)) || 1);
+    out.push({ id: idv, discountType: dt as "percent" | "fixed", discountValue: roundMoney(dv), minQty: mq });
+  }
+  return out;
+}
+
+function parsePromoIdList(raw: unknown): number[] {
+  let arr: unknown = raw;
+  if (typeof raw === "string") { try { arr = JSON.parse(raw); } catch { arr = []; } }
+  if (!Array.isArray(arr)) return [];
+  return [...new Set(arr.map((v) => Math.trunc(Number(v)) || 0).filter((n) => n > 0))];
+}
+
+function parsePromoStringList(raw: unknown): string[] {
+  let arr: unknown = raw;
+  if (typeof raw === "string") { try { arr = JSON.parse(raw); } catch { arr = []; } }
+  if (!Array.isArray(arr)) return [];
+  return [...new Set(arr.map((v) => String(v ?? "").trim()).filter((s) => s !== ""))];
+}
+
+type PromoTimeWindow = { day: number; start: string; end: string };
+function parsePromoTimeWindows(raw: unknown): PromoTimeWindow[] {
+  let arr: unknown = raw;
+  if (typeof raw === "string") { try { arr = JSON.parse(raw); } catch { arr = []; } }
+  if (!Array.isArray(arr)) return [];
+  const out: PromoTimeWindow[] = [];
+  for (const it of arr) {
+    const o = it as Record<string, unknown>;
+    const day = Math.trunc(Number(o.day ?? o.day_of_week ?? 0)) || 0;
+    const start = String(o.start ?? o.start_time ?? "").trim();
+    const end = String(o.end ?? o.end_time ?? "").trim();
+    if (day < 1 || day > 7 || !/^\d{2}:\d{2}/.test(start) || !/^\d{2}:\d{2}/.test(end)) continue;
+    out.push({ day, start: start.slice(0, 5), end: end.slice(0, 5) });
+  }
+  return out;
+}
+
+function parsePromoBlackoutDates(raw: unknown): string[] {
+  return parsePromoStringList(raw).filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s));
+}
+
+// Rebuild a promotion child mapping table (delete existing rows for the promotion,
+// then re-insert). Used for services/products/locations/time-windows/blackouts.
+async function rebuildPromoChild(slug: string, table: string, promotionId: number, rows: Record<string, unknown>[]): Promise<void> {
+  if (!(await tableExists((await tenantTable(slug, table)).name))) return;
+  const t = await tenantTable(slug, table);
+  await dbExecute(`DELETE FROM ${quoteIdentifier(t.name)} WHERE tenant_id = ? AND promotion_id = ?`, [t.tenantId ?? 0, promotionId]).catch(() => undefined);
+  for (const row of rows) await tenantInsert(t, { promotion_id: promotionId, ...row }).catch(() => 0);
+}
+
+// Create / update a promotion, faithful to promotions.php POST (action=new|edit) /
+// Promotions::saveAdvanced. Writes the main promotions row (core + advanced fields:
+// stackable mask, target_fidelity_levels, excluded_client_ids, products global
+// discount, marketplace_visibility) AND rebuilds the sub-tables: promotion_services
+// / promotion_products (selected scope + per-item discount), promotion_locations,
+// promotion_time_windows, promotion_blackout_dates. Nested lists arrive as JSON
+// strings (parseRequestBody flattens objects). NB: the discount APPLICATION engine
+// (matching + discount at checkout) is still deferred — this persists the config.
 export async function saveManagePromotion(slug: string, body: Record<string, string>, id: number): Promise<ManagePromotionRecord> {
   const title = String(body.title ?? "").trim();
   if (title === "") throw new Error("Inserisci il nome della promozione.");
@@ -7884,26 +7994,58 @@ export async function saveManagePromotion(slug: string, body: Record<string, str
     if (discountType === "percent" && discountValue > 100) throw new Error("Lo sconto percentuale servizi non puo superare 100%.");
   }
 
+  const serviceItems = svcMode === "selected" ? parsePromoDiscountItems(body.service_ids_json ?? body.services_json) : [];
+  const productItems = prdMode === "selected" ? parsePromoDiscountItems(body.product_ids_json ?? body.products_json) : [];
+  if (svcMode === "selected" && serviceItems.length === 0) throw new Error("Seleziona almeno un servizio per la promozione.");
+  if (prdMode === "selected" && productItems.length === 0) throw new Error("Seleziona almeno un prodotto per la promozione.");
+
   let target = String(body.target_type ?? "all").trim().toLowerCase();
   if (!["all", "new", "inactive", "birthday", "fidelity"].includes(target)) target = "all";
+
+  // Products global discount (apply_products_mode=all): defaults inherit the service discount.
+  let prdDiscType = String(body.products_discount_type ?? "").trim().toLowerCase();
+  if (prdDiscType !== "percent" && prdDiscType !== "fixed") prdDiscType = discountType;
+  const prdValRaw = String(body.products_discount_value ?? "").trim();
+  let prdDiscValue = prdValRaw === "" ? discountValue : roundMoney(Math.max(0, Number(prdValRaw.replace(",", ".")) || 0));
+  if (prdDiscType === "percent" && prdDiscValue > 100) prdDiscValue = 100;
+
+  // Stackable bitmask (4 = fidelity points, 8 = coupon).
+  const truthy = (v: unknown) => ["1", "true", "yes", "on"].includes(String(v ?? "").toLowerCase());
+  const stackable = (truthy(body.stackable_fidelity) ? 4 : 0) | (truthy(body.stackable_coupon) ? 8 : 0);
+
+  let marketplaceVisibility = String(body.marketplace_visibility ?? "auto").trim().toLowerCase();
+  if (marketplaceVisibility !== "auto" && marketplaceVisibility !== "hidden") marketplaceVisibility = "auto";
+
+  const fidLevels = target === "fidelity" ? parsePromoStringList(body.target_fidelity_levels_json) : [];
+  const excludedClients = parsePromoIdList(body.excluded_client_ids_json);
+  const minQty = Math.max(1, Math.trunc(Number(body.min_qty ?? 1)) || 1);
 
   const values: Record<string, unknown> = {
     title,
     description: String(body.description ?? "").trim() || null,
     starts_at: startsAt !== "" ? startsAt : null,
     ends_at: endsAt !== "" ? endsAt : null,
-    is_active: ["1", "true", "yes", "on"].includes(String(body.is_active ?? "").toLowerCase()) ? 1 : 0,
+    is_active: truthy(body.is_active) ? 1 : 0,
     discount_type: discountType,
     discount_value: discountValue,
+    min_qty: minQty,
     apply_services_mode: svcMode,
     apply_products_mode: prdMode,
+    products_discount_type: prdMode === "all" ? prdDiscType : null,
+    products_discount_value: prdMode === "all" ? prdDiscValue : null,
+    products_min_qty: prdMode === "all" ? minQty : null,
     target_type: target,
     new_within_days: nullableInt(body.new_within_days),
     inactive_days: nullableInt(body.inactive_days),
     birthday_window_days: nullableInt(body.birthday_window_days),
     per_customer_limit: nullableInt(body.per_customer_limit),
-    promo_conditions_enabled: ["1", "true", "yes", "on"].includes(String(body.promo_conditions_enabled ?? "").toLowerCase()) ? 1 : 0,
+    stackable,
+    marketplace_visibility: marketplaceVisibility,
+    target_fidelity_levels: fidLevels.length > 0 ? JSON.stringify(fidLevels) : null,
+    excluded_client_ids: excludedClients.length > 0 ? JSON.stringify(excludedClients) : null,
+    promo_conditions_enabled: truthy(body.promo_conditions_enabled) ? 1 : 0,
     promo_conditions: String(body.promo_conditions ?? "").trim() || null,
+    updated_at: new Date(),
   };
 
   let promotionId = id;
@@ -7912,12 +8054,45 @@ export async function saveManagePromotion(slug: string, body: Record<string, str
     if (!existing[0]) throw new Error("Promozione non trovata.");
     await tenantUpdate({ slug, table: "promotions", id: promotionId, values });
   } else {
-    promotionId = await tenantInsert(await tenantTable(slug, "promotions"), values);
+    promotionId = await tenantInsert(await tenantTable(slug, "promotions"), { ...values, created_at: new Date() });
   }
+
+  // Rebuild the sub-tables.
+  await rebuildPromoChild(slug, "promotion_services", promotionId, serviceItems.map((s) => ({ service_id: s.id, discount_type: s.discountType, discount_value: s.discountValue, min_subtotal: null, min_qty: s.minQty, discounted_qty: null })));
+  await rebuildPromoChild(slug, "promotion_products", promotionId, productItems.map((p) => ({ product_id: p.id, discount_type: p.discountType, discount_value: p.discountValue, min_subtotal: null, min_qty: p.minQty, discounted_qty: null })));
+  await rebuildPromoChild(slug, "promotion_locations", promotionId, parsePromoIdList(body.location_ids_json).map((lid) => ({ location_id: lid })));
+  await rebuildPromoChild(slug, "promotion_time_windows", promotionId, parsePromoTimeWindows(body.time_windows_json).map((w) => ({ day_of_week: w.day, start_time: w.start, end_time: w.end })));
+  await rebuildPromoChild(slug, "promotion_blackout_dates", promotionId, parsePromoBlackoutDates(body.blackout_dates_json).map((d) => ({ blackout_date: d })));
 
   const saved = await getManagePromotion(slug, promotionId);
   if (!saved) throw new Error("Promozione non salvata.");
   return saved;
+}
+
+// Editor form catalogs: active services + products (with price) + locations +
+// fidelity card levels + clients (for exclusions). Port of the SELECTs in
+// promotions.php action=new|edit.
+export async function promotionFormContext(slug: string): Promise<{
+  services: { id: number; name: string; price: number }[];
+  products: { id: number; name: string; price: number; sku: string }[];
+  locations: { id: number; name: string }[];
+  fidelityLevels: { key: string; name: string }[];
+  clients: { id: number; name: string }[];
+}> {
+  const [svc, prd, loc, clients] = await Promise.all([
+    tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, name, price", where: "COALESCE(is_active,1) = 1", orderBy: "name ASC" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "products", columns: "id, name, price, sku", where: "COALESCE(is_active,1) = 1", orderBy: "name ASC" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id, name", orderBy: "name ASC" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, full_name", orderBy: "full_name ASC", limit: 1000 }).catch(() => [] as RowDataPacket[]),
+  ]);
+  const levels = await getFidelityLevelsSettings(slug).catch(() => ({ levels: [] as { key: string; name: string }[] }));
+  return {
+    services: svc.map((r) => ({ id: Number(r.id), name: String(r.name ?? ""), price: roundMoney(Number(r.price ?? 0)) })),
+    products: prd.map((r) => ({ id: Number(r.id), name: String(r.name ?? ""), price: roundMoney(Number(r.price ?? 0)), sku: String(r.sku ?? "") })),
+    locations: loc.map((r) => ({ id: Number(r.id), name: String(r.name ?? "") })),
+    fidelityLevels: (levels.levels ?? []).map((l) => ({ key: l.key, name: l.name })),
+    clients: clients.map((r) => ({ id: Number(r.id), name: String(r.full_name ?? "") })),
+  };
 }
 
 // Selected-scope services/products that must still resolve to a live, active

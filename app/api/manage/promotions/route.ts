@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { deleteManagePromotion, getManagePromotion, listDbPromotions, previewDbPromotion, saveManagePromotion, toggleManagePromotion } from "@/lib/db-repositories";
+import { deleteManagePromotion, getManagePromotion, listDbPromotions, previewDbPromotion, promotionFormContext, saveManagePromotion, toggleManagePromotion } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -15,6 +15,12 @@ export async function GET(request: Request) {
 
   try {
     const url = new URL(request.url);
+
+    // Editor form catalogs (services/products/locations/fidelity levels/clients).
+    if (url.searchParams.get("action") === "context") {
+      if (!can(session.user.perms, "promotions.manage")) return jsonError("Permesso promozioni mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", ...(await promotionFormContext(tenantSlug)) });
+    }
 
     // Edit-form prefill: return ONE promotion's editable fields for one id. Port
     // of promotions.php action=edit. Gated by promotions.manage like the save.
