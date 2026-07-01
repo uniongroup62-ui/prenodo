@@ -6,6 +6,7 @@ import { ClientsContent } from "@/components/modules/clients-content";
 import { ClientFormContent } from "@/components/modules/client_form-content";
 import { ClientDetailContent } from "@/components/modules/client_detail-content";
 import { CommissionsContent } from "@/components/modules/commissions-content";
+import { CommissionsSettingsContent } from "@/components/modules/commissions_settings-content";
 import { CostsContent } from "@/components/modules/costs-content";
 import { CostCategoriesContent } from "@/components/modules/cost_categories-content";
 import { CostFormContent } from "@/components/modules/cost_form-content";
@@ -99,6 +100,7 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType<{ slug?: string }>> =
   coupons: CouponsContent,
   costs: CostsContent,
   commissions: CommissionsContent,
+  commissions_settings: CommissionsSettingsContent,
   quotes: QuotesContent,
   promotions: PromotionsContent,
   locations: LocationsContent,
@@ -393,6 +395,7 @@ function faithfulKey(page: string, tab?: string): string {
   if (page === "packages" && tab === "settings") return "package_settings";
   if (page === "packages") return "packages";
   if (page === "costs" && tab === "categories") return "cost_categories";
+  if (page === "commissions" && tab === "settings") return "commissions_settings";
   return page;
 }
 
