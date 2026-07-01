@@ -2,7 +2,7 @@ import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/ap
 import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { cancelManageSale, checkoutManageSale, deleteCancelledSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected } from "@/lib/manage-pos";
+import { cancelManageSale, checkoutManageSale, deleteCancelledSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected, markPrepaidManualExecution, undoManageSaleItemCollected, undoPrepaidManualExecution } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
@@ -136,9 +136,9 @@ export async function POST(request: Request) {
       });
     }
 
-    // PICKUP ("Segna ritirato"): mark a product sale line as collected. Faithful (minimal)
-    // port of pos_sale_detail.php?do=mark_preorder_collection — gated by pos.preorders OR
-    // pos.manage (the legacy Auth::canAny(['pos.manage','pos.preorders'])).
+    // PICKUP ("Segna ritirato"): mark a product sale line as collected, optionally PARTIAL
+    // (collect_qty). Faithful port of pos_sale_detail.php?do=mark_preorder_collection — gated
+    // by pos.preorders OR pos.manage (the legacy Auth::canAny(['pos.manage','pos.preorders'])).
     if (action === "mark_collected") {
       if (!canAny(session.user.perms, ["pos.manage", "pos.preorders"])) return jsonError("Non hai i permessi per gestire i preordini.", 403);
       const saleId = parseInteger(body.sale_id ?? body.id);
@@ -147,12 +147,64 @@ export async function POST(request: Request) {
       const payload = await markManageSaleItemCollected(tenantSlug, {
         saleId,
         saleItemId,
+        qty: parseInteger(body.collect_qty ?? body.qty, 0),
         userId: session.user.id,
         userName: session.user.name,
       });
       return Response.json({
         ...payload,
       });
+    }
+
+    // UNDO PICKUP ("Rimuovi ritiro"): reverse a collected product line back to ordered +
+    // restore stock. Faithful port of pos_sale_detail.php?do=undo_preorder_collection.
+    if (action === "undo_collected") {
+      if (!canAny(session.user.perms, ["pos.manage", "pos.preorders"])) return jsonError("Non hai i permessi per gestire i preordini.", 403);
+      const saleId = parseInteger(body.sale_id ?? body.id);
+      const saleItemId = parseInteger(body.sale_item_id);
+      if (saleId <= 0 || saleItemId <= 0) return jsonError("Riga prodotto non valida.");
+      const payload = await undoManageSaleItemCollected(tenantSlug, {
+        saleId,
+        saleItemId,
+        userId: session.user.id,
+        userName: session.user.name,
+      });
+      return Response.json({ ...payload });
+    }
+
+    // PREPAID MANUAL EXECUTION ("Segna eseguito"): mark N sessions of a prepaid line as
+    // manually executed (out of appointment). Faithful port of mark_prepaid_manual_execution —
+    // gated by pos.manage OR pos.prepaids (the legacy Auth::canAny(['pos.manage','pos.prepaids'])).
+    if (action === "prepaid_manual_execute") {
+      if (!canAny(session.user.perms, ["pos.manage", "pos.prepaids"])) return jsonError("Non hai i permessi per gestire i prepagati.", 403);
+      const saleId = parseInteger(body.sale_id ?? body.id);
+      const prepaidId = parseInteger(body.prepaid_id);
+      const qty = parseInteger(body.execute_qty ?? body.qty, 1);
+      if (saleId <= 0) return jsonError("Vendita non valida.");
+      if (prepaidId <= 0) return jsonError("Servizio prepagato non valido.");
+      const payload = await markPrepaidManualExecution(tenantSlug, {
+        saleId,
+        prepaidId,
+        qty,
+        userId: session.user.id,
+      });
+      return Response.json({ ...payload });
+    }
+
+    // UNDO PREPAID MANUAL EXECUTION ("Annulla esecuzione"): restore the residual + remove the
+    // manual usage row. Faithful port of undo_prepaid_manual_execution.
+    if (action === "prepaid_manual_undo") {
+      if (!canAny(session.user.perms, ["pos.manage", "pos.prepaids"])) return jsonError("Non hai i permessi per gestire i prepagati.", 403);
+      const saleId = parseInteger(body.sale_id ?? body.id);
+      const usageId = parseInteger(body.usage_id);
+      if (saleId <= 0) return jsonError("Vendita non valida.");
+      if (usageId <= 0) return jsonError("Utilizzo manuale non valido.");
+      const payload = await undoPrepaidManualExecution(tenantSlug, {
+        saleId,
+        usageId,
+        userId: session.user.id,
+      });
+      return Response.json({ ...payload });
     }
 
     return jsonError("Azione POS non supportata.");

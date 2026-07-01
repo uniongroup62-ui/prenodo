@@ -32,6 +32,7 @@ import {
   dbExecute,
   dbQuery,
   quoteIdentifier,
+  tenantDelete,
   tenantInsert,
   tenantSelect,
   tenantTable,
@@ -1017,6 +1018,66 @@ export type PosSaleDetail = {
   quoteRef: PosQuoteRef | null;
   // Whether the sale is already cancelled (drives the "Elimina vendita" hard-delete button).
   canDelete: boolean;
+  // "Cronologia utilizzo": one entry per prepaid-service line linked to this sale, with the
+  // residual/free qty, the manual-execution controls (Segna eseguito / Annulla esecuzione),
+  // and the newest-first usage timeline (appointment redemptions + manual executions).
+  // Faithful (best-effort) to pos_sale_detail.php's $trackingCards for prepaid lines.
+  prepaidTracking: PosPrepaidTracking[];
+  // Per ordered/collected product line: the collected qty (partial-pickup state) driving the
+  // "Segna ritirato" qty selector + the "Rimuovi ritiro" undo on collected lines.
+  preorderTracking: PosPreorderTracking[];
+};
+
+// One event in a prepaid-service usage timeline: either an appointment REDEMPTION
+// (appointmentId>0, with the appointment link/status) or a MANUAL execution
+// (appointmentId=0, isManual=true), newest-first. Faithful to the legacy per-prepaid
+// timeline (appointment_prepaid_service_items + client_prepaid_service_usages).
+export type PosPrepaidUsageEvent = {
+  usageId: number;
+  appointmentId: number;
+  appointmentCode: string;
+  appointmentStatus: string;
+  qty: number;
+  when: string;
+  operator: string;
+  isManual: boolean;
+  // Present only for a manual usage that can be undone from this page (appointmentId=0 and a
+  // 'esecuzione manuale' note). Drives the "Annulla esecuzione" button.
+  canUndo: boolean;
+  // The clean /appointments route the timeline links to (appointmentId>0), else "".
+  appointmentLink: string;
+};
+
+// A prepaid-service line on the sale, with the residual/free qty + the manual-execution
+// controls + the usage timeline. Port of one prepaid $trackingCards entry.
+export type PosPrepaidTracking = {
+  saleItemId: number;
+  prepaidId: number;
+  title: string;
+  serviceName: string;
+  purchasedQty: number;
+  remainingQty: number;
+  // Residual NOT already committed to open appointments (the "residuo libero"): the ceiling on
+  // a manual execution. execute at most this many.
+  freeQty: number;
+  canExecute: boolean;
+  note: string;
+  usageHistory: PosPrepaidUsageEvent[];
+};
+
+// A product line's pickup state: the ordered qty still awaiting pickup and, when a partial
+// pickup has been recorded, the sibling collected line(s) that can be undone.
+export type PosPreorderTracking = {
+  saleItemId: number;
+  productId: number;
+  name: string;
+  status: "ordered" | "collected";
+  qty: number;
+  // For an 'ordered' line: the max qty pickable now (min of line qty and available stock).
+  collectMax: number;
+  canCollect: boolean;
+  stockNow: number;
+  note: string;
 };
 
 // Build the full POS "Dettaglio vendita" payload for one sale: the mapped PosSale (header,
@@ -1039,6 +1100,10 @@ export async function getManageSaleDetail(slug: string, id: number): Promise<Pos
   const { reductions, notesClean } = await buildSaleReductions(slug, row, sale);
   const installmentPlan = await loadSaleInstallmentPlan(slug, id).catch(() => null);
   const quoteRef = await loadSaleQuoteRef(slug, row).catch(() => null);
+  const notCancelled = sale.status !== "cancelled";
+  // "Cronologia utilizzo / ritiro" data: prepaid usage timelines + per-product pickup state.
+  const prepaidTracking = notCancelled ? await buildPrepaidTracking(slug, id, sale).catch(() => []) : [];
+  const preorderTracking = notCancelled ? await buildPreorderTracking(slug, sale).catch(() => []) : [];
   return {
     ok: true,
     sale,
@@ -1052,6 +1117,8 @@ export async function getManageSaleDetail(slug: string, id: number): Promise<Pos
     installmentPlan,
     quoteRef,
     canDelete: sale.status === "cancelled",
+    prepaidTracking,
+    preorderTracking,
   };
 }
 
@@ -1757,20 +1824,408 @@ async function giftboxRedemptionState(slug: string, instanceId: number, giftboxI
   return { fullyRedeemed, redeemedItems, remainingItems };
 }
 
-// Mark a product sale line as collected ("Ritirato") — a faithful MINIMAL port of the
-// pos_sale_detail.php mark_preorder_collection action. Flips the sale_item to
-// item_status='collected', decrements the location stock by the line qty, and writes a
-// best-effort stock_docs/stock_doc_items 'scarico' movement for the pickup audit trail.
+// ---------------------------------------------------------------------------
+// "Cronologia utilizzo / ritiro" tracking + interactive prepaid manual execution.
+// ---------------------------------------------------------------------------
+
+// The prepaid rows linked to a sale: primarily the client_prepaid_services whose sale_id
+// matches (the way issuePrepaidFromSale writes them), tenant-scoped. Returns the raw rows.
+async function prepaidRowsForSale(slug: string, saleId: number): Promise<RowDataPacket[]> {
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "client_prepaid_services",
+    where: "sale_id=?",
+    params: [saleId],
+    orderBy: "id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  return rows;
+}
+
+// qty already committed to OPEN appointments for a prepaid — port of
+// ClientPrepaidServices::activeLinkedQty. Redeemed links (redeemed_at set) and links to
+// terminal appointments (done/canceled/no_show/rejected) do NOT count. Tenant-scoped.
+async function prepaidActiveLinkedQty(slug: string, prepaidId: number): Promise<number> {
+  if (prepaidId <= 0) return 0;
+  const table = await tenantTable(slug, "appointment_prepaid_service_items").catch(() => null);
+  if (!table) return 0;
+  // Both api and appointments carry tenant_id, so the tenant filter must be ALIAS-QUALIFIED
+  // (unqualified would be ambiguous) — scope on api.tenant_id explicitly.
+  const scope = await aliasTenantScope(table, "api", ["api.client_prepaid_service_id=?", "api.redeemed_at IS NULL"], [prepaidId]);
+  const rows = await dbQuery<RowDataPacket[]>(
+    `SELECT COALESCE(SUM(api.qty),0) AS linked
+       FROM ${quoteIdentifier(table.name)} api
+       LEFT JOIN appointments a ON a.id=api.appointment_id
+      ${scope.where}
+        AND (a.id IS NULL OR LOWER(TRIM(COALESCE(a.status,''))) NOT IN ('done','completed','eseguito','canceled','cancelled','no_show','no show','no-show','noshow','non presentato','annullato','annullata','rejected','rifiutato'))`,
+    scope.params,
+  ).catch(() => [] as RowDataPacket[]);
+  return Math.max(0, Number(rows[0]?.linked ?? 0) || 0);
+}
+
+// Like tenantScope but prefixes the injected tenant_id filter with the given table ALIAS, so
+// it is unambiguous in a JOIN where more than one table carries tenant_id.
+async function aliasTenantScope(target: TenantTarget, alias: string, clauses: string[], params: unknown[]) {
+  const scopedClauses = [...clauses];
+  const scopedParams = [...params];
+  if (target.mode === "shared" && await columnExists(target.name, "tenant_id")) {
+    scopedClauses.unshift(`${alias}.tenant_id=?`);
+    scopedParams.unshift(target.tenantId ?? 0);
+  }
+  return { where: scopedClauses.length ? ` WHERE ${scopedClauses.join(" AND ")}` : "", params: scopedParams };
+}
+
+// The usage timeline for one prepaid: appointment redemptions (appointment_prepaid_service_items
+// joined to appointments) + manual/appointment usages (client_prepaid_service_usages joined to
+// appointments), grouped by appointment (an appointment link + its usage row collapse into one
+// event), newest-first. Faithful to the prepaid $trackingCards event builder.
+async function prepaidUsageHistory(slug: string, prepaidId: number): Promise<PosPrepaidUsageEvent[]> {
+  if (prepaidId <= 0) return [];
+  const events = new Map<string, PosPrepaidUsageEvent & { sort: number }>();
+
+  // Appointment links (appointment_prepaid_service_items).
+  const apiTable = await tenantTable(slug, "appointment_prepaid_service_items").catch(() => null);
+  if (apiTable) {
+    const scope = await aliasTenantScope(apiTable, "api", ["api.client_prepaid_service_id=?"], [prepaidId]);
+    const rows = await dbQuery<RowDataPacket[]>(
+      `SELECT api.id, api.appointment_id, api.qty, api.redeemed_at, api.created_at,
+              a.public_code AS appointment_code, a.status AS appointment_status,
+              a.starts_at AS appointment_starts_at
+         FROM ${quoteIdentifier(apiTable.name)} api
+         LEFT JOIN appointments a ON a.id=api.appointment_id
+        ${scope.where}
+        ORDER BY api.id ASC`,
+      scope.params,
+    ).catch(() => [] as RowDataPacket[]);
+    for (const r of rows) {
+      const aid = Math.max(0, Number(r.appointment_id ?? 0) || 0);
+      const key = aid > 0 ? `appt:${aid}` : `link:${Number(r.id ?? 0)}`;
+      const when = dateTimeString(r.appointment_starts_at || r.redeemed_at || r.created_at);
+      const prev = events.get(key);
+      const qty = Math.max(1, Number(r.qty ?? 1) || 1);
+      if (prev) {
+        prev.qty += qty;
+        if (!prev.when) prev.when = when;
+      } else {
+        events.set(key, {
+          usageId: 0,
+          appointmentId: aid,
+          appointmentCode: clean(r.appointment_code, 40),
+          appointmentStatus: clean(r.appointment_status, 40),
+          qty,
+          when,
+          operator: "",
+          isManual: false,
+          canUndo: false,
+          appointmentLink: aid > 0 ? `/${encodeURIComponent(slug)}/appointments?action=edit&id=${aid}` : "",
+          sort: sortValue(when),
+        });
+      }
+    }
+  }
+
+  // Usage rows (client_prepaid_service_usages) — appointment redemptions AND manual executions.
+  const usageTable = await tenantTable(slug, "client_prepaid_service_usages").catch(() => null);
+  if (usageTable) {
+    const scope = await aliasTenantScope(usageTable, "u", ["u.client_prepaid_service_id=?"], [prepaidId]);
+    const rows = await dbQuery<RowDataPacket[]>(
+      `SELECT u.id, u.appointment_id, u.qty, u.used_at, u.note, u.created_by, u.created_at,
+              a.public_code AS appointment_code, a.status AS appointment_status,
+              a.starts_at AS appointment_starts_at
+         FROM ${quoteIdentifier(usageTable.name)} u
+         LEFT JOIN appointments a ON a.id=u.appointment_id
+        ${scope.where}
+        ORDER BY u.id ASC`,
+      scope.params,
+    ).catch(() => [] as RowDataPacket[]);
+    for (const r of rows) {
+      const aid = Math.max(0, Number(r.appointment_id ?? 0) || 0);
+      const usageId = Math.max(0, Number(r.id ?? 0) || 0);
+      const key = aid > 0 ? `appt:${aid}` : `usage:${usageId}`;
+      const manual = aid <= 0 && isManualUsageNote(r.note);
+      const when = dateTimeString(r.appointment_starts_at || r.used_at || r.created_at);
+      const operator = await operatorNameFromUserId(slug, Number(r.created_by ?? 0) || 0);
+      const qty = Math.max(1, Number(r.qty ?? 1) || 1);
+      const prev = events.get(key);
+      if (prev) {
+        prev.qty = Math.max(prev.qty, qty);
+        if (usageId > 0 && prev.usageId <= 0) prev.usageId = usageId;
+        if (manual) prev.isManual = true;
+        if (!prev.when) prev.when = when;
+        if (!prev.operator && operator) prev.operator = operator;
+        if (manual && aid <= 0) prev.canUndo = true;
+      } else {
+        events.set(key, {
+          usageId,
+          appointmentId: aid,
+          appointmentCode: clean(r.appointment_code, 40),
+          appointmentStatus: clean(r.appointment_status, 40),
+          qty,
+          when,
+          operator,
+          isManual: manual,
+          canUndo: manual && aid <= 0 && usageId > 0,
+          appointmentLink: aid > 0 ? `/${encodeURIComponent(slug)}/appointments?action=edit&id=${aid}` : "",
+          sort: sortValue(when),
+        });
+      }
+    }
+  }
+
+  return [...events.values()]
+    .sort((a, b) => b.sort - a.sort || b.appointmentId - a.appointmentId)
+    .map((ev): PosPrepaidUsageEvent => ({
+      usageId: ev.usageId,
+      appointmentId: ev.appointmentId,
+      appointmentCode: ev.appointmentCode,
+      appointmentStatus: ev.appointmentStatus,
+      qty: ev.qty,
+      when: ev.when,
+      operator: ev.operator,
+      isManual: ev.isManual,
+      canUndo: ev.canUndo,
+      appointmentLink: ev.appointmentLink,
+    }));
+}
+
+// A sortable number from a "YYYY-MM-DD HH:MM:SS" timestamp (higher = newer). 0 when empty.
+function sortValue(value: string): number {
+  const t = Date.parse(String(value ?? "").replace(" ", "T"));
+  return Number.isFinite(t) ? t : 0;
+}
+
+// Build the prepaid "Cronologia utilizzo" cards for a sale: one per prepaid line, with the
+// residual/free qty, the can-execute flag + note, and the newest-first usage timeline.
+async function buildPrepaidTracking(slug: string, saleId: number, sale: PosSale): Promise<PosPrepaidTracking[]> {
+  const rows = await prepaidRowsForSale(slug, saleId);
+  if (!rows.length) return [];
+  const out: PosPrepaidTracking[] = [];
+  for (const pr of rows) {
+    const prepaidId = Math.max(0, Number(pr.id ?? 0) || 0);
+    if (prepaidId <= 0) continue;
+    const purchasedQty = Math.max(0, Number(pr.purchased_qty ?? 0) || 0);
+    const remainingQty = Math.max(0, Number(pr.remaining_qty ?? 0) || 0);
+    const status = String(pr.status ?? "active").toLowerCase();
+    const serviceName = clean(pr.service_name, 190) || `Servizio #${Number(pr.service_id ?? 0) || 0}`;
+    // Match the sale line by sale_item_id (else fall back to the prepaid's own name).
+    const saleItemId = Math.max(0, Number(pr.sale_item_id ?? 0) || 0);
+    const linkedItem = sale.items.find((it) => it.id === saleItemId && it.type === "service");
+    const title = linkedItem?.name || serviceName;
+
+    const linkedQty = await prepaidActiveLinkedQty(slug, prepaidId);
+    const freeQty = Math.max(0, remainingQty - linkedQty);
+    const cancelled = ["canceled", "cancelled", "annullato", "annullata"].includes(status);
+    const completed = status === "completed";
+    const canExecute = !cancelled && !completed && remainingQty > 0 && freeQty > 0;
+
+    let note = "";
+    if (cancelled) note = "Residuo annullato.";
+    else if (remainingQty <= 0 || completed) note = "Residuo esaurito.";
+    else if (linkedQty > 0 && freeQty <= 0) note = "Residuo gia collegato a prenotazioni aperte.";
+    else if (linkedQty > 0) note = `Disponibili libere ${freeQty} su ${remainingQty} residue; ${linkedQty} gia prenotate.`;
+
+    const usageHistory = await prepaidUsageHistory(slug, prepaidId);
+
+    out.push({
+      saleItemId,
+      prepaidId,
+      title,
+      serviceName,
+      purchasedQty,
+      remainingQty,
+      freeQty,
+      canExecute,
+      note,
+      usageHistory,
+    });
+  }
+  return out;
+}
+
+// Per product line pickup state: for 'ordered' lines the pickable-now qty (min of the line
+// qty and the available stock at the sale location); 'collected' lines are surfaced so the UI
+// can offer "Rimuovi ritiro" (undo). Faithful to the preorder $trackingCards mark/undo state.
+async function buildPreorderTracking(slug: string, sale: PosSale): Promise<PosPreorderTracking[]> {
+  const productItems = sale.items.filter((it) => it.type === "product" && it.refId > 0 && (it.status === "ordered" || it.status === "collected"));
+  if (!productItems.length) return [];
+  const out: PosPreorderTracking[] = [];
+  for (const it of productItems) {
+    const qty = Math.max(1, Math.round(Number(it.quantity) || 1));
+    if (it.status === "collected") {
+      out.push({ saleItemId: it.id, productId: it.refId, name: it.name, status: "collected", qty, collectMax: 0, canCollect: false, stockNow: 0, note: "" });
+      continue;
+    }
+    const stockNow = Math.max(0, await currentProductStock(slug, it.refId, sale.locationId).catch(() => 0));
+    const collectMax = Math.max(0, Math.min(qty, Math.floor(stockNow)));
+    let note = "";
+    if (collectMax <= 0) note = "Stock insufficiente: registra prima un carico prodotto.";
+    else if (collectMax < qty) note = `Disponibile ritiro parziale fino a ${collectMax} pezzi.`;
+    else note = `Stock attuale: ${Math.floor(stockNow)} pezzi.`;
+    out.push({ saleItemId: it.id, productId: it.refId, name: it.name, status: "ordered", qty, collectMax, canCollect: collectMax > 0, stockNow: Math.floor(stockNow), note });
+  }
+  return out;
+}
+
+// MARK a prepaid-service line as MANUALLY executed (out of appointment) — faithful port of
+// pos_sale_detail.php?do=mark_prepaid_manual_execution + ClientPrepaidServices::redeemManual.
+// Decrements client_prepaid_services.remaining_qty by qty (bounded to the FREE residual, i.e.
+// not already committed to open appointments), recomputes the status, and inserts a
+// client_prepaid_service_usages row tagged with the operator + now + a 'manual' note. Runs in a
+// tenant-scoped transaction. Returns the refreshed sale detail.
+export async function markPrepaidManualExecution(
+  slug: string,
+  input: { saleId: number; prepaidId: number; qty: number; userId: number | null },
+): Promise<PosSaleDetail> {
+  const saleId = Math.max(0, input.saleId);
+  const prepaidId = Math.max(0, input.prepaidId);
+  const qty = Math.max(1, Math.round(input.qty || 0));
+  if (saleId <= 0) throw new Error("Vendita non valida.");
+  if (prepaidId <= 0) throw new Error("Servizio prepagato non valido.");
+  if (qty <= 0) throw new Error("Quantita da eseguire non valida.");
+
+  const saleRow = await getSaleRow(slug, saleId);
+  await assertSaleLocationAccess(slug, Number(saleRow.location_id ?? 0) || 0);
+  if (isCancelledStatus(saleRow.status)) {
+    throw new Error("La vendita e annullata: non e possibile segnare il servizio come eseguito.");
+  }
+
+  const table = await tenantTable(slug, "client_prepaid_services");
+  const usageTable = await tenantTable(slug, "client_prepaid_service_usages");
+
+  await withTenantTransaction(slug, async (q) => {
+    const scope = await tenantScope(table, ["id=?"], [prepaidId]);
+    const rows = await q<RowDataPacket>(
+      `SELECT id, sale_id, service_id, service_name, purchased_qty, remaining_qty, status FROM ${quoteIdentifier(table.name)}${scope.where} FOR UPDATE`,
+      scope.params,
+    );
+    const pre = rows[0];
+    if (!pre) throw new Error("Residuo prepagato non trovato.");
+    if ((Number(pre.sale_id ?? 0) || 0) !== saleId) throw new Error("Residuo prepagato non collegato a questa vendita.");
+
+    const serviceName = clean(pre.service_name, 190) || `Servizio #${Number(pre.service_id ?? 0) || 0}`;
+    const remaining = Math.max(0, Number(pre.remaining_qty ?? 0) || 0);
+    const purchased = Math.max(0, Number(pre.purchased_qty ?? 0) || 0);
+    const status = String(pre.status ?? "active").toLowerCase();
+    if (["canceled", "cancelled"].includes(status)) throw new Error(`Servizio prepagato "${serviceName}": residuo annullato.`);
+    if (remaining <= 0 || status === "completed") throw new Error(`Servizio prepagato "${serviceName}": residuo esaurito.`);
+
+    const linkedQty = await prepaidActiveLinkedQty(slug, prepaidId);
+    const freeQty = Math.max(0, remaining - linkedQty);
+    if (freeQty < qty) {
+      const detail = linkedQty > 0
+        ? ` Disponibili libere ${freeQty}/${purchased} (prenotate ${linkedQty}).`
+        : ` Disponibili ${remaining}/${purchased}.`;
+      throw new Error(`Servizio prepagato "${serviceName}": disponibilita libera insufficiente.${detail}`);
+    }
+
+    const newRemaining = Math.max(0, remaining - qty);
+    const newStatus = prepaidStatusCalc(status, newRemaining);
+    const updScope = await tenantScope(table, ["id=?"], [prepaidId]);
+    await q(
+      `UPDATE ${quoteIdentifier(table.name)} SET remaining_qty=?, status=?, updated_at=NOW()${updScope.where}`,
+      [newRemaining, newStatus, ...updScope.params],
+    );
+
+    // Insert the manual usage row. tenant_id is prepended when the table is tenant-shared so
+    // the row is scoped to this tenant (BEFORE-write triggers also backstop it).
+    const usageCols: string[] = ["client_prepaid_service_id", "appointment_id", "qty", "used_at", "note", "created_by"];
+    const usageVals: unknown[] = [prepaidId, null, qty, nowDateTime(), "Esecuzione manuale servizio prepagato", input.userId && input.userId > 0 ? input.userId : null];
+    if (usageTable.mode === "shared" && await columnExists(usageTable.name, "tenant_id")) {
+      usageCols.unshift("tenant_id");
+      usageVals.unshift(usageTable.tenantId ?? 0);
+    }
+    const ph = usageVals.map(() => "?").join(",");
+    await q(`INSERT INTO ${quoteIdentifier(usageTable.name)} (${usageCols.map((c) => quoteIdentifier(c)).join(",")}) VALUES (${ph})`, usageVals);
+  });
+
+  return getManageSaleDetail(slug, saleId);
+}
+
+// UNDO a manual prepaid execution — faithful port of undo_prepaid_manual_execution +
+// ClientPrepaidServices::undoManualUsage. Restores the residual (bounded to purchased_qty),
+// recomputes the status, and DELETES the manual usage row. Only a manual (appointment_id=0,
+// 'esecuzione manuale' note) usage bound to this sale's prepaid can be undone.
+export async function undoPrepaidManualExecution(
+  slug: string,
+  input: { saleId: number; usageId: number; userId: number | null },
+): Promise<PosSaleDetail> {
+  const saleId = Math.max(0, input.saleId);
+  const usageId = Math.max(0, input.usageId);
+  if (saleId <= 0) throw new Error("Vendita non valida.");
+  if (usageId <= 0) throw new Error("Utilizzo manuale non valido.");
+
+  const saleRow = await getSaleRow(slug, saleId);
+  await assertSaleLocationAccess(slug, Number(saleRow.location_id ?? 0) || 0);
+  if (isCancelledStatus(saleRow.status)) {
+    throw new Error("La vendita e annullata: non e possibile modificare gli utilizzi manuali.");
+  }
+
+  const table = await tenantTable(slug, "client_prepaid_services");
+  const usageTable = await tenantTable(slug, "client_prepaid_service_usages");
+
+  await withTenantTransaction(slug, async (q) => {
+    const uScope = await tenantScope(usageTable, ["id=?"], [usageId]);
+    const uRows = await q<RowDataPacket>(
+      `SELECT id, client_prepaid_service_id, appointment_id, qty, note FROM ${quoteIdentifier(usageTable.name)}${uScope.where} FOR UPDATE`,
+      uScope.params,
+    );
+    const usage = uRows[0];
+    if (!usage) throw new Error("Utilizzo manuale non trovato.");
+    if ((Number(usage.appointment_id ?? 0) || 0) > 0) throw new Error("Questo utilizzo e collegato a una prenotazione e non puo essere annullato da qui.");
+    if (!isManualUsageNote(usage.note)) throw new Error("Questo utilizzo non risulta creato come esecuzione manuale.");
+
+    const prepaidId = Math.max(0, Number(usage.client_prepaid_service_id ?? 0) || 0);
+    const undoQty = Math.max(1, Number(usage.qty ?? 1) || 1);
+    const pScope = await tenantScope(table, ["id=?"], [prepaidId]);
+    const pRows = await q<RowDataPacket>(
+      `SELECT id, sale_id, service_id, service_name, purchased_qty, remaining_qty, status FROM ${quoteIdentifier(table.name)}${pScope.where} FOR UPDATE`,
+      pScope.params,
+    );
+    const pre = pRows[0];
+    if (!pre) throw new Error("Residuo prepagato non trovato.");
+    if ((Number(pre.sale_id ?? 0) || 0) !== saleId) throw new Error("Residuo prepagato non collegato a questa vendita.");
+
+    const serviceName = clean(pre.service_name, 190) || `Servizio #${Number(pre.service_id ?? 0) || 0}`;
+    const status = String(pre.status ?? "active").toLowerCase();
+    if (["canceled", "cancelled"].includes(status)) throw new Error(`Servizio prepagato "${serviceName}": residuo annullato.`);
+
+    const purchased = Math.max(0, Number(pre.purchased_qty ?? 0) || 0);
+    const remaining = Math.max(0, Number(pre.remaining_qty ?? 0) || 0);
+    let newRemaining = remaining + undoQty;
+    if (purchased > 0) newRemaining = Math.min(purchased, newRemaining);
+    const newStatus = prepaidStatusCalc(status, newRemaining);
+
+    const updScope = await tenantScope(table, ["id=?"], [prepaidId]);
+    await q(`UPDATE ${quoteIdentifier(table.name)} SET remaining_qty=?, status=?, updated_at=NOW()${updScope.where}`, [newRemaining, newStatus, ...updScope.params]);
+    const delScope = await tenantScope(usageTable, ["id=?"], [usageId]);
+    await q(`DELETE FROM ${quoteIdentifier(usageTable.name)}${delScope.where}`, delScope.params);
+  });
+
+  return getManageSaleDetail(slug, saleId);
+}
+
+// Recompute a prepaid status from the residual — port of ClientPrepaidServices::statusCalc:
+// a 'canceled' status is never changed here; remaining<=0 -> 'completed'; else 'active'.
+function prepaidStatusCalc(currentStatus: string, remainingQty: number): string {
+  const status = String(currentStatus ?? "").toLowerCase();
+  if (["canceled", "cancelled"].includes(status)) return status;
+  return remainingQty <= 0 ? "completed" : "active";
+}
+
+// Mark a product sale line as collected ("Ritirato") — a faithful port of the
+// pos_sale_detail.php mark_preorder_collection action, now with PARTIAL pickup. Decrements the
+// location stock by the collected qty, writes a best-effort stock_docs 'scarico' movement, and
+// either flips the whole line to item_status='collected' (full pickup) OR SPLITS the ordered
+// line into a residual ordered part + a new collected part (partial pickup, proportional
+// line_total split via splitLineTotal). Appends a [PREORDINE RITIRATO ...] notes marker so the
+// undo can find/strip it (faithful to the legacy marker trail).
 //
-// TODO (deep stock-document tracking): the legacy action also supports PARTIAL pickup
-// (collect_qty < line qty → split the sale_item into a collected row + a residual ordered
-// row, with proportional line_total split), writes a richer stock_docs row (operator_user_id,
-// cause, document_type, location_id, attachment cols), and has an UNDO ("Storno ritiro") that
-// re-creates an inbound stock_doc. This minimal version handles the common FULL pickup only;
-// partial pickup + undo + the full stock-document schema are left for a later pass.
+// TODO (deep stock-document schema): the legacy scarico row also carries operator_user_id /
+// document_type / location_id / attachment_* columns — recordPickupStockDoc writes the subset
+// present in this schema (filterColumns drops the rest). The audit-document richness beyond
+// that subset is the only piece still deferred; the operational split + undo are implemented.
 export async function markManageSaleItemCollected(
   slug: string,
-  input: { saleId: number; saleItemId: number; userId: number | null; userName: string },
+  input: { saleId: number; saleItemId: number; qty?: number; userId: number | null; userName: string },
 ): Promise<PosSaleDetail> {
   if (input.saleId <= 0 || input.saleItemId <= 0) throw new Error("Riga prodotto non valida.");
   const saleRow = await getSaleRow(slug, input.saleId);
@@ -1794,35 +2249,213 @@ export async function markManageSaleItemCollected(
   const currentStatus = normalizeItemStatus("product", item.item_status, Number(saleRow.client_id ?? 0) > 0);
   if (currentStatus !== "ordered") throw new Error("Questo prodotto non e piu in attesa di ritiro.");
   const qty = Math.max(1, Math.round(Number(item.qty ?? 1) || 1));
+  // Requested pickup qty (0/absent -> full). Bounded to [1, line qty] (legacy validation).
+  const requested = Math.max(0, Math.round(Number(input.qty ?? 0) || 0));
+  const collectQty = requested > 0 ? requested : qty;
+  if (collectQty < 1 || collectQty > qty) throw new Error("Quantita da ritirare non valida.");
 
   // Decrement the stock for the pickup (a product whose status was 'ordered' was NOT
   // decremented at checkout, so it is decremented now — faithful to the legacy scarico).
   const available = await currentProductStock(slug, productId, locationId);
-  if (available + 0.00001 < qty) {
+  if (available + 0.00001 < collectQty) {
     throw new Error(`Stock insufficiente per registrare il ritiro${item.item_name ? `: ${String(item.item_name)}` : ""}.`);
   }
 
-  // Best-effort stock movement document (audit), then the stock decrement, then flip status.
+  const unitPrice = roundMoney(Number(item.unit_price ?? 0) || 0);
+  const lineTotal = roundMoney(Number(item.line_total ?? unitPrice * qty) || 0);
+  const [collectLineTotal, remainingLineTotal] = splitLineTotal(qty, lineTotal, collectQty);
+  const itemName = String(item.item_name ?? "Prodotto");
+
+  // Best-effort stock movement document (audit), then the stock decrement, then the split.
+  await recordPickupStockDoc(slug, {
+    saleId: input.saleId,
+    productId,
+    qty: collectQty,
+    locationId,
+    note: `Ritiro preordine da Dettaglio vendita • vendita #${input.saleId} • prodotto: ${itemName} x${collectQty}`,
+    operatorName: input.userName,
+    operatorUserId: input.userId,
+    cause: "scarico",
+  });
+  await adjustProductStock(slug, productId, locationId, -collectQty);
+
+  if (collectQty >= qty) {
+    await tenantUpdate({ slug, table: "sale_items", id: input.saleItemId, values: { item_status: "collected" } });
+  } else {
+    // Split: shrink the ordered line to the residual, insert a new collected line.
+    await tenantUpdate({ slug, table: "sale_items", id: input.saleItemId, values: { qty: qty - collectQty, line_total: remainingLineTotal } });
+    const saleItemsTable = await tenantTable(slug, "sale_items");
+    await tenantInsert(saleItemsTable, await filterColumns(saleItemsTable.name, {
+      sale_id: input.saleId,
+      item_type: "product",
+      item_id: productId,
+      item_name: itemName,
+      qty: collectQty,
+      unit_price: unitPrice,
+      line_total: collectLineTotal,
+      item_status: "collected",
+    }));
+  }
+
+  // Append the [PREORDINE RITIRATO ...] marker to the sale notes (audit + undo anchor).
+  await appendPreorderCollectionMarker(slug, input.saleId, saleRow.notes, itemName, collectQty, input.userName);
+
+  return getManageSaleDetail(slug, input.saleId);
+}
+
+// UNDO a product pickup ("Rimuovi ritiro") — faithful port of undo_preorder_collection.
+// Restores the location stock by the collected qty (best-effort compensating 'carico' doc),
+// returns the line to item_status='ordered' — MERGING it into a sibling ordered line of the
+// same product/name/unit-price when one exists (so partial pickups don't leave a duplicate),
+// and strips the matching [PREORDINE RITIRATO ...] notes marker.
+export async function undoManageSaleItemCollected(
+  slug: string,
+  input: { saleId: number; saleItemId: number; userId: number | null; userName: string },
+): Promise<PosSaleDetail> {
+  if (input.saleId <= 0 || input.saleItemId <= 0) throw new Error("Riga prodotto non valida.");
+  const saleRow = await getSaleRow(slug, input.saleId);
+  await assertSaleLocationAccess(slug, Number(saleRow.location_id ?? 0) || 0);
+  if (isCancelledStatus(saleRow.status)) throw new Error("La vendita e annullata: non e possibile modificare il ritiro.");
+  const locationId = Number(saleRow.location_id ?? 0) || 0;
+
+  const itemRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "sale_items",
+    where: "id=? AND sale_id=?",
+    params: [input.saleItemId, input.saleId],
+    limit: 1,
+  }).catch(() => [] as RowDataPacket[]);
+  const item = itemRows[0];
+  if (!item) throw new Error("Riga preordine non trovata.");
+  if (String(item.item_type ?? "").toLowerCase() !== "product") throw new Error("Operazione consentita solo per righe prodotto.");
+  const productId = Math.max(0, Number(item.item_id ?? 0) || 0);
+  if (productId <= 0) throw new Error("Prodotto collegato non valido.");
+  const currentStatus = normalizeItemStatus("product", item.item_status, Number(saleRow.client_id ?? 0) > 0);
+  if (currentStatus !== "collected") throw new Error("Il ritiro risulta gia rimosso o non ancora registrato.");
+  const qty = Math.max(1, Math.round(Number(item.qty ?? 1) || 1));
+  const unitPrice = roundMoney(Number(item.unit_price ?? 0) || 0);
+  const lineTotal = roundMoney(Number(item.line_total ?? unitPrice * qty) || 0);
+  const itemName = String(item.item_name ?? "Prodotto");
+
+  // Restore stock (compensating carico doc, best-effort), then re-open the line.
   await recordPickupStockDoc(slug, {
     saleId: input.saleId,
     productId,
     qty,
     locationId,
-    note: `Ritiro preordine da Dettaglio vendita • vendita #${input.saleId} • prodotto: ${String(item.item_name ?? "Prodotto")} x${qty}`,
+    note: `Storno ritiro preordine da Dettaglio vendita • vendita #${input.saleId} • prodotto: ${itemName} x${qty}`,
     operatorName: input.userName,
     operatorUserId: input.userId,
+    cause: "carico",
   });
-  await adjustProductStock(slug, productId, locationId, -qty);
-  await tenantUpdate({ slug, table: "sale_items", id: input.saleItemId, values: { item_status: "collected" } });
+  await adjustProductStock(slug, productId, locationId, qty);
+
+  // Merge into a sibling ordered line of the same product/name/unit-price (avoids duplicates
+  // after a partial pickup); else just flip this line back to 'ordered'.
+  const orderedRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "sale_items",
+    where: "sale_id=? AND item_type='product' AND item_id=? AND id<>? AND LOWER(TRIM(COALESCE(item_status,''))) IN ('ordered','ordinato')",
+    params: [input.saleId, productId, input.saleItemId],
+    orderBy: "id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  const target = orderedRows.find((r) =>
+    String(r.item_name ?? "").trim() === itemName.trim()
+    && Math.abs((Number(r.unit_price ?? 0) || 0) - unitPrice) < 0.0001,
+  );
+  if (target) {
+    const targetId = Math.max(0, Number(target.id ?? 0) || 0);
+    const targetQty = Math.max(1, Math.round(Number(target.qty ?? 1) || 1));
+    const targetLineTotal = roundMoney(Number(target.line_total ?? unitPrice * targetQty) || 0);
+    await tenantUpdate({ slug, table: "sale_items", id: targetId, values: { qty: targetQty + qty, line_total: roundMoney(targetLineTotal + lineTotal) } });
+    await tenantDelete({ slug, table: "sale_items", id: input.saleItemId });
+  } else {
+    await tenantUpdate({ slug, table: "sale_items", id: input.saleItemId, values: { item_status: "ordered" } });
+  }
+
+  // Strip the matching [PREORDINE RITIRATO ...] marker from the sale notes.
+  await removePreorderCollectionMarker(slug, input.saleId, saleRow.notes, itemName, qty);
 
   return getManageSaleDetail(slug, input.saleId);
 }
 
-// Best-effort 'scarico' stock document for a pickup. Inserts a stock_docs header + one
-// stock_doc_items line. A no-op (swallowed) when the optional stock-doc tables are absent.
+// Proportional line-total split for a partial pickup — port of _pos_hist_split_line_total:
+// [collectedTotal, remainingTotal] where collectedTotal = round(lineTotal*collectQty/fullQty).
+function splitLineTotal(fullQty: number, lineTotal: number, collectQty: number): [number, number] {
+  const q = Math.max(1, Math.round(fullQty));
+  const c = Math.max(0, Math.min(q, Math.round(collectQty)));
+  const total = roundMoney(lineTotal);
+  if (c <= 0) return [0, total];
+  if (c >= q) return [total, 0];
+  let collected = roundMoney((total * c) / q);
+  if (collected < 0) collected = 0;
+  if (collected > total) collected = total;
+  const remaining = Math.max(0, roundMoney(total - collected));
+  return [collected, remaining];
+}
+
+// Append "[PREORDINE RITIRATO <dt>] <name> x<qty> • <operator>" to the sale notes — port of
+// _pos_hist_append_preorder_collection_marker (best-effort; skipped if sales has no notes col).
+async function appendPreorderCollectionMarker(slug: string, saleId: number, currentNotes: unknown, itemName: string, qty: number, operatorName: string): Promise<void> {
+  const salesTable = await tenantTable(slug, "sales").catch(() => null);
+  if (!salesTable || !(await columnExists(salesTable.name, "notes"))) return;
+  const name = clean(itemName, 190) || "Prodotto";
+  const op = clean(operatorName, 120);
+  let line = `[PREORDINE RITIRATO ${nowDateTime()}] ${name} x${Math.max(1, Math.round(qty))}`;
+  if (op) line += ` • ${op}`;
+  const base = String(currentNotes ?? "").trim();
+  const next = (base ? `${base}\n` : "") + line;
+  await tenantUpdate({ slug, table: "sales", id: saleId, values: { notes: next.trim() } });
+}
+
+// Remove the best-matching "[PREORDINE RITIRATO ...]" marker for a product/qty from the sale
+// notes — port of _pos_hist_remove_preorder_collection_marker (name+qty match, best score).
+async function removePreorderCollectionMarker(slug: string, saleId: number, currentNotes: unknown, itemName: string, qty: number): Promise<void> {
+  const salesTable = await tenantTable(slug, "sales").catch(() => null);
+  if (!salesTable || !(await columnExists(salesTable.name, "notes"))) return;
+  const notes = String(currentNotes ?? "");
+  if (!notes.trim()) return;
+  const lines = notes.split(/\r\n|\r|\n/);
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const wantName = norm(itemName);
+  const wantQty = Math.max(1, Math.round(qty));
+  let bestIdx = -1;
+  let bestScore = -1;
+  lines.forEach((ln, idx) => {
+    const m = ln.trim().match(/^\[PREORDINE\s+RITIRATO\s+[\d-]+\s+[\d:]+\]\s*(.+)$/i);
+    if (!m) return;
+    let rest = m[1].trim();
+    let markerQty = 1;
+    const q = rest.match(/^(.*?)\s*x\s*(\d+)(?:\s*[•\-]\s*(.+))?$/i);
+    if (q) {
+      rest = q[1].trim();
+      markerQty = Math.max(1, Number(q[2]) || 1);
+    } else {
+      const op = rest.match(/^(.*?)\s*[•\-]\s*(.+)$/);
+      if (op) rest = op[1].trim();
+    }
+    const markerName = norm(rest);
+    if (!markerName || !wantName) return;
+    let score = 0;
+    if (markerName === wantName) score += 100;
+    else if (markerName.includes(wantName) || wantName.includes(markerName)) score += 45;
+    else return;
+    if (markerQty === wantQty) score += 30;
+    else if (Math.abs(markerQty - wantQty) === 1) score += 5;
+    if (score > bestScore) { bestScore = score; bestIdx = idx; }
+  });
+  if (bestIdx < 0 || bestScore < 60) return;
+  lines.splice(bestIdx, 1);
+  const next = lines.join("\n").trim();
+  if (next !== notes.trim()) await tenantUpdate({ slug, table: "sales", id: saleId, values: { notes: next } });
+}
+
+// Best-effort stock document for a pickup or its undo. Inserts a stock_docs header
+// (cause='scarico' for a pickup, 'carico' for the compensating undo) + one stock_doc_items
+// line. A no-op (swallowed) when the optional stock-doc tables are absent.
 async function recordPickupStockDoc(
   slug: string,
-  input: { saleId: number; productId: number; qty: number; locationId: number; note: string; operatorName: string; operatorUserId: number | null },
+  input: { saleId: number; productId: number; qty: number; locationId: number; note: string; operatorName: string; operatorUserId: number | null; cause?: "scarico" | "carico" },
 ): Promise<void> {
   try {
     const docsTable = await tenantTable(slug, "stock_docs").catch(() => null);
@@ -1833,7 +2466,7 @@ async function recordPickupStockDoc(
       move_date: today,
       operator_user_id: input.operatorUserId,
       operator_name: clean(input.operatorName, 120) || "Operatore",
-      cause: "scarico",
+      cause: input.cause ?? "scarico",
       location_id: input.locationId > 0 ? input.locationId : null,
       notes: clean(input.note, 500),
       is_canceled: 0,
@@ -4109,6 +4742,20 @@ function formatMoney(value: number): string {
 function todayIso(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+// "YYYY-MM-DD HH:MM:SS" for the local now — matches the legacy date('Y-m-d H:i:s') used for
+// client_prepaid_service_usages.used_at.
+function nowDateTime(): string {
+  const now = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
+}
+
+// A manual (out-of-appointment) prepaid usage note, faithful to
+// ClientPrepaidServices::isManualUsageNote — the marker written by a manual execution.
+function isManualUsageNote(note: unknown): boolean {
+  return String(note ?? "").toLowerCase().includes("esecuzione manuale");
 }
 
 function dateTimeString(value: unknown): string {

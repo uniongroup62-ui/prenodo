@@ -7,11 +7,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 //   GET  ?action=sale_detail&id=<id>  -> the sale (header + grouped items + payments +
 //                                         totals) + the cancel summary/blockers
 //   POST action=cancel                -> annulla vendita (sale_id, reason, stock_cancel_mode)
-//   POST action=mark_collected        -> "Segna ritirato" for an ordered product line
+//   POST action=mark_collected        -> "Segna ritirato" for an ordered product line (qty)
+//   POST action=undo_collected        -> "Rimuovi ritiro" reverse a collected product line
+//   POST action=prepaid_manual_execute-> "Segna eseguito" manual execution of a prepaid line
+//   POST action=prepaid_manual_undo   -> "Annulla esecuzione" reverse a manual execution
 //
-// SCOPE: the operational CORE (view + cancel + pickup + receipt). The deep stock-document
-// internals (partial pickup, undo, the prepaid/preorder "Cronologia utilizzo" tracking
-// cards) are intentionally out of scope — see the precise TODOs at the foot of this file.
+// SCOPE: the operational CORE (view + cancel + pickup + receipt) PLUS the "Cronologia utilizzo /
+// ritiro" tracking cards — prepaid manual execution/undo + usage timeline, and partial pickup +
+// undo. Only the deepest stock-document audit columns remain deferred (see manage-pos.ts).
 
 type PosSaleItemType = "service" | "product" | "prepaid" | "giftcard" | "package" | "giftbox" | "recharge";
 type PosSaleItemStatus = "executed" | "prepaid" | "collected" | "ordered";
@@ -98,6 +101,44 @@ type InstallmentPlanView = {
 
 type QuoteRef = { id: number; number: string; status: string; effectiveStatus: string; exists: boolean };
 
+type PrepaidUsageEvent = {
+  usageId: number;
+  appointmentId: number;
+  appointmentCode: string;
+  appointmentStatus: string;
+  qty: number;
+  when: string;
+  operator: string;
+  isManual: boolean;
+  canUndo: boolean;
+  appointmentLink: string;
+};
+
+type PrepaidTracking = {
+  saleItemId: number;
+  prepaidId: number;
+  title: string;
+  serviceName: string;
+  purchasedQty: number;
+  remainingQty: number;
+  freeQty: number;
+  canExecute: boolean;
+  note: string;
+  usageHistory: PrepaidUsageEvent[];
+};
+
+type PreorderTracking = {
+  saleItemId: number;
+  productId: number;
+  name: string;
+  status: "ordered" | "collected";
+  qty: number;
+  collectMax: number;
+  canCollect: boolean;
+  stockNow: number;
+  note: string;
+};
+
 type SaleDetail = {
   ok: boolean;
   sale: PosSale;
@@ -111,6 +152,8 @@ type SaleDetail = {
   installmentPlan: InstallmentPlanView | null;
   quoteRef: QuoteRef | null;
   canDelete: boolean;
+  prepaidTracking: PrepaidTracking[];
+  preorderTracking: PreorderTracking[];
 };
 
 type BusinessHeader = { name: string; legalVatNumber: string; address: string; logoPath: string };
@@ -177,6 +220,21 @@ function itemStatusBadge(item: PosSaleItem): { cls: string; label: string } | nu
   return null;
 }
 
+// Badge + title for one prepaid usage timeline event — faithful to the legacy per-event
+// badge (Eseguito for a manual execution, Utilizzato for an appointment redemption, and the
+// terminal-appointment states No show / Annullata / Rifiutata).
+function usageEventMeta(ev: PrepaidUsageEvent): { title: string; cls: string; label: string } {
+  const status = ev.appointmentStatus.toLowerCase();
+  if (ev.appointmentId > 0) {
+    if (["no_show", "no show", "no-show", "noshow", "non presentato"].includes(status)) return { title: "Prenotazione No show", cls: "text-bg-warning", label: "No show" };
+    if (["canceled", "cancelled", "annullato", "annullata"].includes(status)) return { title: "Prenotazione annullata", cls: "text-bg-secondary", label: "Annullata" };
+    if (["rejected", "rifiutato"].includes(status)) return { title: "Prenotazione rifiutata", cls: "text-bg-secondary", label: "Rifiutata" };
+    return { title: "Utilizzo collegato a prenotazione", cls: "text-bg-info", label: "Utilizzato" };
+  }
+  if (ev.isManual) return { title: "Esecuzione manuale", cls: "text-bg-success", label: "Eseguito" };
+  return { title: "Utilizzo registrato", cls: "text-bg-secondary", label: "Utilizzato" };
+}
+
 // Group homogeneous sale lines for the view (same type + ref + name + unit price), faithful
 // to _pos_hist_group_sale_items_for_view — collapses duplicate lines, sums qty/total, and
 // keeps the (single) status when all grouped lines share it.
@@ -228,6 +286,11 @@ export function PosSaleDetailContent() {
 
   // Receipt overlay.
   const [receiptOpen, setReceiptOpen] = useState(false);
+
+  // Per-line qty selections for the "Cronologia" cards: collect qty (product pickup) and
+  // execute qty (prepaid manual execution), keyed by sale_item_id / prepaid_id.
+  const [collectQty, setCollectQty] = useState<Record<number, number>>({});
+  const [executeQty, setExecuteQty] = useState<Record<number, number>>({});
 
   // Reload trigger: cancel/pickup bump this to refetch the detail (instead of calling
   // setState synchronously inside the effect, the fetch + all setState live in the effect).
@@ -290,6 +353,12 @@ export function PosSaleDetailContent() {
     [sale, isCancelled],
   );
 
+  // "Cronologia utilizzo / ritiro" data: prepaid usage timelines + per-product pickup state.
+  const prepaidTracking = useMemo(() => (isCancelled ? [] : detail?.prepaidTracking ?? []), [detail, isCancelled]);
+  const preorderTracking = useMemo(() => (isCancelled ? [] : detail?.preorderTracking ?? []), [detail, isCancelled]);
+  const collectedProducts = useMemo(() => preorderTracking.filter((p) => p.status === "collected"), [preorderTracking]);
+  const hasTracking = prepaidTracking.length > 0 || preorderTracking.length > 0;
+
   async function postAction(payload: Record<string, string>): Promise<{ ok: boolean; error?: string; sale?: PosSale; cancelSummary?: CancelSummary }> {
     const res = await fetch(`/api/manage/pos?slug=${encodeURIComponent(slug)}`, {
       method: "POST",
@@ -330,12 +399,14 @@ export function PosSaleDetailContent() {
     }
   }
 
-  async function markCollected(saleItemId: number) {
+  async function markCollected(saleItemId: number, qty?: number) {
     if (!sale) return;
     setBusy(true);
     setError("");
     try {
-      const json = await postAction({ action: "mark_collected", sale_id: String(sale.id), sale_item_id: String(saleItemId) });
+      const payload: Record<string, string> = { action: "mark_collected", sale_id: String(sale.id), sale_item_id: String(saleItemId) };
+      if (qty && qty > 0) payload.collect_qty = String(qty);
+      const json = await postAction(payload);
       if (json?.error) {
         setError(json.error);
       } else {
@@ -344,6 +415,60 @@ export function PosSaleDetailContent() {
       }
     } catch {
       setError("Errore durante la registrazione del ritiro.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function undoCollected(saleItemId: number) {
+    if (!sale) return;
+    setBusy(true);
+    setError("");
+    try {
+      const json = await postAction({ action: "undo_collected", sale_id: String(sale.id), sale_item_id: String(saleItemId) });
+      if (json?.error) setError(json.error);
+      else {
+        setFlash("Ritiro rimosso. Il prodotto e tornato in Preordini.");
+        load();
+      }
+    } catch {
+      setError("Errore durante la rimozione del ritiro.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function prepaidExecute(prepaidId: number, qty: number) {
+    if (!sale) return;
+    setBusy(true);
+    setError("");
+    try {
+      const json = await postAction({ action: "prepaid_manual_execute", sale_id: String(sale.id), prepaid_id: String(prepaidId), execute_qty: String(Math.max(1, qty)) });
+      if (json?.error) setError(json.error);
+      else {
+        setFlash("Servizio segnato come eseguito. Residuo aggiornato.");
+        load();
+      }
+    } catch {
+      setError("Errore durante l'esecuzione manuale.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function prepaidUndo(usageId: number) {
+    if (!sale) return;
+    setBusy(true);
+    setError("");
+    try {
+      const json = await postAction({ action: "prepaid_manual_undo", sale_id: String(sale.id), usage_id: String(usageId) });
+      if (json?.error) setError(json.error);
+      else {
+        setFlash("Esecuzione manuale annullata. Residuo ripristinato.");
+        load();
+      }
+    } catch {
+      setError("Errore durante l'annullamento dell'esecuzione.");
     } finally {
       setBusy(false);
     }
@@ -585,22 +710,154 @@ export function PosSaleDetailContent() {
             </div>
           ) : null}
 
-          {/* "Segna ritirato": ordered product lines awaiting pickup. */}
+          {/* "Segna ritirato": ordered product lines awaiting pickup (with partial-qty selector). */}
           {collectableItems.length > 0 ? (
             <div className="card p-3 mb-3">
               <div className="fw-semibold mb-1">Ritiro prodotti ordinati</div>
               <div className="small text-muted mb-2">Prodotti in attesa di ritiro collegati a questa vendita.</div>
               <div className="d-flex flex-column gap-2">
-                {collectableItems.map((it) => (
-                  <div key={it.id} className="border rounded p-2 d-flex flex-wrap align-items-center justify-content-between gap-2">
-                    <div>
-                      <span className="fw-semibold">{it.name}</span>
-                      <span className="text-muted small ms-2">x{it.quantity}</span>
-                      <span className="badge text-bg-warning ms-2">Ordinato</span>
+                {collectableItems.map((it) => {
+                  const track = preorderTracking.find((p) => p.saleItemId === it.id && p.status === "ordered");
+                  const lineQty = Math.max(1, Math.round(it.quantity));
+                  const collectMax = track ? Math.max(0, track.collectMax) : lineQty;
+                  const canCollect = track ? track.canCollect : true;
+                  const chosen = Math.max(1, Math.min(collectMax > 0 ? collectMax : 1, collectQty[it.id] ?? (collectMax > 0 ? collectMax : 1)));
+                  return (
+                    <div key={it.id} className="border rounded p-2 d-flex flex-wrap align-items-center justify-content-between gap-2">
+                      <div>
+                        <span className="fw-semibold">{it.name}</span>
+                        <span className="text-muted small ms-2">x{lineQty}</span>
+                        <span className="badge text-bg-warning ms-2">Ordinato</span>
+                        {track?.note ? <div className={`small mt-1 ${!canCollect ? "text-danger" : collectMax < lineQty ? "text-warning" : "text-muted"}`}>{track.note}</div> : null}
+                      </div>
+                      <div className="d-flex align-items-center gap-2">
+                        {lineQty > 1 ? (
+                          <input
+                            type="number"
+                            className="form-control form-control-sm text-end"
+                            style={{ width: "5rem" }}
+                            min={1}
+                            max={Math.max(1, collectMax)}
+                            step={1}
+                            value={chosen}
+                            disabled={busy || !canCollect}
+                            onChange={(e) => setCollectQty((m) => ({ ...m, [it.id]: Math.max(1, Math.min(Math.max(1, collectMax), Math.round(Number(e.target.value) || 1))) }))}
+                          />
+                        ) : null}
+                        <button type="button" className="btn btn-sm btn-success" disabled={busy || !canCollect} onClick={() => markCollected(it.id, lineQty > 1 ? chosen : undefined)}>
+                          <i className="bi bi-check2-circle me-1"></i>Segna ritirato
+                        </button>
+                      </div>
                     </div>
-                    <button type="button" className="btn btn-sm btn-success" disabled={busy} onClick={() => markCollected(it.id)}>
-                      <i className="bi bi-check2-circle me-1"></i>Segna ritirato
-                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          {/* "Cronologia utilizzo / ritiro": prepaid usage timelines + collected-pickup undo. */}
+          {hasTracking ? (
+            <div className="card p-3 mb-3">
+              <div className="fw-semibold mb-1">Cronologia utilizzo / ritiro</div>
+              <div className="small text-muted mb-2">Servizi prepagati e prodotti collegati a questa vendita.</div>
+              <div className="row g-3">
+                {prepaidTracking.map((card) => {
+                  const chosen = Math.max(1, Math.min(card.freeQty > 0 ? card.freeQty : 1, executeQty[card.prepaidId] ?? 1));
+                  return (
+                    <div className="col-12 col-xl-6" key={`pp-${card.prepaidId}`}>
+                      <div className="border rounded p-3 h-100">
+                        <div className="d-flex align-items-start justify-content-between gap-3">
+                          <div>
+                            <div className="fw-semibold">{card.title}</div>
+                            <div className="small text-muted">Servizio prepagato</div>
+                          </div>
+                          <span className="badge rounded-pill text-bg-info">Prepagato</span>
+                        </div>
+                        <div className="small text-muted mt-2">Prepagato #{card.prepaidId} • Residuo {card.remainingQty}/{card.purchasedQty}</div>
+
+                        {/* Residuo libero: manual-execution qty spinner + "Segna eseguito". */}
+                        <div className="border rounded p-2 bg-light mt-2">
+                          <div className="small text-muted mb-2">Residuo libero {card.freeQty} su {card.remainingQty}</div>
+                          <div className="d-flex flex-wrap align-items-center gap-2">
+                            {card.freeQty > 1 ? (
+                              <input
+                                type="number"
+                                className="form-control form-control-sm text-end"
+                                style={{ width: "5rem" }}
+                                min={1}
+                                max={card.freeQty}
+                                step={1}
+                                value={chosen}
+                                disabled={busy || !card.canExecute}
+                                onChange={(e) => setExecuteQty((m) => ({ ...m, [card.prepaidId]: Math.max(1, Math.min(card.freeQty, Math.round(Number(e.target.value) || 1))) }))}
+                              />
+                            ) : null}
+                            <button type="button" className="btn btn-sm btn-success" disabled={busy || !card.canExecute} onClick={() => prepaidExecute(card.prepaidId, card.freeQty > 1 ? chosen : 1)}>
+                              <i className="bi bi-check2-circle me-1"></i>Segna eseguito
+                            </button>
+                          </div>
+                          {card.note ? <div className={`small mt-2 ${!card.canExecute ? "text-danger" : "text-muted"}`}>{card.note}</div> : null}
+                        </div>
+
+                        {/* Usage timeline (newest-first) with per-manual "Annulla esecuzione". */}
+                        {card.usageHistory.length > 0 ? (
+                          <div className="mt-3">
+                            {card.usageHistory.map((ev, idx) => {
+                              const meta = usageEventMeta(ev);
+                              const isLast = idx === card.usageHistory.length - 1;
+                              return (
+                                <div key={`ev-${card.prepaidId}-${ev.usageId || ev.appointmentId || idx}`} className={`border-start ps-3 ms-1${isLast ? "" : " pb-3"}`}>
+                                  <div className="small text-muted mb-1">{fmtDateTime(ev.when)}</div>
+                                  <div className="d-flex flex-wrap align-items-center gap-2">
+                                    <div className="fw-semibold">{meta.title}</div>
+                                    <span className={`badge rounded-pill ${meta.cls}`}>{meta.label}</span>
+                                  </div>
+                                  <div className="small mt-1">
+                                    Qta {ev.qty}
+                                    {ev.appointmentId > 0 ? ` • ${ev.appointmentCode ? `Codice prenotazione ${ev.appointmentCode}` : `Prenotazione ID ${ev.appointmentId}`}` : ""}
+                                  </div>
+                                  {ev.operator ? <div className="small text-muted mt-1">Operatore: {ev.operator}</div> : null}
+                                  {ev.appointmentId > 0 && ev.appointmentLink ? (
+                                    <div className="mt-2">
+                                      <a className="btn btn-sm btn-outline-primary" href={ev.appointmentLink}><i className="bi bi-box-arrow-up-right me-1"></i>Apri prenotazione</a>
+                                    </div>
+                                  ) : null}
+                                  {ev.canUndo ? (
+                                    <div className="mt-2">
+                                      <button type="button" className="btn btn-sm btn-outline-danger" disabled={busy} onClick={() => prepaidUndo(ev.usageId)}>
+                                        <i className="bi bi-arrow-counterclockwise me-1"></i>Annulla esecuzione
+                                      </button>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div className="small text-muted mt-3">Nessun utilizzo registrato.</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {collectedProducts.map((p) => (
+                  <div className="col-12 col-xl-6" key={`cp-${p.saleItemId}`}>
+                    <div className="border rounded p-3 h-100">
+                      <div className="d-flex align-items-start justify-content-between gap-3">
+                        <div>
+                          <div className="fw-semibold">{p.name}</div>
+                          <div className="small text-muted">Prodotto ritirato • Qtà {p.qty}</div>
+                        </div>
+                        <span className="badge rounded-pill text-bg-success">Ritirato</span>
+                      </div>
+                      <div className="border rounded p-2 bg-light mt-2 d-flex flex-wrap align-items-center justify-content-between gap-2">
+                        <div className="small text-muted">Ritiro registrato • Qtà {p.qty}</div>
+                        <button type="button" className="btn btn-sm btn-outline-danger" disabled={busy} onClick={() => undoCollected(p.saleItemId)}>
+                          <i className="bi bi-arrow-counterclockwise me-1"></i>Rimuovi ritiro
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 ))}
               </div>
