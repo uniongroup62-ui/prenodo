@@ -82,11 +82,16 @@ export type SupplierRow = {
   phone: string;
   mobile: string;
   city: string;
+  province: string;
   vatNumber: string;
   isActive: boolean;
   isActiveCosts: boolean;
   warehouseLocationIds: number[];
   costLocationIds: number[];
+  // Usage counts — products linked by supplier_name, costs by supplier_id (the legacy "Uso" column
+  // + the delete-when-unused gate). productCount+costCount>0 blocks deletion.
+  productCount: number;
+  costCount: number;
 };
 
 // Full editable supplier record for the NEW / EDIT form. The list SupplierRow
@@ -563,22 +568,37 @@ async function listProductLocations(slug: string): Promise<ProductLocationRow[]>
 async function listSuppliers(slug: string): Promise<SupplierRow[]> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "suppliers", columns: "*", orderBy: "name ASC, id ASC" }).catch(() => []);
   const locationMaps = await supplierLocationMaps(slug, rows.map((row) => Number(row.id ?? 0)));
+  // Usage counts (faithful to the legacy "Uso" column): products link by supplier_name (string),
+  // costs by supplier_id. Counted in memory from tenant-scoped reads (guarded — the costs table may
+  // be absent). Drives the "Prodotti/Costi: N" display + the delete-when-unused gate.
+  const [prodRows, costRows] = await Promise.all([
+    tenantSelect<RowDataPacket>({ slug, table: "products", columns: "supplier_name" }).catch(() => [] as RowDataPacket[]),
+    tenantSelect<RowDataPacket>({ slug, table: "costs", columns: "supplier_id" }).catch(() => [] as RowDataPacket[]),
+  ]);
+  const productCountByName = new Map<string, number>();
+  for (const r of prodRows) { const n = String(r.supplier_name ?? "").trim(); if (n) productCountByName.set(n, (productCountByName.get(n) ?? 0) + 1); }
+  const costCountBySupplierId = new Map<number, number>();
+  for (const r of costRows) { const sid = Number(r.supplier_id ?? 0) || 0; if (sid > 0) costCountBySupplierId.set(sid, (costCountBySupplierId.get(sid) ?? 0) + 1); }
   return rows.map((row) => {
     const id = Number(row.id ?? 0);
+    const name = String(row.name ?? "");
     const maps = locationMaps.get(id) ?? { warehouse: [], costs: [] };
     return {
       id,
-      name: String(row.name ?? ""),
+      name,
       businessName: String(row.business_name ?? ""),
       email: String(row.email ?? ""),
       phone: String(row.phone ?? ""),
       mobile: String(row.mobile ?? ""),
       city: String(row.city ?? ""),
+      province: String(row.province ?? ""),
       vatNumber: String(row.vat_number ?? ""),
       isActive: Number(row.is_active ?? 1) === 1,
       isActiveCosts: Number(row.is_active_costs ?? 1) === 1,
       warehouseLocationIds: maps.warehouse,
       costLocationIds: maps.costs,
+      productCount: productCountByName.get(name.trim()) ?? 0,
+      costCount: costCountBySupplierId.get(id) ?? 0,
     };
   });
 }

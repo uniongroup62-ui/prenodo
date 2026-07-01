@@ -14,11 +14,14 @@ type Supplier = {
   phone: string;
   mobile: string;
   city: string;
+  province: string;
   vatNumber: string;
   isActive: boolean;
   isActiveCosts: boolean;
   warehouseLocationIds: number[];
   costLocationIds: number[];
+  productCount: number;
+  costCount: number;
 };
 
 type LocationRow = { id: number; name: string; isActive: boolean };
@@ -38,6 +41,7 @@ export function SuppliersContent() {
     "all" | "warehouse_active" | "warehouse_inactive" | "costs_active" | "costs_inactive"
   >("all");
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(0);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -62,6 +66,30 @@ export function SuppliersContent() {
 
   function href(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`suppliers${suffix}`.replace("&", "?")}`;
+  }
+
+  // Delete a supplier via POST (the server refuses one still used by products/costs); reloads on
+  // success. Confirm-gated. Replaces the old GET ?action=delete link (which fell to the Tailwind app).
+  async function deleteSupplier(s: Supplier) {
+    if (busyId) return;
+    if (s.productCount + s.costCount > 0) return;
+    if (typeof window !== "undefined" && !window.confirm("Eliminare definitivamente questo fornitore?")) return;
+    setBusyId(s.id);
+    try {
+      const res = await fetch(`/api/manage/products?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "supplier_delete", id: s.id }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        if (typeof window !== "undefined") window.alert(j?.error || "Impossibile eliminare il fornitore.");
+      } else {
+        load();
+      }
+    } finally {
+      setBusyId(0);
+    }
   }
 
   const locationNames = useMemo(() => {
@@ -224,6 +252,9 @@ export function SuppliersContent() {
                       const phone = (s.phone ?? "").trim();
                       const email = (s.email ?? "").trim();
                       const city = (s.city ?? "").trim();
+                      const province = (s.province ?? "").trim();
+                      const locality = city ? (province ? `${city} (${province})` : city) : (province || "—");
+                      const usageCount = (s.productCount ?? 0) + (s.costCount ?? 0);
                       return (
                         <tr key={s.id}>
                           <td className="fw-semibold">{s.name}</td>
@@ -231,7 +262,7 @@ export function SuppliersContent() {
                             {phone !== "" ? phone : "—"}
                             {email !== "" ? <div className="small">{email}</div> : null}
                           </td>
-                          <td className="text-muted">{city !== "" ? city : "—"}</td>
+                          <td className="text-muted">{locality}</td>
                           <td>
                             <div className="d-flex flex-column gap-1">
                               <div>
@@ -267,8 +298,8 @@ export function SuppliersContent() {
                             </div>
                           </td>
                           <td className="text-muted small">
-                            <div>Prodotti: —</div>
-                            <div>Costi: —</div>
+                            <div>Prodotti: {s.productCount ?? 0}</div>
+                            <div>Costi: {s.costCount ?? 0}</div>
                           </td>
                           <td className="text-end">
                             <a
@@ -277,13 +308,25 @@ export function SuppliersContent() {
                             >
                               Modifica
                             </a>{" "}
-                            <a
-                              className="btn btn-sm btn-outline-danger"
-                              href={href(`&action=delete&id=${s.id}`)}
-                              data-confirm="Eliminare definitivamente questo fornitore?"
-                            >
-                              Elimina
-                            </a>
+                            {usageCount > 0 ? (
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-outline-danger"
+                                disabled
+                                title="Fornitore usato in prodotti o costi: non puo essere eliminato."
+                              >
+                                Elimina
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-outline-danger"
+                                disabled={busyId === s.id}
+                                onClick={() => deleteSupplier(s)}
+                              >
+                                Elimina
+                              </button>
+                            )}
                           </td>
                         </tr>
                       );
