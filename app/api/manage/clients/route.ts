@@ -70,6 +70,14 @@ export async function GET(request: Request) {
         // each entry is a still-available service reward covering its service_id, pinned by
         // instance_id + reward_item_index (the reward's array index in reward_items_json).
         gifts: context.gifts,
+        // FIDELITY redeem settings + the client's available points, for the drawer's
+        // #qbFidelityBox (Block 4): pointsAvailable = clients.points; euroPerPoint/minPoints/
+        // redeemEnabled mirror Fidelity::settings() so the drawer can bound the points-use
+        // input and compute the "Sconto Fidelity" (pointsUsed x euroPerPoint) deduction.
+        fidelity: context.fidelity,
+        // The client's spendable CREDIT balance (clients.credit_balance) for the drawer's
+        // inline "Usa credito" input (Block 4). Same source the residuals credit badge uses.
+        creditAvailable: context.residuals.credit_available,
       });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore contesto cliente.");

@@ -1322,6 +1322,71 @@ function normalizeAppointmentDiscount(
   return { discount_type: dtype, discount_value: roundMoney(dval) };
 }
 
+// COUPON persistence via appointments.notes (Block 4). The Next appointments table has no
+// coupon_code/coupon_discount columns (unlike the legacy sales/appointments), so — mirroring
+// the legacy coupon_apply_meta_to_notes (Helpers.php:3329) — the applied coupon is embedded
+// as two marker lines appended to notes: "Coupon: <CODE>" and "Sconto coupon: - € <AMT>".
+// extract_coupon_meta_from_notes reads them back on action=get so an edited appointment
+// re-shows the coupon. The markers are stripped before re-embedding so a re-save can't stack.
+const COUPON_CODE_MARKER = "Coupon:";
+const COUPON_DISCOUNT_MARKER = "Sconto coupon: - €"; // "Sconto coupon: - €"
+
+// Format an amount the legacy way for the notes marker: 2 decimals, dot-decimal (the legacy
+// stores the raw figure; the drawer re-parses it tolerating comma/dot). e.g. 5 -> "5.00".
+function formatCouponAmount(amount: number): string {
+  return (Math.round((Math.max(0, amount) + Number.EPSILON) * 100) / 100).toFixed(2);
+}
+
+// Strip any previously-embedded coupon marker lines from a notes string (idempotent), so
+// re-embedding never duplicates them. Trims trailing blank lines the strip may leave.
+function stripCouponMetaFromNotes(notes: unknown): string {
+  const raw = String(notes ?? "");
+  if (!raw) return "";
+  const kept = raw
+    .split(/\r?\n/)
+    .filter((line) => {
+      const t = line.trim();
+      return !(t.startsWith(COUPON_CODE_MARKER) || t.startsWith(COUPON_DISCOUNT_MARKER));
+    });
+  return kept.join("\n").replace(/\n+$/g, "").trim();
+}
+
+// Embed the applied coupon (code + discount) into notes as the two marker lines, after
+// stripping any prior markers. Empty code / non-positive discount => the markers are removed
+// (a coupon was cleared). Returns the new notes string (may be ""), for the notes column.
+function couponApplyMetaToNotes(
+  notes: unknown,
+  couponCode: string | undefined,
+  couponDiscount: number | undefined,
+): string {
+  const base = stripCouponMetaFromNotes(notes);
+  const code = String(couponCode ?? "").trim().toUpperCase();
+  const amount = roundMoney(Math.max(0, Number(couponDiscount ?? 0) || 0));
+  if (!code || amount <= 0) return base;
+  const markers = `${COUPON_CODE_MARKER} ${code}\n${COUPON_DISCOUNT_MARKER} ${formatCouponAmount(amount)}`;
+  return base ? `${base}\n${markers}` : markers;
+}
+
+// Read the embedded coupon back out of a notes string (port of extract_coupon_meta_from_notes,
+// api_appointments.php:8950). Returns the code + discount when both markers are present, else
+// an empty code + 0 (no coupon). Tolerates comma/dot in the amount.
+function extractCouponMetaFromNotes(notes: unknown): { code: string; discount: number } {
+  const raw = String(notes ?? "");
+  if (!raw) return { code: "", discount: 0 };
+  let code = "";
+  let discount = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (t.startsWith(COUPON_CODE_MARKER)) {
+      code = t.slice(COUPON_CODE_MARKER.length).trim().toUpperCase();
+    } else if (t.startsWith(COUPON_DISCOUNT_MARKER)) {
+      discount = roundMoney(Math.max(0, parseMoney(t.slice(COUPON_DISCOUNT_MARKER.length), 0)));
+    }
+  }
+  if (!code || discount <= 0) return { code: "", discount: 0 };
+  return { code, discount };
+}
+
 export async function createDbAppointment({
   slug,
   clientName,
@@ -1350,6 +1415,10 @@ export async function createDbAppointment({
   status: statusInput = "pending",
   discountType,
   discountValue,
+  fidelityPointsUsed,
+  creditUsed,
+  couponCode,
+  couponDiscount,
 }: {
   slug: string;
   clientName: string;
@@ -1364,6 +1433,13 @@ export async function createDbAppointment({
   status?: string;
   discountType?: string;
   discountValue?: string;
+  // Block 4 deductions from the drawer price panel: fidelity points RESERVED at booking
+  // (settled on done by awardAppointmentFidelityOnDone), the customer CREDIT spent (debited
+  // from the wallet at create), and the applied COUPON (embedded into notes).
+  fidelityPointsUsed?: number;
+  creditUsed?: number;
+  couponCode?: string;
+  couponDiscount?: number;
 } & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   const client = await resolveClientForAppointment(slug, clientName, locationId);
   const staff = operator ? await resolveStaffForAppointment(slug, operator) : null;
@@ -1411,6 +1487,14 @@ export async function createDbAppointment({
   // Manual sconto from the quick-booking price panel (#qb_discount_type/#qb_discount_value),
   // normalized to the discount_type/discount_value columns (was hardcoded to 0 before).
   const discount = normalizeAppointmentDiscount(discountType, discountValue);
+  // Block 4: fidelity points RESERVED (settled on done) + CREDIT spent, persisted on the row
+  // so the lifecycle (awardAppointmentFidelityOnDone earn/redeem, cancelDone/restore refunds)
+  // can settle/reverse them. Both clamped >= 0; fidelity points are whole.
+  const fidelityPointsUse = Math.max(0, Math.round(Number(fidelityPointsUsed ?? 0) || 0));
+  const creditUse = roundMoney(Math.max(0, Number(creditUsed ?? 0) || 0));
+  // Block 4: embed the applied coupon into the general `notes` column (the appointments table
+  // has no coupon columns), mirroring the legacy coupon_apply_meta_to_notes.
+  const notesWithCoupon = couponApplyMetaToNotes(null, couponCode, couponDiscount);
   const appointmentValues: Record<string, unknown> = {
     client_id: client.id,
     service_id: plan.primaryService.id,
@@ -1420,6 +1504,9 @@ export async function createDbAppointment({
     status: normalizedStatus,
     discount_type: discount.discount_type,
     discount_value: discount.discount_value,
+    fidelity_points_used: fidelityPointsUse,
+    credit_used: creditUse,
+    notes: notesWithCoupon || null,
     location_id: locationId,
     staff_notes: staffNotes || null,
     customer_notes: customerNotes || null,
@@ -1522,6 +1609,28 @@ export async function createDbAppointment({
     });
     if (giftcardWarnings) giftcardWarnings.push(...warnings);
   }
+  // CREDIT debit (Block 4): when the drawer applied customer credit (credit_used>0), DEBIT the
+  // client wallet at booking (mirroring the giftcard decrement) so the balance drops immediately.
+  // A cancel (pending->canceled via restoreAppointmentRedeems) or cancel-done (cancelDoneAppointment)
+  // re-credits it. Best-effort: a credit debit failure never fails the booking; on failure we zero
+  // the persisted credit_used so a later restore can't refund credit that was never debited.
+  if (creditUse > 0 && Number(client.id ?? 0) > 0) {
+    try {
+      await addDbWalletMovement(
+        {
+          clientId: Number(client.id),
+          type: "debit",
+          amount: -creditUse,
+          source_type: "appointment",
+          source_id: id,
+          note: `Utilizzo credito prenotazione #${id}`,
+        },
+        slug,
+      );
+    } catch {
+      await tenantUpdate({ slug, table: "appointments", id, values: { credit_used: 0 } }).catch(() => 0);
+    }
+  }
   if (token) await markDbAppointmentHoldConverted(slug, token, "manage", id);
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", where: "id = ?", params: [id], limit: 1 });
@@ -1554,6 +1663,10 @@ export async function updateDbAppointment({
   cabinMap = {},
   discountType,
   discountValue,
+  fidelityPointsUsed,
+  creditUsed,
+  couponCode,
+  couponDiscount,
 }: {
   slug: string;
   id: number;
@@ -1568,6 +1681,15 @@ export async function updateDbAppointment({
   customerNotes?: string | null;
   discountType?: string;
   discountValue?: string;
+  // Block 4: mirrors createDbAppointment. Persisted so the price panel round-trips on edit and
+  // the lifecycle can settle/reverse. NOTE: updateDbAppointment does NOT re-debit the wallet
+  // credit (the debit happened at create; re-saving must not double-charge) and does NOT
+  // re-apply redeems (see the redeem-on-edit TODO) — it only persists the columns + coupon
+  // notes so a re-open shows them. The drawer today only sends these on CREATE.
+  fidelityPointsUsed?: number;
+  creditUsed?: number;
+  couponCode?: string;
+  couponDiscount?: number;
 } & MultiServiceAppointmentInput): Promise<AppointmentWithMeta> {
   // Tenant-scoped existence guard: the SELECT only returns rows for this tenant,
   // so a row from another tenant (or a missing id) yields no match.
@@ -1617,22 +1739,40 @@ export async function updateDbAppointment({
   // Manual sconto from the quick-booking price panel (#qb_discount_type/#qb_discount_value),
   // normalized to the discount_type/discount_value columns (mirrors createDbAppointment).
   const discount = normalizeAppointmentDiscount(discountType, discountValue);
+  const updateValues: Record<string, unknown> = {
+    client_id: client.id,
+    service_id: plan.primaryService.id,
+    cabin_id: plan.primaryCabinId,
+    starts_at: start,
+    ends_at: end,
+    location_id: locationId,
+    staff_notes: staffNotes || null,
+    customer_notes: customerNotes || null,
+    discount_type: discount.discount_type,
+    discount_value: discount.discount_value,
+  };
+  // Block 4: persist the price-panel deductions ONLY when the caller sent them (the drawer
+  // sends them on CREATE; a plain edit/move leaves them undefined and must not clobber the
+  // existing reservation). fidelity/credit are persisted as-is (NO wallet re-debit here — the
+  // create-time debit stands; re-saving must not double-charge). Coupon is re-embedded into
+  // `notes` (preserving any non-coupon note text), matching coupon_apply_meta_to_notes.
+  if (fidelityPointsUsed !== undefined) {
+    updateValues.fidelity_points_used = Math.max(0, Math.round(Number(fidelityPointsUsed) || 0));
+  }
+  if (creditUsed !== undefined) {
+    updateValues.credit_used = roundMoney(Math.max(0, Number(creditUsed) || 0));
+  }
+  if (couponCode !== undefined || couponDiscount !== undefined) {
+    const currentRows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "notes", where: "id = ?", params: [id], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    const currentNotes = currentRows[0] ? String(currentRows[0].notes ?? "") : "";
+    const merged = couponApplyMetaToNotes(currentNotes, couponCode, couponDiscount);
+    updateValues.notes = merged || null;
+  }
   await tenantUpdate({
     slug,
     table: "appointments",
     id,
-    values: {
-      client_id: client.id,
-      service_id: plan.primaryService.id,
-      cabin_id: plan.primaryCabinId,
-      starts_at: start,
-      ends_at: end,
-      location_id: locationId,
-      staff_notes: staffNotes || null,
-      customer_notes: customerNotes || null,
-      discount_type: discount.discount_type,
-      discount_value: discount.discount_value,
-    },
+    values: updateValues,
   });
 
   // Replace the snapshot child rows so the edit reflects the new
@@ -1909,6 +2049,12 @@ export type AppointmentEditPayload = {
   // panel prefills it on edit (round-trips with createDbAppointment/updateDbAppointment).
   discountType: string;
   discountValue: number;
+  // Block 4: the persisted price-panel deductions, so the drawer prefills them on edit.
+  // fidelityPointsUsed = appointments.fidelity_points_used (points reserved); creditUsed =
+  // appointments.credit_used; coupon = { code, discount } extracted from notes (or null).
+  fidelityPointsUsed: number;
+  creditUsed: number;
+  coupon: { code: string; discount: number } | null;
 };
 
 export async function getDbAppointmentForEdit(slug: string, id: number): Promise<AppointmentEditPayload | null> {
@@ -2023,6 +2169,14 @@ export async function getDbAppointmentForEdit(slug: string, id: number): Promise
     // Manual sconto: "" (none) | "percent" | "fixed" + its value (0 when no discount).
     discountType: String(row.discount_type ?? "") === "percent" || String(row.discount_type ?? "") === "fixed" ? String(row.discount_type) : "",
     discountValue: roundMoney(Number(row.discount_value ?? 0)),
+    // Block 4 deductions: the reserved fidelity points + spent credit + the coupon (read back
+    // from the notes markers via extract_coupon_meta_from_notes) for the price-panel prefill.
+    fidelityPointsUsed: Math.max(0, Math.round(Number(row.fidelity_points_used ?? 0) || 0)),
+    creditUsed: roundMoney(Math.max(0, parseMoney(row.credit_used, 0))),
+    coupon: (() => {
+      const meta = extractCouponMetaFromNotes(row.notes);
+      return meta.code && meta.discount > 0 ? meta : null;
+    })(),
   };
 }
 
@@ -2092,11 +2246,12 @@ export async function restoreAppointmentRedeems(slug: string, appointmentId: num
   const id = Number(appointmentId);
   if (!Number.isFinite(id) || id <= 0) return;
 
-  // Appointment-level giftcard linkage (refund amount + which card).
+  // Appointment-level giftcard linkage (refund amount + which card) + the Block 4
+  // credit/fidelity reservations (credit debited at create, fidelity points reserved).
   const existing = await tenantSelect<RowDataPacket>({
     slug,
     table: "appointments",
-    columns: "id, giftcard_id, giftcard_used",
+    columns: "id, client_id, giftcard_id, giftcard_used, credit_used, fidelity_points_used",
     where: "id = ?",
     params: [id],
     limit: 1,
@@ -2147,6 +2302,33 @@ export async function restoreAppointmentRedeems(slug: string, appointmentId: num
   const giftcardUsed = roundMoney(Math.max(0, parseMoney(existing[0].giftcard_used, 0)));
   if (giftcardId > 0 && giftcardUsed > 0) {
     await restoreGiftcardBalance(slug, giftcardId, giftcardUsed);
+  }
+
+  // Block 4 CREDIT restore: the drawer DEBITED the client wallet at create (credit_used>0),
+  // so a cancel/no_show (pending/scheduled -> canceled, this path) or the cancel-done flow
+  // must re-credit it. Re-credit the wallet then ZERO credit_used so a re-run can't double
+  // refund. This is the single source of truth for the credit refund — cancelDoneAppointment
+  // calls this helper first (step 2), so its own step 4 no longer re-refunds credit.
+  const clientId = Math.max(0, Number(existing[0].client_id ?? 0) || 0);
+  const creditUsed = roundMoney(Math.max(0, parseMoney(existing[0].credit_used, 0)));
+  if (creditUsed > 0 && clientId > 0) {
+    await addDbWalletMovement(
+      { clientId, type: "recharge", amount: creditUsed, source_type: "appointment", source_id: id, note: `Storno credito prenotazione #${id}` },
+      slug,
+    ).catch(() => undefined);
+    await tenantUpdate({ slug, table: "appointments", id, values: { credit_used: 0 } }).catch(() => 0);
+  }
+
+  // Block 4 FIDELITY reservation drop: for a pending/scheduled cancel the points were only
+  // RESERVED (fidelity_points_used>0) — never redeemed from the wallet (the redeem settles on
+  // done via awardAppointmentFidelityOnDone). So there is nothing to refund to the wallet; we
+  // just ZERO the reservation so the canceled booking holds none. When this runs as step 2 of
+  // cancelDoneAppointment (a DONE booking whose redeem WAS settled), the redeem refund is done
+  // by that flow's step 3 (points_earn +pointsUsed) using the value it captured BEFORE calling
+  // this helper, so zeroing here does not lose it. Best-effort.
+  const fidelityPointsUsed = Math.max(0, Math.round(Number(existing[0].fidelity_points_used ?? 0) || 0));
+  if (fidelityPointsUsed > 0) {
+    await tenantUpdate({ slug, table: "appointments", id, values: { fidelity_points_used: 0 } }).catch(() => 0);
   }
 }
 
@@ -2229,14 +2411,19 @@ export async function cancelDoneAppointment(
   try {
     // REVERSE the EARNED points: a negative points_redeem removes the loyalty points
     // awarded when the appointment was completed, so a canceled booking leaves none.
+    // IMPORTANT: the reversal movements DO NOT tag source_type/source_id — the settlement
+    // rows (awardAppointmentFidelityOnDone) already occupy the unique key (tenant_id, client_id,
+    // kind, source_type, source_id) = (..,'earn'|'redeem','appointment',id), so a same-kind
+    // reversal tagged the same way would violate `transactions_uq_fid_src`. We mirror the POS
+    // void (manage-pos.ts cancelLinkedSaleResidues), which leaves source_type/source_id NULL on
+    // its reversal movements (NULLs are distinct in the unique index) — so the storno always
+    // inserts. Idempotency here is the step-1 status guard (a canceled row can't be re-cancelled).
     if (pointsEarned > 0 && clientId > 0) {
       await addDbWalletMovement(
         {
           clientId,
           type: "points_redeem",
           points: -pointsEarned,
-          source_type: "appointment",
-          source_id: id,
           createdBy: by,
           note: `Storno punti guadagnati prenotazione #${id}`,
         },
@@ -2248,38 +2435,34 @@ export async function cancelDoneAppointment(
       await tenantUpdate({ slug, table: "appointments", id, values: { fidelity_points_earned: 0 } }).catch(() => 0);
     }
     // REFUND the USED/redeemed points: a positive points_earn re-credits clients.points
-    // (the inverse of the points_redeem reserved at booking). Dormant (always 0 today).
+    // (the inverse of the points_redeem SETTLED on done by awardAppointmentFidelityOnDone).
+    // We use `pointsUsed` captured BEFORE restoreAppointmentRedeems (step 2) zeroed the
+    // reservation column, so the refund is not lost. Block 4: fires when the done booking
+    // actually redeemed points (fidelity_points_used>0). Untagged (see the note above) so it
+    // does not collide with the settlement redeem row under the unique index.
     if (pointsUsed > 0 && clientId > 0) {
       await addDbWalletMovement(
         {
           clientId,
           type: "points_earn",
           points: pointsUsed,
-          source_type: "appointment",
-          source_id: id,
           createdBy: by,
           note: `Storno punti usati prenotazione #${id}`,
         },
         slug,
       ).catch(() => undefined);
     }
-    if (pointsUsed > 0) {
-      await tenantUpdate({ slug, table: "appointments", id, values: { fidelity_points_used: 0 } }).catch(() => 0);
-    }
+    // fidelity_points_used is already zeroed by restoreAppointmentRedeems (step 2); no re-zero
+    // needed here (a re-run is guarded by the status validation in step 1 anyway).
   } catch {
     // best-effort: fidelity reverse must never block the status flip.
   }
 
-  // 4) CREDIT restore: re-credit the client wallet by the credit this appointment spent,
-  //    then zero appointments.credit_used so a re-run can't double-credit. Dormant today
-  //    (credit_used is always 0 — the drawer credit row is inert/Block 4) but ported.
-  if (creditUsed > 0 && clientId > 0) {
-    await addDbWalletMovement(
-      { clientId, type: "recharge", amount: creditUsed, note: `Storno credito prenotazione #${id}` },
-      slug,
-    ).catch(() => undefined);
-    await tenantUpdate({ slug, table: "appointments", id, values: { credit_used: 0 } }).catch(() => 0);
-  }
+  // 4) CREDIT restore is now handled inside restoreAppointmentRedeems (step 2 above) — the
+  //    single source of truth for the credit refund (re-credits the wallet + zeroes
+  //    credit_used). We keep `creditUsed` captured above only for the log note below; no
+  //    second refund happens here (that would double-credit).
+  void creditUsed;
 
   // 5) Flip the status to the php target (canceled|no_show). The ROW is KEPT (legacy
   //    keeps canceled appointments). This is the one step that must always run.
@@ -7575,6 +7758,18 @@ export type QuickBookClientGift = {
   name: string;
 };
 
+// FIDELITY REDEEM context for the quick-booking drawer's "Punti Fidelity" box (Block 4).
+// `pointsAvailable` is the client's spendable clients.points balance (the same source the
+// POS residuals + wallet use); the settings mirror Fidelity::settings() redeem block
+// (euroPerPoint for points->€, minPoints the minimum redeemable, redeemEnabled the global
+// gate). The drawer converts pointsUsed*euroPerPoint into the "Sconto Fidelity" deduction.
+export type QuickBookClientFidelity = {
+  redeemEnabled: boolean;
+  euroPerPoint: number;
+  minPoints: number;
+  pointsAvailable: number;
+};
+
 export type QuickBookClientContext = {
   history: QuickBookClientHistorySummary;
   residuals: QuickBookClientResidualsSummary;
@@ -7583,7 +7778,44 @@ export type QuickBookClientContext = {
   giftcards: QuickBookClientGiftcard[];
   giftboxes: QuickBookClientGiftbox[];
   gifts: QuickBookClientGift[];
+  // Block 4: fidelity redeem settings + the client's available points, so the drawer's
+  // #qbFidelityBox can offer a bounded points-use input and compute the € discount.
+  fidelity: QuickBookClientFidelity;
 };
+
+// Port of Fidelity::settings() redeem block (app/lib/Fidelity.php ~610-620): the redeem
+// config off the single `businesses` row, with the legacy defaults + clamps. Duplicated
+// here (rather than imported from manage-pos) to avoid a manage-pos -> db-repositories
+// import cycle. euroPerPoint defaults 0.10 (>0, <=100000); minPoints defaults 0 (whole,
+// [0, 100000000]); redeemEnabled = fidelity_enabled AND fidelity_redeem_enabled. Schema-
+// guarded: a missing column falls back to the defaults (redeem disabled).
+async function quickBookFidelityRedeemSettings(
+  slug: string,
+): Promise<{ redeemEnabled: boolean; euroPerPoint: number; minPoints: number }> {
+  const defaults = { redeemEnabled: false, euroPerPoint: 0.1, minPoints: 0 };
+  try {
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "businesses",
+      columns: "fidelity_enabled,fidelity_redeem_enabled,fidelity_redeem_euro_per_point,fidelity_redeem_min_points",
+      orderBy: "id ASC",
+      limit: 1,
+    });
+    const row = rows[0];
+    if (!row) return defaults;
+    const enabled = Number(row.fidelity_enabled ?? 0) === 1 && Number(row.fidelity_redeem_enabled ?? 0) === 1;
+    let euroPerPoint = Number(row.fidelity_redeem_euro_per_point ?? 0.1);
+    if (!Number.isFinite(euroPerPoint) || euroPerPoint <= 0) euroPerPoint = 0.1;
+    if (euroPerPoint > 100000) euroPerPoint = 100000;
+    let minPoints = Number(row.fidelity_redeem_min_points ?? 0);
+    if (!Number.isFinite(minPoints) || minPoints < 0) minPoints = 0;
+    if (minPoints > 100000000) minPoints = 100000000;
+    minPoints = Math.max(0, Math.round(minPoints));
+    return { redeemEnabled: enabled, euroPerPoint: roundMoney(euroPerPoint), minPoints };
+  } catch {
+    return defaults;
+  }
+}
 
 // History summary — port of api_clients.php lines ~3926-3958:
 //   total      = COUNT(*) of ALL appointments for the client (no status filter)
@@ -7810,16 +8042,25 @@ export async function quickBookClientContext({
   locationId?: number;
 }): Promise<QuickBookClientContext> {
   if (clientId <= 0) throw new Error("client_id mancante");
-  const [history, residuals, packages, prepaids, giftcards, giftboxes, gifts] = await Promise.all([
-    quickBookClientHistorySummary(slug, clientId),
-    quickBookClientResidualsSummary(slug, clientId),
-    quickBookClientPackages(slug, clientId),
-    quickBookClientPrepaids(slug, clientId),
-    quickBookClientGiftcards(slug, clientId),
-    quickBookClientGiftboxes(slug, clientId),
-    quickBookClientGifts(slug, clientId),
-  ]);
-  return { history, residuals, packages, prepaids, giftcards, giftboxes, gifts };
+  const [history, residuals, packages, prepaids, giftcards, giftboxes, gifts, fidelitySettings, wallet] =
+    await Promise.all([
+      quickBookClientHistorySummary(slug, clientId),
+      quickBookClientResidualsSummary(slug, clientId),
+      quickBookClientPackages(slug, clientId),
+      quickBookClientPrepaids(slug, clientId),
+      quickBookClientGiftcards(slug, clientId),
+      quickBookClientGiftboxes(slug, clientId),
+      quickBookClientGifts(slug, clientId),
+      quickBookFidelityRedeemSettings(slug),
+      dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 })),
+    ]);
+  const fidelity: QuickBookClientFidelity = {
+    redeemEnabled: fidelitySettings.redeemEnabled,
+    euroPerPoint: fidelitySettings.euroPerPoint,
+    minPoints: fidelitySettings.minPoints,
+    pointsAvailable: Math.max(0, Math.round(Number(wallet.points ?? 0) || 0)),
+  };
+  return { history, residuals, packages, prepaids, giftcards, giftboxes, gifts, fidelity };
 }
 
 // Available (redeemable) packages for a client, with the services each package

@@ -611,10 +611,18 @@ export async function POST(request: Request) {
       // #qb_discount_value). Threaded into create/updateDbAppointment (the appointments
       // table has discount_type/discount_value columns); each clamps it the same way the
       // drawer's recompute does. Empty type => no discount. Mirrors how `status` is threaded.
-      // TODO(coupon-persist): coupon_code/coupon_discount are posted by the drawer but the
-      // Next appointments table has no coupon columns yet, so they are not persisted here.
       discountType: body.discount_type ? String(body.discount_type) : undefined,
       discountValue: body.discount_value === undefined ? undefined : String(body.discount_value),
+      // Block 4 price-panel deductions from the drawer. fidelity_points_use = the points the
+      // staff chose to REDEEM (reserved on the row; settled -points_redeem on done by
+      // awardAppointmentFidelityOnDone). credit_use = the customer CREDIT applied (debited from
+      // the wallet at create; refunded on cancel via restoreAppointmentRedeems). coupon_code/
+      // coupon_discount = the applied coupon (embedded into appointments.notes since the table
+      // has no coupon columns). All re-validated/clamped server-side inside create/update.
+      fidelityPointsUsed: body.fidelity_points_use === undefined ? undefined : Math.max(0, Math.round(Number(body.fidelity_points_use) || 0)),
+      creditUsed: body.credit_use === undefined ? undefined : Math.max(0, Number(body.credit_use) || 0),
+      couponCode: body.coupon_code === undefined ? undefined : String(body.coupon_code ?? ""),
+      couponDiscount: body.coupon_discount === undefined ? undefined : Math.max(0, Number(body.coupon_discount) || 0),
       packageRedeems,
       packageWarnings,
       prepaidRedeems,

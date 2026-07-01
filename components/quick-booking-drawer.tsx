@@ -104,6 +104,12 @@ type AppointmentEditPayload = {
   // Persisted manual sconto (discount_type/discount_value) to prefill the price panel.
   discountType?: string;
   discountValue?: number;
+  // Block 4: the persisted price-panel deductions, to prefill on edit. fidelityPointsUsed =
+  // the reserved points; creditUsed = the spent credit; coupon = the code+discount read back
+  // from notes (or null when none).
+  fidelityPointsUsed?: number;
+  creditUsed?: number;
+  coupon?: { code: string; discount: number } | null;
 };
 
 // Minimal Bootstrap offcanvas/modal surface used here (the bundle is loaded by
@@ -257,6 +263,17 @@ type QbClientGift = {
   service_id: number;
   name: string;
 };
+// Block 4: fidelity redeem settings + the client's available points (from
+// quickbook_client_context). Drives #qbFidelityBox: the points-use input is bounded by
+// [0, min(pointsAvailable, floor(remainingTotal/euroPerPoint))] respecting minPoints, and the
+// € discount = pointsUsed x euroPerPoint. Only offered when redeemEnabled.
+type QbClientFidelity = {
+  redeemEnabled?: boolean;
+  euroPerPoint?: number;
+  minPoints?: number;
+  pointsAvailable?: number;
+};
+
 type QbClientContextResponse = {
   ok?: boolean;
   summary?: QbHistorySummary;
@@ -266,6 +283,9 @@ type QbClientContextResponse = {
   giftcards?: QbClientGiftcard[];
   giftboxes?: QbClientGiftbox[];
   gifts?: QbClientGift[];
+  // Block 4: fidelity redeem settings + the client's points; the client's spendable credit.
+  fidelity?: QbClientFidelity;
+  creditAvailable?: number;
 };
 
 // One entry written to #qb_package_redeem (assets/js/app.js qbReadPackageRedeem):
@@ -402,6 +422,26 @@ export function QuickBookingDrawer() {
   const [couponMsg, setCouponMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [couponApplying, setCouponApplying] = useState(false);
   const couponReqRef = useRef(0);
+
+  // ---- FIDELITY points use (#qbFidelityBox / #qb_fidelity_points_use) — Block 4 ----
+  // The client's redeem context (from quickbook_client_context): whether redeem is enabled,
+  // euro-per-point, the minimum redeemable, and the client's available points. `fidelityInput`
+  // is the raw points text the staff types (parsed/clamped in the recompute -> the € discount
+  // = pointsUsed x euroPerPoint feeds the Totale + #qb_fidelity_points_use on save). Reset by
+  // resetForm; the settings are loaded on client select (cleared on client change).
+  const [fidelityRedeemEnabled, setFidelityRedeemEnabled] = useState(false);
+  const [fidelityEuroPerPoint, setFidelityEuroPerPoint] = useState<number>(0.1);
+  const [fidelityMinPoints, setFidelityMinPoints] = useState<number>(0);
+  const [fidelityPointsAvailable, setFidelityPointsAvailable] = useState<number>(0);
+  const [fidelityInput, setFidelityInput] = useState<string>("");
+
+  // ---- CREDIT use (#qbCreditRow / #qb_credit_use) — Block 4 ----
+  // The client's spendable credit balance (clients.credit_balance) + the raw amount text the
+  // staff types (parsed/clamped [0, min(clientCredit, remainingTotal)] in the recompute -> the
+  // Totale drops + #qb_credit_use on save). A minimal inline input (the full residuals-modal
+  // port is out of scope — see the TODO on the credit control). Reset by resetForm.
+  const [clientCredit, setClientCredit] = useState<number>(0);
+  const [creditInput, setCreditInput] = useState<string>("");
 
   // ---- GIFTBOX redeem (#qb_giftbox_redeem) ----
   // The selected client's AVAILABLE giftbox ITEMS (issued, not expired, residual unit
@@ -562,6 +602,14 @@ export function QuickBookingDrawer() {
     setCouponDiscount(0);
     setCouponMsg(null);
     setCouponApplying(false);
+    // Block 4: drop the price-panel deduction context + the staff's points/credit inputs.
+    setFidelityRedeemEnabled(false);
+    setFidelityEuroPerPoint(0.1);
+    setFidelityMinPoints(0);
+    setFidelityPointsAvailable(0);
+    setFidelityInput("");
+    setClientCredit(0);
+    setCreditInput("");
     setFormError("");
     setFindQuery("");
     setFindResults([]);
@@ -1254,24 +1302,91 @@ export function QuickBookingDrawer() {
     coupon = Math.round((coupon + Number.EPSILON) * 100) / 100;
     const couponApplied = couponCode.trim() !== "" && coupon > 0.000001;
 
-    // Fidelity points / GiftCard monetary / Credito: not wired here yet (see TODO on
-    // the rows). They are 0 for now so the Totale = subtotal - sconto - coupon.
-    // TODO(fidelity/giftcard-monetary/credito): drive these from the residuals-modal
-    // subsystem (qbFidelityPointsUse / qb_giftcard_redeem amount / qb_credit_use) once
-    // ported; render their rows when value > 0 and subtract them here. Do NOT fake amounts.
-    const fidelity = 0;
-    const giftcardMonetary = 0;
-    const credito = 0;
+    // ===== Block 4 deductions, applied AFTER the base cascade (subtotal - sconto - coupon),
+    // in the LEGACY ORDER (app.js renderPriceDetails ~7572-7599): fidelity discount is part of
+    // the cascade, then giftcard, then credit. Each is clamped to what remains so the Totale
+    // can never go negative and no deduction exceeds the running total.
+    const afterCoupon = Math.max(0, Math.round((subtotal - discount - coupon + Number.EPSILON) * 100) / 100);
+
+    // FIDELITY (points -> €): only when redeem is enabled. The staff types a POINTS count; it is
+    // bounded by [0, min(pointsAvailable, floor(afterCoupon / euroPerPoint))] and — respecting
+    // the business minPoints — a non-zero use must be >= minPoints (else it contributes 0, like
+    // the legacy which refuses a sub-minimum redeem). The € discount = pointsUsed x euroPerPoint.
+    const euroPerPoint = Number.isFinite(fidelityEuroPerPoint) && fidelityEuroPerPoint > 0 ? fidelityEuroPerPoint : 0.1;
+    let fidelityPointsUsed = 0;
+    let fidelity = 0;
+    if (fidelityRedeemEnabled) {
+      const maxByTotal = Math.floor((afterCoupon + 1e-9) / euroPerPoint);
+      const maxPoints = Math.max(0, Math.min(Math.max(0, Math.floor(fidelityPointsAvailable)), maxByTotal));
+      let pts = Number.parseInt(String(fidelityInput).replace(/[^0-9]/g, ""), 10);
+      if (!Number.isFinite(pts) || pts < 0) pts = 0;
+      pts = Math.min(pts, maxPoints);
+      // Respect the minimum: a positive use below minPoints is refused (contributes 0).
+      if (pts > 0 && fidelityMinPoints > 0 && pts < fidelityMinPoints) pts = 0;
+      fidelityPointsUsed = pts;
+      fidelity = Math.round((pts * euroPerPoint + Number.EPSILON) * 100) / 100;
+      if (fidelity > afterCoupon) fidelity = afterCoupon;
+    }
+    const afterFidelity = Math.max(0, Math.round((afterCoupon - fidelity + Number.EPSILON) * 100) / 100);
+
+    // GIFTCARD (monetary): the already-computed giftcardAmount (min(card balance, payable total),
+    // possibly lowered by the staff), clamped to the running total after fidelity. #3 simply
+    // reveals this deduction; the redeem itself is already posted/persisted server-side.
+    let giftcardMonetary = Number.isFinite(giftcardAmount) && giftcardAmount > 0 ? giftcardAmount : 0;
+    if (giftcardMonetary > afterFidelity) giftcardMonetary = afterFidelity;
+    giftcardMonetary = Math.round((giftcardMonetary + Number.EPSILON) * 100) / 100;
+    const afterGiftcard = Math.max(0, Math.round((afterFidelity - giftcardMonetary + Number.EPSILON) * 100) / 100);
+
+    // CREDITO (customer credit): the staff types an amount, bounded by [0, min(clientCredit,
+    // running total after giftcard)]. Feeds the Totale + #qb_credit_use on save.
+    let creditRequested = Number.parseFloat(String(creditInput).replace(",", "."));
+    if (!Number.isFinite(creditRequested) || creditRequested < 0) creditRequested = 0;
+    let credito = Math.min(creditRequested, Math.max(0, clientCredit), afterGiftcard);
+    if (!Number.isFinite(credito) || credito < 0) credito = 0;
+    credito = Math.round((credito + Number.EPSILON) * 100) / 100;
 
     let total = subtotal - discount - coupon - fidelity - giftcardMonetary - credito;
     if (!Number.isFinite(total) || total < 0) total = 0;
     total = Math.round((total + Number.EPSILON) * 100) / 100;
 
-    return { lines, subtotal, discount, coupon, couponApplied, fidelity, giftcardMonetary, credito, total };
-  }, [selectedServiceIds, services, redeemBadgeByService, discountType, discountValue, couponDiscount, couponCode]);
+    return { lines, subtotal, discount, coupon, couponApplied, fidelity, fidelityPointsUsed, giftcardMonetary, credito, total };
+  }, [
+    selectedServiceIds,
+    services,
+    redeemBadgeByService,
+    discountType,
+    discountValue,
+    couponDiscount,
+    couponCode,
+    fidelityRedeemEnabled,
+    fidelityEuroPerPoint,
+    fidelityMinPoints,
+    fidelityPointsAvailable,
+    fidelityInput,
+    giftcardAmount,
+    clientCredit,
+    creditInput,
+  ]);
 
   // The panel (#qbPriceDetailsBox) reveals whenever >=1 service is selected (legacy).
   const showPriceDetails = selectedServiceIds.length > 0;
+
+  // Block 4 "Max" affordances: the maximum points the client could redeem given the total
+  // BEFORE fidelity (subtotal - sconto - coupon) and their balance, and the maximum credit
+  // usable given the total AFTER fidelity+giftcard and their balance. These drive the "Max"
+  // buttons + the availability hints; they mirror the recompute clamps exactly.
+  const fidelityMaxUsablePoints = useMemo(() => {
+    if (!fidelityRedeemEnabled) return 0;
+    const euroPerPoint = Number.isFinite(fidelityEuroPerPoint) && fidelityEuroPerPoint > 0 ? fidelityEuroPerPoint : 0.1;
+    const beforeFidelity = Math.max(0, priceDetails.subtotal - priceDetails.discount - priceDetails.coupon);
+    const maxByTotal = Math.floor((beforeFidelity + 1e-9) / euroPerPoint);
+    return Math.max(0, Math.min(Math.floor(fidelityPointsAvailable), maxByTotal));
+  }, [fidelityRedeemEnabled, fidelityEuroPerPoint, fidelityPointsAvailable, priceDetails.subtotal, priceDetails.discount, priceDetails.coupon]);
+
+  const creditMaxUsable = useMemo(() => {
+    const afterGiftcard = Math.max(0, priceDetails.subtotal - priceDetails.discount - priceDetails.coupon - priceDetails.fidelity - priceDetails.giftcardMonetary);
+    return Math.round((Math.min(Math.max(0, clientCredit), afterGiftcard) + Number.EPSILON) * 100) / 100;
+  }, [clientCredit, priceDetails.subtotal, priceDetails.discount, priceDetails.coupon, priceDetails.fidelity, priceDetails.giftcardMonetary]);
 
   // ---- COUPON handlers (port of qbApplyCouponPreview + Apply/Remove buttons) ----
   // The IDs of the services the coupon applies to: only the PAYABLE (non-redeemed)
@@ -1395,6 +1510,15 @@ export function QuickBookingDrawer() {
     // The gift rewards + per-service redeem also belong to the client; clear on change.
     setClientGifts([]);
     setGiftRedeems({});
+    // Block 4: the fidelity-redeem context + credit balance belong to the client; reset the
+    // settings/availability AND the staff's points/credit inputs so they don't leak.
+    setFidelityRedeemEnabled(false);
+    setFidelityEuroPerPoint(0.1);
+    setFidelityMinPoints(0);
+    setFidelityPointsAvailable(0);
+    setFidelityInput("");
+    setClientCredit(0);
+    setCreditInput("");
   }, []);
 
   const loadClientContext = useCallback(
@@ -1421,6 +1545,14 @@ export function QuickBookingDrawer() {
       // ...and any previous gift rewards + per-service redeem selection.
       setClientGifts([]);
       setGiftRedeems({});
+      // ...and any previous Block 4 fidelity/credit context + the staff's points/credit inputs.
+      setFidelityRedeemEnabled(false);
+      setFidelityEuroPerPoint(0.1);
+      setFidelityMinPoints(0);
+      setFidelityPointsAvailable(0);
+      setFidelityInput("");
+      setClientCredit(0);
+      setCreditInput("");
 
       const params = new URLSearchParams({ slug, action: "quickbook_client_context", client_id: id });
       const locId = String(locationId || "").trim();
@@ -1442,6 +1574,13 @@ export function QuickBookingDrawer() {
           setClientGiftcards(Array.isArray(data.giftcards) ? data.giftcards : []);
           setClientGiftboxes(Array.isArray(data.giftboxes) ? data.giftboxes : []);
           setClientGifts(Array.isArray(data.gifts) ? data.gifts : []);
+          // Block 4: fidelity redeem settings + available points, and the spendable credit.
+          const fid = data.fidelity ?? {};
+          setFidelityRedeemEnabled(Boolean(fid.redeemEnabled));
+          setFidelityEuroPerPoint(Number.isFinite(fid.euroPerPoint) && Number(fid.euroPerPoint) > 0 ? Number(fid.euroPerPoint) : 0.1);
+          setFidelityMinPoints(Math.max(0, Math.round(Number(fid.minPoints ?? 0) || 0)));
+          setFidelityPointsAvailable(Math.max(0, Math.round(Number(fid.pointsAvailable ?? 0) || 0)));
+          setClientCredit(Math.max(0, Number(data.creditAvailable ?? data.residuals?.credit_available ?? 0) || 0));
         })
         .catch(() => {
           if (myReq !== contextReqRef.current) return;
@@ -1599,10 +1738,23 @@ export function QuickBookingDrawer() {
           setStaffNotes(a.staffNotes ?? "");
           setCustomerNotes(a.customerNotes ?? "");
           // Manual sconto: prefill the price panel from the persisted discount columns.
-          // (Coupon is not persisted on the appointment yet, so it starts empty on edit.)
           const editDiscountType = a.discountType === "percent" || a.discountType === "fixed" ? a.discountType : "";
           setDiscountType(editDiscountType);
           setDiscountValue(editDiscountType && Number(a.discountValue ?? 0) > 0 ? String(a.discountValue) : "");
+          // Block 4: prefill the persisted fidelity points + credit use, and the coupon (read
+          // back from notes). fidelity/credit inputs prefill only the STAFF-visible figure; the
+          // fidelity box + credit box only render once the client context loads (redeem enabled /
+          // credit balance > 0), so a stale figure without context simply shows no row.
+          const editPoints = Math.max(0, Math.round(Number(a.fidelityPointsUsed ?? 0) || 0));
+          setFidelityInput(editPoints > 0 ? String(editPoints) : "");
+          const editCredit = Math.max(0, Number(a.creditUsed ?? 0) || 0);
+          setCreditInput(editCredit > 0 ? String(editCredit) : "");
+          if (a.coupon && a.coupon.code && Number(a.coupon.discount ?? 0) > 0) {
+            setCouponCode(String(a.coupon.code).toUpperCase());
+            setCouponInput(String(a.coupon.code).toUpperCase());
+            setCouponDiscount(Math.round((Math.max(0, Number(a.coupon.discount)) + Number.EPSILON) * 100) / 100);
+            setCouponBoxOpen(true);
+          }
           // An existing slot is already booked: no hold needed (the update reuses it).
           setHoldToken("");
         })
@@ -1849,12 +2001,19 @@ export function QuickBookingDrawer() {
             discount_type: discountType,
             discount_value: discountValue,
             // COUPON: the applied code + its preview discount (only when actually applied),
-            // mirroring the hidden #qb_coupon_code / #qb_coupon_discount inputs.
-            // TODO(coupon-persist): the Next `appointments` table has no coupon_code/
-            // coupon_discount columns (unlike the legacy), so the save route does not yet
-            // persist these — they are posted for parity once the schema/route add them.
+            // mirroring the hidden #qb_coupon_code / #qb_coupon_discount inputs. Persisted by the
+            // save route into appointments.notes (coupon_apply_meta_to_notes) — the table has no
+            // coupon columns — and read back on action=get for the edit prefill (Block 4).
             coupon_code: priceDetails.couponApplied ? couponCode : "",
             coupon_discount: priceDetails.couponApplied ? String(priceDetails.coupon) : "0",
+            // Block 4 FIDELITY: the points the staff chose to redeem (0 when none / redeem off).
+            // Persisted on appointments.fidelity_points_used; settled (-points_redeem) on done by
+            // awardAppointmentFidelityOnDone; refunded on cancel. Derived by the recompute so the
+            // posted value always matches the displayed "Sconto Fidelity".
+            fidelity_points_use: String(priceDetails.fidelityPointsUsed || 0),
+            // Block 4 CREDIT: the customer credit applied (0 when none). Persisted on
+            // appointments.credit_used + debited from the wallet at create; refunded on cancel.
+            credit_use: String(priceDetails.credito || 0),
             date,
             time: startTime,
             location_id: locationId,
@@ -2944,13 +3103,13 @@ export function QuickBookingDrawer() {
                   </div>
                 </div>
 
-                <input type="hidden" name="fidelity_points_use" id="qb_fidelity_points_use" value="0" readOnly />
+                <input type="hidden" name="fidelity_points_use" id="qb_fidelity_points_use" value={String(priceDetails.fidelityPointsUsed || 0)} readOnly />
                 <div className="alert alert-info p-2 mt-2 d-none" id="qbFidelityNote" style={{ borderRadius: 10 }} />
 
-                {/* GiftCard (monetary) row — reveals when a giftcard amount > 0 is applied.
-                    TODO(giftcard-monetary): priceDetails.giftcardMonetary is 0 until the
-                    appointment-level giftcard amount (qb_giftcard_redeem) feeds the recompute
-                    via the residuals subsystem; until then the row stays hidden (faithful). */}
+                {/* GiftCard (monetary) row (Block 4) — reveals when a giftcard amount > 0 is
+                    applied. priceDetails.giftcardMonetary = the effective giftcardAmount (already
+                    posted via #qb_giftcard_redeem + decremented server-side by the redeem),
+                    clamped to the running total; it now feeds the recompute so the Totale drops. */}
                 <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.giftcardMonetary > 0 ? "" : " d-none"}`} id="qbGiftcardRow" style={{ color: "#047857" }}>
                   <button type="button" className="btn btn-link btn-sm p-0 fw-semibold qb-giftcard-open" id="qbGiftcardLabel" style={{ color: "inherit", textDecoration: "none" }} title="Dettagli GiftCard">GiftCard</button>
                   <div className="d-flex align-items-center gap-2">
@@ -2958,46 +3117,94 @@ export function QuickBookingDrawer() {
                     <button type="button" className="btn btn-sm btn-link text-danger p-0 d-none" id="qbGiftcardRemoveBtn" title="Rimuovi GiftCard"><i className="bi bi-x-circle" /></button>
                   </div>
                 </div>
-                <input type="hidden" name="credit_use" id="qb_credit_use" value="0" readOnly />
+                <input type="hidden" name="credit_use" id="qb_credit_use" value={String(priceDetails.credito || 0)} readOnly />
                 <input type="hidden" name="credit_use_from_booking" id="qb_credit_use_from_booking" value="0" readOnly />
-                {/* Credito row — reveals when a customer credit amount > 0 is applied.
-                    TODO(credito): priceDetails.credito is 0 until the residuals-modal
-                    credit selection (qb_credit_use) feeds the recompute; row stays hidden. */}
+
+                {/* CREDITO use (Block 4) — a MINIMAL inline "Usa credito" input, shown only when
+                    the selected client has a spendable credit balance. The staff types an amount;
+                    the recompute clamps it to [0, min(clientCredit, running total)] and reveals the
+                    Credito row below. TODO(credito-residuals): the legacy credit selection lived in
+                    the full residuals modal ("Apri scheda" deep port) with per-movement detail; that
+                    modal is out of scope here — this is the minimal amount input. */}
+                {clientCredit > 0 ? (
+                  <div className="card border-0 bg-light p-2 mt-2" id="qbCreditBox">
+                    <div className="d-flex justify-content-between align-items-center">
+                      <div className="fw-semibold"><i className="bi bi-wallet2 me-1" /> Credito cliente</div>
+                      <div className="small text-muted" id="qbCreditAvail">Disponibile: {fmtEUR(clientCredit)}</div>
+                    </div>
+                    <div className="mt-2 d-flex align-items-center gap-2">
+                      <div className="input-group input-group-sm" style={{ maxWidth: 220 }}>
+                        <span className="input-group-text">€</span>
+                        <input
+                          className="form-control"
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          inputMode="decimal"
+                          id="qbCreditAmountInput"
+                          placeholder="0"
+                          value={creditInput}
+                          onChange={(e) => setCreditInput(e.target.value)}
+                        />
+                      </div>
+                      <button type="button" className="btn btn-sm btn-outline-secondary" id="qbCreditMaxBtn" onClick={() => setCreditInput(String(creditMaxUsable))}>Max</button>
+                      {creditInput.trim() !== "" ? (
+                        <button type="button" className="btn btn-sm btn-link text-danger p-0" id="qbCreditClearBtn" onClick={() => setCreditInput("")} title="Rimuovi credito"><i className="bi bi-x-circle" /></button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                {/* Credito row — reveals when a customer credit amount > 0 is applied. */}
                 <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.credito > 0 ? "" : " d-none"}`} id="qbCreditRow" style={{ color: "#047857" }}>
                   <div className="small fw-semibold">Credito</div>
                   <div className="small fw-semibold" id="qbCreditAmount">- {fmtEUR(priceDetails.credito)}</div>
                 </div>
 
-                <div className="card border-0 bg-light p-2 mt-2 d-none" id="qbFidelityBox">
-                  <div className="d-flex justify-content-between align-items-center">
-                    <div className="fw-semibold"><i className="bi bi-percent me-1" /> Punti Fidelity</div>
-                    <div className="small text-muted" id="qbFidelityAvail">Disponibili: 0 Punti</div>
-                  </div>
-
-                  <div className="mt-2">
-                    <div className="d-flex align-items-center d-none" id="qbFidelityToggleRow">
-                      <div className="form-check form-switch m-0">
-                        <input className="form-check-input" type="checkbox" id="qbFidelityToggle" />
-                        <label className="form-check-label" htmlFor="qbFidelityToggle">Usa sconto Punti Fidelity</label>
-                      </div>
-                      <button type="button" className="btn btn-sm btn-outline-secondary ms-auto d-none" id="qbFidelityMaxBtn">Max</button>
+                {/* Punti Fidelity box (Block 4) — shown only when redeem is enabled for the tenant
+                    AND the selected client has points. The staff enters a POINTS count (bounded by
+                    the recompute to [0, min(available, floor(total/euroPerPoint))] respecting the
+                    business minimum); the € discount = pointsUsed x euroPerPoint feeds the Totale +
+                    #qb_fidelity_points_use. Wired via `fidelityInput`. */}
+                {fidelityRedeemEnabled && fidelityPointsAvailable > 0 ? (
+                  <div className="card border-0 bg-light p-2 mt-2" id="qbFidelityBox">
+                    <div className="d-flex justify-content-between align-items-center">
+                      <div className="fw-semibold"><i className="bi bi-percent me-1" /> Punti Fidelity</div>
+                      <div className="small text-muted" id="qbFidelityAvail">Disponibili: {fidelityPointsAvailable} Punti</div>
                     </div>
 
-                    <div className="mt-2 d-none" id="qbFidelityAmountWrap">
-                      <div className="input-group input-group-sm" style={{ maxWidth: 220 }}>
-                        <input className="form-control" type="number" step="1" min="0" inputMode="numeric" id="qbFidelityAmountInput" placeholder="0" />
-                        <span className="input-group-text" id="qbFidelityAmountSuffix">Punti</span>
+                    <div className="mt-2">
+                      <div className="d-flex align-items-center gap-2">
+                        <div className="input-group input-group-sm" style={{ maxWidth: 220 }}>
+                          <input
+                            className="form-control"
+                            type="number"
+                            step="1"
+                            min="0"
+                            inputMode="numeric"
+                            id="qbFidelityAmountInput"
+                            placeholder="0"
+                            value={fidelityInput}
+                            onChange={(e) => setFidelityInput(e.target.value)}
+                          />
+                          <span className="input-group-text" id="qbFidelityAmountSuffix">Punti</span>
+                        </div>
+                        <button type="button" className="btn btn-sm btn-outline-secondary" id="qbFidelityMaxBtn" onClick={() => setFidelityInput(String(fidelityMaxUsablePoints))}>Max</button>
+                        {fidelityInput.trim() !== "" ? (
+                          <button type="button" className="btn btn-sm btn-link text-danger p-0" id="qbFidelityClearBtn" onClick={() => setFidelityInput("")} title="Rimuovi punti"><i className="bi bi-x-circle" /></button>
+                        ) : null}
+                      </div>
+
+                      <div className="small text-muted mt-2" id="qbFidelityHint">
+                        {fidelityMinPoints > 0 ? `Minimo ${fidelityMinPoints} punti • ` : ""}
+                        {`1 punto = ${fmtEUR(fidelityEuroPerPoint)} • Usabili: ${fidelityMaxUsablePoints} punti`}
                       </div>
                     </div>
-
-                    <div className="small text-muted mt-2" id="qbFidelityHint" />
                   </div>
-                </div>
+                ) : null}
 
-                {/* Sconto Fidelity row — reveals when a fidelity points discount > 0 is applied.
-                    TODO(fidelity): priceDetails.fidelity is 0 until the fidelity-points
-                    subsystem (qb_fidelity_points_use + the preview API) feeds the recompute;
-                    until then the row stays hidden and the Box above is inert (faithful). */}
+                {/* Sconto Fidelity row — reveals when a fidelity points discount > 0 is applied
+                    (priceDetails.fidelity = pointsUsed x euroPerPoint, fed by #qbFidelityBox). */}
                 <div className={`d-flex justify-content-between align-items-center mt-2 pt-2 border-top${priceDetails.fidelity > 0 ? "" : " d-none"}`} id="qbFidelityRow" style={{ color: "#047857" }}>
                   <div className="small fw-semibold" id="qbFidelityLabel">Sconto Fidelity</div>
                   <div className="small fw-semibold" id="qbFidelityAmount">- {fmtEUR(priceDetails.fidelity)}</div>
