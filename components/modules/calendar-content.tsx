@@ -662,8 +662,12 @@ type CalendarResize = {
   endTime: string;
 };
 
-export function CalendarContent() {
-  const slug = tenantSlug();
+export function CalendarContent({ slug: slugProp }: { slug?: string } = {}) {
+  // Prefer the slug passed by the server page so SSR-rendered links (e.g. the toolbar
+  // "Lista" button) use the real tenant slug instead of "" (window is unavailable on the
+  // server), avoiding a "//appointments" href + hydration mismatch. Falls back to the
+  // window-derived slug when rendered without the prop.
+  const slug = slugProp || tenantSlug();
 
   const [date, setDate] = useState<string>(() => isoLocal(new Date()));
   const [view, setView] = useState<CalendarView>("staffTimeGridDay");

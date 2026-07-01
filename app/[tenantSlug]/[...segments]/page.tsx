@@ -87,7 +87,12 @@ import { shouldPromptOnboarding } from "@/lib/manage-onboarding";
 // The legacy /<slug>/index.php?page=X[&tab=Y] URLs are 307-redirected here by
 // middleware.ts, so old links/bookmarks keep working. Public pages (voucher
 // viewers) are handled before the session check.
-const FAITHFUL_MODULES: Record<string, React.ComponentType> = {
+// The faithful modules accept an optional `slug` prop (passed from this server page so
+// their SSR-rendered links use the real tenant slug — components that read the slug from
+// window.location alone would render "//page" on the server, causing a hydration mismatch +
+// a broken link, e.g. the calendar toolbar "Lista" button). Components that don't need it
+// simply ignore the prop.
+const FAITHFUL_MODULES: Record<string, React.ComponentType<{ slug?: string }>> = {
   clients: ClientsContent,
   suppliers: SuppliersContent,
   coupons: CouponsContent,
@@ -366,7 +371,7 @@ export default async function TenantPage({
   if (FaithfulContent && !query.action) {
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
-        <FaithfulContent />
+        <FaithfulContent slug={tenantSlug} />
       </ManageShell>
     );
   }
