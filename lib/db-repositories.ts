@@ -3499,73 +3499,206 @@ export async function listDbQuotes(slug: string): Promise<Quote[]> {
   return Promise.all(rows.map((row) => mapQuote(slug, row)));
 }
 
-export async function createDbQuote(
-  input: { clientId?: number; clientName?: string; lines: PosSaleItemInput[]; discount?: number },
-  slug: string,
-): Promise<Quote> {
-  if (!input.lines.length) throw new Error("Aggiungi almeno una voce al preventivo.");
-  const client = await resolveSaleClientForDb(slug, input.clientId ?? 0, input.clientName);
-  const items = await Promise.all(input.lines.map((line, index) => buildDbSaleItem(slug, line, index + 1)));
-  const subtotal = roundMoney(items.reduce((total, item) => total + item.total, 0));
-  const discount = roundMoney(Math.min(subtotal, Math.max(0, input.discount ?? 0)));
-  const total = roundMoney(Math.max(0, subtotal - discount));
-  const tempNumber = `Q-${Date.now().toString(36).toUpperCase()}`;
-  const id = await tenantInsert(await tenantTable(slug, "quotes"), {
-    number: tempNumber,
+// Drop values whose column doesn't exist on the physical table (schema-guarded
+// writes) — one INFORMATION_SCHEMA query, matching the helper used across the
+// manage-* modules.
+async function filterColumns(table: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const rows = await dbQuery<RowDataPacket[]>(
+    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
+    [table],
+  );
+  const columns = new Set(rows.map((row) => String(row.column_name ?? row.COLUMN_NAME)));
+  return Object.fromEntries(Object.entries(values).filter(([key, value]) => columns.has(key) && value !== undefined));
+}
+
+// Rich quote-editor input (port of the quotes.php new/edit fields): client +
+// optional anagrafica snapshot + dates + notes/terms/public note + the content
+// lines (each with per-line IVA + discount%).
+export type QuoteLineInput = { type: "service" | "product" | "package" | "custom"; refId: number; name: string; sku?: string; quantity: number; unitPrice: number; taxRate?: number; discountPercent?: number };
+export type QuoteSaveInput = {
+  clientId?: number;
+  clientName?: string;
+  client?: { companyName?: string; vatNumber?: string; taxCode?: string; sdi?: string; pec?: string; email?: string; phone?: string; address?: string; cap?: string; city?: string; province?: string };
+  quoteDate?: string;
+  validUntil?: string;
+  notes?: string;
+  terms?: string;
+  publicNote?: string;
+  lines: QuoteLineInput[];
+};
+
+// Per-line + total computation, faithful to quotes.php save: for each line
+// gross=qty*unit, lineSub=gross*(1-disc%), lineTax=lineSub*iva%, lineTot=lineSub+lineTax;
+// the quote subtotal is NET of line discounts, tax_total = Σ line tax, total = net+tax.
+function computeQuoteLines(lines: QuoteLineInput[]): {
+  items: Array<Record<string, unknown>>;
+  subtotal: number;
+  discountTotal: number;
+  taxTotal: number;
+  total: number;
+} {
+  let subtotal = 0;
+  let discountTotal = 0;
+  let taxTotal = 0;
+  let total = 0;
+  const items: Array<Record<string, unknown>> = [];
+  let pos = 0;
+  for (const l of lines) {
+    const desc = String(l.name ?? "").trim();
+    if (desc === "" && !(l.refId > 0)) continue;
+    const qty = l.quantity > 0 ? l.quantity : 1;
+    const unit = Math.max(0, Number(l.unitPrice) || 0);
+    const taxRate = Math.min(100, Math.max(0, Number(l.taxRate) || 0));
+    const disc = Math.min(100, Math.max(0, Number(l.discountPercent) || 0));
+    const type = ["service", "product", "package", "custom"].includes(l.type) ? l.type : "custom";
+    const gross = qty * unit;
+    const lineSub = roundMoney(gross * (1 - disc / 100));
+    const lineDisc = roundMoney(gross - lineSub);
+    const lineTax = roundMoney(lineSub * (taxRate / 100));
+    const lineTot = roundMoney(lineSub + lineTax);
+    subtotal += lineSub;
+    discountTotal += lineDisc;
+    taxTotal += lineTax;
+    total += lineTot;
+    items.push({
+      position: pos,
+      item_type: type,
+      item_id: l.refId > 0 ? l.refId : null,
+      description: desc || `${type} #${l.refId}`,
+      sku: String(l.sku ?? "").trim() || null,
+      qty,
+      unit_price: unit,
+      tax_rate: taxRate,
+      discount_percent: disc,
+      line_subtotal: lineSub,
+      line_tax: lineTax,
+      line_total: lineTot,
+    });
+    pos++;
+  }
+  return { items, subtotal: roundMoney(subtotal), discountTotal: roundMoney(discountTotal), taxTotal: roundMoney(taxTotal), total: roundMoney(total) };
+}
+
+// The quotes-row client anagrafica snapshot columns from a save input + resolved client.
+function quoteClientValues(input: QuoteSaveInput, client: { id: number; name: string }): Record<string, unknown> {
+  const s = input.client ?? {};
+  const clean = (v: unknown) => { const t = String(v ?? "").trim(); return t !== "" ? t : null; };
+  return {
     client_id: client.id > 0 ? client.id : null,
     client_name: client.name,
+    client_email: clean(s.email),
+    client_phone: clean(s.phone),
+    client_company_name: clean(s.companyName),
+    client_vat_number: clean(s.vatNumber),
+    client_tax_code: clean(s.taxCode),
+    client_sdi: clean(s.sdi),
+    client_pec: clean(s.pec),
+    client_address: clean(s.address),
+    client_cap: clean(s.cap),
+    client_city: clean(s.city),
+    client_province: clean(s.province),
+  };
+}
+
+export async function createDbQuote(input: QuoteSaveInput, slug: string): Promise<Quote> {
+  if (!input.lines.length) throw new Error("Aggiungi almeno una voce al preventivo.");
+  const client = await resolveSaleClientForDb(slug, input.clientId ?? 0, input.clientName);
+  const { items, subtotal, discountTotal, taxTotal, total } = computeQuoteLines(input.lines);
+  if (items.length === 0) throw new Error("Aggiungi almeno una riga al preventivo.");
+  const validFrom = normalizeClientDate(input.quoteDate) || todayIso();
+  const validUntil = normalizeClientDate(input.validUntil) || addDaysDate(30);
+  const tempNumber = `Q-${Date.now().toString(36).toUpperCase()}`;
+  const values = await filterColumns((await tenantTable(slug, "quotes")).name, {
+    number: tempNumber,
+    ...quoteClientValues(input, client),
     subtotal,
-    discount_total: discount,
+    discount_total: discountTotal,
+    tax_total: taxTotal,
     total,
     status: "draft",
     public_token: randomHex(32),
-    quote_date: todayIso(),
-    valid_until: addDaysDate(30),
+    quote_date: validFrom,
+    valid_until: validUntil,
+    notes: String(input.notes ?? "").trim() || null,
+    terms: String(input.terms ?? "").trim() || null,
+    public_note: String(input.publicNote ?? "").trim() || null,
     created_at: new Date(),
     updated_at: new Date(),
   });
+  const id = await tenantInsert(await tenantTable(slug, "quotes"), values);
 
   await tenantUpdate({ slug, table: "quotes", id, values: { number: `Q-${String(id).padStart(5, "0")}` } }).catch(() => undefined);
-
-  for (const [index, item] of items.entries()) {
-    await tenantInsert(await tenantTable(slug, "quote_items"), {
-      quote_id: id,
-      item_type: item.type === "product" ? "product" : "service",
-      item_id: item.refId > 0 ? item.refId : null,
-      description: item.name,
-      qty: item.quantity,
-      unit_price: item.unitPrice,
-      line_total: item.total,
-      position: index + 1,
-    });
-  }
+  await insertQuoteItems(slug, id, items);
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Preventivo creato ma non riletta.");
   return mapQuote(slug, rows[0]);
 }
 
+// Insert quote_items rows (schema-filtered so a missing line_subtotal/line_tax
+// column degrades gracefully).
+async function insertQuoteItems(slug: string, quoteId: number, items: Array<Record<string, unknown>>): Promise<void> {
+  const table = await tenantTable(slug, "quote_items");
+  for (const item of items) {
+    const values = await filterColumns(table.name, { quote_id: quoteId, ...item });
+    await tenantInsert(table, values);
+  }
+}
+
 // Edit-form prefill: return an existing quote in the CORE editor's shape
 // (client + discount + lines) so QuoteFormContent can prefill it. Port of
 // quotes.php action=edit load.
-export type ManageQuoteEdit = { id: number; clientId: number; clientName: string; discount: number; lines: Array<{ type: "service" | "product"; refId: number; name: string; quantity: number; unitPrice: number }> };
+export type ManageQuoteEditLine = { type: "service" | "product" | "package" | "custom"; refId: number; name: string; sku: string; quantity: number; unitPrice: number; taxRate: number; discountPercent: number };
+export type ManageQuoteEdit = {
+  id: number;
+  clientId: number;
+  clientName: string;
+  quoteDate: string;
+  validUntil: string;
+  notes: string;
+  terms: string;
+  publicNote: string;
+  client: { companyName: string; vatNumber: string; taxCode: string; sdi: string; pec: string; email: string; phone: string; address: string; cap: string; city: string; province: string };
+  lines: ManageQuoteEditLine[];
+};
 export async function getManageQuoteForEdit(slug: string, id: number): Promise<ManageQuoteEdit | null> {
   if (id <= 0) return null;
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) return null;
   const qrow = rows[0];
   const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "quote_items", where: "quote_id = ?", params: [id], orderBy: "position ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const lineType = (t: string): "service" | "product" | "package" | "custom" => (["service", "product", "package", "custom"].includes(t) ? (t as "service" | "product" | "package" | "custom") : "custom");
   return {
     id,
     clientId: Number(qrow.client_id ?? 0) || 0,
     clientName: String(qrow.client_name ?? ""),
-    discount: roundMoney(Number(qrow.discount_total ?? 0)),
+    quoteDate: qrow.quote_date ? String(qrow.quote_date).slice(0, 10) : "",
+    validUntil: qrow.valid_until ? String(qrow.valid_until).slice(0, 10) : "",
+    notes: String(qrow.notes ?? ""),
+    terms: String(qrow.terms ?? ""),
+    publicNote: String(qrow.public_note ?? ""),
+    client: {
+      companyName: String(qrow.client_company_name ?? ""),
+      vatNumber: String(qrow.client_vat_number ?? ""),
+      taxCode: String(qrow.client_tax_code ?? ""),
+      sdi: String(qrow.client_sdi ?? ""),
+      pec: String(qrow.client_pec ?? ""),
+      email: String(qrow.client_email ?? ""),
+      phone: String(qrow.client_phone ?? ""),
+      address: String(qrow.client_address ?? ""),
+      cap: String(qrow.client_cap ?? ""),
+      city: String(qrow.client_city ?? ""),
+      province: String(qrow.client_province ?? ""),
+    },
     lines: itemRows.map((r) => ({
-      type: String(r.item_type ?? "") === "product" ? "product" : "service",
+      type: lineType(String(r.item_type ?? "")),
       refId: Number(r.item_id ?? 0) || 0,
       name: String(r.description ?? ""),
+      sku: String(r.sku ?? ""),
       quantity: Math.max(1, Number(r.qty ?? 1)),
       unitPrice: roundMoney(Number(r.unit_price ?? 0)),
+      taxRate: Number(r.tax_rate ?? 0),
+      discountPercent: Number(r.discount_percent ?? 0),
     })),
   };
 }
@@ -3574,11 +3707,7 @@ export async function getManageQuoteForEdit(slug: string, id: number): Promise<M
 // quotes are editable (converted/accepted ones are locked). Recomputes the
 // client + lines + subtotal/discount/total, keeps the number/status/dates, and
 // rebuilds quote_items.
-export async function updateDbQuote(
-  id: number,
-  input: { clientId?: number; clientName?: string; lines: PosSaleItemInput[]; discount?: number },
-  slug: string,
-): Promise<Quote> {
+export async function updateDbQuote(id: number, input: QuoteSaveInput, slug: string): Promise<Quote> {
   if (id <= 0) throw new Error("ID preventivo mancante.");
   if (!input.lines.length) throw new Error("Aggiungi almeno una voce al preventivo.");
   const existing = await tenantSelect<RowDataPacket>({ slug, table: "quotes", columns: "id, status", where: "id = ?", params: [id], limit: 1 });
@@ -3587,19 +3716,25 @@ export async function updateDbQuote(
   if (status !== "draft" && status !== "sent") throw new Error("Questo preventivo non è modificabile.");
 
   const client = await resolveSaleClientForDb(slug, input.clientId ?? 0, input.clientName);
-  const items = await Promise.all(input.lines.map((line, index) => buildDbSaleItem(slug, line, index + 1)));
-  const subtotal = roundMoney(items.reduce((total, item) => total + item.total, 0));
-  const discount = roundMoney(Math.min(subtotal, Math.max(0, input.discount ?? 0)));
-  const total = roundMoney(Math.max(0, subtotal - discount));
+  const { items, subtotal, discountTotal, taxTotal, total } = computeQuoteLines(input.lines);
+  if (items.length === 0) throw new Error("Aggiungi almeno una riga al preventivo.");
+  const validFrom = normalizeClientDate(input.quoteDate);
+  const validUntil = normalizeClientDate(input.validUntil);
 
-  await tenantUpdate({ slug, table: "quotes", id, values: {
-    client_id: client.id > 0 ? client.id : null,
-    client_name: client.name,
+  const values = await filterColumns((await tenantTable(slug, "quotes")).name, {
+    ...quoteClientValues(input, client),
     subtotal,
-    discount_total: discount,
+    discount_total: discountTotal,
+    tax_total: taxTotal,
     total,
+    quote_date: validFrom ?? undefined,
+    valid_until: validUntil ?? undefined,
+    notes: String(input.notes ?? "").trim() || null,
+    terms: String(input.terms ?? "").trim() || null,
+    public_note: String(input.publicNote ?? "").trim() || null,
     updated_at: new Date(),
-  } });
+  });
+  await tenantUpdate({ slug, table: "quotes", id, values });
 
   // Rebuild quote_items.
   const itemTable = await tenantTable(slug, "quote_items");
@@ -3608,18 +3743,7 @@ export async function updateDbQuote(
     `DELETE FROM ${quoteIdentifier(itemTable.name)} WHERE quote_id = ?${scoped ? " AND tenant_id = ?" : ""}`,
     scoped ? [id, itemTable.tenantId ?? 0] : [id],
   ).catch(() => undefined);
-  for (const [index, item] of items.entries()) {
-    await tenantInsert(itemTable, {
-      quote_id: id,
-      item_type: item.type === "product" ? "product" : "service",
-      item_id: item.refId > 0 ? item.refId : null,
-      description: item.name,
-      qty: item.quantity,
-      unit_price: item.unitPrice,
-      line_total: item.total,
-      position: index + 1,
-    });
-  }
+  await insertQuoteItems(slug, id, items);
 
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Preventivo non trovato.");

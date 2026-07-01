@@ -1,9 +1,8 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, getManageQuoteDetail, getManageQuoteForEdit, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuote, updateDbQuoteStatus } from "@/lib/db-repositories";
+import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, getManageQuoteDetail, getManageQuoteForEdit, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuote, updateDbQuoteStatus, type QuoteLineInput, type QuoteSaveInput } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
-import type { PosSaleItemInput } from "@/lib/tenant-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -79,12 +78,7 @@ export async function POST(request: Request) {
 
   try {
     if (action === "create") {
-      const quote = await createDbQuote({
-        clientId: parseInteger(body.client_id, 0),
-        clientName: body.client_name,
-        discount: parseNumber(body.discount, 0),
-        lines: quoteLinesFromBody(body),
-      }, tenantSlug);
+      const quote = await createDbQuote(quoteSaveInputFromBody(body), tenantSlug);
       return Response.json({ ok: true, source: "quotes?action=create", sourceMode: "database", quote, quotes: await listDbQuotes(tenantSlug) });
     }
 
@@ -93,12 +87,7 @@ export async function POST(request: Request) {
 
     // Update an existing quote (port of quotes.php action=edit save).
     if (action === "update") {
-      const quote = await updateDbQuote(id, {
-        clientId: parseInteger(body.client_id, 0),
-        clientName: body.client_name,
-        discount: parseNumber(body.discount, 0),
-        lines: quoteLinesFromBody(body),
-      }, tenantSlug);
+      const quote = await updateDbQuote(id, quoteSaveInputFromBody(body), tenantSlug);
       return Response.json({ ok: true, source: "quotes?action=update", sourceMode: "database", quote, quotes: await listDbQuotes(tenantSlug) });
     }
 
@@ -133,21 +122,54 @@ export async function POST(request: Request) {
   }
 }
 
-function quoteLinesFromBody(body: Record<string, string>): PosSaleItemInput[] {
+// Build the rich QuoteSaveInput (port of the quotes.php new/edit fields) from the
+// posted body: client + anagrafica snapshot + dates + notes/terms/public note +
+// the content lines (each with per-line IVA + discount%).
+function quoteSaveInputFromBody(body: Record<string, string>): QuoteSaveInput {
+  let lines: QuoteLineInput[] = [];
   if (body.lines_json) {
     try {
-      const lines = JSON.parse(body.lines_json) as PosSaleItemInput[];
-      if (Array.isArray(lines) && lines.length > 0) return lines;
+      const parsed = JSON.parse(body.lines_json);
+      if (Array.isArray(parsed)) {
+        lines = parsed.map((l: Record<string, unknown>) => ({
+          type: (["service", "product", "package", "custom"].includes(String(l.type)) ? String(l.type) : "service") as QuoteLineInput["type"],
+          refId: Number(l.refId ?? 0) || 0,
+          name: String(l.name ?? ""),
+          sku: String(l.sku ?? ""),
+          quantity: Number(l.quantity ?? 1) || 1,
+          unitPrice: Number(l.unitPrice ?? 0) || 0,
+          taxRate: Number(l.taxRate ?? 0) || 0,
+          discountPercent: Number(l.discountPercent ?? 0) || 0,
+        }));
+      }
     } catch {
       // fallback below
     }
   }
-
-  return [{
-    type: "service",
-    refId: parseInteger(body.service_id, 0),
-    name: body.service_name,
-    quantity: parseNumber(body.quantity, 1),
-    unitPrice: body.price ? parseNumber(body.price, 0) : undefined,
-  }];
+  if (lines.length === 0) {
+    lines = [{ type: "service", refId: parseInteger(body.service_id, 0), name: body.service_name ?? "", quantity: parseNumber(body.quantity, 1), unitPrice: body.price ? parseNumber(body.price, 0) : 0 }];
+  }
+  return {
+    clientId: parseInteger(body.client_id, 0),
+    clientName: body.client_name,
+    client: {
+      companyName: body.client_company_name,
+      vatNumber: body.client_vat_number,
+      taxCode: body.client_tax_code,
+      sdi: body.client_sdi,
+      pec: body.client_pec,
+      email: body.client_email,
+      phone: body.client_phone,
+      address: body.client_address,
+      cap: body.client_cap,
+      city: body.client_city,
+      province: body.client_province,
+    },
+    quoteDate: body.quote_date,
+    validUntil: body.valid_until,
+    notes: body.notes,
+    terms: body.terms,
+    publicNote: body.public_note,
+    lines,
+  };
 }

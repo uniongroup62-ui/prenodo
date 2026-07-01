@@ -32,9 +32,22 @@ type Line = {
   type: LineType;
   refId: number;
   name: string;
+  sku: string;
   quantity: number;
   unitPrice: number;
+  taxRate: number;
+  discountPercent: number;
 };
+
+// Per-line net + tax (faithful to quotes.php): gross=qty*unit,
+// net=gross*(1-disc%), tax=net*iva%, total=net+tax.
+function lineNet(l: Line): number {
+  const gross = Math.max(1, l.quantity) * Math.max(0, l.unitPrice);
+  return roundMoney(gross * (1 - Math.min(100, Math.max(0, l.discountPercent)) / 100));
+}
+function lineTaxAmt(l: Line): number {
+  return roundMoney(lineNet(l) * (Math.min(100, Math.max(0, l.taxRate)) / 100));
+}
 
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
@@ -68,8 +81,17 @@ export function QuoteFormContent() {
 
   const [clientId, setClientId] = useState(0);
   const [clientName, setClientName] = useState("");
-  const [discount, setDiscount] = useState("0");
   const [lines, setLines] = useState<Line[]>([]);
+
+  // Header fields (dates + notes/terms/public note).
+  const [quoteDate, setQuoteDate] = useState("");
+  const [validUntil, setValidUntil] = useState("");
+  const [notes, setNotes] = useState("");
+  const [terms, setTerms] = useState("");
+  const [publicNote, setPublicNote] = useState("");
+
+  // Client anagrafica snapshot (collapsible "Dati fiscali cliente").
+  const [snap, setSnap] = useState({ companyName: "", vatNumber: "", taxCode: "", sdi: "", pec: "", email: "", phone: "", address: "", cap: "", city: "", province: "" });
 
   // Add-line picker state
   const [pickType, setPickType] = useState<LineType>("service");
@@ -105,14 +127,35 @@ export function QuoteFormContent() {
               setQuoteId(Number(qd.id ?? editId));
               setClientId(Number(qd.clientId ?? 0) || 0);
               setClientName(String(qd.clientName ?? ""));
-              setDiscount(String(qd.discount ?? 0));
+              setQuoteDate(String(qd.quoteDate ?? "").slice(0, 10));
+              setValidUntil(String(qd.validUntil ?? "").slice(0, 10));
+              setNotes(String(qd.notes ?? ""));
+              setTerms(String(qd.terms ?? ""));
+              setPublicNote(String(qd.publicNote ?? ""));
+              const s = qd.client ?? {};
+              setSnap({
+                companyName: String(s.companyName ?? ""),
+                vatNumber: String(s.vatNumber ?? ""),
+                taxCode: String(s.taxCode ?? ""),
+                sdi: String(s.sdi ?? ""),
+                pec: String(s.pec ?? ""),
+                email: String(s.email ?? ""),
+                phone: String(s.phone ?? ""),
+                address: String(s.address ?? ""),
+                cap: String(s.cap ?? ""),
+                city: String(s.city ?? ""),
+                province: String(s.province ?? ""),
+              });
               setLines(
                 (qd.lines ?? []).map((l: Record<string, unknown>) => ({
                   type: l.type === "product" ? "product" : "service",
                   refId: Number(l.refId ?? 0) || 0,
                   name: String(l.name ?? ""),
+                  sku: String(l.sku ?? ""),
                   quantity: Math.max(1, Number(l.quantity ?? 1)),
                   unitPrice: Number(l.unitPrice ?? 0) || 0,
+                  taxRate: Number(l.taxRate ?? 0) || 0,
+                  discountPercent: Number(l.discountPercent ?? 0) || 0,
                 })),
               );
             })
@@ -134,7 +177,7 @@ export function QuoteFormContent() {
     if (!item) return;
     setLines((prev) => [
       ...prev,
-      { type: pickType, refId: item.id, name: item.name, quantity: Math.max(1, pickQty), unitPrice: item.price },
+      { type: pickType, refId: item.id, name: item.name, sku: "", quantity: Math.max(1, pickQty), unitPrice: item.price, taxRate: 0, discountPercent: 0 },
     ]);
     setPickRefId(0);
     setPickQty(1);
@@ -148,12 +191,15 @@ export function QuoteFormContent() {
     setLines((prev) => prev.filter((_, i) => i !== index));
   }
 
-  const subtotal = useMemo(() => roundMoney(lines.reduce((sum, l) => sum + l.quantity * l.unitPrice, 0)), [lines]);
-  const discountValue = useMemo(() => {
-    const d = Number.parseFloat(discount.replace(",", ".")) || 0;
-    return roundMoney(Math.min(subtotal, Math.max(0, d)));
-  }, [discount, subtotal]);
-  const total = useMemo(() => roundMoney(Math.max(0, subtotal - discountValue)), [subtotal, discountValue]);
+  // Totals faithful to quotes.php: subtotale = Σ net, sconto = Σ (gross-net),
+  // IVA = Σ line tax, totale = subtotale + IVA.
+  const subtotal = useMemo(() => roundMoney(lines.reduce((sum, l) => sum + lineNet(l), 0)), [lines]);
+  const discountValue = useMemo(
+    () => roundMoney(lines.reduce((sum, l) => sum + (Math.max(1, l.quantity) * Math.max(0, l.unitPrice) - lineNet(l)), 0)),
+    [lines],
+  );
+  const taxValue = useMemo(() => roundMoney(lines.reduce((sum, l) => sum + lineTaxAmt(l), 0)), [lines]);
+  const total = useMemo(() => roundMoney(subtotal + taxValue), [subtotal, taxValue]);
 
   function backToList() {
     window.location.href = `/${encodeURIComponent(slug)}/quotes`;
@@ -172,15 +218,33 @@ export function QuoteFormContent() {
         type: l.type,
         refId: l.refId,
         name: l.name,
+        sku: l.sku,
         quantity: l.quantity,
         unitPrice: l.unitPrice,
+        taxRate: l.taxRate,
+        discountPercent: l.discountPercent,
       }));
       const payload: Record<string, unknown> = {
         action: action === "edit" ? "update" : "create",
         id: String(quoteId),
         client_id: String(clientId || 0),
         client_name: clientId > 0 ? "" : clientName,
-        discount: String(discountValue),
+        quote_date: quoteDate,
+        valid_until: validUntil,
+        notes,
+        terms,
+        public_note: publicNote,
+        client_company_name: snap.companyName,
+        client_vat_number: snap.vatNumber,
+        client_tax_code: snap.taxCode,
+        client_sdi: snap.sdi,
+        client_pec: snap.pec,
+        client_email: snap.email,
+        client_phone: snap.phone,
+        client_address: snap.address,
+        client_cap: snap.cap,
+        client_city: snap.city,
+        client_province: snap.province,
         lines_json: JSON.stringify(linesJson),
       };
       const res = await fetch(`/api/manage/quotes?slug=${encodeURIComponent(slug)}`, {
@@ -256,7 +320,67 @@ export function QuoteFormContent() {
                   onChange={(e) => setClientName(e.target.value)}
                 />
               </div>
+              <div className="col-md-3">
+                <label className="form-label">Data preventivo</label>
+                <input className="form-control" type="date" value={quoteDate} onChange={(e) => setQuoteDate(e.target.value)} />
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">Valido fino al</label>
+                <input className="form-control" type="date" value={validUntil} onChange={(e) => setValidUntil(e.target.value)} />
+              </div>
             </div>
+
+            <details className="mt-3">
+              <summary className="text-muted small" style={{ cursor: "pointer" }}>
+                Dati fiscali cliente (opzionale)
+              </summary>
+              <div className="row g-2 mt-1">
+                <div className="col-md-4">
+                  <label className="form-label small">Ragione sociale</label>
+                  <input className="form-control form-control-sm" value={snap.companyName} onChange={(e) => setSnap((s) => ({ ...s, companyName: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">P.IVA</label>
+                  <input className="form-control form-control-sm" value={snap.vatNumber} onChange={(e) => setSnap((s) => ({ ...s, vatNumber: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">Codice fiscale</label>
+                  <input className="form-control form-control-sm" value={snap.taxCode} onChange={(e) => setSnap((s) => ({ ...s, taxCode: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">SDI</label>
+                  <input className="form-control form-control-sm" value={snap.sdi} onChange={(e) => setSnap((s) => ({ ...s, sdi: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">PEC</label>
+                  <input className="form-control form-control-sm" value={snap.pec} onChange={(e) => setSnap((s) => ({ ...s, pec: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">Email</label>
+                  <input className="form-control form-control-sm" value={snap.email} onChange={(e) => setSnap((s) => ({ ...s, email: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">Telefono</label>
+                  <input className="form-control form-control-sm" value={snap.phone} onChange={(e) => setSnap((s) => ({ ...s, phone: e.target.value }))} />
+                </div>
+                <div className="col-md-4">
+                  <label className="form-label small">Indirizzo</label>
+                  <input className="form-control form-control-sm" value={snap.address} onChange={(e) => setSnap((s) => ({ ...s, address: e.target.value }))} />
+                </div>
+                <div className="col-md-1">
+                  <label className="form-label small">CAP</label>
+                  <input className="form-control form-control-sm" value={snap.cap} onChange={(e) => setSnap((s) => ({ ...s, cap: e.target.value }))} />
+                </div>
+                <div className="col-md-2">
+                  <label className="form-label small">Città</label>
+                  <input className="form-control form-control-sm" value={snap.city} onChange={(e) => setSnap((s) => ({ ...s, city: e.target.value }))} />
+                </div>
+                <div className="col-md-1">
+                  <label className="form-label small">Prov.</label>
+                  <input className="form-control form-control-sm" value={snap.province} onChange={(e) => setSnap((s) => ({ ...s, province: e.target.value }))} />
+                </div>
+              </div>
+            </details>
           </div>
 
           <div className="card p-3 mb-3">
@@ -311,10 +435,11 @@ export function QuoteFormContent() {
               <table className="table mb-0 align-middle">
                 <thead>
                   <tr>
-                    <th>Tipo</th>
                     <th>Voce</th>
                     <th className="text-end">Prezzo</th>
                     <th className="text-end">Q.tà</th>
+                    <th className="text-end">Sconto %</th>
+                    <th className="text-end">IVA %</th>
                     <th className="text-end">Totale</th>
                     <th className="text-end">Azioni</th>
                   </tr>
@@ -322,16 +447,18 @@ export function QuoteFormContent() {
                 <tbody>
                   {lines.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="text-muted small p-3">
+                      <td colSpan={7} className="text-muted small p-3">
                         Nessuna voce. Aggiungi servizi o prodotti al preventivo.
                       </td>
                     </tr>
                   ) : (
                     lines.map((l, index) => (
                       <tr key={`${l.type}-${l.refId}-${index}`}>
-                        <td>{l.type === "service" ? "Servizio" : "Prodotto"}</td>
-                        <td className="fw-semibold">{l.name}</td>
-                        <td className="text-end" style={{ maxWidth: 140 }}>
+                        <td className="fw-semibold">
+                          {l.name}
+                          <div className="small text-muted">{l.type === "service" ? "Servizio" : l.type === "product" ? "Prodotto" : "Voce"}</div>
+                        </td>
+                        <td className="text-end" style={{ maxWidth: 120 }}>
                           <input
                             className="form-control form-control-sm text-end"
                             type="number"
@@ -341,7 +468,7 @@ export function QuoteFormContent() {
                             onChange={(e) => setLine(index, { unitPrice: Math.max(0, Number.parseFloat(e.target.value) || 0) })}
                           />
                         </td>
-                        <td className="text-end" style={{ maxWidth: 110 }}>
+                        <td className="text-end" style={{ maxWidth: 90 }}>
                           <input
                             className="form-control form-control-sm text-end"
                             type="number"
@@ -350,7 +477,29 @@ export function QuoteFormContent() {
                             onChange={(e) => setLine(index, { quantity: Math.max(1, Number.parseInt(e.target.value, 10) || 1) })}
                           />
                         </td>
-                        <td className="text-end fw-semibold">{fmtEuro(roundMoney(l.quantity * l.unitPrice))}</td>
+                        <td className="text-end" style={{ maxWidth: 90 }}>
+                          <input
+                            className="form-control form-control-sm text-end"
+                            type="number"
+                            min={0}
+                            max={100}
+                            step="0.01"
+                            value={l.discountPercent}
+                            onChange={(e) => setLine(index, { discountPercent: Math.min(100, Math.max(0, Number.parseFloat(e.target.value) || 0)) })}
+                          />
+                        </td>
+                        <td className="text-end" style={{ maxWidth: 90 }}>
+                          <input
+                            className="form-control form-control-sm text-end"
+                            type="number"
+                            min={0}
+                            max={100}
+                            step="0.01"
+                            value={l.taxRate}
+                            onChange={(e) => setLine(index, { taxRate: Math.min(100, Math.max(0, Number.parseFloat(e.target.value) || 0)) })}
+                          />
+                        </td>
+                        <td className="text-end fw-semibold">{fmtEuro(roundMoney(lineNet(l) + lineTaxAmt(l)))}</td>
                         <td className="text-end">
                           <button className="btn btn-sm btn-outline-danger" type="button" onClick={() => removeLine(index)}>
                             ✕
@@ -365,31 +514,42 @@ export function QuoteFormContent() {
           </div>
 
           <div className="card p-3 mb-3">
-            <div className="row g-3 justify-content-end">
-              <div className="col-md-3">
-                <label className="form-label">Sconto (€)</label>
-                <input
-                  className="form-control"
-                  type="number"
-                  step="0.01"
-                  min={0}
-                  value={discount}
-                  onChange={(e) => setDiscount(e.target.value)}
-                />
+            <div className="row g-3">
+              <div className="col-md-8">
+                <div className="row g-3">
+                  <div className="col-md-4">
+                    <label className="form-label">Nota per il cliente</label>
+                    <textarea className="form-control" rows={2} value={publicNote} onChange={(e) => setPublicNote(e.target.value)} placeholder="Testo mostrato al cliente…" />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Condizioni</label>
+                    <textarea className="form-control" rows={2} value={terms} onChange={(e) => setTerms(e.target.value)} placeholder="Condizioni di vendita…" />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Note interne</label>
+                    <textarea className="form-control" rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Non mostrate al cliente…" />
+                  </div>
+                </div>
               </div>
-              <div className="col-md-3">
-                <div className="d-flex justify-content-between">
-                  <span className="text-muted">Subtotale</span>
-                  <span className="fw-semibold">{fmtEuro(subtotal)}</span>
-                </div>
-                <div className="d-flex justify-content-between">
-                  <span className="text-muted">Sconto</span>
-                  <span className="fw-semibold">- {fmtEuro(discountValue)}</span>
-                </div>
-                <hr className="my-2" />
-                <div className="d-flex justify-content-between">
-                  <span className="fw-semibold">Totale</span>
-                  <span className="h5 fw-bold m-0">{fmtEuro(total)}</span>
+              <div className="col-md-4">
+                <div className="border rounded-3 p-3 bg-light">
+                  <div className="d-flex justify-content-between">
+                    <span className="text-muted">Subtotale</span>
+                    <span className="fw-semibold">{fmtEuro(subtotal)}</span>
+                  </div>
+                  <div className="d-flex justify-content-between">
+                    <span className="text-muted">Sconto</span>
+                    <span className="fw-semibold">- {fmtEuro(discountValue)}</span>
+                  </div>
+                  <div className="d-flex justify-content-between">
+                    <span className="text-muted">IVA</span>
+                    <span className="fw-semibold">{fmtEuro(taxValue)}</span>
+                  </div>
+                  <hr className="my-2" />
+                  <div className="d-flex justify-content-between">
+                    <span className="fw-semibold">Totale</span>
+                    <span className="h5 fw-bold m-0">{fmtEuro(total)}</span>
+                  </div>
                 </div>
               </div>
             </div>
