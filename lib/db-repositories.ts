@@ -4295,7 +4295,7 @@ export async function issueDbGiftCard(input: Partial<GiftCard>, slug: string): P
   return getSingleGiftCard(slug, id);
 }
 
-export async function redeemDbGiftCard(id: number, amount: number, slug: string): Promise<GiftCard> {
+export async function redeemDbGiftCard(id: number, amount: number, slug: string, note?: string): Promise<GiftCard> {
   const giftCard = await getSingleGiftCard(slug, id);
   if (giftCard.status !== "active") throw new Error("GiftCard non utilizzabile.");
   const value = roundMoney(Math.max(0, amount));
@@ -4316,11 +4316,138 @@ export async function redeemDbGiftCard(id: number, amount: number, slug: string)
     giftcard_id: id,
     type: "redeem",
     amount: value,
-    note: "Riscatto GiftCard",
+    note: String(note ?? "").trim() || "Riscatto GiftCard",
     created_at: new Date(),
   });
 
   return getSingleGiftCard(slug, id);
+}
+
+// ---- GiftCard DETAIL + manage (giftcard.php action=edit) ---------------------
+export type GiftCardTransaction = { id: number; type: string; amount: number; note: string; createdAt: string };
+export type ManageGiftCard = {
+  id: number;
+  code: string;
+  recipientName: string;
+  recipientEmail: string;
+  clientId: number;
+  initialAmount: number;
+  balance: number;
+  currency: string;
+  status: string;
+  statusLabel: string;
+  statusBadge: string;
+  issuedAt: string;
+  expiresAt: string;
+  redeemedAt: string;
+  cancelledAt: string;
+  note: string;
+  giftMessage: string;
+  internalNote: string;
+  eventType: string;
+  linkedSaleId: number | null;
+  transactions: GiftCardTransaction[];
+  canRedeem: boolean;
+  canEdit: boolean;
+};
+
+const GIFTCARD_STATUS_META: Record<string, { label: string; badge: string }> = {
+  active: { label: "Attiva", badge: "bg-success" },
+  used: { label: "Utilizzata", badge: "bg-secondary" },
+  expired: { label: "Scaduta", badge: "bg-warning text-dark" },
+  cancelled: { label: "Annullata", badge: "bg-danger" },
+};
+
+// Full giftcard DETAIL (port of giftcard.php action=edit): the header (code /
+// recipient / balance / status / dates / messages) + the transactions ledger
+// (giftcard_transactions) + the linked sale (from the "Vendita #N" note) and the
+// redeem/edit eligibility.
+export async function getManageGiftCard(slug: string, id: number): Promise<ManageGiftCard | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftcards", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const card = rows[0];
+  const base = mapGiftCard(card);
+
+  const txRows = await tenantSelect<RowDataPacket>({ slug, table: "giftcard_transactions", where: "giftcard_id = ?", params: [id], orderBy: "created_at DESC, id DESC", limit: 100 }).catch(() => [] as RowDataPacket[]);
+  const transactions: GiftCardTransaction[] = txRows.map((r) => ({
+    id: Number(r.id ?? 0),
+    type: String(r.type ?? ""),
+    amount: roundMoney(Number(r.amount ?? 0)),
+    note: String(r.note ?? ""),
+    createdAt: toIso(r.created_at),
+  }));
+
+  let linkedSaleId: number | null = null;
+  const noteMatch = String(card.note ?? "").match(/Vendita\s+#(\d+)/i);
+  if (noteMatch) linkedSaleId = Number(noteMatch[1]) || null;
+
+  const meta = GIFTCARD_STATUS_META[base.status] ?? { label: base.status, badge: "bg-secondary" };
+  return {
+    id,
+    code: base.code,
+    recipientName: String(card.recipient_name ?? ""),
+    recipientEmail: String(card.recipient_email ?? ""),
+    clientId: Number(card.recipient_client_id ?? card.client_id ?? 0) || 0,
+    initialAmount: base.initialAmount,
+    balance: base.balance,
+    currency: String(card.currency ?? "EUR"),
+    status: base.status,
+    statusLabel: meta.label,
+    statusBadge: meta.badge,
+    issuedAt: card.issued_at ? toIso(card.issued_at) : "",
+    expiresAt: card.expires_at ? String(card.expires_at).slice(0, 10) : "",
+    redeemedAt: card.redeemed_at ? toIso(card.redeemed_at) : "",
+    cancelledAt: card.cancelled_at ? toIso(card.cancelled_at) : "",
+    note: String(card.note ?? ""),
+    giftMessage: String(card.gift_message ?? ""),
+    internalNote: String(card.internal_note ?? ""),
+    eventType: String(card.event_type ?? ""),
+    linkedSaleId,
+    transactions,
+    canRedeem: base.status === "active" && base.balance > 0,
+    canEdit: base.status !== "cancelled",
+  };
+}
+
+// Update a giftcard's recipient + note + expiry (port of giftcard.php update /
+// update_expiry / update_note / update_internal_note). Assigning a
+// recipient_client_id links the card to that client and forces the recipient
+// name/email from the anagrafica. A cancelled card is not editable.
+export async function updateManageGiftCard(
+  slug: string,
+  id: number,
+  input: { recipientClientId?: number; recipientName?: string; recipientEmail?: string; giftMessage?: string; internalNote?: string; expiresAt?: string },
+): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("GiftCard non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftcards", columns: "id, status", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("GiftCard non trovata.");
+  const st = String(rows[0].status ?? "").trim().toLowerCase();
+  if (st === "cancelled" || st === "canceled") throw new Error("GiftCard annullata: non modificabile.");
+
+  let recipientName = String(input.recipientName ?? "").trim();
+  let recipientEmail = String(input.recipientEmail ?? "").trim();
+  const recipientClientId = Math.max(0, Math.trunc(Number(input.recipientClientId ?? 0)));
+  if (recipientClientId > 0) {
+    const cRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "full_name, email", where: "id = ?", params: [recipientClientId], limit: 1 });
+    if (!cRows[0]) throw new Error("Cliente destinatario non trovato.");
+    const cName = String(cRows[0].full_name ?? "").trim();
+    if (cName !== "") recipientName = cName;
+    const cEmail = String(cRows[0].email ?? "").trim();
+    if (cEmail !== "" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cEmail)) recipientEmail = cEmail;
+  }
+
+  const values = await filterColumns((await tenantTable(slug, "giftcards")).name, {
+    recipient_client_id: recipientClientId > 0 ? recipientClientId : null,
+    recipient_name: recipientName !== "" ? recipientName : null,
+    recipient_email: recipientEmail !== "" ? recipientEmail : null,
+    gift_message: input.giftMessage !== undefined ? (String(input.giftMessage).trim() || null) : undefined,
+    internal_note: input.internalNote !== undefined ? (String(input.internalNote).trim() || null) : undefined,
+    expires_at: input.expiresAt !== undefined && normalizeClientDate(input.expiresAt) ? normalizeClientDate(input.expiresAt) : undefined,
+    updated_at: new Date(),
+  });
+  await tenantUpdate({ slug, table: "giftcards", id, values });
+  return { ok: true };
 }
 
 // Inverse of redeemDbGiftCard, exported for the POS void flow: refund `amount` back

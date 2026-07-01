@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { issueDbGiftCard, listDbGiftCards, redeemDbGiftCard } from "@/lib/db-repositories";
+import { getManageGiftCard, issueDbGiftCard, listDbClients, listDbGiftCards, redeemDbGiftCard, updateManageGiftCard } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { canAny } from "@/lib/role-permissions";
@@ -16,6 +16,19 @@ export async function GET(request: Request) {
   if (!canAny(session.user.perms, giftCardPerms)) return jsonError("Permesso GiftCard mancante.", 403);
 
   try {
+    const url = new URL(request.url);
+    const action = url.searchParams.get("action");
+
+    // Card DETAIL (action=view/edit): header + balance + transactions + linked
+    // sale + redeem/edit eligibility. Also returns the clients list for the
+    // recipient picker.
+    if (action === "view" || action === "edit") {
+      const detail = await getManageGiftCard(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
+      if (!detail) return jsonError("GiftCard non trovata.", 404);
+      const clients = (await listDbClients({ slug: tenantSlug })).map((c) => ({ id: c.id, name: c.name }));
+      return Response.json({ ok: true, sourceMode: "database", detail, clients });
+    }
+
     return Response.json({
       ok: true,
       sourceMode: "database",
@@ -49,9 +62,25 @@ export async function POST(request: Request) {
 
     if (action === "redeem") {
       const id = parseInteger(body.id);
-      const amount = parseNumber(body.amount, 0);
-      const giftCard = await redeemDbGiftCard(id, amount, tenantSlug);
-      return Response.json({ ok: true, source: "giftcard?action=redeem", sourceMode: "database", giftCard, giftCards: await listDbGiftCards(tenantSlug) });
+      const amount = parseNumber(body.amount ?? body.redeem_amount, 0);
+      await redeemDbGiftCard(id, amount, tenantSlug, body.note ?? body.redeem_note);
+      const detail = await getManageGiftCard(tenantSlug, id);
+      return Response.json({ ok: true, source: "giftcard?action=redeem", sourceMode: "database", detail, giftCards: await listDbGiftCards(tenantSlug) });
+    }
+
+    // Update a card's recipient/note/expiry (port of update / update_note / update_expiry).
+    if (action === "update") {
+      const id = parseInteger(body.id);
+      await updateManageGiftCard(tenantSlug, id, {
+        recipientClientId: parseInteger(body.recipient_client_id, 0),
+        recipientName: body.recipient_name,
+        recipientEmail: body.recipient_email,
+        giftMessage: body.gift_message,
+        internalNote: body.internal_note,
+        expiresAt: body.expires_at,
+      });
+      const detail = await getManageGiftCard(tenantSlug, id);
+      return Response.json({ ok: true, source: "giftcard?action=update", sourceMode: "database", detail });
     }
 
     return jsonError("Azione GiftCard non supportata.");

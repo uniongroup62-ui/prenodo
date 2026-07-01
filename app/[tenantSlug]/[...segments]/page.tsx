@@ -25,6 +25,7 @@ import { SuppliersContent } from "@/components/modules/suppliers-content";
 import { SupplierFormContent } from "@/components/modules/supplier_form-content";
 import { CabinsContent } from "@/components/modules/cabins-content";
 import { GiftcardContent } from "@/components/modules/giftcard-content";
+import { GiftCardDetailContent } from "@/components/modules/giftcard_detail-content";
 import { GiftsContent } from "@/components/modules/gifts-content";
 import { GiftFormContent } from "@/components/modules/gift_form-content";
 import { GiftBoxFormContent } from "@/components/modules/giftbox_form-content";
@@ -382,6 +383,16 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ClientPackageDetailContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful giftcard DETAIL (giftcard.php action=edit/view): header + balance +
+  // transactions + redeem/update-recipient, instead of the Tailwind fallback.
+  if (page === "giftcard" && (query.action === "edit" || query.action === "view")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <GiftCardDetailContent />
       </ManageShell>
     );
   }

@@ -140,12 +140,13 @@ export function GiftcardContent() {
                   <th>Stato</th>
                   <th className="text-end">Saldo</th>
                   <th className="text-end">Importo</th>
+                  <th className="text-end">Azioni</th>
                 </tr>
               </thead>
               <tbody>
                 {giftCards.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="text-muted small p-3">
+                    <td colSpan={8} className="text-muted small p-3">
                       {loading ? "Caricamento…" : "Nessuna GiftCard."}
                     </td>
                   </tr>
@@ -163,6 +164,11 @@ export function GiftcardContent() {
                         </td>
                         <td className="text-end fw-semibold">{fmtEuro(card.balance)}</td>
                         <td className="text-end text-muted">{fmtEuro(card.initialAmount)}</td>
+                        <td className="text-end">
+                          <a className="btn btn-sm btn-outline-secondary" href={href(`giftcard&action=edit&id=${card.id}`)}>
+                            Apri
+                          </a>
+                        </td>
                       </tr>
                     );
                   })
