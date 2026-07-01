@@ -3,6 +3,7 @@ import { currentManageSession } from "@/lib/manage-auth";
 import { resolveManageLocationId } from "@/lib/manage-locations";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { cancelManageSale, checkoutManageSale, deleteCancelledSale, getManagePosAppointmentCart, getManagePosContext, getManagePosResiduals, getManageSaleDetail, markManageSaleItemCollected, markPrepaidManualExecution, undoManageSaleItemCollected, undoPrepaidManualExecution } from "@/lib/manage-pos";
+import type { PointsStornoMode } from "@/lib/manage-pos";
 import { can, canAny } from "@/lib/role-permissions";
 import type {
   PosCheckoutInput,
@@ -112,6 +113,11 @@ export async function POST(request: Request) {
         stockCancelMode: normalizeStockCancelMode(body.stock_cancel_mode),
         userId: session.user.id,
         userName: session.user.name,
+        // Fidelity-points storno decisions from the cancel modal. Default "normal" (fails safe
+        // by throwing on insufficient balance); the decision UI, when it appears, defaults to
+        // "negative". Port of pos_history.php's points_storno_mode + recharge_points_storno_mode.
+        pointsStornoMode: normalizePointsStornoMode(body.points_storno_mode),
+        rechargePointsModes: normalizeRechargePointsModes(body.recharge_points_storno_mode),
       });
       return Response.json({
         ...payload,
@@ -403,4 +409,36 @@ function normalizeStockCancelMode(value: string | undefined): "restore" | "no_re
   if (value === "no_restore") return "no_restore";
   if (value === "none") return "none";
   return "restore";
+}
+
+// Normalize a fidelity-points storno mode to "normal" | "negative" | "skip". Default "normal"
+// (fails safe — the void throws on insufficient balance). Port of pos_history.php ~1120-1121:
+// strtolower(trim(... ?? 'normal')); anything not in the whitelist collapses to "normal".
+function normalizePointsStornoMode(value: unknown): PointsStornoMode {
+  const v = String(value ?? "normal").trim().toLowerCase();
+  if (v === "negative" || v === "skip") return v;
+  return "normal";
+}
+
+// Parse recharge_points_storno_mode: an object/array keyed by recharge id → mode string. Port
+// of pos_history.php ~1122-1124 + the per-recharge read at ~1762-1763 (default "normal" per id).
+// Accepts both a plain object ({ "12": "skip" }) and JSON-encoded string; ignores non-numeric
+// keys and normalizes each value.
+function normalizeRechargePointsModes(value: unknown): Record<number, PointsStornoMode> {
+  const out: Record<number, PointsStornoMode> = {};
+  let src: unknown = value;
+  if (typeof src === "string") {
+    try {
+      src = JSON.parse(src);
+    } catch {
+      return out;
+    }
+  }
+  if (!src || typeof src !== "object") return out;
+  for (const [key, val] of Object.entries(src as Record<string, unknown>)) {
+    const id = Number(key);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    out[id] = normalizePointsStornoMode(val);
+  }
+  return out;
 }

@@ -58,12 +58,24 @@ type CancelSummary = {
   giftboxes: Array<{ id: number; code: string; status: string; fullyRedeemed: boolean; redeemedItems: string[]; remainingItems: string[] }>;
   packages: Array<{ id: number; name: string; sessionsTotal: number; sessionsRemaining: number }>;
   prepaidServices: Array<{ id: number; name: string; purchasedQty: number; remainingQty: number }>;
-  recharges: Array<{ id: number; totalAmount: number; isVoid: boolean }>;
+  recharges: Array<{ id: number; totalAmount: number; earnedStorno: number; isVoid: boolean }>;
   installmentPlans: Array<{ id: number; status: string }>;
   creditRestored: number;
   giftcardResidualRefunded: number;
   giftcardResidualCode: string;
   pointsRestored: number;
+  // SALE-level earned-points storno decision (present only when reversing would go negative).
+  pointsStornoExtra: { current: number; usedRestore: number; earnedStorno: number; wouldBe: number } | null;
+  // PER-recharge earned-points storno decisions.
+  rechargePointStornoItems: Array<{
+    id: number;
+    label: string;
+    current: number;
+    earnedStorno: number;
+    wouldBe: number;
+    isProjected: boolean;
+    totalAmount: number;
+  }>;
   summary: string[];
   warnings: string[];
   blockers: string[];
@@ -279,6 +291,10 @@ export function PosSaleDetailContent() {
   const [cancelReason, setCancelReason] = useState("");
   const [stockMode, setStockMode] = useState<"restore" | "no_restore">("restore");
   const [busy, setBusy] = useState(false);
+  // Fidelity-points storno decisions. When a decision section appears the radio DEFAULTS to
+  // "negative" (matching the legacy checked radio); an absent selection is treated as "negative".
+  const [saleStornoMode, setSaleStornoMode] = useState<"negative" | "skip">("negative");
+  const [rechargeStornoModes, setRechargeStornoModes] = useState<Record<number, "negative" | "skip">>({});
 
   // Delete modal state (hard-delete of an already-cancelled sale).
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -359,7 +375,7 @@ export function PosSaleDetailContent() {
   const collectedProducts = useMemo(() => preorderTracking.filter((p) => p.status === "collected"), [preorderTracking]);
   const hasTracking = prepaidTracking.length > 0 || preorderTracking.length > 0;
 
-  async function postAction(payload: Record<string, string>): Promise<{ ok: boolean; error?: string; sale?: PosSale; cancelSummary?: CancelSummary }> {
+  async function postAction(payload: Record<string, unknown>): Promise<{ ok: boolean; error?: string; sale?: PosSale; cancelSummary?: CancelSummary }> {
     const res = await fetch(`/api/manage/pos?slug=${encodeURIComponent(slug)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
@@ -378,11 +394,25 @@ export function PosSaleDetailContent() {
     setBusy(true);
     setError("");
     try {
+      // Fidelity-points storno modes. Sent ONLY as decided by the operator when the decision
+      // section is shown; when no section appears the mode is omitted (server defaults "normal",
+      // behaviour unchanged). Faithful to the legacy modal: shown → default "negative"; the
+      // per-recharge object keys each recharge id whose section appears.
+      const rechargeModes: Record<string, string> = {};
+      for (const item of summary?.rechargePointStornoItems ?? []) {
+        rechargeModes[String(item.id)] = rechargeStornoModes[item.id] ?? "negative";
+      }
       const json = await postAction({
         action: "cancel",
         sale_id: String(sale.id),
         reason,
         stock_cancel_mode: summary?.requiresStockDecision ? stockMode : "none",
+        ...(summary?.pointsStornoExtra ? { points_storno_mode: saleStornoMode } : {}),
+        // JSON-encode the per-recharge map: postAction serialises the body as JSON and the
+        // server's parseRequestBody flattens each top-level value to a string (an object would
+        // become "[object Object]"), so send a JSON string that normalizeRechargePointsModes
+        // parses back into the { rechargeId: mode } map.
+        ...(summary && summary.rechargePointStornoItems.length > 0 ? { recharge_points_storno_mode: JSON.stringify(rechargeModes) } : {}),
       });
       if (json?.error) {
         setError(json.error);
@@ -1034,6 +1064,114 @@ export function PosSaleDetailContent() {
                       />
                       <label className="form-check-label" htmlFor="stockNoRestore">
                         Non ripristinare la giacenza
+                      </label>
+                    </div>
+                  </div>
+                ) : null}
+
+                {/* PER-recharge fidelity-points storno decisions (port of pos_sale_detail.php
+                    ~5953-6019). One block per recharge whose earned-points storno would push the
+                    projected balance negative; radios default to "negative" (storna comunque). */}
+                {summary && summary.rechargePointStornoItems.length > 0 ? (
+                  <div className="mb-2">
+                    <div className="alert alert-warning py-2 mb-2">
+                      <div className="fw-semibold mb-1">Disponibile insufficiente per lo storno dei punti ricarica</div>
+                      <div className="small">
+                        Almeno una ricarica di questa vendita ha punti Fidelity accreditati che non sono piu completamente disponibili per lo storno.
+                        Puoi stornare comunque i punti portando il saldo disponibile in negativo oppure completare l&apos;annullamento senza stornare i punti guadagnati da quella ricarica.
+                      </div>
+                    </div>
+                    {summary.rechargePointStornoItems.map((item) => {
+                      const mode = rechargeStornoModes[item.id] ?? "negative";
+                      return (
+                        <div className="border rounded p-2 mb-2 bg-light-subtle" key={item.id}>
+                          <div className="fw-semibold small">{item.label} — punti Fidelity ricarica</div>
+                          <div className="small text-muted mb-2">
+                            Credito ricarica: <strong>€ {fmtMoney(item.totalAmount)}</strong>
+                            {" • "}
+                            {item.isProjected ? "Saldo stimato prima di questo storno" : "Saldo totale"}: <strong>{item.current} pt</strong>
+                            {" • "}Storno: <strong>-{item.earnedStorno} pt</strong>
+                            {" • "}Saldo finale: <strong>{item.wouldBe} pt</strong>
+                          </div>
+                          <div className="form-check">
+                            <input
+                              className="form-check-input"
+                              type="radio"
+                              name={`rechargePtsMode_${item.id}`}
+                              id={`rechargePtsNeg_${item.id}`}
+                              checked={mode === "negative"}
+                              onChange={() => setRechargeStornoModes((prev) => ({ ...prev, [item.id]: "negative" }))}
+                            />
+                            <label className="form-check-label small" htmlFor={`rechargePtsNeg_${item.id}`}>
+                              Porta il disponibile punti in negativo (storna comunque)
+                            </label>
+                          </div>
+                          <div className="form-check">
+                            <input
+                              className="form-check-input"
+                              type="radio"
+                              name={`rechargePtsMode_${item.id}`}
+                              id={`rechargePtsSkip_${item.id}`}
+                              checked={mode === "skip"}
+                              onChange={() => setRechargeStornoModes((prev) => ({ ...prev, [item.id]: "skip" }))}
+                            />
+                            <label className="form-check-label small" htmlFor={`rechargePtsSkip_${item.id}`}>
+                              Procedi con l&apos;annullamento senza scalare i punti guadagnati da {item.label}
+                            </label>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+
+                {/* SALE-level fidelity-points storno decision (port of pos_sale_detail.php
+                    ~6025-6077). Shown only when reversing the sale's earned points would push the
+                    balance negative; radio defaults to "negative". */}
+                {summary && summary.pointsStornoExtra ? (
+                  <div className="mb-2">
+                    <div className="alert alert-warning py-2 mb-2">
+                      <div className="fw-semibold mb-1">Disponibile insufficiente per lo storno dei punti Fidelity</div>
+                      <div className="small">
+                        Il cliente non ha piu disponibilita libera sufficiente per stornare punti Fidelity guadagnati con questa vendita.
+                        Puoi compensare lo storno con eventuali importi usati come sconto e, se non basta, portare il disponibile in negativo. In alternativa puoi annullare senza scalare i punti guadagnati.
+                      </div>
+                    </div>
+                    <div className="small fw-semibold mb-1">Punti Fidelity vendita</div>
+                    <div className="small text-muted mb-2">
+                      Saldo totale: <strong>{summary.pointsStornoExtra.current} pt</strong>
+                      {summary.pointsStornoExtra.usedRestore > 0 ? (
+                        <> {" • "}Ripristino: <strong>+{summary.pointsStornoExtra.usedRestore} pt</strong></>
+                      ) : null}
+                      {" • "}Storno: <strong>-{summary.pointsStornoExtra.earnedStorno} pt</strong>
+                      {" • "}Saldo finale: <strong>{summary.pointsStornoExtra.wouldBe} pt</strong>
+                    </div>
+                    <div className="form-check">
+                      <input
+                        className="form-check-input"
+                        type="radio"
+                        name="saleStornoMode"
+                        id="saleStornoNeg"
+                        checked={saleStornoMode === "negative"}
+                        onChange={() => setSaleStornoMode("negative")}
+                      />
+                      <label className="form-check-label small" htmlFor="saleStornoNeg">
+                        {summary.pointsStornoExtra.usedRestore > 0
+                          ? "Porta il disponibile punti in negativo (compensa anche con i punti ripristinati)"
+                          : "Porta il disponibile punti in negativo (storna comunque)"}
+                      </label>
+                    </div>
+                    <div className="form-check">
+                      <input
+                        className="form-check-input"
+                        type="radio"
+                        name="saleStornoMode"
+                        id="saleStornoSkip"
+                        checked={saleStornoMode === "skip"}
+                        onChange={() => setSaleStornoMode("skip")}
+                      />
+                      <label className="form-check-label small" htmlFor="saleStornoSkip">
+                        Procedi con l&apos;annullamento senza scalare i punti guadagnati
                       </label>
                     </div>
                   </div>

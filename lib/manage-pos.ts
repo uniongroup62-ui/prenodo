@@ -775,9 +775,27 @@ function shiftInstallmentDate(date: string, unit: "day" | "week" | "month", valu
   return addMonthsIso(safeDate, step * steps);
 }
 
+// Fidelity-points STORNO mode when reversing earned points would drive the balance negative
+// (port of pos_history.php's points_storno_mode). "normal" fails safe (throws on insufficient
+// balance); "negative" reverses anyway (balance allowed to go below zero); "skip" completes the
+// void WITHOUT reversing the earned points (writes an audit note instead).
+export type PointsStornoMode = "normal" | "negative" | "skip";
+
 export async function cancelManageSale(
   slug: string,
-  input: { saleId: number; reason: string; stockCancelMode: "restore" | "no_restore" | "none"; userId: number | null; userName: string },
+  input: {
+    saleId: number;
+    reason: string;
+    stockCancelMode: "restore" | "no_restore" | "none";
+    userId: number | null;
+    userName: string;
+    // SALE-level earned-points storno decision (default "normal"). Only meaningful when the
+    // preview surfaced pointsStornoExtra; otherwise the balance is sufficient and "normal" is
+    // a no-throw reverse.
+    pointsStornoMode?: PointsStornoMode;
+    // PER-recharge earned-points storno decisions, keyed by recharge id (default "normal" per id).
+    rechargePointsModes?: Record<number, PointsStornoMode>;
+  },
 ): Promise<ManagePosContext & { sale: PosSale }> {
   if (input.saleId <= 0) throw new Error("Vendita non valida.");
   const saleRow = await getSaleRow(slug, input.saleId);
@@ -816,12 +834,21 @@ export async function cancelManageSale(
     });
   }
 
+  // Refuse a normal-mode storno that would go negative BEFORE mutating anything (the cancel is
+  // not one transaction), reproducing the legacy transaction-rollback for the only throw the
+  // storno decision adds. negative/skip never gate here.
+  const pointsModes = {
+    pointsStornoMode: input.pointsStornoMode ?? ("normal" as PointsStornoMode),
+    rechargePointsModes: input.rechargePointsModes ?? {},
+  };
+  await assertNormalStornoFeasible(slug, saleRow, pointsModes);
+
   await markSaleCancelled(slug, input.saleId, {
     userId: input.userId,
     reason,
     note: cancelNote(input.saleId, input.userName, reason, stockMode, productItems),
   });
-  await cancelLinkedSaleResidues(slug, input.saleId, reason, saleRow, input.userId);
+  await cancelLinkedSaleResidues(slug, input.saleId, reason, saleRow, input.userId, pointsModes);
 
   const updated = await getSale(slug, input.saleId);
   return {
@@ -936,13 +963,34 @@ export type PosCancelSummary = {
   giftboxes: Array<{ id: number; code: string; status: string; fullyRedeemed: boolean; redeemedItems: string[]; remainingItems: string[] }>;
   packages: Array<{ id: number; name: string; sessionsTotal: number; sessionsRemaining: number }>;
   prepaidServices: Array<{ id: number; name: string; purchasedQty: number; remainingQty: number }>;
-  recharges: Array<{ id: number; totalAmount: number; isVoid: boolean }>;
+  recharges: Array<{ id: number; totalAmount: number; earnedStorno: number; isVoid: boolean }>;
   installmentPlans: Array<{ id: number; status: string }>;
   // Residui RESTORED on void (re-credited credit / refunded giftcard / refunded points).
   creditRestored: number;
   giftcardResidualRefunded: number;
   giftcardResidualCode: string;
   pointsRestored: number;
+  // SALE-level fidelity-points STORNO decision (port of _pos_sale_cancel_preview's
+  // extra['points_storno'], pos_sale_detail.php ~1930-1966). Present ONLY when reversing the
+  // sale's earned points would push the client's points balance below zero — i.e. when
+  // preWouldBe = current - earnedStorno < 0 (the legacy condition). null otherwise (sufficient
+  // balance → no decision UI, mode stays "normal", behaviour unchanged). When present, the UI
+  // offers negative (default) / skip; a "normal" mode fails safe by throwing.
+  pointsStornoExtra: { current: number; usedRestore: number; earnedStorno: number; wouldBe: number } | null;
+  // PER-recharge fidelity-points STORNO decisions (port of recharge_cancel_enrich_sale_cancel_preview's
+  // per-recharge extra['points_storno'], CreditRechargeCancel.php ~622-668). One entry per recharge
+  // ISSUED by this sale whose earned-points storno would push the projected available balance
+  // below zero. `wouldBe` is PROJECTED: each recharge subtracts from a running balance seeded at
+  // the client's current points, so a later recharge reflects the earlier ones (is_projected).
+  rechargePointStornoItems: Array<{
+    id: number;
+    label: string;
+    current: number;
+    earnedStorno: number;
+    wouldBe: number;
+    isProjected: boolean;
+    totalAmount: number;
+  }>;
   summary: string[];
   warnings: string[];
   blockers: string[];
@@ -1200,6 +1248,9 @@ async function buildCancelSummary(slug: string, saleId: number, row: RowDataPack
   const recharges = await summarizeLinkedRows(slug, "recharges", saleId, (r) => ({
     id: Number(r.id ?? 0),
     totalAmount: roundMoney(Number(r.total_amount ?? 0) || 0),
+    // Earned points issued by this recharge — reversed (storno) on void; drives the per-recharge
+    // negative-balance decision below.
+    earnedStorno: normalizePoints(Number(r.points_earned ?? 0) || 0),
     isVoid: Number(r.is_void ?? 0) === 1,
   }));
   if (recharges.some((r) => !r.isVoid)) {
@@ -1227,6 +1278,66 @@ async function buildCancelSummary(slug: string, saleId: number, row: RowDataPack
   if (giftcardResidualRefunded > 0.00001) summary.push(`GiftCard da rimborsare${giftcardResidualCode ? ` (${giftcardResidualCode})` : ""}: € ${formatMoney(giftcardResidualRefunded)}`);
   if (pointsRestored > 0) summary.push(`Punti Fidelity da ripristinare: ${pointsRestored} pt`);
 
+  // --- SALE-level fidelity-points STORNO decision (port of _pos_sale_cancel_preview
+  // ~1930-1966). If the client already spent (even partially) the points earned with this
+  // sale, reversing them could drive the balance negative. Rather than blocking, surface a
+  // decision. The legacy condition is preWouldBe = curPts - ptsEarn < -epsilon (RAW clients.points,
+  // no lock concept) — computed BEFORE the +usedRestore compensation, exactly like the PHP.
+  const clientId = Math.max(0, Number(row.client_id ?? 0) || 0);
+  const ptsUsed = normalizePoints(Number(row.fidelity_points_used ?? 0) || 0);
+  const ptsEarn = normalizePoints(Number(row.fidelity_points_earned ?? 0) || 0);
+  let pointsStornoExtra: PosCancelSummary["pointsStornoExtra"] = null;
+  // Running projection of clients.points across the movements this cancel applies IN ORDER
+  // (sale-level restore(+used)/storno(-earned) → per-recharge storno), so each would_be
+  // reflects the prior movements — faithful to the apply order in cancelLinkedSaleResidues.
+  let projectedPoints = 0;
+  if (clientId > 0) {
+    const bal = await dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 }));
+    const curPts = normalizePoints(Number(bal.points ?? 0) || 0);
+    projectedPoints = curPts;
+    if (ptsEarn > 0.00001) {
+      const preWouldBe = curPts - ptsEarn;
+      const wouldBe = curPts + ptsUsed - ptsEarn;
+      if (preWouldBe < -0.00001) {
+        pointsStornoExtra = { current: curPts, usedRestore: ptsUsed, earnedStorno: ptsEarn, wouldBe };
+      }
+      // Whatever the operator chooses, the running projection advances by the net sale-level
+      // effect (+used restore then -earned storno), so the recharge projection below chains
+      // from the post-sale-level balance.
+      projectedPoints = curPts + ptsUsed - ptsEarn;
+    }
+  }
+
+  // --- PER-recharge fidelity-points STORNO decisions (port of
+  // recharge_cancel_enrich_sale_cancel_preview ~622-668). For each recharge ISSUED by this
+  // sale (not yet void) with earned points, project the running points balance forward: if
+  // subtracting its earned points would go below zero, surface a per-recharge decision. Each
+  // recharge chains from the prior projection (is_projected when the start differs from the
+  // client's real balance because a prior movement in this same cancel already reduced it).
+  const rechargePointStornoItems: PosCancelSummary["rechargePointStornoItems"] = [];
+  if (clientId > 0) {
+    const realPoints = normalizePoints((await dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 }))).points || 0);
+    for (const r of recharges) {
+      if (r.isVoid) continue;
+      const needPts = normalizePoints(r.earnedStorno);
+      if (needPts <= 0.00001) continue;
+      const startBal = projectedPoints;
+      const wouldBe = normalizePoints(startBal - needPts);
+      if (wouldBe < -0.00001) {
+        rechargePointStornoItems.push({
+          id: r.id,
+          label: `R#${r.id}`,
+          current: startBal,
+          earnedStorno: needPts,
+          wouldBe,
+          isProjected: Math.abs(startBal - realPoints) > 0.00001,
+          totalAmount: r.totalAmount,
+        });
+      }
+      projectedPoints = wouldBe;
+    }
+  }
+
   return {
     products,
     requiresStockDecision,
@@ -1240,6 +1351,8 @@ async function buildCancelSummary(slug: string, saleId: number, row: RowDataPack
     giftcardResidualRefunded,
     giftcardResidualCode,
     pointsRestored,
+    pointsStornoExtra,
+    rechargePointStornoItems,
     summary,
     warnings,
     blockers,
@@ -3420,7 +3533,66 @@ async function markSaleCancelled(slug: string, saleId: number, input: { userId: 
   }
 }
 
-async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: string, saleRow?: RowDataPacket, voidedBy: number | null = null): Promise<void> {
+// PRE-FLIGHT feasibility guard for the "normal" storno mode. The cancel is NOT wrapped in a
+// single DB transaction, so a normal-mode points storno that would drive the balance negative
+// must be refused BEFORE any mutation (markSaleCancelled + residue reversals) — otherwise the
+// sale would already be voided when the storno later throws, leaving a half-cancelled sale.
+// The legacy runs the whole cancel in one transaction (rollback on the RuntimeException); this
+// reproduces that all-or-nothing guarantee for the only throw the storno decision introduces.
+// Replays the exact apply order (sale-level restore(+used)/storno(-earned) → per-recharge storno)
+// so each check reflects the prior movements; only "normal" mode gates, matching the in-apply
+// checks (negative/skip never throw here).
+async function assertNormalStornoFeasible(
+  slug: string,
+  saleRow: RowDataPacket,
+  modes: { pointsStornoMode: PointsStornoMode; rechargePointsModes: Record<number, PointsStornoMode> },
+): Promise<void> {
+  const clientId = Math.max(0, Number(saleRow.client_id ?? 0) || 0);
+  if (clientId <= 0) return;
+  const saleId = Math.max(0, Number(saleRow.id ?? 0) || 0);
+  const ptsUsed = normalizePoints(Number(saleRow.fidelity_points_used ?? 0) || 0);
+  const ptsEarn = normalizePoints(Number(saleRow.fidelity_points_earned ?? 0) || 0);
+  let projected = normalizePoints((await dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 }))).points || 0);
+  // Sale-level: the redeemed points are always restored (+used) first, then the earned points
+  // are stornoed (-earned) unless the operator skipped them.
+  projected += ptsUsed;
+  if (ptsEarn > 0.00001) {
+    if (modes.pointsStornoMode === "normal" && projected - ptsEarn < -0.00001) {
+      throw new Error("Impossibile annullare: punti guadagnati gia utilizzati (saldo insufficiente per lo storno).");
+    }
+    if (modes.pointsStornoMode !== "skip") projected -= ptsEarn;
+  }
+  // Per-recharge storno, chained from the post-sale-level balance (legacy step 6b order).
+  const table = await tenantTable(slug, "recharges").catch(() => null);
+  if (!table) return;
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: table.name,
+    columns: "id, points_earned, is_void",
+    where: "sale_id=?",
+    params: [saleId],
+  }).catch(() => [] as RowDataPacket[]);
+  for (const row of rows) {
+    if (Number(row.is_void ?? 0) === 1) continue;
+    const rechargeId = Math.max(0, Number(row.id ?? 0) || 0);
+    const earned = normalizePoints(Number(row.points_earned ?? 0) || 0);
+    if (earned <= 0.00001) continue;
+    const mode = modes.rechargePointsModes[rechargeId] ?? "normal";
+    if (mode === "normal" && projected - earned < -0.00001) {
+      throw new Error(`R#${rechargeId}: i punti accreditati sulla ricarica (${earned} pt) non sono disponibili per lo storno.`);
+    }
+    if (mode !== "skip") projected -= earned;
+  }
+}
+
+async function cancelLinkedSaleResidues(
+  slug: string,
+  saleId: number,
+  reason: string,
+  saleRow?: RowDataPacket,
+  voidedBy: number | null = null,
+  pointsModes: { pointsStornoMode: PointsStornoMode; rechargePointsModes: Record<number, PointsStornoMode> } = { pointsStornoMode: "normal", rechargePointsModes: {} },
+): Promise<void> {
   await updateBySaleId(slug, "client_prepaid_services", saleId, { status: "cancelled", canceled_at: new Date(), cancel_note: reason });
   await updateBySaleId(slug, "client_packages", saleId, { status: "canceled", updated_at: new Date() });
   await updateBySaleId(slug, "sale_installment_plans", saleId, { status: "cancelled", cancelled_at: new Date(), cancelled_reason: reason });
@@ -3439,19 +3611,6 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
   // operation keyed off the sale linkage, so the two never collide.
   await cancelIssuedSaleGiftboxes(slug, saleId, reason);
 
-  // REVERSE the RECHARGE this sale ISSUED (the SELL path): flip each recharges row for this
-  // sale to is_void=1 (+ voided_at/by), DEBIT the wallet by total_amount (the inverse of the
-  // top-up credit) and reverse the earned points (points_redeem). Found by recharges.sale_id
-  // (the table HAS sale_id + is_void). Idempotent: only a not-yet-void row is reversed, so a
-  // re-void is a no-op. Kept distinct from the residui-credit restore below (that re-credits
-  // SPENT credit, keyed off sales.credit_used) — both touch clients.credit_balance but are
-  // linked to different rows/notes and guarded by recharges.is_void, so they never collide.
-  await reverseIssuedSaleRecharges(slug, saleId, voidedBy);
-
-  // Restore the residui consumed at checkout: refund the GiftCard balance (re-activating
-  // a card the redeem flipped to 'redeemed') and credit the wallet back. Both are linked
-  // by the sale row's credit_used / giftcard_id / giftcard_used columns. Best-effort and
-  // idempotency-guarded: zero the columns so a re-void cannot double-refund.
   if (!saleRow) return;
   const creditUsed = roundMoney(Number(saleRow.credit_used ?? 0) || 0);
   const giftcardUsed = roundMoney(Number(saleRow.giftcard_used ?? 0) || 0);
@@ -3469,6 +3628,12 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
       slug,
     ).catch(() => undefined);
   }
+  // SALE-level fidelity points, applied IN THE LEGACY ORDER (pos_history.php ~1604-1652):
+  //   1) REFUND the redeemed points (+ptsUsed) — the inverse of the points spent as discount.
+  //   2) STORNO the earned points (-ptsEarned) — subject to the operator's pointsStornoMode.
+  // Both hit clients.points and MUST run BEFORE the per-recharge storno so the recharge
+  // balance reflects them (replicating the PHP step 6 → step 6b ordering).
+  //
   // REFUND the redeemed FIDELITY points: a positive points_earn movement re-credits
   // clients.points (the inverse of the points_redeem consumed at checkout), mirroring the
   // legacy `Fidelity::addTransaction(clientId, +ptsUsed, ...)` on sale cancel.
@@ -3478,14 +3643,45 @@ async function cancelLinkedSaleResidues(slug: string, saleId: number, reason: st
       slug,
     ).catch(() => undefined);
   }
-  // REVERSE the EARNED fidelity points: a negative points_redeem movement removes the
-  // points awarded at checkout, so a cancelled sale doesn't leave its loyalty points.
+  // REVERSE the EARNED fidelity points, honouring pointsStornoMode:
+  //  - skip     → do NOT reverse (audit-note only, best-effort; balance untouched).
+  //  - negative → reverse unconditionally (balance allowed to go negative).
+  //  - normal   → pre-check the current clients.points balance; if the storno would push it
+  //               below zero, THROW a clear error (fail safe) instead of silently proceeding.
+  // Faithful to pos_history.php ~1626-1649: skip → info note; negative → allowNeg reverse;
+  // normal → Fidelity::addTransaction returns false on insufficient balance → RuntimeException.
   if (pointsEarned > 0 && clientId > 0) {
-    await addDbWalletMovement(
-      { clientId, type: "points_redeem", points: -pointsEarned, source: "sale", note: `Storno punti guadagnati vendita #${saleId}` },
-      slug,
-    ).catch(() => undefined);
+    const mode = pointsModes.pointsStornoMode;
+    if (mode !== "skip") {
+      if (mode === "normal") {
+        // Pre-check AFTER the +ptsUsed restore already applied above (the PHP order), so the
+        // guard matches the legacy would_be = current + used - earned. Read the live balance.
+        const bal = await dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 }));
+        const curPts = normalizePoints(Number(bal.points ?? 0) || 0);
+        if (curPts - pointsEarned < -0.00001) {
+          throw new Error("Impossibile annullare: punti guadagnati gia utilizzati (saldo insufficiente per lo storno).");
+        }
+      }
+      await addDbWalletMovement(
+        { clientId, type: "points_redeem", points: -pointsEarned, source: "sale", note: `Storno punti guadagnati vendita #${saleId}` },
+        slug,
+      ).catch(() => undefined);
+    }
+    // mode === "skip": intentionally no movement — the earned points are left on the client's
+    // balance (the operator chose to complete the void without scaling them).
   }
+
+  // REVERSE the RECHARGE this sale ISSUED (the SELL path), AFTER the sale-level points block
+  // above so the recharge storno sees the post-sale-level balance (legacy step 6b). Flip each
+  // recharges row to is_void=1 (+ voided_at/by), DEBIT the wallet by total_amount (the inverse
+  // of the top-up credit) and reverse the earned points (points_redeem) subject to each
+  // recharge's storno mode. Found by recharges.sale_id (the table HAS sale_id + is_void).
+  // Idempotent: only a not-yet-void row is reversed, so a re-void is a no-op. Kept distinct
+  // from the residui-credit restore above (that re-credits SPENT credit, keyed off
+  // sales.credit_used) — both touch clients.credit_balance but are linked to different
+  // rows/notes and guarded by recharges.is_void, so they never collide.
+  await reverseIssuedSaleRecharges(slug, saleId, voidedBy, pointsModes.rechargePointsModes);
+
   const salesTableName = (await tenantTable(slug, "sales")).name;
   if ((creditUsed > 0 || giftcardUsed > 0) && (await columnExists(salesTableName, "credit_used"))) {
     await tenantUpdate({ slug, table: "sales", id: saleId, values: { credit_used: 0, giftcard_used: 0 } }).catch(() => 0);
@@ -3635,7 +3831,12 @@ async function cancelIssuedSaleGiftboxes(slug: string, saleId: number, reason: s
 // so a re-void is a no-op. Kept distinct from the residui-credit restore (which RE-CREDITS
 // credit the sale SPENT, keyed off sales.credit_used) — guarded by recharges.is_void so the
 // two credit_balance operations never collide.
-async function reverseIssuedSaleRecharges(slug: string, saleId: number, voidedBy: number | null): Promise<void> {
+async function reverseIssuedSaleRecharges(
+  slug: string,
+  saleId: number,
+  voidedBy: number | null,
+  rechargePointsModes: Record<number, PointsStornoMode> = {},
+): Promise<void> {
   const table = await tenantTable(slug, "recharges").catch(() => null);
   if (!table) return;
   const rows = await tenantSelect<RowDataPacket>({
@@ -3654,6 +3855,7 @@ async function reverseIssuedSaleRecharges(slug: string, saleId: number, voidedBy
     const clientId = Math.max(0, Number(row.client_id ?? 0) || 0);
     const totalAmount = roundMoney(Math.max(0, Number(row.total_amount ?? 0) || 0));
     const pointsEarned = normalizePoints(Number(row.points_earned ?? 0) || 0);
+    const mode = rechargePointsModes[rechargeId] ?? "normal";
 
     // Flip is_void FIRST so the row is guarded even if a wallet movement throws (a re-void
     // then skips it). Schema-guarded via filterColumns.
@@ -3672,14 +3874,28 @@ async function reverseIssuedSaleRecharges(slug: string, saleId: number, voidedBy
         slug,
       ).catch(() => undefined);
     }
-    if (clientId > 0 && pointsEarned > 0) {
-      // REVERSE the earned points (negative points_redeem -> transactions row +
-      // clients.points decrement), the inverse of the issue-time points_earn.
+    // REVERSE the earned points, honouring the per-recharge storno mode (port of
+    // recharge_cancel_void_apply, CreditRechargeCancel.php ~876-922):
+    //  - skip     → do NOT reverse (leave the recharge's earned points on the balance).
+    //  - negative → reverse unconditionally (balance allowed to go negative).
+    //  - normal   → pre-check the live clients.points balance; if the storno would go below
+    //               zero, THROW (fail safe) — the legacy raises a RuntimeException here.
+    if (clientId > 0 && pointsEarned > 0 && mode !== "skip") {
+      if (mode === "normal") {
+        const bal = await dbWalletBalance(clientId, slug).catch(() => ({ credit: 0, points: 0 }));
+        const curPts = normalizePoints(Number(bal.points ?? 0) || 0);
+        if (pointsEarned > curPts + 0.0000001) {
+          throw new Error(`R#${rechargeId}: i punti accreditati sulla ricarica (${pointsEarned} pt) non sono disponibili per lo storno.`);
+        }
+      }
+      // Negative points_redeem -> transactions row + clients.points decrement, the inverse of
+      // the issue-time points_earn.
       await addDbWalletMovement(
         { clientId, type: "points_redeem", points: -pointsEarned, source: "recharge", note: `Storno punti ricarica vendita #${saleId}` },
         slug,
       ).catch(() => undefined);
     }
+    // mode === "skip": intentionally no points movement.
   }
 }
 
