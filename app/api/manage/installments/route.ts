@@ -2,7 +2,7 @@ import type { RowDataPacket } from "@/lib/tenant-db";
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
-import { createDbInstallmentPlan, listDbInstallmentPlans } from "@/lib/db-repositories";
+import { cancelDbInstallmentPlan, createDbInstallmentPlan, listDbInstallmentPlans, searchDbInstallmentPlans } from "@/lib/db-repositories";
 import { can } from "@/lib/role-permissions";
 import { tenantSelect, tenantUpdate } from "@/lib/tenant-db";
 import type { InstallmentPlan } from "@/lib/tenant-store";
@@ -16,11 +16,23 @@ export async function GET(request: Request) {
   if (!session) return jsonError("Sessione scaduta o non valida.", 401);
   if (!can(session.user.perms, "installments.manage")) return jsonError("Permesso rate mancante.", 403);
 
+  // Filters (faithful to installments_manage.php searchPlans query params): status / client_id /
+  // sale_id / q / due_from / due_to. Empty/absent → the full list (searchDbInstallmentPlans with {}).
+  const url = new URL(request.url);
+  const filters = {
+    status: url.searchParams.get("status") || undefined,
+    clientId: parseInteger(url.searchParams.get("client_id"), 0) || undefined,
+    saleId: parseInteger(url.searchParams.get("sale_id"), 0) || undefined,
+    q: url.searchParams.get("q") || undefined,
+    dueFrom: url.searchParams.get("due_from") || undefined,
+    dueTo: url.searchParams.get("due_to") || undefined,
+  };
+
   try {
     return Response.json({
       ok: true,
       sourceMode: "database",
-      plans: await listDbInstallmentPlans(tenantSlug),
+      plans: await searchDbInstallmentPlans(tenantSlug, filters),
     });
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore rate.");
@@ -63,6 +75,19 @@ export async function POST(request: Request) {
     if (action === "pending" || action === "reopen" || action === "mark_pending") {
       const plan = await markInstallmentPending(tenantSlug, parseInteger(body.installment_id ?? body.id), session.user.id);
       return Response.json({ ok: true, source: "installments?action=mark_pending", sourceMode: "database", plan, plans: await listDbInstallmentPlans(tenantSlug) });
+    }
+
+    // CANCEL the whole plan (faithful to SaleInstallments::cancelPlanBySaleId): blocks on already-paid
+    // installments unless allow_paid is set. Requires plan_id.
+    if (action === "cancel" || action === "cancel_plan") {
+      const plan = await cancelDbInstallmentPlan(
+        tenantSlug,
+        parseInteger(body.plan_id ?? body.id, 0),
+        body.reason ?? "",
+        session.user.id,
+        ["1", "true", "yes"].includes(String(body.allow_paid ?? "").toLowerCase()),
+      );
+      return Response.json({ ok: true, source: "installments?action=cancel", sourceMode: "database", plan, plans: await listDbInstallmentPlans(tenantSlug) });
     }
 
     return jsonError("Azione rate non supportata.");
@@ -116,7 +141,10 @@ async function markInstallmentPending(slug: string, installmentId: number, userI
   });
 
   const planId = Number(row.plan_id ?? 0);
-  await tenantUpdate({ slug, table: "sale_installment_plans", id: planId, values: { status: "active", updated_by: userId } });
+  // Recompute the plan status from ALL installments (not a blind 'active'): reopening the last
+  // paid installment of an otherwise-complete plan flips it back to active, but reopening one of
+  // many keeps the correct state. Faithful to SaleInstallments::syncPlanStatus.
+  await refreshInstallmentPlanStatus(slug, planId, userId);
   return installmentPlan(slug, planId);
 }
 
@@ -133,8 +161,11 @@ async function installmentRow(slug: string, installmentId: number): Promise<RowD
   return rows[0];
 }
 
-async function refreshInstallmentPlanStatus(slug: string, planId: number): Promise<void> {
+async function refreshInstallmentPlanStatus(slug: string, planId: number, userId?: number): Promise<void> {
   if (planId <= 0) return;
+  // Never re-open a cancelled plan (faithful to syncPlanStatus: a cancelled plan is terminal).
+  const planRows = await tenantSelect<RowDataPacket>({ slug, table: "sale_installment_plans", columns: "status", where: "id = ?", params: [planId], limit: 1 });
+  if (String(planRows[0]?.status ?? "").toLowerCase() === "cancelled") return;
   const open = await tenantSelect<RowDataPacket>({
     slug,
     table: "sale_installments",
@@ -147,7 +178,7 @@ async function refreshInstallmentPlanStatus(slug: string, planId: number): Promi
     slug,
     table: "sale_installment_plans",
     id: planId,
-    values: { status: open[0] ? "active" : "completed" },
+    values: { status: open[0] ? "active" : "completed", ...(userId ? { updated_by: userId } : {}) },
   });
 }
 

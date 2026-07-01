@@ -6447,6 +6447,60 @@ export async function createDbInstallmentPlan(
   return getSingleInstallmentPlan(slug, planId);
 }
 
+// CANCEL an entire installment plan (faithful port of SaleInstallments::cancelPlanBySaleId
+// ~640-686, keyed by plan id here): flip the plan to 'cancelled' (+ cancelled_at/reason), flip every
+// installment to 'cancelled' and append a "[ANNULLATA <ts>] <reason>" marker to its note. Blocks when
+// any installment is already PAID unless allowPaid is set (the legacy "Esistono rate già incassate…"
+// guard) so an operator does not silently void collected money. Returns the re-hydrated plan.
+export async function cancelDbInstallmentPlan(
+  slug: string,
+  planId: number,
+  reason: string,
+  userId: number | null = null,
+  allowPaid = false,
+): Promise<InstallmentPlan> {
+  if (planId <= 0) throw new Error("Piano rateale non valido.");
+  const planTable = await tenantTable(slug, "sale_installment_plans");
+  const planRows = await tenantSelect<RowDataPacket>({ slug, table: planTable.name, where: "id = ?", params: [planId], limit: 1 });
+  const plan = planRows[0];
+  if (!plan) throw new Error("Piano rateale non trovato.");
+  if (String(plan.status ?? "").toLowerCase() === "cancelled") throw new Error("Piano rateale gia annullato.");
+
+  const installmentRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "sale_installments",
+    columns: "id, status, note",
+    where: "plan_id = ?",
+    params: [planId],
+  });
+  const paidCount = installmentRows.filter((r) => String(r.status ?? "").toLowerCase() === "paid").length;
+  if (paidCount > 0 && !allowPaid) {
+    throw new Error("Esistono rate gia incassate: non e possibile annullare il piano.");
+  }
+
+  const cleanReason = String(reason ?? "").trim().slice(0, 255) || "Annullamento piano rateale";
+  const now = new Date();
+  const tsLabel = now.toISOString().slice(0, 16).replace("T", " ");
+
+  const planValues: Record<string, unknown> = { status: "cancelled", updated_by: userId };
+  if (await columnExists(planTable.name, "cancelled_at")) planValues.cancelled_at = now;
+  if (await columnExists(planTable.name, "cancelled_reason")) planValues.cancelled_reason = cleanReason;
+  await tenantUpdate({ slug, table: "sale_installment_plans", id: planId, values: planValues });
+
+  for (const r of installmentRows) {
+    const prevNote = String(r.note ?? "");
+    const nextNote = `${prevNote}${prevNote ? "\n" : ""}[ANNULLATA ${tsLabel}] ${cleanReason}`.slice(0, 1000);
+    await tenantUpdate({
+      slug,
+      table: "sale_installments",
+      id: Number(r.id ?? 0),
+      values: { status: "cancelled", note: nextNote, updated_by: userId },
+    }).catch(() => 0);
+  }
+
+  return getSingleInstallmentPlan(slug, planId);
+}
+
 export async function payDbInstallment(planId: number, installmentId: number, slug: string): Promise<InstallmentPlan> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "sale_installments", where: "plan_id = ? AND id = ?", params: [planId, installmentId], limit: 1 });
   if (!rows[0]) throw new Error("Rata non trovata.");
