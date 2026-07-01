@@ -4894,13 +4894,449 @@ export async function applyAppointmentGiftcardRedeem({
   return { applied: null, warnings };
 }
 
+// POS Prepaids list — faithful port of pos_prepaids.php's three-source merge.
+// Sources: (1) client_prepaid_services -> kind "prepaid"; (2) the services inside
+// client_packages (client_package_services) -> kind "package"; (3) the service
+// items inside giftbox_instances (giftbox_instance_items) -> kind "giftbox".
+//
+// Residual split (the load-bearing correctness fix): bookedQty = sessions tied to
+// an OPEN appointment (pending/scheduled, redeemed_at IS NULL) via the per-source
+// appointment_*_items table; bookableQty = remaining - bookedQty. Each source also
+// carries lastUsedAt (MAX used_at / redeemed_at) and sourceSaleId.
+//
+// Tenant-safe: every read is a tenant-scoped tenantSelect; cross-table linkage is
+// resolved in memory (no cross-tenant raw joins). Missing tables degrade to 0/skip.
 export async function listDbPrepaids(slug: string): Promise<ClientPrepaid[]> {
+  const [prepaids, packages, giftboxes] = await Promise.all([
+    listPrepaidSourceRows(slug),
+    listPackageSourceRows(slug),
+    listGiftboxSourceRows(slug),
+  ]);
+  return [...prepaids, ...packages, ...giftboxes];
+}
+
+// ---- Source 1: standalone prepaids (client_prepaid_services) ----
+async function listPrepaidSourceRows(slug: string): Promise<ClientPrepaid[]> {
+  const table = await tenantTable(slug, "client_prepaid_services").catch(() => null);
+  if (!table || !(await tableExists(table.name))) return [];
   const rows = await tenantSelect<RowDataPacket>({
     slug,
     table: "client_prepaid_services",
     orderBy: "created_at DESC, id DESC",
   });
-  return Promise.all(rows.map((row) => mapClientPrepaid(slug, row)));
+  if (rows.length === 0) return [];
+
+  const ids = rows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+  const [bookedMap, lastUsedMap] = await Promise.all([
+    prepaidBookedMap(slug, ids),
+    prepaidLastUsedMap(slug, ids),
+  ]);
+
+  return Promise.all(
+    rows.map(async (row) => {
+      const id = Number(row.id ?? 0);
+      const remaining = Math.max(0, Number(row.remaining_qty ?? 0));
+      const bookedQty = Math.min(remaining, bookedMap.get(id) ?? 0);
+      return {
+        id,
+        kind: "prepaid" as const,
+        clientId: Number(row.client_id ?? 0),
+        clientName: await appointmentClientName(slug, Number(row.client_id ?? 0)),
+        serviceId: Number(row.service_id ?? 0),
+        serviceName: String(row.service_name ?? "Servizio"),
+        totalQuantity: Math.max(0, Number(row.purchased_qty ?? remaining)),
+        remainingQuantity: remaining,
+        bookedQty,
+        bookableQty: Math.max(0, remaining - bookedQty),
+        lastUsedAt: lastUsedMap.get(id) || undefined,
+        expiresAt: row.expires_at ? String(row.expires_at).slice(0, 10) : undefined,
+        status: clientPrepaidStatus(String(row.status ?? "active"), remaining, String(row.expires_at ?? "")),
+        sourceSaleId: row.sale_id ? Number(row.sale_id) : undefined,
+        createdAt: toIso(row.created_at ?? row.purchase_date),
+      };
+    }),
+  );
+}
+
+// Batched booked-qty for many prepaids: link rows (redeemed_at IS NULL) grouped by
+// client_prepaid_service_id, kept only when their appointment is OPEN. Missing
+// linkage/appointments tables -> empty map (0 booked for all).
+async function prepaidBookedMap(slug: string, prepaidServiceIds: number[]): Promise<Map<number, number>> {
+  const out = new Map<number, number>();
+  const ids = prepaidServiceIds.filter((n) => n > 0);
+  if (ids.length === 0) return out;
+  try {
+    const linkTable = await tenantTable(slug, "appointment_prepaid_service_items");
+    if (!(await tableExists(linkTable.name))) return out;
+    const placeholders = ids.map(() => "?").join(",");
+    const linkRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_prepaid_service_items",
+      columns: "client_prepaid_service_id, appointment_id, qty",
+      where: `client_prepaid_service_id IN (${placeholders}) AND redeemed_at IS NULL`,
+      params: ids,
+    });
+    if (linkRows.length === 0) return out;
+    const openIds = await openAppointmentIds(slug, linkRows.map((r) => Number(r.appointment_id ?? 0)));
+    for (const r of linkRows) {
+      if (!openIds.has(Number(r.appointment_id ?? 0))) continue;
+      const key = Number(r.client_prepaid_service_id ?? 0);
+      out.set(key, (out.get(key) ?? 0) + Math.max(0, Number(r.qty ?? 0)));
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+// Batched last-usage (MAX used_at) per prepaid. Missing table -> empty map.
+async function prepaidLastUsedMap(slug: string, prepaidServiceIds: number[]): Promise<Map<number, string>> {
+  const out = new Map<number, string>();
+  const ids = prepaidServiceIds.filter((n) => n > 0);
+  if (ids.length === 0) return out;
+  try {
+    const usageTable = await tenantTable(slug, "client_prepaid_service_usages");
+    if (!(await tableExists(usageTable.name))) return out;
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_prepaid_service_usages",
+      columns: "client_prepaid_service_id, used_at",
+      where: `client_prepaid_service_id IN (${placeholders})`,
+      params: ids,
+    });
+    for (const r of rows) {
+      const key = Number(r.client_prepaid_service_id ?? 0);
+      const at = r.used_at ? toIso(r.used_at) : "";
+      if (!at) continue;
+      const prev = out.get(key);
+      if (!prev || at > prev) out.set(key, at);
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+// ---- Source 2: package services (client_packages + client_package_services) ----
+async function listPackageSourceRows(slug: string): Promise<ClientPrepaid[]> {
+  const pkgTable = await tenantTable(slug, "client_packages").catch(() => null);
+  const svcTable = await tenantTable(slug, "client_package_services").catch(() => null);
+  if (!pkgTable || !(await tableExists(pkgTable.name))) return [];
+  if (!svcTable || !(await tableExists(svcTable.name))) return [];
+
+  const packages = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "client_packages",
+    columns: "id, client_id, package_name, expires_at, status, sale_id, purchase_date, start_date, created_at",
+    orderBy: "created_at DESC, id DESC",
+  });
+  if (packages.length === 0) return [];
+  const pkgById = new Map<number, RowDataPacket>();
+  for (const p of packages) pkgById.set(Number(p.id ?? 0), p);
+
+  const pkgIds = Array.from(pkgById.keys());
+  const placeholders = pkgIds.map(() => "?").join(",");
+  const serviceRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "client_package_services",
+    columns: "id, client_package_id, service_id, sessions_total, sessions_remaining, service_snapshot_json",
+    where: `client_package_id IN (${placeholders}) AND COALESCE(service_id, 0) > 0`,
+    params: pkgIds,
+  });
+  if (serviceRows.length === 0) return [];
+
+  const [bookedMap, lastUsedMap] = await Promise.all([
+    packageBookedMap(slug),
+    packageLastUsedMap(slug),
+  ]);
+
+  return Promise.all(
+    serviceRows.map(async (row) => {
+      const cpsId = Number(row.id ?? 0);
+      const pkgId = Number(row.client_package_id ?? 0);
+      const serviceId = Number(row.service_id ?? 0);
+      const pkg = pkgById.get(pkgId) ?? {};
+      const total = Math.max(0, Number(row.sessions_total ?? 0));
+      const remaining = Math.max(0, Number(row.sessions_remaining ?? 0));
+      const booked = Math.min(
+        remaining,
+        bookedMap.get(`${pkgId}:${cpsId}:${serviceId}`) ?? bookedMap.get(`${pkgId}:0:${serviceId}`) ?? 0,
+      );
+      const snapshotName = snapshotServiceName(row.service_snapshot_json);
+      const serviceName = snapshotName || (await serviceNameById(slug, serviceId, `Servizio #${serviceId}`));
+      const status = packageDisplayStatus(String(pkg.status ?? "active"), remaining, pkg.expires_at ? String(pkg.expires_at) : "");
+      const lastUsedAt = lastUsedMap.get(`${pkgId}:${serviceId}`) ?? lastUsedMap.get(`${pkgId}:0`) ?? "";
+      const saleId = Number(pkg.sale_id ?? 0);
+      return {
+        // Encode source in the id so the merged list keys stay unique across kinds.
+        id: cpsId > 0 ? 2_000_000_000 + cpsId : 2_000_000_000 + pkgId,
+        kind: "package" as const,
+        clientId: Number(pkg.client_id ?? 0),
+        clientName: await appointmentClientName(slug, Number(pkg.client_id ?? 0)),
+        serviceId,
+        serviceName,
+        totalQuantity: total,
+        remainingQuantity: remaining,
+        bookedQty: booked,
+        bookableQty: Math.max(0, remaining - booked),
+        lastUsedAt: lastUsedAt || undefined,
+        expiresAt: pkg.expires_at ? String(pkg.expires_at).slice(0, 10) : undefined,
+        status,
+        sourceSaleId: saleId > 0 ? saleId : undefined,
+        createdAt: toIso(pkg.purchase_date ?? pkg.start_date ?? pkg.created_at),
+      };
+    }),
+  );
+}
+
+// Booked-qty per package service: appointment_package_items (redeemed_at IS NULL)
+// keyed by client_package_id:client_package_service_id:service_id, kept only when
+// the appointment is OPEN. Missing tables -> empty map.
+async function packageBookedMap(slug: string): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  try {
+    const linkTable = await tenantTable(slug, "appointment_package_items");
+    if (!(await tableExists(linkTable.name))) return out;
+    const hasRedeemed = await columnExists(linkTable.name, "redeemed_at");
+    const linkRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_package_items",
+      columns: "appointment_id, client_package_id, client_package_service_id, service_id, qty",
+      where: hasRedeemed ? "redeemed_at IS NULL" : "",
+    });
+    if (linkRows.length === 0) return out;
+    const openIds = await openAppointmentIds(slug, linkRows.map((r) => Number(r.appointment_id ?? 0)));
+    for (const r of linkRows) {
+      if (!openIds.has(Number(r.appointment_id ?? 0))) continue;
+      const cpId = Number(r.client_package_id ?? 0);
+      const cpsId = Number(r.client_package_service_id ?? 0);
+      const sid = Number(r.service_id ?? 0);
+      const qty = Math.max(0, Number(r.qty ?? 0));
+      out.set(`${cpId}:${cpsId}:${sid}`, (out.get(`${cpId}:${cpsId}:${sid}`) ?? 0) + qty);
+      // Fallback key for links that don't carry the per-service row id.
+      if (cpsId <= 0) out.set(`${cpId}:0:${sid}`, (out.get(`${cpId}:0:${sid}`) ?? 0) + 0);
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+// Last-usage per package service: MAX(used_at) over decrements (delta < 0), keyed by
+// client_package_id:service_id (plus a :0 fallback). Missing table -> empty map.
+async function packageLastUsedMap(slug: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  try {
+    const usageTable = await tenantTable(slug, "client_package_usages");
+    if (!(await tableExists(usageTable.name))) return out;
+    const hasService = await columnExists(usageTable.name, "service_id");
+    const hasDelta = await columnExists(usageTable.name, "delta");
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_package_usages",
+      columns: hasService
+        ? "client_package_id, service_id, used_at"
+        : "client_package_id, used_at",
+      where: hasDelta ? "delta < 0" : "",
+    });
+    for (const r of rows) {
+      const cpId = Number(r.client_package_id ?? 0);
+      const sid = hasService ? Number(r.service_id ?? 0) : 0;
+      const at = r.used_at ? toIso(r.used_at) : "";
+      if (!at) continue;
+      for (const key of [`${cpId}:${sid}`, `${cpId}:0`]) {
+        const prev = out.get(key);
+        if (!prev || at > prev) out.set(key, at);
+      }
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+// ---- Source 3: giftbox services (giftbox_instances + giftbox_instance_items) ----
+async function listGiftboxSourceRows(slug: string): Promise<ClientPrepaid[]> {
+  const instTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
+  const itemTable = await tenantTable(slug, "giftbox_instance_items").catch(() => null);
+  if (!instTable || !(await tableExists(instTable.name))) return [];
+  if (!itemTable || !(await tableExists(itemTable.name))) return [];
+
+  const hasRecipient = await columnExists(instTable.name, "recipient_client_id");
+  const instances = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "giftbox_instances",
+    columns: hasRecipient
+      ? "id, client_id, recipient_client_id, code, status, issued_at, expires_at, created_at"
+      : "id, client_id, code, status, issued_at, expires_at, created_at",
+    orderBy: "created_at DESC, id DESC",
+  });
+  if (instances.length === 0) return [];
+  const instById = new Map<number, RowDataPacket>();
+  for (const i of instances) instById.set(Number(i.id ?? 0), i);
+
+  const instIds = Array.from(instById.keys());
+  const placeholders = instIds.map(() => "?").join(",");
+  const items = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "giftbox_instance_items",
+    columns: "id, instance_id, giftbox_item_id, service_id, qty, service_snapshot_json",
+    where: `instance_id IN (${placeholders}) AND item_type = 'service' AND COALESCE(service_id, 0) > 0`,
+    params: instIds,
+  });
+  if (items.length === 0) return [];
+
+  const [redeemMap, bookedMap] = await Promise.all([
+    giftboxRedeemMap(slug),
+    giftboxBookedMap(slug),
+  ]);
+
+  return Promise.all(
+    items.map(async (row) => {
+      const itemRowId = Number(row.id ?? 0);
+      const instanceId = Number(row.instance_id ?? 0);
+      const giftboxItemId = Number(row.giftbox_item_id ?? 0);
+      const serviceId = Number(row.service_id ?? 0);
+      const inst = instById.get(instanceId) ?? {};
+      const total = Math.max(0, Number(row.qty ?? 0));
+      const redeem = redeemMap.get(`${instanceId}:${giftboxItemId}`);
+      const usedQty = Math.max(0, redeem?.qty ?? 0);
+      const remaining = Math.max(0, total - usedQty);
+      const booked = Math.min(remaining, bookedMap.get(`${instanceId}:${giftboxItemId}:${serviceId}`) ?? 0);
+      const snapshotName = snapshotServiceName(row.service_snapshot_json);
+      const serviceName = snapshotName || (await serviceNameById(slug, serviceId, `Servizio #${serviceId}`));
+      const ownerId = hasRecipient && Number(inst.recipient_client_id ?? 0) > 0
+        ? Number(inst.recipient_client_id ?? 0)
+        : Number(inst.client_id ?? 0);
+      const status = giftboxDisplayStatus(String(inst.status ?? "issued"), remaining, inst.expires_at ? String(inst.expires_at) : "");
+      return {
+        id: itemRowId > 0 ? 3_000_000_000 + itemRowId : 3_000_000_000 + instanceId,
+        kind: "giftbox" as const,
+        clientId: ownerId,
+        clientName: await appointmentClientName(slug, ownerId),
+        serviceId,
+        serviceName,
+        totalQuantity: total,
+        remainingQuantity: remaining,
+        bookedQty: booked,
+        bookableQty: Math.max(0, remaining - booked),
+        lastUsedAt: redeem?.lastRedeemedAt || undefined,
+        expiresAt: inst.expires_at ? String(inst.expires_at).slice(0, 10) : undefined,
+        status,
+        // The GiftBox source sale isn't directly linked by a column; leave undefined
+        // (legacy resolves it heuristically by matching the code in sale_items —
+        // TODO if the source-sale link is required for GiftBox rows too).
+        sourceSaleId: undefined,
+        createdAt: toIso(inst.issued_at ?? inst.created_at),
+      };
+    }),
+  );
+}
+
+// Redeemed qty + last redemption per giftbox item: giftbox_redemptions joined with
+// giftbox_redemption_items, keyed by instance_id:giftbox_item_id. Missing tables -> map.
+async function giftboxRedeemMap(slug: string): Promise<Map<string, { qty: number; lastRedeemedAt: string }>> {
+  const out = new Map<string, { qty: number; lastRedeemedAt: string }>();
+  try {
+    const redTable = await tenantTable(slug, "giftbox_redemptions");
+    const redItemTable = await tenantTable(slug, "giftbox_redemption_items");
+    if (!(await tableExists(redTable.name)) || !(await tableExists(redItemTable.name))) return out;
+    const redemptions = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftbox_redemptions",
+      columns: "id, instance_id, redeemed_at",
+    });
+    if (redemptions.length === 0) return out;
+    const redById = new Map<number, RowDataPacket>();
+    for (const r of redemptions) redById.set(Number(r.id ?? 0), r);
+    const redIds = Array.from(redById.keys());
+    const placeholders = redIds.map(() => "?").join(",");
+    const redItems = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "giftbox_redemption_items",
+      columns: "redemption_id, giftbox_item_id, qty",
+      where: `redemption_id IN (${placeholders})`,
+      params: redIds,
+    });
+    for (const ri of redItems) {
+      const red = redById.get(Number(ri.redemption_id ?? 0));
+      if (!red) continue;
+      const instanceId = Number(red.instance_id ?? 0);
+      const itemId = Number(ri.giftbox_item_id ?? 0);
+      const key = `${instanceId}:${itemId}`;
+      const at = red.redeemed_at ? toIso(red.redeemed_at) : "";
+      const prev = out.get(key) ?? { qty: 0, lastRedeemedAt: "" };
+      out.set(key, {
+        qty: prev.qty + Math.max(0, Number(ri.qty ?? 0)),
+        lastRedeemedAt: at && at > prev.lastRedeemedAt ? at : prev.lastRedeemedAt,
+      });
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+// Booked-qty per giftbox item: appointment_giftbox_items (redeemed_at IS NULL) tied
+// to an OPEN appointment, keyed by instance_id:giftbox_item_id:service_id.
+async function giftboxBookedMap(slug: string): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  try {
+    const linkTable = await tenantTable(slug, "appointment_giftbox_items");
+    if (!(await tableExists(linkTable.name))) return out;
+    const hasRedeemed = await columnExists(linkTable.name, "redeemed_at");
+    const linkRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_giftbox_items",
+      columns: "appointment_id, instance_id, giftbox_item_id, service_id, qty",
+      where: hasRedeemed ? "redeemed_at IS NULL" : "",
+    });
+    if (linkRows.length === 0) return out;
+    const openIds = await openAppointmentIds(slug, linkRows.map((r) => Number(r.appointment_id ?? 0)));
+    for (const r of linkRows) {
+      if (!openIds.has(Number(r.appointment_id ?? 0))) continue;
+      const key = `${Number(r.instance_id ?? 0)}:${Number(r.giftbox_item_id ?? 0)}:${Number(r.service_id ?? 0)}`;
+      out.set(key, (out.get(key) ?? 0) + Math.max(0, Number(r.qty ?? 0)));
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+// Decode a service snapshot JSON blob (package/giftbox) and return its stored name.
+function snapshotServiceName(json: unknown): string {
+  if (!json) return "";
+  try {
+    const data = JSON.parse(String(json));
+    if (data && typeof data === "object" && typeof (data as { name?: unknown }).name === "string") {
+      return String((data as { name: string }).name).trim();
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+// Package display status (port of _pos_pp_package_display_status).
+function packageDisplayStatus(status: string, remaining: number, expiresAt: string): ClientPrepaidStatus {
+  const s = status.trim().toLowerCase();
+  if (s === "canceled" || s === "cancelled") return "cancelled";
+  if (remaining <= 0 || s === "completed") return "completed";
+  if (s === "expired") return "expired";
+  if (expiresAt && /^\d{4}-\d{2}-\d{2}/.test(expiresAt) && expiresAt.slice(0, 10) < todayIso()) return "expired";
+  return "active";
+}
+
+// GiftBox display status (port of _pos_pp_giftbox_display_status).
+function giftboxDisplayStatus(status: string, remaining: number, expiresAt: string): ClientPrepaidStatus {
+  const s = status.trim().toLowerCase();
+  if (s === "cancelled" || s === "canceled") return "cancelled";
+  if (remaining <= 0 || s === "redeemed") return "completed";
+  if (s === "expired") return "expired";
+  if (expiresAt && /^\d{4}-\d{2}-\d{2}/.test(expiresAt) && expiresAt.slice(0, 10) < todayIso()) return "expired";
+  return "active";
 }
 
 export async function issueDbPrepaid(
@@ -5855,19 +6291,107 @@ async function getSinglePrepaid(slug: string, id: number): Promise<ClientPrepaid
 
 async function mapClientPrepaid(slug: string, row: RowDataPacket): Promise<ClientPrepaid> {
   const remaining = Math.max(0, Number(row.remaining_qty ?? 0));
+  const prepaidId = Number(row.id ?? 0);
+  // Single-row path (issue/consume result): compute the same booked/lastUsed split
+  // the list uses, scoped to this one prepaid. listDbPrepaids batches these instead.
+  const [booked, lastUsedAt] = await Promise.all([
+    prepaidBookedQty(slug, prepaidId),
+    prepaidLastUsedAt(slug, prepaidId),
+  ]);
+  const bookedQty = Math.min(remaining, booked);
   return {
-    id: Number(row.id ?? 0),
+    id: prepaidId,
+    kind: "prepaid",
     clientId: Number(row.client_id ?? 0),
     clientName: await appointmentClientName(slug, Number(row.client_id ?? 0)),
     serviceId: Number(row.service_id ?? 0),
     serviceName: String(row.service_name ?? "Servizio"),
     totalQuantity: Math.max(0, Number(row.purchased_qty ?? remaining)),
     remainingQuantity: remaining,
+    bookedQty,
+    bookableQty: Math.max(0, remaining - bookedQty),
+    lastUsedAt: lastUsedAt || undefined,
     expiresAt: row.expires_at ? String(row.expires_at).slice(0, 10) : undefined,
     status: clientPrepaidStatus(String(row.status ?? "active"), remaining, String(row.expires_at ?? "")),
     sourceSaleId: row.sale_id ? Number(row.sale_id) : undefined,
     createdAt: toIso(row.created_at ?? row.purchase_date),
   };
+}
+
+// Booked sessions for ONE standalone prepaid: qty on appointment_prepaid_service_items
+// tied to an OPEN appointment (pending/scheduled) and not yet redeemed (redeemed_at IS
+// NULL) — the legacy linked_qty. Tenant-scoped per table + in-memory join (no
+// cross-tenant raw join). Missing tables -> 0.
+async function prepaidBookedQty(slug: string, prepaidServiceId: number): Promise<number> {
+  if (prepaidServiceId <= 0) return 0;
+  try {
+    const linkTable = await tenantTable(slug, "appointment_prepaid_service_items");
+    if (!(await tableExists(linkTable.name))) return 0;
+    const linkRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointment_prepaid_service_items",
+      columns: "appointment_id, qty",
+      where: "client_prepaid_service_id = ? AND redeemed_at IS NULL",
+      params: [prepaidServiceId],
+    });
+    if (linkRows.length === 0) return 0;
+    const openIds = await openAppointmentIds(slug, linkRows.map((r) => Number(r.appointment_id ?? 0)));
+    return linkRows.reduce(
+      (acc, r) => acc + (openIds.has(Number(r.appointment_id ?? 0)) ? Math.max(0, Number(r.qty ?? 0)) : 0),
+      0,
+    );
+  } catch {
+    return 0;
+  }
+}
+
+// Last-usage timestamp for ONE prepaid: MAX(used_at) over its usages. Missing table -> "".
+async function prepaidLastUsedAt(slug: string, prepaidServiceId: number): Promise<string> {
+  if (prepaidServiceId <= 0) return "";
+  try {
+    const usageTable = await tenantTable(slug, "client_prepaid_service_usages");
+    if (!(await tableExists(usageTable.name))) return "";
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "client_prepaid_service_usages",
+      columns: "used_at",
+      where: "client_prepaid_service_id = ?",
+      params: [prepaidServiceId],
+    });
+    let last = "";
+    for (const r of rows) {
+      const at = r.used_at ? toIso(r.used_at) : "";
+      if (at && at > last) last = at;
+    }
+    return last;
+  } catch {
+    return "";
+  }
+}
+
+// Given a set of appointment ids, return the subset whose status is OPEN
+// (pending/scheduled) for this tenant. One tenant-scoped query, in-memory filter.
+async function openAppointmentIds(slug: string, ids: number[]): Promise<Set<number>> {
+  const unique = Array.from(new Set(ids.filter((n) => n > 0)));
+  if (unique.length === 0) return new Set();
+  try {
+    const apptTable = await tenantTable(slug, "appointments");
+    if (!(await tableExists(apptTable.name))) {
+      // No appointments table: legacy treats not-yet-redeemed links as booked.
+      return new Set(unique);
+    }
+    const placeholders = unique.map(() => "?").join(",");
+    const rows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "appointments",
+      columns: "id",
+      where: `id IN (${placeholders}) AND LOWER(TRIM(COALESCE(status, ''))) IN ('pending', 'scheduled')`,
+      params: unique,
+    });
+    return new Set(rows.map((r) => Number(r.id ?? 0)));
+  } catch {
+    return new Set(unique);
+  }
 }
 
 function clientPrepaidStatus(status: string, remaining: number, expiresAt: string): ClientPrepaidStatus {

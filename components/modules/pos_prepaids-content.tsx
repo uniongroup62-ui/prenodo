@@ -3,25 +3,37 @@
 import { useEffect, useMemo, useState } from "react";
 
 // Faithful port of the PHP POS prepaids page (app/pages/pos_prepaids.php):
-// purchased services tracked as "Prepagato" with residual sessions, filters
-// (period / location / search / clients / services / view) and a results table.
-// Fed by the existing DB-backed /api/manage/prepaids route. The PHP page also
-// links the source sale, splits residual sessions into "prenotabili" vs "già
-// prenotate", and shows the last usage; the API does not expose those, so those
-// cells fall back to "—" (see risks).
+// purchased services tracked as prepaid/package/giftbox with residual sessions,
+// filters (period / location / search / clients / services / view) and a results
+// table. Fed by the DB-backed /api/manage/prepaids route, which now merges the
+// three sources and returns the real residual split (bookableQty / bookedQty),
+// last usage and source sale, mirroring the legacy page.
+
+type PrepaidKind = "prepaid" | "package" | "giftbox";
 
 type Prepaid = {
   id: number;
+  kind: PrepaidKind;
   clientId: number;
   clientName: string;
   serviceId: number;
   serviceName: string;
   totalQuantity: number;
   remainingQuantity: number;
+  bookedQty: number;
+  bookableQty: number;
+  lastUsedAt?: string;
   expiresAt?: string;
   status: "active" | "completed" | "expired" | "cancelled";
   sourceSaleId?: number;
   createdAt: string;
+};
+
+// Tipo badge per source kind (mirrors the legacy sourceBadge* mapping).
+const KIND_BADGE: Record<PrepaidKind, { label: string; className: string }> = {
+  prepaid: { label: "Prepagato", className: "text-bg-info" },
+  package: { label: "Pacchetto", className: "text-bg-primary" },
+  giftbox: { label: "GiftBox", className: "text-bg-warning text-dark" },
 };
 
 type LocationOption = { id: number; name: string };
@@ -126,8 +138,9 @@ export function PosPrepaidsContent() {
       case "active":
         return p.status === "active";
       case "linked":
-        // "Già prenotati": linked to an open appointment. Not exposed by API.
-        return Boolean(p.sourceSaleId) && p.status === "active";
+        // "Già prenotati": active rows with at least one session tied to an open
+        // appointment (the real residual split from the API).
+        return p.status === "active" && p.bookedQty > 0;
       case "expired":
         return p.status === "expired";
       case "completed":
@@ -160,17 +173,12 @@ export function PosPrepaidsContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prepaids, applied]);
 
-  // Stats (PHP computes from the visible rows).
+  // Stats (PHP sums the visible rows: remaining, free_qty, linked_qty).
   const stats = useMemo(() => {
     const visible = filtered.length;
     const residual = filtered.reduce((acc, p) => acc + Math.max(0, p.remainingQuantity), 0);
-    // "Prenotabili" vs "Già prenotate" require appointment linkage the API does
-    // not expose; we approximate booked from sourceSaleId, bookable as the rest.
-    const booked = filtered.reduce(
-      (acc, p) => acc + (p.sourceSaleId ? Math.max(0, p.remainingQuantity) : 0),
-      0,
-    );
-    const bookable = residual - booked;
+    const bookable = filtered.reduce((acc, p) => acc + Math.max(0, p.bookableQty), 0);
+    const booked = filtered.reduce((acc, p) => acc + Math.max(0, p.bookedQty), 0);
     return { visible, residual, bookable, booked };
   }, [filtered]);
 
@@ -254,13 +262,21 @@ export function PosPrepaidsContent() {
         <div className="col-12 col-sm-6 col-xl-3">
           <div className="card p-3 h-100">
             <div className="small text-muted">Prenotabili</div>
-            <div className="h3 fw-semibold mb-0 text-success">{stats.bookable}</div>
+            <div
+              className={`h3 fw-semibold mb-0 ${
+                stats.bookable <= 0 && stats.visible > 0 ? "text-warning" : "text-success"
+              }`}
+            >
+              {stats.bookable}
+            </div>
           </div>
         </div>
         <div className="col-12 col-sm-6 col-xl-3">
           <div className="card p-3 h-100">
             <div className="small text-muted">Già prenotate</div>
-            <div className="h3 fw-semibold mb-0 ">{stats.booked}</div>
+            <div className={`h3 fw-semibold mb-0 ${stats.booked > 0 ? "text-primary" : ""}`}>
+              {stats.booked}
+            </div>
           </div>
         </div>
       </div>
@@ -527,47 +543,65 @@ export function PosPrepaidsContent() {
                       </td>
                     </tr>
                   ) : (
-                    filtered.map((p) => (
-                      <tr key={p.id}>
-                        <td className="pos-prepaids-col-purchase">
-                          <div>{fmtDate(p.createdAt)}</div>
-                          {p.expiresAt ? (
-                            <div className="text-muted small">Scade: {fmtDate(p.expiresAt)}</div>
-                          ) : null}
-                        </td>
-                        <td className="pos-prepaids-col-sale">
-                          {p.sourceSaleId ? (
-                            <a
-                              href={`/${encodeURIComponent(slug)}/pos_sale?id=${p.sourceSaleId}`}
-                            >
-                              #{p.sourceSaleId}
-                            </a>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                        <td className="pos-prepaids-col-type text-muted">—</td>
-                        <td className="pos-prepaids-col-client">{p.clientName || "—"}</td>
-                        <td>{p.serviceName}</td>
-                        <td className="pos-prepaids-col-availability">
-                          <span className="fw-semibold">{p.remainingQuantity}</span>
-                          <span className="text-muted small"> / {p.totalQuantity}</span>
-                        </td>
-                        <td className="pos-prepaids-col-status">
-                          <span className={`badge ${STATUS_BADGE[p.status] ?? "text-bg-light"}`}>
-                            {STATUS_LABELS[p.status] ?? p.status}
-                          </span>
-                        </td>
-                        <td className="text-end pos-prepaids-col-actions">
-                          <a
-                            className="btn btn-sm btn-outline-secondary"
-                            href={`/${encodeURIComponent(slug)}/pos_prepaids?action=view&id=${p.id}`}
-                          >
-                            Apri
-                          </a>
-                        </td>
-                      </tr>
-                    ))
+                    filtered.map((p) => {
+                      const kind = KIND_BADGE[p.kind] ?? KIND_BADGE.prepaid;
+                      const usedQty = Math.max(0, p.totalQuantity - p.remainingQuantity);
+                      const saleHref = p.sourceSaleId
+                        ? `/${encodeURIComponent(slug)}/pos_sale_detail?id=${p.sourceSaleId}&back=prepaids`
+                        : "";
+                      return (
+                        <tr key={p.id}>
+                          <td className="pos-prepaids-col-purchase">
+                            <div>{fmtDate(p.createdAt)}</div>
+                            {p.expiresAt ? (
+                              <div className="text-muted small">Scade: {fmtDate(p.expiresAt)}</div>
+                            ) : null}
+                          </td>
+                          <td className="pos-prepaids-col-sale">
+                            {p.sourceSaleId ? <a href={saleHref}>#{p.sourceSaleId}</a> : "—"}
+                          </td>
+                          <td className="pos-prepaids-col-type">
+                            <span className={`badge ${kind.className}`}>{kind.label}</span>
+                          </td>
+                          <td className="pos-prepaids-col-client">{p.clientName || "—"}</td>
+                          <td>{p.serviceName}</td>
+                          <td className="pos-prepaids-col-availability">
+                            <div className="fw-semibold">
+                              {p.remainingQuantity} / {p.totalQuantity} residue
+                            </div>
+                            <div className="text-muted small">
+                              Prenotabili {p.bookableQty} • Prenotate {p.bookedQty} • Usate {usedQty}
+                            </div>
+                            {p.lastUsedAt ? (
+                              <div className="text-muted small">Ultimo utilizzo: {fmtDate(p.lastUsedAt)}</div>
+                            ) : usedQty <= 0 ? (
+                              <div className="text-muted small">Mai utilizzato</div>
+                            ) : null}
+                          </td>
+                          <td className="pos-prepaids-col-status">
+                            <div className="d-flex flex-column gap-1">
+                              <span className={`badge ${STATUS_BADGE[p.status] ?? "text-bg-light"}`}>
+                                {STATUS_LABELS[p.status] ?? p.status}
+                              </span>
+                              {p.bookedQty > 0 ? (
+                                <span className="badge text-bg-primary">
+                                  {p.bookedQty} {p.bookedQty === 1 ? "prenotato" : "prenotati"}
+                                </span>
+                              ) : null}
+                            </div>
+                          </td>
+                          <td className="text-end pos-prepaids-col-actions">
+                            {p.sourceSaleId ? (
+                              <a className="btn btn-sm btn-outline-primary" href={saleHref}>
+                                Dettaglio vendita
+                              </a>
+                            ) : (
+                              <span className="text-muted small">Nessuna vendita</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>

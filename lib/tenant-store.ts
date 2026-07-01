@@ -374,14 +374,25 @@ export type ClientPackage = {
 
 export type ClientPrepaidStatus = "active" | "completed" | "expired" | "cancelled";
 
+// Source of a prepaid row, mirroring the legacy pos_prepaids.php `source_type`:
+// a standalone prepaid, a service inside a package, or a service inside a GiftBox.
+export type ClientPrepaidKind = "prepaid" | "package" | "giftbox";
+
 export type ClientPrepaid = {
   id: number;
+  kind: ClientPrepaidKind;
   clientId: number;
   clientName: string;
   serviceId: number;
   serviceName: string;
   totalQuantity: number;
   remainingQuantity: number;
+  // Residual split (legacy free_qty / linked_qty): bookedQty = sessions already
+  // tied to an OPEN appointment (pending/scheduled, not yet redeemed);
+  // bookableQty = remainingQuantity - bookedQty.
+  bookedQty: number;
+  bookableQty: number;
+  lastUsedAt?: string;
   expiresAt?: string;
   status: ClientPrepaidStatus;
   sourceSaleId?: number;
