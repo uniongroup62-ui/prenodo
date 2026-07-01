@@ -375,7 +375,30 @@ function normalizeSaleItemInput(item: Record<string, unknown>): PosSaleItemInput
     bonusAmount: item.bonusAmount === undefined && item.bonus_amount === undefined ? undefined : parseNumber(item.bonusAmount ?? item.bonus_amount, 0),
     totalAmount: item.totalAmount === undefined && item.total_amount === undefined ? undefined : parseNumber(item.totalAmount ?? item.total_amount, 0),
     earnPoints: parseBoolean(item.earnPoints ?? item.earn_points),
+    // Custom GiftBox contents (faithful to the legacy giftbox_items POST payload): a nested array
+    // of {type:'service'|'product', id, qty} carried inside items_json (so it survives the JSON
+    // parse intact, unlike a top-level body field). Read only for a type:"giftbox" custom-build line.
+    customItems: normalizeCustomGiftboxItems(item.customItems ?? item.giftbox_items),
   };
+}
+
+// Parse the custom-giftbox contents array: keep only valid {service|product, id>0, qty>=1} entries.
+function normalizeCustomGiftboxItems(value: unknown): Array<{ type: "service" | "product"; id: number; qty: number }> | undefined {
+  let src: unknown = value;
+  if (typeof src === "string") {
+    try { src = JSON.parse(src); } catch { return undefined; }
+  }
+  if (!Array.isArray(src)) return undefined;
+  const out: Array<{ type: "service" | "product"; id: number; qty: number }> = [];
+  for (const raw of src) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const type = String(r.type ?? "").toLowerCase() === "product" ? "product" : "service";
+    const id = parseInteger(r.id ?? r.service_id ?? r.product_id, 0);
+    const qty = Math.max(1, parseInteger(r.qty ?? r.quantity, 1));
+    if (id > 0) out.push({ type, id, qty });
+  }
+  return out.length ? out : undefined;
 }
 
 function parseBoolean(value: unknown): boolean | undefined {

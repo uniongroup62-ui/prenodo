@@ -3354,6 +3354,13 @@ async function buildSaleItems(slug: string, inputItems: PosSaleItemInput[], loca
       bonusAmount: isRecharge ? rechargeBonus : undefined,
       totalAmount: isRecharge ? rechargeTotal : undefined,
       earnPoints: isRecharge ? input.earnPoints === true : undefined,
+      // Custom GiftBox contents ride only on a giftbox line with NO template (refId 0). Filtered
+      // to valid entries; issueGiftboxFromSale materialises a transient template from them.
+      customItems: isGiftbox && refId <= 0 && Array.isArray(input.customItems) && input.customItems.length > 0
+        ? input.customItems
+            .map((ci) => ({ type: ci.type === "product" ? "product" as const : "service" as const, id: Math.max(0, Number(ci.id ?? 0) || 0), qty: Math.max(1, Number(ci.qty ?? 1) || 1) }))
+            .filter((ci) => ci.id > 0)
+        : undefined,
     });
   }
   return items.filter((item) => item.quantity > 0);
@@ -4483,13 +4490,68 @@ async function defaultGiftcardExpiry(slug: string, issuedAtYmd: string): Promise
 // qty/custom_label) so the redeem reader sees the box contents. Returns the new instance id (0
 // when not issued). Optional issue email is OUT OF SCOPE (see TODO). The box PRICE is the line
 // price (qty 1) — set as the sale_items line, so the sale TOTAL equals the giftbox price.
+// Materialise a ONE-OFF ("custom build") giftbox TEMPLATE from the chosen cart items, faithful to
+// the legacy pos.php issue_giftbox → GiftBox::saveGiftBox (~2598-2667): a transient giftboxes row
+// (name "GiftBox per <recipient> • DD/MM/YYYY", eligibility all_clients, points_cost 0, active) +
+// one giftbox_items row per selected service/product. Returns the new giftboxes id (0 on failure),
+// which issueGiftboxFromSale then treats exactly like a pre-defined template (copying its items
+// into giftbox_instance_items). NOT reused across sales — each custom box gets its own template.
+async function saveGiftboxFromCart(slug: string, item: PosSaleItem, recipientLabel: string): Promise<number> {
+  const items = item.customItems ?? [];
+  if (!items.length) return 0;
+  const table = await tenantTable(slug, "giftboxes").catch(() => null);
+  if (!table) return 0;
+  const [y, m, d] = todayIso().split("-");
+  const name = clean(`GiftBox per ${recipientLabel || "Cliente"} • ${d}/${m}/${y}`, 190);
+  const validTo = item.expiresAt && /^\d{4}-\d{2}-\d{2}$/.test(item.expiresAt) ? item.expiresAt : null;
+  const giftboxId = await tenantInsert(table, await filterColumns(table.name, {
+    name,
+    description: "GiftBox personalizzata composta dal carrello",
+    eligibility: "all_clients",
+    points_cost: 0,
+    active: 1,
+    sort_order: 0,
+    valid_to: validTo,
+    created_at: new Date(),
+    updated_at: new Date(),
+  })).catch(() => 0);
+  if (!giftboxId) return 0;
+
+  const itemsTable = await tenantTable(slug, "giftbox_items").catch(() => null);
+  if (itemsTable) {
+    for (const [index, ci] of items.entries()) {
+      const isProduct = ci.type === "product";
+      await tenantInsert(itemsTable, await filterColumns(itemsTable.name, {
+        giftbox_id: giftboxId,
+        item_type: isProduct ? "product" : "service",
+        service_id: isProduct ? null : (ci.id > 0 ? ci.id : null),
+        product_id: isProduct ? (ci.id > 0 ? ci.id : null) : null,
+        qty: Math.max(1, Number(ci.qty ?? 1) || 1),
+        sort_order: index,
+        created_at: new Date(),
+        updated_at: new Date(),
+      })).catch(() => undefined);
+    }
+  }
+  return giftboxId;
+}
+
 async function issueGiftboxFromSale(slug: string, saleId: number, clientId: number, item: PosSaleItem, locationId: number): Promise<IssueResult> {
   const instanceTable = await tenantTable(slug, "giftbox_instances").catch(() => null);
   if (!instanceTable) return { id: 0, voucher: null };
 
-  // The chosen giftboxes TEMPLATE (the cart line refId). A giftbox sale always picks a
-  // template; without one there are no contents to copy, so skip silently.
-  const giftboxId = Math.max(0, Number(item.refId ?? 0) || 0);
+  // The chosen giftboxes TEMPLATE (the cart line refId), OR — for a CUSTOM build (refId 0 with
+  // cart contents) — a transient template materialised on the fly from the chosen cart items
+  // (port of pos.php issue_giftbox → GiftBox::saveGiftBox before issueInstance). Either way, from
+  // here on giftboxId is a real giftboxes row whose giftbox_items get copied into the instance.
+  let giftboxId = Math.max(0, Number(item.refId ?? 0) || 0);
+  if (giftboxId <= 0 && item.customItems && item.customItems.length > 0) {
+    const buildLabel = clean(item.recipientName, 120)
+      || (Number(item.recipientClientId ?? 0) > 0 ? await clientName(slug, Number(item.recipientClientId)) : "")
+      || (clientId > 0 ? await clientName(slug, clientId) : "")
+      || "Cliente";
+    giftboxId = await saveGiftboxFromCart(slug, item, buildLabel);
+  }
   if (giftboxId <= 0) return { id: 0, voucher: null };
   const template = await giftboxTemplateRow(slug, giftboxId);
   if (!template) return { id: 0, voucher: null };
@@ -4569,10 +4631,9 @@ async function issueGiftboxFromSale(slug: string, saleId: number, clientId: numb
     }
   }
 
-  // TODO: the in-GiftBox custom-build mode (the legacy pos.php issue_giftbox action that builds
-  // a one-off giftbox from cart services/products via GiftBox::saveGiftBox before issuing) is
-  // OUT OF SCOPE — only the template sale is wired. TODO: the optional issue email (recipient_
-  // email / scheduled_send_on) is also out of scope; the giftbox-send cron handles delivery.
+  // The in-GiftBox custom-build mode (refId 0 + item.customItems) is now wired via
+  // saveGiftboxFromCart above. TODO: the optional issue email (recipient_email /
+  // scheduled_send_on) remains out of scope; the giftbox-send cron handles delivery.
   return { id: instanceId, voucher: { type: "giftbox", code, recipientName, amount } };
 }
 

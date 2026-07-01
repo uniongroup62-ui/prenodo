@@ -121,6 +121,11 @@ export type PosSaleItemInput = {
   bonusAmount?: number;
   totalAmount?: number;
   earnPoints?: boolean;
+  // Custom GiftBox build (faithful to pos.php issue_giftbox / GiftBox::saveGiftBox): the chosen
+  // cart services/products that compose a ONE-OFF giftbox when the line carries no template
+  // (refId 0). Read only for a type:"giftbox" line — saveGiftboxFromCart materialises a transient
+  // giftboxes template + giftbox_items from these before the instance copies them. Ignored otherwise.
+  customItems?: Array<{ type: "service" | "product"; id: number; qty: number }>;
 };
 
 export type PosPaymentInput = {
@@ -166,6 +171,10 @@ export type PosSaleItem = {
   bonusAmount?: number;
   totalAmount?: number;
   earnPoints?: boolean;
+  // Custom GiftBox build: the chosen cart services/products composing a one-off giftbox, carried
+  // from the cart to issueGiftboxFromSale (which materialises a transient template via
+  // saveGiftboxFromCart when refId is 0). Set only on a type:"giftbox" custom-build line.
+  customItems?: Array<{ type: "service" | "product"; id: number; qty: number }>;
 };
 
 export type PosPayment = {
