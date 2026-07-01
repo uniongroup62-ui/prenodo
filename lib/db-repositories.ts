@@ -8664,6 +8664,113 @@ export async function touchDbConfigModule(moduleId: string, slug: string): Promi
   return listDbConfigModule(moduleId, slug);
 }
 
+// ---- Global Fidelity toggle (fidelity.php _mode=toggle_fidelity) --------------
+export type FidelityDisableImpact = {
+  blockingPromotions: Array<{ id: number; name: string }>;
+  blockingGifts: Array<{ id: number; name: string }>;
+  linkedAppointmentCount: number;
+};
+
+export async function getFidelityEnabled(slug: string): Promise<boolean> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_enabled", orderBy: "id ASC", limit: 1 });
+  return Number(rows[0]?.fidelity_enabled ?? 0) === 1;
+}
+
+// Pending/scheduled appointments still carrying Fidelity benefits (the disable
+// would strip them). Returns the rows (id + client + reserved points) for the strip.
+async function fidelityLinkedAppointments(slug: string): Promise<RowDataPacket[]> {
+  return tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, client_id, fidelity_points_used, fidelity_gift_points_used",
+    where: "status IN ('pending','scheduled') AND (COALESCE(fidelity_points_used,0) > 0 OR COALESCE(fidelity_discount,0) > 0 OR COALESCE(fidelity_gift_points_used,0) > 0 OR COALESCE(fidelity_gift_idx,0) > 0 OR COALESCE(fidelity_conflict_choice,'') <> '')",
+  }).catch(() => [] as RowDataPacket[]);
+}
+
+// Fidelity-linked campaigns that block disabling (port of the two collect_*
+// helpers): active promotions targeting fidelity + active fidelity-only gifts.
+async function fidelityDisableImpact(slug: string): Promise<FidelityDisableImpact> {
+  const promoRows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", columns: "id, title", where: "target_type = 'fidelity' AND COALESCE(is_active,0) = 1", orderBy: "title ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const giftRows = await tenantSelect<RowDataPacket>({ slug, table: "gifts", columns: "id, name", where: "deleted_at IS NULL AND eligibility = 'fidelity_only' AND COALESCE(active,0) = 1", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const linked = await fidelityLinkedAppointments(slug);
+  return {
+    blockingPromotions: promoRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.title || `Promozione #${r.id}`) })),
+    blockingGifts: giftRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name || `Omaggio #${r.id}`) })),
+    linkedAppointmentCount: linked.length,
+  };
+}
+
+// Enable/disable the whole Fidelity program (port of fidelity.php toggle_fidelity).
+// Enabling is a plain flag write. Disabling: refuse while fidelity-targeted
+// Promozioni/Omaggi campaigns are active; when pending/scheduled appointments
+// still carry Fidelity benefits, require `confirmed` (returns needsConfirm), then
+// strip those benefits (restore the reserved points to the client + clear the
+// fidelity columns), flip the flag, and deactivate active fidelity_campaigns.
+export async function setFidelityEnabled(
+  slug: string,
+  enabled: boolean,
+  confirmed: boolean,
+): Promise<{ ok: boolean; enabled: boolean; needsConfirm?: boolean; impact?: FidelityDisableImpact; strippedAppointments?: number; deactivatedCampaigns?: number }> {
+  const bizRows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "id, fidelity_enabled", orderBy: "id ASC", limit: 1 });
+  if (!bizRows[0]) throw new Error("Business non trovato.");
+  const bizId = Number(bizRows[0].id ?? 0);
+  const currentlyEnabled = Number(bizRows[0].fidelity_enabled ?? 0) === 1;
+
+  if (enabled) {
+    await tenantUpdate({ slug, table: "businesses", id: bizId, values: { fidelity_enabled: 1 } });
+    return { ok: true, enabled: true };
+  }
+
+  if (!currentlyEnabled) {
+    await tenantUpdate({ slug, table: "businesses", id: bizId, values: { fidelity_enabled: 0 } });
+    return { ok: true, enabled: false };
+  }
+
+  const impact = await fidelityDisableImpact(slug);
+  if (impact.blockingPromotions.length > 0 || impact.blockingGifts.length > 0) {
+    const parts: string[] = [];
+    if (impact.blockingPromotions.length > 0) parts.push(`${impact.blockingPromotions.length} ${impact.blockingPromotions.length === 1 ? "campagna Promozioni collegata alla Fidelity" : "campagne Promozioni collegate alla Fidelity"}`);
+    if (impact.blockingGifts.length > 0) parts.push(`${impact.blockingGifts.length} ${impact.blockingGifts.length === 1 ? "campagna Omaggi collegata alla Fidelity" : "campagne Omaggi collegate alla Fidelity"}`);
+    throw new Error(`Per disattivare l'impostazione generale Fidelity devi prima disattivare le campagne collegate: ${parts.join(" e ")}.`);
+  }
+
+  const linked = await fidelityLinkedAppointments(slug);
+  if (linked.length > 0 && !confirmed) {
+    return { ok: false, enabled: true, needsConfirm: true, impact };
+  }
+
+  // Strip the fidelity benefits from the linked appointments + restore points.
+  for (const appt of linked) {
+    const apptId = Number(appt.id ?? 0);
+    const clientId = Number(appt.client_id ?? 0);
+    const restore = Math.max(0, Math.round(Number(appt.fidelity_points_used ?? 0))) + Math.max(0, Math.round(Number(appt.fidelity_gift_points_used ?? 0)));
+    if (restore > 0 && clientId > 0) {
+      await dbExecute(
+        `UPDATE ${quoteIdentifier((await tenantTable(slug, "clients")).name)} SET points = COALESCE(points,0) + ? WHERE id = ?${(await columnExists((await tenantTable(slug, "clients")).name, "tenant_id")) ? " AND tenant_id = ?" : ""}`,
+        (await columnExists((await tenantTable(slug, "clients")).name, "tenant_id")) ? [restore, clientId, (await tenantTable(slug, "clients")).tenantId ?? 0] : [restore, clientId],
+      ).catch(() => undefined);
+    }
+    await tenantUpdate({ slug, table: "appointments", id: apptId, values: { fidelity_points_used: 0, fidelity_discount: 0, fidelity_gift_points_used: 0, fidelity_gift_idx: null, fidelity_conflict_choice: "", fidelity_campaign_id: null } }).catch(() => undefined);
+  }
+
+  await tenantUpdate({ slug, table: "businesses", id: bizId, values: { fidelity_enabled: 0 } });
+
+  // Deactivate active points campaigns.
+  let deactivatedCampaigns = 0;
+  const campTable = await tenantTable(slug, "fidelity_campaigns").catch(() => null);
+  if (campTable) {
+    const scoped = campTable.mode === "shared" && (await columnExists(campTable.name, "tenant_id"));
+    const hasDeleted = await columnExists(campTable.name, "deleted_at");
+    const res = await dbExecute(
+      `UPDATE ${quoteIdentifier(campTable.name)} SET active = 0 WHERE COALESCE(active,0) = 1${hasDeleted ? " AND deleted_at IS NULL" : ""}${scoped ? " AND tenant_id = ?" : ""}`,
+      scoped ? [campTable.tenantId ?? 0] : [],
+    ).catch(() => ({ affectedRows: 0, insertId: 0 }));
+    deactivatedCampaigns = res.affectedRows ?? 0;
+  }
+
+  return { ok: true, enabled: false, strippedAppointments: linked.length, deactivatedCampaigns };
+}
+
 async function getSingleClient(slug: string, id: number): Promise<ManagedClient> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Cliente non trovato.");

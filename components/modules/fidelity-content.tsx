@@ -2,46 +2,71 @@
 
 import { useEffect, useState } from "react";
 
-// Pixel-faithful port of the PHP fidelity settings page (app/pages/fidelity.php).
-// The page is a single "Impostazione generale" card with a global on/off switch.
-// The toggle state mirrors the businesses.fidelity_enabled flag, which the
-// /api/manage/configuration?module=fidelity_membership endpoint exposes as the
-// "Programma fidelity" record (active = enabled).
+// Faithful port of the PHP fidelity settings page (app/pages/fidelity.php): a
+// single "Impostazione generale" card with a global on/off switch mirroring the
+// businesses.fidelity_enabled flag. The toggle now POSTs to
+// /api/manage/fidelity (action=toggle) — the legacy toggle_fidelity — with the
+// disable guards: refuse while fidelity-targeted Promozioni/Omaggi are active,
+// and a confirm modal when pending/scheduled appointments still carry Fidelity
+// benefits (stripped + points restored on confirm).
 
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
 }
 
-type ConfigRecord = {
-  id: number;
-  module: string;
-  title: string;
-  detail: string;
-  value: string;
-  active: boolean;
-  updatedAt?: string;
+type Impact = {
+  blockingPromotions?: Array<{ id: number; name: string }>;
+  blockingGifts?: Array<{ id: number; name: string }>;
+  linkedAppointmentCount?: number;
 };
 
 export function FidelityContent() {
   const slug = tenantSlug();
-  // Default to the captured PHP state (checked) until the API resolves.
   const [enabled, setEnabled] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [flash, setFlash] = useState("");
+  const [confirmImpact, setConfirmImpact] = useState<Impact | null>(null);
 
   useEffect(() => {
-    fetch(`/api/manage/configuration?module=fidelity_membership&slug=${encodeURIComponent(slug)}`, {
-      headers: { "x-tenant-slug": slug },
-    })
+    fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}&action=state`, { headers: { "x-tenant-slug": slug } })
       .then((r) => r.json())
       .then((j) => {
-        const records: ConfigRecord[] = Array.isArray(j.records) ? j.records : [];
-        const program = records.find((rec) => rec.id === 1 || rec.title === "Programma fidelity");
-        if (program) setEnabled(Boolean(program.active));
+        if (typeof j?.enabled === "boolean") setEnabled(j.enabled);
       })
       .catch(() => {});
   }, [slug]);
 
-  const pageHref = `/${encodeURIComponent(slug)}/fidelity`;
+  async function submit(nextEnabled: boolean, confirmed: boolean) {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    setFlash("");
+    try {
+      const res = await fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "toggle", fidelity_enabled: nextEnabled ? "1" : "0", disable_appointments_confirmed: confirmed ? "1" : "0" }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        setError(String(j?.error ?? "Impossibile salvare."));
+        setEnabled((prev) => prev); // keep current
+        return;
+      }
+      if (j.needsConfirm) {
+        setConfirmImpact(j.impact ?? {});
+        return;
+      }
+      setConfirmImpact(null);
+      setEnabled(Boolean(j.enabled));
+      const stripped = Number(j.strippedAppointments ?? 0);
+      setFlash(nextEnabled ? "Fidelity attivata." : `Fidelity disattivata.${stripped > 0 ? ` Agevolazioni rimosse da ${stripped} prenotazioni.` : ""}`);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="container-fluid">
@@ -55,6 +80,9 @@ export function FidelityContent() {
         </div>
       </div>
 
+      {error ? <div className="alert alert-danger">{error}</div> : null}
+      {flash ? <div className="alert alert-success">{flash}</div> : null}
+
       <div className="card p-4 mb-3">
         <div className="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3">
           <div>
@@ -64,29 +92,69 @@ export function FidelityContent() {
               vengono disabilitate; Ricariche e Portafoglio credito restano disponibili.
             </div>
           </div>
-          <form method="post" action={pageHref} className="d-flex align-items-center gap-3" id="fidToggleForm">
-            <input type="hidden" name="_mode" value="toggle_fidelity" />
+          <form
+            className="d-flex align-items-center gap-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              submit(enabled, false);
+            }}
+          >
             <div className="form-check form-switch m-0">
               <input
                 className="form-check-input"
                 type="checkbox"
                 id="fidEnabledGlobal"
-                name="fidelity_enabled"
-                value="1"
                 checked={enabled}
+                disabled={saving}
                 onChange={(e) => setEnabled(e.target.checked)}
               />
               <label className="form-check-label fw-semibold" htmlFor="fidEnabledGlobal">
-                Attivo
+                {enabled ? "Attivo" : "Disattivo"}
               </label>
             </div>
-            <button className="btn btn-primary btn-pill" type="submit">
+            <button className="btn btn-primary btn-pill" type="submit" disabled={saving}>
               <i className="bi bi-check2-circle me-1" />
-              Salva
+              {saving ? "Salvataggio…" : "Salva"}
             </button>
           </form>
         </div>
       </div>
+
+      {confirmImpact ? (
+        <>
+          <div className="modal fade show d-block" tabIndex={-1} role="dialog">
+            <div className="modal-dialog modal-dialog-centered">
+              <div className="modal-content">
+                <div className="modal-header">
+                  <h5 className="modal-title">Disattiva Fidelity</h5>
+                  <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => { setConfirmImpact(null); setEnabled(true); }} />
+                </div>
+                <div className="modal-body">
+                  <div className="alert alert-warning">
+                    <div className="fw-semibold mb-1">
+                      {confirmImpact.linkedAppointmentCount ?? 0} prenotazioni con agevolazioni Fidelity
+                    </div>
+                    <div className="small">
+                      Disattivando Fidelity il sistema rimuoverà automaticamente sconti punti, omaggi o scelte Fidelity dalle
+                      prenotazioni In sospeso / Prenotato coinvolte; i relativi punti torneranno disponibili. Continuare?
+                    </div>
+                  </div>
+                </div>
+                <div className="modal-footer">
+                  <button type="button" className="btn btn-outline-secondary" onClick={() => { setConfirmImpact(null); setEnabled(true); }}>
+                    Annulla
+                  </button>
+                  <button type="button" className="btn btn-danger" disabled={saving} onClick={() => submit(false, true)}>
+                    <i className="bi bi-check2-circle me-1" />
+                    Conferma disattivazione
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="modal-backdrop fade show" />
+        </>
+      ) : null}
     </div>
   );
 }
