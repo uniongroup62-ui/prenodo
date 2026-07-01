@@ -3935,7 +3935,7 @@ async function issuePackageFromSale(slug: string, saleId: number, clientId: numb
     const validityDays = Math.max(0, Number(packageRow?.validity_days ?? 0) || 0);
     if (validityDays > 0) expiresAt = addDaysIso(startDate, validityDays);
   }
-  await tenantInsert(table, await filterColumns(table.name, {
+  const clientPackageId = await tenantInsert(table, await filterColumns(table.name, {
     client_id: clientId,
     sale_id: saleId,
     package_id: item.refId > 0 ? item.refId : null,
@@ -3948,7 +3948,63 @@ async function issuePackageFromSale(slug: string, saleId: number, clientId: numb
     sessions_remaining: sessions,
     status: "active",
     notes: item.note ?? null,
-  })).catch(() => undefined);
+  })).catch(() => 0);
+
+  // PER-SERVICE breakdown (client_package_services): faithful to the legacy issue_package
+  // (pos.php ~2376-2387) — one row per service in the package template with its own
+  // sessions_total/remaining, so the redeem path (db-repositories: prefer a per-service row,
+  // keep package.remaining == SUM(cps.remaining)) and the residuals reader see the same
+  // per-service pools the rest of the app issues. Without this, a POS-sold package had ONLY the
+  // aggregate client_packages row and degraded to package-level redemption.
+  if (clientPackageId > 0 && item.refId > 0) {
+    const breakdown = await packageServicesBreakdown(slug, item.refId, packageRow ?? undefined, sessions);
+    const cpsTable = await tenantTable(slug, "client_package_services").catch(() => null);
+    if (cpsTable) {
+      for (const svc of breakdown) {
+        await tenantInsert(cpsTable, await filterColumns(cpsTable.name, {
+          client_package_id: clientPackageId,
+          service_id: svc.serviceId,
+          sessions_total: svc.sessions,
+          sessions_remaining: svc.sessions,
+          sort_order: svc.sortOrder,
+        })).catch(() => 0);
+      }
+    }
+  }
+}
+
+// Per-service breakdown for a sold package, faithful to the legacy pkReadPackageServicesBreakdown
+// (pos.php ~2282-2322): the package_services template rows (service_id + sessions_total, qty >= 1),
+// or — when the template has none — a single fallback row for the package's own service_id carrying
+// the full session total (matching the legacy fallback). Returns [] when neither is resolvable.
+async function packageServicesBreakdown(
+  slug: string,
+  packageId: number,
+  packageRow: RowDataPacket | undefined,
+  totalSessions: number,
+): Promise<Array<{ serviceId: number; sessions: number; sortOrder: number }>> {
+  const rows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "package_services",
+    columns: "service_id, sessions_total, sort_order",
+    where: "package_id=?",
+    params: [packageId],
+    orderBy: "sort_order ASC, id ASC",
+  }).catch(() => [] as RowDataPacket[]);
+  const out: Array<{ serviceId: number; sessions: number; sortOrder: number }> = [];
+  rows.forEach((r, index) => {
+    const serviceId = Math.max(0, Number(r.service_id ?? 0) || 0);
+    if (serviceId <= 0) return;
+    out.push({
+      serviceId,
+      sessions: Math.max(1, Number(r.sessions_total ?? 1) || 1),
+      sortOrder: Number(r.sort_order ?? index) || index,
+    });
+  });
+  if (out.length) return out;
+  const fallbackService = Math.max(0, Number(packageRow?.service_id ?? 0) || 0);
+  if (fallbackService > 0) return [{ serviceId: fallbackService, sessions: Math.max(1, totalSessions), sortOrder: 0 }];
+  return [];
 }
 
 async function packageRowById(slug: string, id: number): Promise<RowDataPacket | null> {
