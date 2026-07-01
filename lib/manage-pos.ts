@@ -511,14 +511,16 @@ export async function checkoutManageSale(
   const paidAmount = roundMoney(payments.reduce((sum, payment) => sum + payment.amount, 0));
   if (paidAmount + 0.00001 < total) throw new Error("Pagamento insufficiente.");
 
-  // FIDELITY points EARNED on this sale (port of Fidelity::calcEarnPointsForAmount ->
-  // addTransaction 'earn','sale'): floor(total / earn_step), whole points, gated on
-  // fidelity_enabled + fidelity_points_enabled + a real client. Persisted on the sale row
-  // and AWARDED after the insert (below), reversed on void. TODO(parity): per-item earn
-  // modes + campaigns (calcEarnPointsForCartWithCampaign) — only the flat earn-step is
-  // ported, like the recharge earn.
+  // FIDELITY points EARNED on this sale. The earn base is the "totale pagato, netto sconti e al
+  // netto di credito/GiftCard usati" (pos.php ~4671-4695): the sale total AFTER discounts MINUS the
+  // residui the client redeemed (their own wallet credit + GiftCard balance), so points accrue only
+  // on NEW external spend and never on redeemed residui. Computed just below, once the residui are
+  // resolved (line ~528). Gated on fidelity_enabled + fidelity_points_enabled + a real client;
+  // persisted on the sale row + AWARDED after the insert, reversed on void. TODO(parity): per-item
+  // earn eligibility + campaigns (calcEarnPointsForCartWithCampaign) AND the card-adhesion gate
+  // (Fidelity::isClientAdhering) — deferred to the Fidelity subsystem (the migrated `cards` table is
+  // empty, so a strict adhesion gate here would zero out earning for every client).
   const earnSettings = await getFidelityEarnSettings(slug);
-  const pointsEarned = earnSettings.enabled && client.id > 0 ? earnFidelityPoints(total, earnSettings.earnStep) : 0;
 
   // Residui: validate the wallet CREDIT + GiftCard tenders against the client's real
   // balances BEFORE writing anything. The base method (cash/card/transfer) covers the
@@ -526,6 +528,11 @@ export async function checkoutManageSale(
   // credit_used = min(walletBalance, total - giftcard_used, req). Residui require a
   // real client (id > 0); a bench sale ("Cliente banco") cannot spend residui.
   const residui = await resolveResiduiTenders(slug, payments, client.id, total);
+
+  // Earn base = net after residui (see the fidelity-earn note above): the total minus the client's
+  // own credit + GiftCard redeemed, so redeemed residui never generate fresh points.
+  const earnBase = roundMoney(Math.max(0, total - residui.creditUsed - residui.giftcardUsed));
+  const pointsEarned = earnSettings.enabled && client.id > 0 ? earnFidelityPoints(earnBase, earnSettings.earnStep) : 0;
 
   for (const item of items) {
     if (item.type === "product" && item.refId > 0 && item.status !== "ordered") {
