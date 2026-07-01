@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { FidelityCampaignsSection } from "@/components/modules/fidelity_campaigns-section";
 
 // Faithful port of the PHP Fidelity Points page (app/pages/fidelity_points.php).
 // Fed by the existing DB-backed /api/manage/fidelity route, which exposes the
@@ -387,6 +388,8 @@ export function FidelityPointsContent() {
           </form>
         </div>
       </div>
+
+      <FidelityCampaignsSection slug={slug} />
 
       <div className="row g-3">
         <div className="col-lg-7">

@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { addDbWalletMovement, dbWalletBalance, getFidelityEnabled, getFidelityPointsSettings, listDbClients, listDbWalletMovements, saveFidelityPointsSettings, setFidelityEnabled } from "@/lib/db-repositories";
+import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, getFidelityEnabled, getFidelityPointsSettings, listDbClients, listDbWalletMovements, listFidelityCampaigns, saveFidelityCampaign, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -27,6 +27,11 @@ export async function GET(request: Request) {
     // Fidelity Points earn/redeem/expire settings (fidelity_points.php).
     if (url.searchParams.get("action") === "points_settings") {
       return Response.json({ ok: true, sourceMode: "database", settings: await getFidelityPointsSettings(tenantSlug) });
+    }
+
+    // Fidelity POINTS campaigns list (fidelity_campaigns).
+    if (url.searchParams.get("action") === "campaigns") {
+      return Response.json({ ok: true, sourceMode: "database", campaigns: await listFidelityCampaigns(tenantSlug) });
     }
 
     const clients = await listDbClients({ slug: tenantSlug });
@@ -63,6 +68,23 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso punti fidelity mancante.", 403);
       const settings = await saveFidelityPointsSettings(tenantSlug, body);
       return Response.json({ ok: true, sourceMode: "database", settings });
+    }
+
+    // Points campaign CRUD (port of save/toggle/delete_fidelity_campaign).
+    const campaignAction = body.action ?? "";
+    if (["campaign_save", "campaign_toggle", "campaign_delete"].includes(String(campaignAction))) {
+      if (!can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso punti fidelity mancante.", 403);
+      if (campaignAction === "campaign_save") {
+        const campaign = await saveFidelityCampaign(tenantSlug, body, parseInteger(body.id, 0));
+        return Response.json({ ok: true, sourceMode: "database", campaign, campaigns: await listFidelityCampaigns(tenantSlug) });
+      }
+      if (campaignAction === "campaign_toggle") {
+        const active = ["1", "true", "on", "yes"].includes(String(body.active ?? "").toLowerCase());
+        const campaign = await toggleFidelityCampaign(tenantSlug, parseInteger(body.id, 0), active);
+        return Response.json({ ok: true, sourceMode: "database", campaign, campaigns: await listFidelityCampaigns(tenantSlug) });
+      }
+      const result = await deleteFidelityCampaign(tenantSlug, parseInteger(body.id, 0), session.user.id);
+      return Response.json({ ok: true, sourceMode: "database", mode: result.mode, campaigns: await listFidelityCampaigns(tenantSlug) });
     }
 
     const input = {

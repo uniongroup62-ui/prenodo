@@ -8873,6 +8873,206 @@ export async function saveFidelityPointsSettings(slug: string, body: Record<stri
   return getFidelityPointsSettings(slug);
 }
 
+// ---- Fidelity CAMPAIGNS (fidelity_points.php save/toggle/delete campaign) -----
+export type FidelityCampaignTier = { minSpend: number; points: number };
+export type FidelityCampaign = {
+  id: number;
+  name: string;
+  active: boolean;
+  startsAt: string;
+  endsAt: string;
+  earnMode: "amount" | "tiers";
+  earnStepEuro: number;
+  tiers: FidelityCampaignTier[];
+  eligibleLevels: string[];
+  minSpend: number;
+};
+
+function parseCampaignTiers(raw: unknown): FidelityCampaignTier[] {
+  let src: unknown = raw;
+  if (typeof src === "string") { try { src = JSON.parse(src); } catch { return []; } }
+  const arr = Array.isArray(src) ? src : Array.isArray((src as { tiers?: unknown })?.tiers) ? (src as { tiers: unknown[] }).tiers : [];
+  const seen = new Map<number, number>();
+  for (const t of arr) {
+    const o = t as Record<string, unknown>;
+    const minSpend = roundMoney(Math.max(0, Number(o.minSpend ?? o.min_spend ?? 0) || 0));
+    const points = Math.max(0, Math.min(100000000, Math.round(Number(o.points ?? 0) || 0)));
+    if (points <= 0) continue;
+    if (!seen.has(minSpend) || points > (seen.get(minSpend) ?? 0)) seen.set(minSpend, points);
+  }
+  return Array.from(seen.entries()).sort((a, b) => a[0] - b[0]).map(([minSpend, points]) => ({ minSpend, points }));
+}
+
+function parseCampaignLevels(raw: unknown): string[] {
+  let src: unknown = raw;
+  if (typeof src === "string") {
+    const s = src.trim();
+    if (s === "") return [];
+    if (s.startsWith("[")) { try { src = JSON.parse(s); } catch { src = s.split(","); } }
+    else src = s.split(",");
+  }
+  if (!Array.isArray(src)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of src) { const k = String(v ?? "").trim().toLowerCase(); if (k !== "" && !seen.has(k)) { seen.add(k); out.push(k); } }
+  return out;
+}
+
+function mapFidelityCampaign(row: RowDataPacket): FidelityCampaign {
+  const earnMode = String(row.earn_mode ?? "amount") === "tiers" ? "tiers" : "amount";
+  return {
+    id: Number(row.id ?? 0),
+    name: String(row.name ?? "Campagna punti"),
+    active: Number(row.active ?? 0) === 1,
+    startsAt: row.starts_at ? String(row.starts_at).slice(0, 10) : "",
+    endsAt: row.ends_at ? String(row.ends_at).slice(0, 10) : "",
+    earnMode,
+    earnStepEuro: roundMoney(Number(row.earn_step_euro ?? 10) || 10),
+    tiers: earnMode === "tiers" ? parseCampaignTiers(row.earn_tiers) : [],
+    eligibleLevels: parseCampaignLevels(row.eligible_points_levels),
+    minSpend: roundMoney(Number(row.min_spend ?? 0) || 0),
+  };
+}
+
+export async function listFidelityCampaigns(slug: string): Promise<FidelityCampaign[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "fidelity_campaigns", where: "deleted_at IS NULL", orderBy: "id DESC" }).catch(() => [] as RowDataPacket[]);
+  return rows.map(mapFidelityCampaign);
+}
+
+// The set of valid point-level keys (businesses.fidelity_card_levels_json + the
+// always-present 'base'). Used to validate a campaign's eligible levels.
+async function fidelityPointLevelKeys(slug: string): Promise<Set<string>> {
+  const keys = new Set<string>(["base"]);
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_card_levels_json", orderBy: "id ASC", limit: 1 }).catch(() => [] as RowDataPacket[]);
+  const raw = String(rows[0]?.fidelity_card_levels_json ?? "").trim();
+  if (raw !== "") {
+    try {
+      const data = JSON.parse(raw) as unknown;
+      const arr = Array.isArray(data) ? data : Array.isArray((data as { levels?: unknown })?.levels) ? (data as { levels: unknown[] }).levels : [];
+      for (const l of arr) { const k = String((l as { key?: unknown })?.key ?? "").trim().toLowerCase(); if (k !== "") keys.add(k); }
+    } catch {}
+  }
+  return keys;
+}
+
+// Two campaign periods overlap (null start = -inf, null end = +inf).
+function campaignPeriodsOverlap(s1: string, e1: string, s2: string, e2: string): boolean {
+  const S1 = s1 || "0000-01-01";
+  const E1 = e1 || "9999-12-31";
+  const S2 = s2 || "0000-01-01";
+  const E2 = e2 || "9999-12-31";
+  return S1 <= E2 && S2 <= E1;
+}
+
+async function assertNoActiveCampaignOverlap(slug: string, campaignId: number, startsAt: string, endsAt: string): Promise<void> {
+  const actives = (await listFidelityCampaigns(slug)).filter((c) => c.active && c.id !== campaignId);
+  const clash = actives.find((c) => campaignPeriodsOverlap(startsAt, endsAt, c.startsAt, c.endsAt));
+  if (clash) throw new Error(`Periodo sovrapposto a un'altra campagna punti attiva ("${clash.name}"). Modifica le date o disattiva l'altra campagna.`);
+}
+
+// Create / update a points campaign (port of save_fidelity_campaign): amount or
+// tiers earn mode, level eligibility, min spend, active window; activating needs
+// Fidelity on + a non-overlapping active period + valid levels.
+export async function saveFidelityCampaign(slug: string, body: Record<string, string>, id: number): Promise<FidelityCampaign> {
+  let name = String(body.name ?? body.fid_campaign_name ?? "").trim();
+  if (name === "") name = "Campagna punti";
+  if (name.length > 120) name = name.slice(0, 120);
+  const active = ["1", "true", "on", "yes"].includes(String(body.active ?? body.fid_campaign_active ?? "").toLowerCase());
+  if (active && !(await getFidelityEnabled(slug))) throw new Error("Attiva prima Punti Fidelity per attivare le campagne punti.");
+
+  const startsAt = normalizeClientDate(body.starts_at ?? body.fid_campaign_starts_at) ?? "";
+  const endsNever = ["1", "true", "on", "yes"].includes(String(body.ends_never ?? body.fid_campaign_ends_never ?? "").toLowerCase());
+  const endsAt = endsNever ? "" : (normalizeClientDate(body.ends_at ?? body.fid_campaign_ends_at) ?? "");
+  if (startsAt !== "" && endsAt !== "" && endsAt < startsAt) throw new Error("La data di scadenza non puo essere precedente alla data di attivazione.");
+
+  let earnMode = String(body.earn_mode ?? body.fid_campaign_earn_mode ?? "amount").toLowerCase();
+  if (earnMode !== "amount" && earnMode !== "tiers") earnMode = "amount";
+  const settings = await getFidelityPointsSettings(slug);
+  let earnStep = clampNum(Number(String(body.earn_step_euro ?? body.fid_campaign_earn_step_euro ?? "").replace(",", ".")), 0, 100000, settings.earnStepEuro || 10);
+
+  let tiers: FidelityCampaignTier[] = [];
+  if (earnMode === "tiers") {
+    tiers = parseCampaignTiers(body.tiers_json ?? body.tiers);
+    if (tiers.length === 0) throw new Error("Aggiungi almeno uno scaglione punti valido.");
+  }
+
+  const levels = parseCampaignLevels(body.eligible_levels ?? body.fid_campaign_level);
+  if (levels.length > 0) {
+    const available = await fidelityPointLevelKeys(slug);
+    for (const k of levels) if (!available.has(k)) throw new Error("Il livello card selezionato non esiste piu. Aggiorna la campagna e scegli un livello valido.");
+  }
+
+  let minSpend = roundMoney(Math.max(0, Math.min(100000000, Number(String(body.min_spend ?? body.fid_campaign_min_spend ?? "0").replace(",", ".")) || 0)));
+  if (earnMode === "tiers") minSpend = 0;
+
+  if (active) await assertNoActiveCampaignOverlap(slug, id, startsAt, endsAt);
+
+  const values = await filterColumns((await tenantTable(slug, "fidelity_campaigns")).name, {
+    name,
+    active: active ? 1 : 0,
+    starts_at: startsAt || null,
+    ends_at: endsAt || null,
+    earn_mode: earnMode,
+    earn_step_euro: roundMoney(earnStep),
+    earn_tiers: earnMode === "tiers" ? JSON.stringify({ tiers }) : null,
+    item_rules: JSON.stringify({ rules: [] }),
+    eligible_points_levels: JSON.stringify(levels),
+    min_spend: minSpend,
+    auto_disabled_by_points: 0,
+    updated_at: new Date(),
+  });
+
+  let campaignId = id;
+  if (campaignId > 0) {
+    const existing = await tenantSelect<RowDataPacket>({ slug, table: "fidelity_campaigns", columns: "id, deleted_at", where: "id = ?", params: [campaignId], limit: 1 });
+    if (!existing[0]) throw new Error("Campagna punti non trovata.");
+    if (existing[0].deleted_at) throw new Error("Questa campagna punti e stata rimossa e non puo essere modificata.");
+    await tenantUpdate({ slug, table: "fidelity_campaigns", id: campaignId, values });
+  } else {
+    campaignId = await tenantInsert(await tenantTable(slug, "fidelity_campaigns"), { ...values, created_at: new Date() });
+  }
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "fidelity_campaigns", where: "id = ?", params: [campaignId], limit: 1 });
+  if (!rows[0]) throw new Error("Campagna non salvata.");
+  return mapFidelityCampaign(rows[0]);
+}
+
+// Activate/deactivate a campaign (port of toggle_fidelity_campaign): activating
+// needs Fidelity on, valid levels, and a non-overlapping active period.
+export async function toggleFidelityCampaign(slug: string, id: number, active: boolean): Promise<FidelityCampaign> {
+  if (id <= 0) throw new Error("Campagna non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "fidelity_campaigns", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Campagna non trovata.");
+  if (rows[0].deleted_at) throw new Error("Questa campagna punti e stata rimossa e non puo essere riattivata.");
+  if (active) {
+    if (!(await getFidelityEnabled(slug))) throw new Error("Attiva prima Punti Fidelity per riattivare le campagne punti.");
+    const camp = mapFidelityCampaign(rows[0]);
+    if (camp.eligibleLevels.length > 0) {
+      const available = await fidelityPointLevelKeys(slug);
+      for (const k of camp.eligibleLevels) if (!available.has(k)) throw new Error("Questa campagna usa un livello card non piu disponibile. Modifica la campagna prima di riattivarla.");
+    }
+    await assertNoActiveCampaignOverlap(slug, id, camp.startsAt, camp.endsAt);
+  }
+  await tenantUpdate({ slug, table: "fidelity_campaigns", id, values: { active: active ? 1 : 0, auto_disabled_by_points: 0, updated_at: new Date() } });
+  const out = await tenantSelect<RowDataPacket>({ slug, table: "fidelity_campaigns", where: "id = ?", params: [id], limit: 1 });
+  return mapFidelityCampaign(out[0]);
+}
+
+// Delete a campaign (port of delete_fidelity_campaign): hard-delete when nothing
+// references it, else soft-delete (deleted_at + active=0) to preserve history.
+export async function deleteFidelityCampaign(slug: string, id: number, by: number): Promise<{ ok: true; mode: "hard" | "soft" }> {
+  if (id <= 0) throw new Error("Campagna non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "fidelity_campaigns", columns: "id, deleted_at", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Campagna non trovata.");
+  if (rows[0].deleted_at) return { ok: true, mode: "soft" };
+  const refs = (await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id", where: "fidelity_campaign_id = ?", params: [id], limit: 1 }).catch(() => [] as RowDataPacket[])).length;
+  if (refs === 0) {
+    await tenantDelete({ slug, table: "fidelity_campaigns", id });
+    return { ok: true, mode: "hard" };
+  }
+  await tenantUpdate({ slug, table: "fidelity_campaigns", id, values: { active: 0, deleted_at: new Date(), deleted_by: by > 0 ? by : null, updated_at: new Date() } });
+  return { ok: true, mode: "soft" };
+}
+
 async function getSingleClient(slug: string, id: number): Promise<ManagedClient> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Cliente non trovato.");
