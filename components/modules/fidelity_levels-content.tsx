@@ -1,35 +1,28 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-// Faithful port of the PHP "Livelli Card" section (app/pages/fidelity_points.php#livelli-card),
-// surfaced as the standalone module ?page=fidelity_levels. In the legacy PHP app a GET to
-// ?page=fidelity_levels redirects to ?page=fidelity_points (the levels card lives inside that
-// page); the levels <form> posts to index.php?page=fidelity_levels with _mode=save_levels.
-// This component reproduces that form VERBATIM (original Bootstrap markup, bi bi-* icons,
-// inputs/labels/template) and pre-fills the level names and "Punti necessari" from the live
-// /api/manage/configuration?module=fidelity_levels endpoint (Soglia Silver / Soglia Gold).
+// Faithful port of the PHP "Livelli Card" section (app/pages/fidelity_points.php#livelli-card,
+// posting to index.php?page=fidelity_levels with _mode=save_levels). In the legacy app this card
+// lives inside fidelity_points.php; the inline <form id="fidLevelsInlineForm"> hardcodes both
+// fidelity_levels_enabled=1 and fidelity_levels_points_enabled=1 (saving from this card always
+// keeps the levels + points families on). This component reproduces that markup VERBATIM
+// (Bootstrap, bi bi-* icons, template) and wires it to the real endpoints:
+//   - GET  /api/manage/fidelity?action=levels   -> { enabled, pointsEnabled, levels:[{key,name,minPoints}] }
+//   - POST /api/manage/fidelity  action=save_levels + fidelity_levels_enabled/points_enabled + levels_json
+// The base level (key 'base') is non-removable and locked to 0 points; only its name is editable.
 
-type ConfigRecord = {
-  id: number;
-  module: string;
-  title: string;
-  detail: string;
-  value: string;
-  active: boolean;
-  updatedAt?: string;
-};
-
-type ConfigData = {
+type ApiLevel = { key: string; name: string; minPoints: number };
+type LevelsResponse = {
   ok: boolean;
-  module?: { records?: ConfigRecord[] };
-  records?: ConfigRecord[];
+  levels?: { enabled: boolean; pointsEnabled: boolean; levels: ApiLevel[] };
+  error?: string;
 };
 
 type Level = {
   key: string;
   name: string;
-  points: string; // base level keeps "" (hidden input is 0); silver/gold show numeric points
+  points: string; // base level keeps "0" (locked); other levels show numeric points
   baseLevel: boolean;
 };
 
@@ -38,41 +31,39 @@ function tenantSlug(): string {
   return window.location.pathname.split("/")[1] || "";
 }
 
-// Parse a "200 punti" style detail into a numeric points string ("200").
-function pointsFromDetail(detail?: string): string {
-  if (!detail) return "";
-  const m = String(detail).match(/-?\d+/);
-  return m ? m[0] : "";
-}
-
-// Default PHP levels (Bronze base + Silver/Gold) used until the API responds.
+// Levels shown until the API responds / for a never-configured tenant.
 const DEFAULT_LEVELS: Level[] = [
-  { key: "bronze", name: "Bronze", points: "0", baseLevel: true },
+  { key: "base", name: "Base", points: "0", baseLevel: true },
   { key: "silver", name: "Silver", points: "200", baseLevel: false },
   { key: "gold", name: "Gold", points: "500", baseLevel: false },
 ];
+
+// Map the canonical persisted levels payload back to editable rows.
+function toRows(apiLevels: ApiLevel[]): Level[] {
+  return apiLevels.map((l) => ({
+    key: l.key,
+    name: l.name,
+    points: l.key === "base" ? "0" : String(l.minPoints ?? 0),
+    baseLevel: l.key === "base",
+  }));
+}
 
 export function FidelityLevelsContent() {
   const slug = tenantSlug();
 
   const [levels, setLevels] = useState<Level[]>(DEFAULT_LEVELS);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    fetch(`/api/manage/configuration?slug=${encodeURIComponent(slug)}&module=fidelity_levels`, {
+    fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}&action=levels`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
-      .then((j: ConfigData) => {
-        const records = j.module?.records ?? j.records ?? [];
-        const silver = records.find((r) => /silver/i.test(r.title) || /silver/i.test(r.value));
-        const gold = records.find((r) => /gold/i.test(r.title) || /gold/i.test(r.value));
-        const silverPts = pointsFromDetail(silver?.detail) || "200";
-        const goldPts = pointsFromDetail(gold?.detail) || "500";
-        setLevels([
-          { key: "bronze", name: "Bronze", points: "0", baseLevel: true },
-          { key: "silver", name: silver?.value || "Silver", points: silverPts, baseLevel: false },
-          { key: "gold", name: gold?.value || "Gold", points: goldPts, baseLevel: false },
-        ]);
+      .then((j: LevelsResponse) => {
+        const apiLevels = j.levels?.levels ?? [];
+        setLevels(apiLevels.length === 0 ? DEFAULT_LEVELS : toRows(apiLevels));
       })
       .catch(() => setLevels(DEFAULT_LEVELS));
   }, [slug]);
@@ -81,18 +72,56 @@ export function FidelityLevelsContent() {
     return `/${encodeURIComponent(slug)}/${`${page}${suffix}`.replace("&", "?")}`;
   }
 
-  const action = useMemo(() => pageHref("fidelity_levels"), [slug]); // eslint-disable-line react-hooks/exhaustive-deps
-
   function updateLevel(idx: number, patch: Partial<Level>) {
+    setSaved(false);
     setLevels((prev) => prev.map((lvl, i) => (i === idx ? { ...lvl, ...patch } : lvl)));
   }
 
   function removeLevel(idx: number) {
+    setSaved(false);
     setLevels((prev) => prev.filter((_, i) => i !== idx));
   }
 
   function addLevel() {
+    setSaved(false);
     setLevels((prev) => [...prev, { key: "", name: "", points: "", baseLevel: false }]);
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError("");
+    setSaved(false);
+    setSaving(true);
+    try {
+      const levelsJson = JSON.stringify(
+        levels.map((l) => ({
+          key: l.key,
+          name: l.name,
+          minPoints: l.baseLevel ? 0 : Number(String(l.points).replace(",", ".")) || 0,
+        })),
+      );
+      const res = await fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({
+          action: "save_levels",
+          fidelity_levels_enabled: "1",
+          fidelity_levels_points_enabled: "1",
+          levels_json: levelsJson,
+        }),
+      });
+      const j: LevelsResponse = await res.json().catch(() => ({ ok: false }));
+      if (!res.ok || !j.ok || !j.levels) {
+        throw new Error(j.error || "Impossibile salvare i livelli.");
+      }
+      // Re-hydrate from the canonical persisted result (base ensured, sorted, deduped).
+      setLevels(toRows(j.levels.levels));
+      setSaved(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Impossibile salvare i livelli.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -113,7 +142,7 @@ export function FidelityLevelsContent() {
       </div>
 
       <div className="card p-4 mt-3 fidCampaignsCard " id="livelli-card" data-levels-card="1">
-        <form method="post" action={action} className="row g-3" id="fidLevelsInlineForm">
+        <form method="post" className="row g-3" id="fidLevelsInlineForm" onSubmit={handleSubmit}>
           <input type="hidden" name="_mode" value="save_levels" />
           <input type="hidden" name="return_page" value="fidelity_points" />
           <input type="hidden" name="fidelity_levels_enabled" value="1" />
@@ -127,7 +156,14 @@ export function FidelityLevelsContent() {
           </div>
 
           <div className="col-12">
-            <div className="alert alert-danger d-none mb-0" id="fidLevelsInlineError" role="alert" />
+            <div className={`alert alert-danger mb-0 ${error ? "" : "d-none"}`} id="fidLevelsInlineError" role="alert">
+              {error}
+            </div>
+            {saved ? (
+              <div className="alert alert-success mb-0 mt-2" role="alert">
+                Livelli Card salvati
+              </div>
+            ) : null}
           </div>
 
           <div className="col-12">
@@ -233,9 +269,9 @@ export function FidelityLevelsContent() {
               <i className="bi bi-plus-lg me-1" />
               Aggiungi livello
             </button>
-            <button className="btn btn-primary btn-sm" type="submit">
+            <button className="btn btn-primary btn-sm" type="submit" disabled={saving}>
               <i className="bi bi-check2-circle me-1" />
-              Salva livelli
+              {saving ? "Salvataggio…" : "Salva livelli"}
             </button>
           </div>
         </form>

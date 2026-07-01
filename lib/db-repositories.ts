@@ -4797,7 +4797,7 @@ export async function saveManagePackageCatalog(slug: string, body: Record<string
 
   let totalDiscountType = String(body.total_discount_type ?? "percent").toLowerCase();
   if (totalDiscountType !== "percent" && totalDiscountType !== "amount") totalDiscountType = "percent";
-  let totalDiscountValue = Math.max(0, Number(String(body.total_discount_value ?? "0").replace(",", ".")) || 0);
+  const totalDiscountValue = Math.max(0, Number(String(body.total_discount_value ?? "0").replace(",", ".")) || 0);
 
   // Sede gate (when the tenant has active sedi).
   const activeLocs = await activeLocationIds(slug);
@@ -8944,15 +8944,110 @@ export async function listFidelityCampaigns(slug: string): Promise<FidelityCampa
 async function fidelityPointLevelKeys(slug: string): Promise<Set<string>> {
   const keys = new Set<string>(["base"]);
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_card_levels_json", orderBy: "id ASC", limit: 1 }).catch(() => [] as RowDataPacket[]);
-  const raw = String(rows[0]?.fidelity_card_levels_json ?? "").trim();
-  if (raw !== "") {
-    try {
-      const data = JSON.parse(raw) as unknown;
-      const arr = Array.isArray(data) ? data : Array.isArray((data as { levels?: unknown })?.levels) ? (data as { levels: unknown[] }).levels : [];
-      for (const l of arr) { const k = String((l as { key?: unknown })?.key ?? "").trim().toLowerCase(); if (k !== "") keys.add(k); }
-    } catch {}
-  }
+  for (const l of parseFidelityCardLevels(rows[0]?.fidelity_card_levels_json).levels) keys.add(l.key);
   return keys;
+}
+
+// ---- Fidelity LEVELS (fidelity_levels.php save_levels) ------------------------
+export type FidelityLevel = { key: string; name: string; minPoints: number };
+export type FidelityLevelsSettings = { enabled: boolean; pointsEnabled: boolean; levels: FidelityLevel[] };
+
+// Parse businesses.fidelity_card_levels_json ({format:'split', points_enabled,
+// points_levels:[{key,name,min_points}]}; tolerates a bare array / {levels:[]}).
+function parseFidelityCardLevels(raw: unknown): { pointsEnabled: boolean; levels: FidelityLevel[] } {
+  const s = String(raw ?? "").trim();
+  if (s === "") return { pointsEnabled: false, levels: [] };
+  try {
+    const data = JSON.parse(s) as Record<string, unknown>;
+    const arr = Array.isArray(data) ? data : Array.isArray(data.points_levels) ? data.points_levels : Array.isArray((data as { levels?: unknown }).levels) ? (data as { levels: unknown[] }).levels : [];
+    const levels: FidelityLevel[] = [];
+    for (const l of arr) {
+      const o = l as Record<string, unknown>;
+      const key = String(o.key ?? o.level ?? "").trim().toLowerCase();
+      const name = String(o.name ?? "").trim();
+      if (key === "" || name === "") continue;
+      levels.push({ key, name, minPoints: Math.max(0, Number(o.min_points ?? o.minPoints ?? 0) || 0) });
+    }
+    return { pointsEnabled: Number(data.points_enabled ?? 0) === 1, levels };
+  } catch {
+    return { pointsEnabled: false, levels: [] };
+  }
+}
+
+export async function getFidelityLevelsSettings(slug: string): Promise<FidelityLevelsSettings> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_levels_enabled, fidelity_card_levels_json", orderBy: "id ASC", limit: 1 });
+  const r = rows[0] ?? ({} as RowDataPacket);
+  const parsed = parseFidelityCardLevels(r.fidelity_card_levels_json);
+  return { enabled: Number(r.fidelity_levels_enabled ?? 0) === 1, pointsEnabled: parsed.pointsEnabled, levels: parsed.levels };
+}
+
+function normalizeLevelKey(v: string): string {
+  let k = String(v ?? "").trim().toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_-]/g, "").replace(/^[_-]+|[_-]+$/g, "");
+  if (k === "") k = "level";
+  if (k.length > 64) k = k.slice(0, 64);
+  return k;
+}
+
+// Save the card levels (port of fidelity_levels.php save_levels): normalize + dedup
+// keys, sort by min_points, ensure the always-present 'base' (min 0) level, refuse
+// two levels with the same min points. When disabled the existing levels are
+// preserved (only the toggle flips). Persists fidelity_levels_enabled +
+// fidelity_card_levels_json ({format:'split', points_enabled, points_levels}).
+export async function saveFidelityLevels(slug: string, body: Record<string, string>): Promise<FidelityLevelsSettings> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "id, fidelity_card_levels_json", orderBy: "id ASC", limit: 1 });
+  if (!rows[0]) throw new Error("Business non trovato.");
+  const bizId = Number(rows[0].id ?? 0);
+  const existing = parseFidelityCardLevels(rows[0].fidelity_card_levels_json);
+  const truthy = (v: unknown) => ["1", "true", "on", "yes"].includes(String(v ?? "").toLowerCase());
+
+  const enabled = truthy(body.fidelity_levels_enabled);
+  const pointsEnabled = enabled && truthy(body.fidelity_levels_points_enabled);
+
+  let levels: FidelityLevel[] = existing.levels;
+  if (pointsEnabled) {
+    let raw: unknown = body.levels_json;
+    if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { raw = []; } }
+    const inputs = Array.isArray(raw) ? raw : [];
+    const seen = new Set<string>();
+    const uniqKey = (base: string): string => {
+      let k = normalizeLevelKey(base);
+      if (seen.has(k)) { let n = 2; while (seen.has(`${k}_${n}`)) n++; k = `${k}_${n}`; }
+      seen.add(k);
+      return k;
+    };
+    const parsed: FidelityLevel[] = [];
+    for (const l of inputs) {
+      const o = l as Record<string, unknown>;
+      let name = String(o.name ?? "").trim();
+      if (name === "") continue;
+      if (name.length > 50) name = name.slice(0, 50);
+      const key = uniqKey(String(o.key ?? "").trim() !== "" ? String(o.key) : name);
+      parsed.push({ key, name, minPoints: Math.max(0, Number(String(o.minPoints ?? o.min_points ?? 0).replace(",", ".")) || 0) });
+    }
+    parsed.sort((a, b) => a.minPoints - b.minPoints);
+    // Ensure the base level (key 'base', min 0).
+    if (!parsed.some((l) => l.key === "base")) {
+      const baseName = existing.levels.find((l) => l.key === "base")?.name ?? "Base";
+      parsed.unshift({ key: "base", name: baseName, minPoints: 0 });
+    }
+    // No two levels with the same min points.
+    const seenPts = new Set<string>();
+    for (const l of parsed) {
+      const k = l.minPoints.toFixed(2);
+      if (seenPts.has(k)) throw new Error("Non puoi salvare due livelli card con gli stessi punti necessari.");
+      seenPts.add(k);
+    }
+    levels = parsed;
+  }
+
+  const json = JSON.stringify({ format: "split", points_enabled: pointsEnabled ? 1 : 0, points_levels: levels.map((l) => ({ key: l.key, name: l.name, min_points: l.minPoints })) });
+  const values = await filterColumns((await tenantTable(slug, "businesses")).name, {
+    fidelity_levels_enabled: enabled ? 1 : 0,
+    fidelity_card_levels_json: json,
+    updated_at: new Date(),
+  });
+  await tenantUpdate({ slug, table: "businesses", id: bizId, values });
+  return getFidelityLevelsSettings(slug);
 }
 
 // Two campaign periods overlap (null start = -inf, null end = +inf).
@@ -8988,7 +9083,7 @@ export async function saveFidelityCampaign(slug: string, body: Record<string, st
   let earnMode = String(body.earn_mode ?? body.fid_campaign_earn_mode ?? "amount").toLowerCase();
   if (earnMode !== "amount" && earnMode !== "tiers") earnMode = "amount";
   const settings = await getFidelityPointsSettings(slug);
-  let earnStep = clampNum(Number(String(body.earn_step_euro ?? body.fid_campaign_earn_step_euro ?? "").replace(",", ".")), 0, 100000, settings.earnStepEuro || 10);
+  const earnStep = clampNum(Number(String(body.earn_step_euro ?? body.fid_campaign_earn_step_euro ?? "").replace(",", ".")), 0, 100000, settings.earnStepEuro || 10);
 
   let tiers: FidelityCampaignTier[] = [];
   if (earnMode === "tiers") {

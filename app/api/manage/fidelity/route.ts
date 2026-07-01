@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, getFidelityEnabled, getFidelityPointsSettings, listDbClients, listDbWalletMovements, listFidelityCampaigns, saveFidelityCampaign, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign } from "@/lib/db-repositories";
+import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, getFidelityEnabled, getFidelityLevelsSettings, getFidelityPointsSettings, listDbClients, listDbWalletMovements, listFidelityCampaigns, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -32,6 +32,11 @@ export async function GET(request: Request) {
     // Fidelity POINTS campaigns list (fidelity_campaigns).
     if (url.searchParams.get("action") === "campaigns") {
       return Response.json({ ok: true, sourceMode: "database", campaigns: await listFidelityCampaigns(tenantSlug) });
+    }
+
+    // Fidelity card LEVELS settings (fidelity_levels.php).
+    if (url.searchParams.get("action") === "levels") {
+      return Response.json({ ok: true, sourceMode: "database", levels: await getFidelityLevelsSettings(tenantSlug) });
     }
 
     const clients = await listDbClients({ slug: tenantSlug });
@@ -68,6 +73,13 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso punti fidelity mancante.", 403);
       const settings = await saveFidelityPointsSettings(tenantSlug, body);
       return Response.json({ ok: true, sourceMode: "database", settings });
+    }
+
+    // Save card levels (port of fidelity_levels.php save_levels).
+    if (body.action === "save_levels" || body._mode === "save_levels") {
+      if (!can(session.user.perms, "fidelity.levels") && !can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso livelli fidelity mancante.", 403);
+      const levels = await saveFidelityLevels(tenantSlug, body);
+      return Response.json({ ok: true, sourceMode: "database", levels });
     }
 
     // Points campaign CRUD (port of save/toggle/delete_fidelity_campaign).
