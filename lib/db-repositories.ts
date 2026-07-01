@@ -4213,6 +4213,213 @@ async function deletePackageChildRows(slug: string, table: string, packageId: nu
   );
 }
 
+// ---- Package CATALOG editor (catalog_new / catalog_edit) ---------------------
+export type PackageCatalogFormContext = {
+  services: { id: number; name: string; price: number }[];
+  products: { id: number; name: string; price: number; sku: string }[];
+  locations: { id: number; name: string }[];
+};
+
+// Catalog editor context: the active services (+ list price) + active products
+// (+ price/sku) selectable as package contents, and the active sedi.
+export async function getPackageCatalogFormContext(slug: string): Promise<PackageCatalogFormContext> {
+  const svcRows = await tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, name, price", where: "COALESCE(is_active,1) = 1", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const prodRows = await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "id, name, price, sku", where: "COALESCE(is_active,1) = 1", orderBy: "name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id, name", where: "COALESCE(is_active,1) = 1", orderBy: "COALESCE(sort_order,999999) ASC, name ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  return {
+    services: svcRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? ""), price: roundMoney(Number(r.price ?? 0)) })).filter((s) => s.id > 0),
+    products: prodRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? ""), price: roundMoney(Number(r.price ?? 0)), sku: String(r.sku ?? "") })).filter((p) => p.id > 0),
+    locations: locRows.map((r) => ({ id: Number(r.id ?? 0), name: String(r.name ?? `Sede #${r.id}`) })).filter((l) => l.id > 0),
+  };
+}
+
+export type PackageCatalogEditItem = { itemType: "service" | "product"; itemId: number; qty: number; unitPrice: number; discountType: "percent" | "amount"; discountValue: number; lineTotal: number };
+export type ManagePackageCatalogEdit = {
+  id: number;
+  name: string;
+  description: string;
+  validityDays: number | null;
+  isActive: boolean;
+  items: PackageCatalogEditItem[];
+  totalDiscountType: "percent" | "amount";
+  totalDiscountValue: number;
+  locationIds: number[];
+};
+
+// Edit-form prefill (port of catalog_edit load): the template header + its
+// package_items lines + package_pricing total discount + enabled sedi.
+export async function getManagePackageCatalog(slug: string, id: number): Promise<ManagePackageCatalogEdit | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "packages", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const row = rows[0];
+  const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "package_items", where: "package_id = ?", params: [id], orderBy: "sort_order ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const items: PackageCatalogEditItem[] = itemRows
+    .map((r) => {
+      const itemType = String(r.item_type ?? "") === "product" ? "product" : "service";
+      const dt = String(r.discount_type ?? "percent") === "amount" ? "amount" : "percent";
+      return {
+        itemType: itemType as "service" | "product",
+        itemId: Number(r.item_id ?? 0),
+        qty: Math.max(1, Number(r.qty ?? 1)),
+        unitPrice: roundMoney(Number(r.unit_price ?? 0)),
+        discountType: dt as "percent" | "amount",
+        discountValue: roundMoney(Math.max(0, Number(r.discount_value ?? 0))),
+        lineTotal: roundMoney(Number(r.line_total ?? 0)),
+      };
+    })
+    .filter((it) => it.itemId > 0);
+  const pricingRows = await tenantSelect<RowDataPacket>({ slug, table: "package_pricing", where: "package_id = ?", params: [id], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  const totalDiscountType = String(pricingRows[0]?.discount_type ?? "percent") === "amount" ? "amount" : "percent";
+  const totalDiscountValue = roundMoney(Math.max(0, Number(pricingRows[0]?.discount_value ?? 0)));
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "package_locations", columns: "location_id", where: "package_id = ?", params: [id] }).catch(() => [] as RowDataPacket[]);
+  const locationIds = locRows.map((r) => Number(r.location_id ?? 0)).filter((n) => n > 0);
+  const validity = Number(row.validity_days ?? 0);
+  return {
+    id,
+    name: String(row.name ?? ""),
+    description: String(row.description ?? ""),
+    validityDays: validity > 0 ? validity : null,
+    isActive: Number(row.is_active ?? 1) === 1,
+    items,
+    totalDiscountType,
+    totalDiscountValue,
+    locationIds,
+  };
+}
+
+// Replace a package's enabled sedi (package_locations): clear then re-insert.
+async function syncPackageLocations(slug: string, packageId: number, locationIds: number[]): Promise<void> {
+  const table = await tenantTable(slug, "package_locations").catch(() => null);
+  if (!table) return;
+  await deletePackageChildRows(slug, "package_locations", packageId);
+  for (const lid of locationIds) await tenantInsert(table, { package_id: packageId, location_id: lid }).catch(() => 0);
+}
+
+// Create / update a catalog template (port of packages.php catalog_new/catalog_edit).
+// Parses the content lines (service/product with qty + list price + per-line
+// discount) + the total discount, computes each line_total + the subtotal/total
+// (the template price IS the computed total), aggregates services into
+// package_services (sessions), and persists packages + package_services +
+// package_items + package_pricing + package_locations. Requires a name, >=1 line,
+// >=1 service, and (when sedi exist) >=1 sede.
+export async function saveManagePackageCatalog(slug: string, body: Record<string, string>, id: number): Promise<{ id: number }> {
+  const name = String(body.name ?? "").trim();
+  if (name === "") throw new Error("Nome obbligatorio.");
+  const description = String(body.description ?? "").trim();
+  const validityRaw = Math.trunc(Number(body.validity_days ?? 0));
+  const validityDays = validityRaw > 0 ? validityRaw : null;
+  const isActive = String(body.is_active ?? "1") === "1" || String(body.is_active ?? "") === "true";
+
+  // Content lines (nested → sent as a JSON string to survive parseRequestBody).
+  let rawLines: unknown = body.items;
+  if (typeof rawLines === "string") { try { rawLines = JSON.parse(rawLines); } catch { rawLines = []; } }
+  const lineInputs = Array.isArray(rawLines) ? rawLines : [];
+  const locationIds = parseCouponIdList(body.location_ids);
+
+  let totalDiscountType = String(body.total_discount_type ?? "percent").toLowerCase();
+  if (totalDiscountType !== "percent" && totalDiscountType !== "amount") totalDiscountType = "percent";
+  let totalDiscountValue = Math.max(0, Number(String(body.total_discount_value ?? "0").replace(",", ".")) || 0);
+
+  // Sede gate (when the tenant has active sedi).
+  const activeLocs = await activeLocationIds(slug);
+  if (activeLocs.length > 0 && locationIds.length === 0) throw new Error("Seleziona almeno una sede per il pacchetto.");
+
+  // Resolve list prices for lines whose unit price is 0 (legacy $catalogItemPrice).
+  const svcIds = new Set<number>();
+  const prodIds = new Set<number>();
+  for (const raw of lineInputs) {
+    const it = raw as Record<string, unknown>;
+    const iid = Math.trunc(Number(it.item_id ?? it.itemId ?? 0));
+    if (iid <= 0) continue;
+    if (String(it.item_type ?? it.itemType ?? "service") === "product") prodIds.add(iid);
+    else svcIds.add(iid);
+  }
+  const svcPrice = new Map<number, number>();
+  const prodPrice = new Map<number, number>();
+  if (svcIds.size > 0) {
+    const ids = Array.from(svcIds);
+    const ph = ids.map(() => "?").join(",");
+    for (const r of await tenantSelect<RowDataPacket>({ slug, table: "services", columns: "id, price", where: `id IN (${ph})`, params: ids }).catch(() => [] as RowDataPacket[])) svcPrice.set(Number(r.id ?? 0), Number(r.price ?? 0));
+  }
+  if (prodIds.size > 0) {
+    const ids = Array.from(prodIds);
+    const ph = ids.map(() => "?").join(",");
+    for (const r of await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "id, price", where: `id IN (${ph})`, params: ids }).catch(() => [] as RowDataPacket[])) prodPrice.set(Number(r.id ?? 0), Number(r.price ?? 0));
+  }
+
+  const lines: Array<{ item_type: string; item_id: number; qty: number; unit_price: number; discount_type: string; discount_value: number; line_total: number; sort_order: number }> = [];
+  const byService = new Map<number, { sessions: number; order: number }>();
+  let hasService = false;
+  for (const raw of lineInputs) {
+    const it = raw as Record<string, unknown>;
+    const type = String(it.item_type ?? it.itemType ?? "service") === "product" ? "product" : "service";
+    const itemId = Math.trunc(Number(it.item_id ?? it.itemId ?? 0));
+    if (itemId <= 0) continue;
+    let qty = Math.trunc(Number(it.qty ?? 1));
+    if (qty <= 0) qty = 1;
+    let unitPrice = Number(it.unit_price ?? it.unitPrice ?? 0);
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) unitPrice = 0;
+    if (unitPrice === 0) unitPrice = type === "product" ? (prodPrice.get(itemId) ?? 0) : (svcPrice.get(itemId) ?? 0);
+    let discType = String(it.discount_type ?? it.discountType ?? "percent").toLowerCase();
+    if (discType !== "percent" && discType !== "amount") discType = "percent";
+    let discValue = Number(it.discount_value ?? it.discountValue ?? 0);
+    if (!Number.isFinite(discValue) || discValue < 0) discValue = 0;
+    const lineSubtotal = qty * unitPrice;
+    let discountAmt = discType === "percent" ? lineSubtotal * (discValue / 100) : discValue;
+    discountAmt = Math.min(Math.max(0, discountAmt), lineSubtotal);
+    const lineTotal = roundMoney(lineSubtotal - discountAmt);
+    lines.push({ item_type: type, item_id: itemId, qty, unit_price: roundMoney(unitPrice), discount_type: discType, discount_value: roundMoney(discValue), line_total: lineTotal, sort_order: lines.length });
+    if (type === "service") {
+      hasService = true;
+      const entry = byService.get(itemId) ?? { sessions: 0, order: lines.length };
+      entry.sessions += qty;
+      byService.set(itemId, entry);
+    }
+  }
+  if (lines.length === 0) throw new Error("Aggiungi almeno un servizio/prodotto al pacchetto.");
+  if (!hasService) throw new Error("Per creare un pacchetto è necessario almeno un servizio (sedute).");
+
+  const svcItems = Array.from(byService.entries())
+    .sort((a, b) => a[1].order - b[1].order)
+    .map(([serviceId, v], idx) => ({ serviceId, sessions: Math.max(1, v.sessions), sortOrder: idx }));
+  const serviceId = svcItems.length === 1 ? svcItems[0].serviceId : null;
+  const sessionsTotal = Math.max(1, svcItems.reduce((sum, s) => sum + s.sessions, 0));
+
+  const subtotal = roundMoney(lines.reduce((sum, l) => sum + l.line_total, 0));
+  let totalDiscountAmt = totalDiscountType === "percent" ? subtotal * (totalDiscountValue / 100) : totalDiscountValue;
+  totalDiscountAmt = Math.min(Math.max(0, totalDiscountAmt), subtotal);
+  const total = roundMoney(subtotal - totalDiscountAmt);
+  const price = total;
+
+  const header = { name, description: description !== "" ? description : null, service_id: serviceId, sessions_total: sessionsTotal, price, validity_days: validityDays, is_active: isActive ? 1 : 0 };
+
+  let packageId = id;
+  if (packageId > 0) {
+    const existing = await tenantSelect<RowDataPacket>({ slug, table: "packages", columns: "id", where: "id = ?", params: [packageId], limit: 1 });
+    if (!existing[0]) throw new Error("Pacchetto catalogo non trovato.");
+    await tenantUpdate({ slug, table: "packages", id: packageId, values: header });
+  } else {
+    packageId = await tenantInsert(await tenantTable(slug, "packages"), header);
+  }
+
+  // Rebuild package_services + package_items + package_pricing + package_locations.
+  await deletePackageChildRows(slug, "package_services", packageId).catch(() => undefined);
+  const svcTable = await tenantTable(slug, "package_services");
+  for (const s of svcItems) await tenantInsert(svcTable, { package_id: packageId, service_id: s.serviceId, sessions_total: s.sessions, sort_order: s.sortOrder }).catch(() => 0);
+
+  await deletePackageChildRows(slug, "package_items", packageId).catch(() => undefined);
+  const itemTable = await tenantTable(slug, "package_items");
+  for (const l of lines) await tenantInsert(itemTable, { package_id: packageId, item_type: l.item_type, item_id: l.item_id, qty: l.qty, unit_price: l.unit_price, discount_type: l.discount_type, discount_value: l.discount_value, line_total: l.line_total, sort_order: l.sort_order }).catch(() => 0);
+
+  await deletePackageChildRows(slug, "package_pricing", packageId).catch(() => undefined);
+  await tenantInsert(await tenantTable(slug, "package_pricing"), { package_id: packageId, subtotal, discount_type: totalDiscountType, discount_value: roundMoney(totalDiscountValue), total }).catch(() => 0);
+
+  await syncPackageLocations(slug, packageId, locationIds);
+
+  return { id: packageId };
+}
+
 export async function issueDbClientPackage(
   input: { packageId?: number; clientId?: number; clientName?: string; expiresAt?: string; sourceSaleId?: number },
   slug: string,

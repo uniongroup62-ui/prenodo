@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
-import { consumeDbClientPackage, deleteManagePackageCatalog, issueDbClientPackage, listDbPackageState, listManagePackageCatalog } from "@/lib/db-repositories";
+import { consumeDbClientPackage, deleteManagePackageCatalog, getManagePackageCatalog, getPackageCatalogFormContext, issueDbClientPackage, listDbPackageState, listManagePackageCatalog, saveManagePackageCatalog } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { canAny } from "@/lib/role-permissions";
@@ -25,6 +25,20 @@ export async function GET(request: Request) {
     if (url.searchParams.get("action") === "catalog") {
       if (!canAny(session.user.perms, packageCatalogPerms)) return jsonError("Permesso catalogo pacchetti mancante.", 403);
       return Response.json({ ok: true, sourceMode: "database", catalog: await listManagePackageCatalog(tenantSlug) });
+    }
+
+    // Catalog editor context (services + products + sedi for the contents rows).
+    if (url.searchParams.get("action") === "catalog_form_context") {
+      if (!canAny(session.user.perms, packageCatalogPerms)) return jsonError("Permesso catalogo pacchetti mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", context: await getPackageCatalogFormContext(tenantSlug) });
+    }
+
+    // Catalog editor prefill (catalog_edit): one template's header + lines + sedi.
+    if (url.searchParams.get("action") === "catalog_get") {
+      if (!canAny(session.user.perms, packageCatalogPerms)) return jsonError("Permesso catalogo pacchetti mancante.", 403);
+      const template = await getManagePackageCatalog(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
+      if (!template) return jsonError("Pacchetto catalogo non trovato.", 404);
+      return Response.json({ ok: true, sourceMode: "database", template });
     }
 
     return Response.json({
@@ -65,6 +79,13 @@ export async function POST(request: Request) {
       const sessions = parseInteger(body.sessions, 1);
       const clientPackage = await consumeDbClientPackage(id, sessions, tenantSlug);
       return Response.json({ ok: true, source: "packages?action=use", sourceMode: "database", clientPackage, ...await listDbPackageState(tenantSlug) });
+    }
+
+    // Create / update a catalog template (port of catalog_new/catalog_edit).
+    if (action === "catalog_save" || action === "catalog_new" || action === "catalog_edit") {
+      if (!canAny(session.user.perms, packageCatalogPerms)) return jsonError("Permesso catalogo pacchetti mancante.", 403);
+      const saved = await saveManagePackageCatalog(tenantSlug, body, parseInteger(body.id, 0));
+      return Response.json({ ok: true, source: "packages?action=catalog_save", sourceMode: "database", ...saved, catalog: await listManagePackageCatalog(tenantSlug) });
     }
 
     // Delete a catalog template (port of action=catalog_delete): detach client

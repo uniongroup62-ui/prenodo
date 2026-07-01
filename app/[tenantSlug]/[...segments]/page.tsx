@@ -69,6 +69,7 @@ import { ServiceCategoriesContent } from "@/components/modules/service_categorie
 import { ServiceRecommendationsContent } from "@/components/modules/service_recommendations-content";
 import { PackagesContent } from "@/components/modules/packages-content";
 import { PackagesCatalogContent } from "@/components/modules/packages_catalog-content";
+import { PackagesCatalogFormContent } from "@/components/modules/packages_catalog_form-content";
 import { PackageSettingsContent } from "@/components/modules/package_settings-content";
 import { MarketplaceSettingsContent } from "@/components/modules/marketplace-content";
 import { FidelityWalletContent } from "@/components/modules/fidelity_wallet-content";
@@ -346,6 +347,17 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <GiftFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful package CATALOG editor (packages.php tab=catalog action=catalog_new|
+  // catalog_edit): the template form (header + Sedi + contents rows + pricing),
+  // instead of the Tailwind fallback.
+  if (page === "packages" && tab === "catalog" && (query.action === "catalog_new" || query.action === "catalog_edit")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <PackagesCatalogFormContent />
       </ManageShell>
     );
   }
