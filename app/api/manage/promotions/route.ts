@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { getManagePromotion, listDbPromotions, previewDbPromotion, saveManagePromotion, toggleDbPromotion } from "@/lib/db-repositories";
+import { deleteManagePromotion, getManagePromotion, listDbPromotions, previewDbPromotion, saveManagePromotion, toggleManagePromotion } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -50,8 +50,15 @@ export async function POST(request: Request) {
     if (action === "toggle") {
       if (!can(session.user.perms, "promotions.manage")) return jsonError("Permesso promozioni mancante.", 403);
       const active = ["1", "true", "yes", "on"].includes((body.active ?? "").toLowerCase());
-      const promotion = await toggleDbPromotion(id, active, tenantSlug);
+      const promotion = await toggleManagePromotion(tenantSlug, id, active, session.user.id);
       return Response.json({ ok: true, source: "promotions?action=toggle", sourceMode: "database", promotion, promotions: await listDbPromotions(tenantSlug) });
+    }
+
+    // Delete a promotion (port of promotions.php action=delete / Promotions::delete).
+    if (action === "delete") {
+      if (!can(session.user.perms, "promotions.manage")) return jsonError("Permesso promozioni mancante.", 403);
+      const result = await deleteManagePromotion(tenantSlug, id);
+      return Response.json({ source: "promotions?action=delete", sourceMode: "database", ...result, promotions: await listDbPromotions(tenantSlug) });
     }
 
     // Faithful promotion editor save (port of promotions.php POST action=new|edit).

@@ -7920,6 +7920,77 @@ export async function saveManagePromotion(slug: string, body: Record<string, str
   return saved;
 }
 
+// Selected-scope services/products that must still resolve to a live, active
+// catalog item before an inactive promotion can be re-activated (port of
+// Promotions::activationContentIssues). Returns human-readable blocker strings.
+async function promotionActivationContentIssues(slug: string, id: number): Promise<string[]> {
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", columns: "apply_services_mode, apply_products_mode", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return [];
+  const issues: string[] = [];
+
+  const check = async (childTable: string, refCol: string, catalog: string, typeLabel: string) => {
+    const refs = await tenantSelect<RowDataPacket>({ slug, table: childTable, columns: `${refCol} AS ref`, where: "promotion_id = ?", params: [id], orderBy: `${refCol} ASC` }).catch(() => [] as RowDataPacket[]);
+    for (const r of refs) {
+      const refId = Number(r.ref ?? 0);
+      if (refId <= 0) continue;
+      const cat = await tenantSelect<RowDataPacket>({ slug, table: catalog, columns: "id, name, is_active", where: "id = ?", params: [refId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+      if (!cat[0]) issues.push(`${typeLabel} "${typeLabel} #${refId}" è stato eliminato`);
+      else if (Number(cat[0].is_active ?? 1) !== 1) issues.push(`${typeLabel} "${String(cat[0].name ?? `#${refId}`)}" è stato disattivato`);
+    }
+  };
+
+  if (String(rows[0].apply_services_mode ?? "all").toLowerCase() === "selected") await check("promotion_services", "service_id", "services", "Servizio");
+  if (String(rows[0].apply_products_mode ?? "none").toLowerCase() === "selected") await check("promotion_products", "product_id", "products", "Prodotto");
+  return issues;
+}
+
+// Detach a promotion from still-open appointments so a delete/deactivate does not
+// leave a dangling reference (port of Promotions::clearPendingAppointmentsForPromotion).
+// Done + historical rows keep their promotion for the record.
+async function clearPendingAppointmentsForPromotion(slug: string, id: number): Promise<void> {
+  const appt = await tenantTable(slug, "appointments");
+  if (!(await columnExists(appt.name, "promotion_id"))) return;
+  const setConds = (await columnExists(appt.name, "promotion_conditions")) ? ", promotion_conditions = NULL" : "";
+  await dbExecute(`UPDATE ${quoteIdentifier(appt.name)} SET promotion_id = NULL${setConds} WHERE tenant_id = ? AND promotion_id = ? AND status IN ('pending','scheduled')`, [appt.tenantId ?? 0, id]).catch(() => undefined);
+}
+
+// Activate/deactivate a promotion (port of promotions.php toggle / Promotions::
+// setActive): activating is refused while a selected service/product is deleted or
+// disabled; deactivating detaches the promo from open appointments.
+export async function toggleManagePromotion(slug: string, id: number, active: boolean, by: number): Promise<PromotionRule> {
+  if (id <= 0) throw new Error("Promozione non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", columns: "id", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Promozione non trovata.");
+  if (active) {
+    const issues = await promotionActivationContentIssues(slug, id);
+    if (issues.length > 0) {
+      throw new Error(`Non è possibile riattivare la promozione perché ${issues.join("; ")}. Attiva o ripristina gli elementi indicati per continuare.`);
+    }
+  }
+  await tenantUpdate({ slug, table: "promotions", id, values: { is_active: active ? 1 : 0, updated_by: by > 0 ? by : null, updated_at: new Date() } });
+  if (!active) await clearPendingAppointmentsForPromotion(slug, id);
+  const updated = await tenantSelect<RowDataPacket>({ slug, table: "promotions", where: "id = ?", params: [id], limit: 1 });
+  return mapPromotion(updated[0]);
+}
+
+// Delete a promotion (port of Promotions::delete): detach open appointments, drop
+// the mapping children (services/products/time windows/blackouts/locations), then
+// the promotions row.
+export async function deleteManagePromotion(slug: string, id: number): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Promozione non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "promotions", columns: "id", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return { ok: true };
+
+  await clearPendingAppointmentsForPromotion(slug, id);
+  for (const child of ["promotion_services", "promotion_products", "promotion_time_windows", "promotion_blackout_dates", "promotion_locations"]) {
+    if (!(await tableExists((await tenantTable(slug, child)).name))) continue;
+    const t = await tenantTable(slug, child);
+    await dbExecute(`DELETE FROM ${quoteIdentifier(t.name)} WHERE tenant_id = ? AND promotion_id = ?`, [t.tenantId ?? 0, id]).catch(() => undefined);
+  }
+  await tenantDelete({ slug, table: "promotions", id });
+  return { ok: true };
+}
+
 function normalizePromoMode(value: string, fallback: "all" | "none"): "none" | "all" | "selected" {
   const mode = value.trim().toLowerCase();
   return mode === "none" || mode === "all" || mode === "selected" ? mode : fallback;

@@ -55,10 +55,12 @@ export function PromotionsContent() {
   const slug = tenantSlug();
   const [promotions, setPromotions] = useState<Promotion[]>([]);
   const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(() => {
-    setLoading(true);
-    fetch(`/api/manage/promotions?slug=${encodeURIComponent(slug)}`, {
+    return fetch(`/api/manage/promotions?slug=${encodeURIComponent(slug)}`, {
       headers: { "x-tenant-slug": slug },
     })
       .then((r) => r.json())
@@ -75,6 +77,39 @@ export function PromotionsContent() {
     return `/${encodeURIComponent(slug)}/${`promotions${suffix}`.replace("&", "?")}`;
   }
 
+  async function post(fields: Record<string, string>): Promise<boolean> {
+    setBusy(true);
+    setMsg("");
+    setErr("");
+    try {
+      const res = await fetch(`/api/manage/promotions?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify(fields),
+      });
+      const j = await res.json().catch(() => ({ ok: false }));
+      if (!res.ok || !j.ok) throw new Error(String(j.error || "Operazione non riuscita."));
+      if (Array.isArray(j.promotions)) setPromotions(j.promotions as Promotion[]);
+      return true;
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Operazione non riuscita.");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggle(promo: Promotion) {
+    if (await post({ action: "toggle", id: String(promo.id), active: promo.active ? "0" : "1" })) {
+      setMsg(promo.active ? "Promozione sospesa." : "Promozione attivata.");
+    }
+  }
+
+  async function remove(promo: Promotion) {
+    if (!window.confirm(`Eliminare la promozione "${promo.name}"? Le prenotazioni ancora aperte perderanno la promozione.`)) return;
+    if (await post({ action: "delete", id: String(promo.id) })) setMsg("Promozione eliminata.");
+  }
+
   return (
     <div className="container-fluid">
       <link rel="stylesheet" href="/assets/css/pages/promotions.css" />
@@ -89,6 +124,9 @@ export function PromotionsContent() {
           <div className="d-flex gap-2" />
         </div>
       </div>
+
+      {msg ? <div className="alert alert-success">{msg}</div> : null}
+      {err ? <div className="alert alert-danger">{err}</div> : null}
 
       {promotions.length === 0 ? (
         <div className="card border-0 shadow-sm promotions-empty-card">
@@ -144,9 +182,15 @@ export function PromotionsContent() {
                       )}
                     </td>
                     <td className="text-end">
-                      <a className="btn btn-sm btn-primary" href={href(`&action=edit&id=${promo.id}`)}>
+                      <a className="btn btn-sm btn-outline-primary me-1" href={href(`&action=edit&id=${promo.id}`)}>
                         Modifica
                       </a>
+                      <button className="btn btn-sm btn-outline-secondary me-1" type="button" onClick={() => toggle(promo)} disabled={busy}>
+                        {promo.active ? "Sospendi" : "Attiva"}
+                      </button>
+                      <button className="btn btn-sm btn-outline-danger" type="button" onClick={() => remove(promo)} disabled={busy}>
+                        Elimina
+                      </button>
                     </td>
                   </tr>
                 ))}
