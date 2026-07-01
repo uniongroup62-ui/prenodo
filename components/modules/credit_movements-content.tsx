@@ -1,158 +1,125 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-// Faithful port of the PHP credit movements page (?page=credit_movements):
-// a "Movimenti Credito" list with a client filter, a manual operation form,
-// the movements table, and the pending-credit card. Fed by the existing
-// DB-backed /api/manage/fidelity route (clients + wallet movements).
+// Faithful port of the PHP credit movements page (app/pages/credit_movements.php,
+// ?page=credit_movements): "Movimenti Credito". Wired to /api/manage/fidelity:
+//   - GET  action=credit[&client_id=N] -> { clients, movements, pending, total }
+//   - POST action=credit_debit (client_id, amount, note) — manual credit scale
+// The ledger merges recharges (+ storni), appointment + sale credit usage, and
+// manual credit_adjustments (newest first). The manual debit is guarded
+// (blocked client / note required / sufficient balance), like the legacy.
 
-type WalletMovementType = "recharge" | "debit" | "points_earn" | "points_redeem" | "adjustment";
-
+type CreditClient = { id: number; name: string; email: string; credit: number };
+type MovementKind = "recharge" | "void" | "redeem" | "manual_debit" | "manual_credit";
 type Movement = {
-  id: number;
-  clientId: number;
-  type: WalletMovementType;
-  amount: number;
-  points: number;
-  note: string;
-  source: string;
   createdAt: string;
+  clientId: number;
+  clientName: string;
+  kind: MovementKind;
+  sourceType: string;
+  sourceId: number;
+  locationName: string;
+  rechargeAmount: number | null;
+  bonusAmount: number | null;
+  totalAmount: number;
+  note: string;
 };
-
-type Client = {
-  id: number;
-  name: string;
-  email?: string;
-  phone?: string;
-  locationId?: number;
-  wallet?: { credit: number; points: number };
-};
-
-type ClientItem = { id: string; label: string; search: string };
+type Pending = { id: number; publicCode: string; clientId: number; clientName: string; startsAt: string; status: string; creditUsed: number };
+type CreditData = { clients: CreditClient[]; movements: Movement[]; pending: Pending[]; total: number };
 
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
 }
 
-function fmtDateTime(iso?: string): string {
+function fmtDateTime(iso: string): string {
   if (!iso) return "—";
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return iso;
-  const d = new Date(ms);
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function fmtMoney(n?: number): string {
-  if (n === undefined || n === null || !Number.isFinite(n)) return "—";
-  return n.toFixed(2).replace(".", ",");
+// Signed euro amount ("+€ 12,00" / "-€ 12,00"), matching the legacy formatCreditAmount(signed).
+function signedEuro(n: number): string {
+  if (Math.abs(n) < 0.00001) return "€ 0,00";
+  const s = Math.abs(n).toFixed(2).replace(".", ",");
+  return `${n > 0 ? "+€ " : "-€ "}${s}`;
 }
 
-const TYPE_LABELS: Record<WalletMovementType, string> = {
-  recharge: "Ricarica",
-  debit: "Scalo",
-  points_earn: "Punti",
-  points_redeem: "Riscatto punti",
-  adjustment: "Rettifica",
+const BADGES: Record<MovementKind, { cls: string; label: string }> = {
+  recharge: { cls: "bg-success", label: "ricarica" },
+  void: { cls: "bg-danger", label: "storno" },
+  redeem: { cls: "bg-warning text-dark", label: "utilizzo" },
+  manual_debit: { cls: "bg-danger", label: "scalo manuale" },
+  manual_credit: { cls: "bg-info text-dark", label: "rettifica manuale" },
 };
 
 export function CreditMovementsContent() {
   const slug = tenantSlug();
 
-  const [clients, setClients] = useState<Client[]>([]);
-  const [movements, setMovements] = useState<Movement[]>([]);
+  const [data, setData] = useState<CreditData | null>(null);
+  const [selectedClientId, setSelectedClientId] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  // Filter form state
-  const [filterClientId, setFilterClientId] = useState("");
-  const [filterSearch, setFilterSearch] = useState("");
-  const [filterOpen, setFilterOpen] = useState(false);
-
-  // Manual operation form state
+  // Manual operation form.
   const [manualClientId, setManualClientId] = useState("");
-  const [manualSearch, setManualSearch] = useState("");
-  const [manualOpen, setManualOpen] = useState(false);
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
-  const [feedback, setFeedback] = useState<{ type: "success" | "danger"; text: string } | null>(null);
 
-  useEffect(() => {
-    setLoading(true);
-    fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}`, {
-      headers: { "x-tenant-slug": slug },
-    })
+  const load = useCallback(() => {
+    return fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}&action=credit${selectedClientId ? `&client_id=${selectedClientId}` : ""}`, { headers: { "x-tenant-slug": slug } })
       .then((r) => r.json())
       .then((j) => {
-        setClients(Array.isArray(j.clients) ? j.clients : []);
-        setMovements(Array.isArray(j.movements) ? j.movements : []);
+        if (j?.credit) setData(j.credit as CreditData);
       })
-      .catch(() => {
-        setClients([]);
-        setMovements([]);
-      })
+      .catch(() => undefined)
       .finally(() => setLoading(false));
-  }, [slug]);
+  }, [slug, selectedClientId]);
 
-  const clientItems: ClientItem[] = useMemo(
-    () =>
-      clients.map((c) => ({
-        id: String(c.id),
-        label: c.name,
-        search: `${c.name} ${c.email ?? ""} ${c.phone ?? ""}`.toLowerCase().trim(),
-      })),
-    [clients],
-  );
+  useEffect(() => {
+    load();
+  }, [load]);
 
-  const clientName = (id: number): string => clients.find((c) => c.id === id)?.name ?? "—";
-
-  const filteredMovements = useMemo(() => {
-    if (!filterClientId) return movements;
-    const id = Number(filterClientId);
-    return movements.filter((m) => m.clientId === id);
-  }, [movements, filterClientId]);
-
-  const filterMatches = clientItems.filter((it) => it.search.includes(filterSearch.toLowerCase()));
-  const manualMatches = clientItems.filter((it) => it.search.includes(manualSearch.toLowerCase()));
-  const filterLabel = clientItems.find((it) => it.id === filterClientId)?.label ?? "";
-  const manualLabel = clientItems.find((it) => it.id === manualClientId)?.label ?? "";
+  const clients = useMemo(() => data?.clients ?? [], [data]);
+  const movements = data?.movements ?? [];
+  const pending = data?.pending ?? [];
 
   async function submitManual(e: React.FormEvent) {
     e.preventDefault();
-    setFeedback(null);
+    setMsg("");
+    setErr("");
     if (!manualClientId) {
-      setFeedback({ type: "danger", text: "Seleziona un cliente." });
+      setErr("Seleziona un cliente.");
       return;
     }
     if (!window.confirm("Confermi lo scalo manuale del credito?")) return;
+    setBusy(true);
     try {
       const res = await fetch(`/api/manage/fidelity?slug=${encodeURIComponent(slug)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
-        body: JSON.stringify({
-          slug,
-          client_id: manualClientId,
-          type: "debit",
-          amount,
-          note,
-          source: "manual",
-        }),
+        headers: { "content-type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "credit_debit", client_id: manualClientId, amount, note }),
       });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok || j?.ok === false) {
-        setFeedback({ type: "danger", text: String(j?.error ?? j?.message ?? "Errore.") });
-        return;
-      }
-      setMovements(Array.isArray(j.movements) ? j.movements : movements);
-      setManualClientId("");
+      const j = await res.json().catch(() => ({ ok: false }));
+      if (!res.ok || !j.ok) throw new Error(String(j.error || "Operazione non riuscita."));
+      setMsg(String(j.message || "Scalo registrato."));
       setAmount("");
       setNote("");
-      setFeedback({ type: "success", text: "Scalo registrato." });
-    } catch {
-      setFeedback({ type: "danger", text: "Errore di rete." });
+      if (j.movements) setData(j.movements as CreditData);
+      else await load();
+    } catch (e2) {
+      setErr(e2 instanceof Error ? e2.message : "Operazione non riuscita.");
+    } finally {
+      setBusy(false);
     }
   }
+
+  const pendingTotal = pending.reduce((s, p) => s + p.creditUsed, 0);
 
   return (
     <div className="container-fluid">
@@ -165,228 +132,148 @@ export function CreditMovementsContent() {
           <div className="bs-page-subtitle">Consulta movimenti, filtri e saldi credito.</div>
         </div>
         <div className="bs-page-actions">
-          <div className="text-muted small">20 risultati per pagina</div>
+          <div className="text-muted small">{data ? `${data.total} movimenti` : ""}</div>
         </div>
       </div>
 
-      {feedback ? (
-        <div className={`alert alert-${feedback.type}`} role="alert">
-          {feedback.text}
-        </div>
-      ) : null}
+      {msg ? <div className="alert alert-success">{msg}</div> : null}
+      {err ? <div className="alert alert-danger">{err}</div> : null}
 
       <div className="row g-3 align-items-start">
+        <div className="col-12 col-xl-9 order-xl-1">
+          <div className="card p-3 mb-3">
+            <div className="row g-2 align-items-end">
+              <div className="col-lg-8">
+                <label className="form-label">Cliente</label>
+                <select className="form-select" value={selectedClientId} onChange={(e) => setSelectedClientId(Number(e.target.value))}>
+                  <option value={0}>Tutti i clienti</option>
+                  {clients.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} {c.credit ? `— € ${c.credit.toFixed(2).replace(".", ",")}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {pending.length > 0 ? (
+            <div className="card p-3 mb-3">
+              <div className="d-flex justify-content-between align-items-center mb-2">
+                <div className="fw-semibold">Credito in sospeso</div>
+                <div className="text-muted small">Totale € {pendingTotal.toFixed(2).replace(".", ",")}</div>
+              </div>
+              <div className="table-responsive">
+                <table className="table table-sm align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>Prenotazione</th>
+                      <th>Cliente</th>
+                      <th>Data</th>
+                      <th>Stato</th>
+                      <th className="text-end">Credito</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pending.map((p) => (
+                      <tr key={p.id}>
+                        <td>{p.publicCode}</td>
+                        <td>{p.clientName || `#${p.clientId}`}</td>
+                        <td>{fmtDateTime(p.startsAt)}</td>
+                        <td>{p.status === "pending" ? "In sospeso" : "Prenotato"}</td>
+                        <td className="text-end">€ {p.creditUsed.toFixed(2).replace(".", ",")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="card p-3">
+            <div className="fw-semibold mb-2">Movimenti Credito</div>
+            <div className="table-responsive">
+              <table className="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th>Data</th>
+                    <th>Cliente</th>
+                    <th>Tipo</th>
+                    <th>Sede</th>
+                    <th>Nota</th>
+                    <th className="text-end">Importo</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {movements.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="text-muted p-3">
+                        {loading ? "Caricamento…" : "Nessun movimento."}
+                      </td>
+                    </tr>
+                  ) : (
+                    movements.map((m) => {
+                      const badge = BADGES[m.kind];
+                      return (
+                        <tr key={`${m.sourceType}-${m.sourceId}-${m.kind}`}>
+                          <td>{fmtDateTime(m.createdAt)}</td>
+                          <td>{m.clientName || `#${m.clientId}`}</td>
+                          <td>
+                            <span className={`badge ${badge.cls}`}>{badge.label}</span>
+                          </td>
+                          <td className="text-muted">{m.locationName || "—"}</td>
+                          <td className="text-muted">{m.note}</td>
+                          <td className={`text-end fw-semibold ${m.totalAmount < 0 ? "text-danger" : m.totalAmount > 0 ? "text-success" : "text-muted"}`}>
+                            {signedEuro(m.totalAmount)}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
         <div className="col-12 col-xl-3 order-xl-2">
           <div className="card mb-3">
             <div className="card-header">
               <div className="fw-semibold">Operazione manuale</div>
             </div>
             <div className="card-body">
-              <form method="post" className="row g-3" onSubmit={submitManual}>
-                <input type="hidden" name="_mode" value="manual_credit_debit" />
-
+              <form className="row g-3" onSubmit={submitManual}>
                 <div className="col-12">
                   <label className="form-label fw-semibold">Cliente</label>
-                  <div className="app-combobox dropdown" id="creditManualClientBox">
-                    <button
-                      className="btn btn-outline-secondary dropdown-toggle w-100 app-combobox-toggle"
-                      type="button"
-                      aria-expanded={manualOpen}
-                      onClick={() => setManualOpen((v) => !v)}
-                    >
-                      <span className={`app-combobox-text ${manualLabel ? "" : "d-none"}`}>{manualLabel}</span>
-                      <span className={`text-muted app-combobox-placeholder ${manualLabel ? "d-none" : ""}`}>Seleziona...</span>
-                    </button>
-                    <div className={`dropdown-menu p-2 w-100 ${manualOpen ? "show" : ""}`}>
-                      <input
-                        type="text"
-                        className="form-control form-control-sm app-combobox-search"
-                        placeholder="Cerca..."
-                        autoComplete="off"
-                        value={manualSearch}
-                        onChange={(e) => setManualSearch(e.target.value)}
-                      />
-                      <div className="app-combobox-list mt-2">
-                        {manualMatches.map((it) => (
-                          <button
-                            type="button"
-                            key={it.id}
-                            className="dropdown-item"
-                            onClick={() => {
-                              setManualClientId(it.id);
-                              setManualOpen(false);
-                            }}
-                          >
-                            {it.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <input type="hidden" name="client_id" value={manualClientId} />
-                  </div>
+                  <select className="form-select" value={manualClientId} onChange={(e) => setManualClientId(e.target.value)}>
+                    <option value="">Seleziona…</option>
+                    {clients.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name} {c.credit ? `— € ${c.credit.toFixed(2).replace(".", ",")}` : ""}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-
                 <div className="col-12">
-                  <label className="form-label fw-semibold">Importo</label>
+                  <label className="form-label fw-semibold">Importo da scalare</label>
                   <div className="input-group">
                     <span className="input-group-text">€</span>
-                    <input
-                      className="form-control"
-                      type="number"
-                      name="amount"
-                      min="0.01"
-                      step="0.01"
-                      max="99999999.99"
-                      required
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                    />
+                    <input className="form-control" type="number" step="0.01" min="0.01" placeholder="0,00" value={amount} onChange={(e) => setAmount(e.target.value)} />
                   </div>
                 </div>
-
                 <div className="col-12">
                   <label className="form-label fw-semibold">Nota</label>
-                  <input
-                    className="form-control"
-                    name="note"
-                    maxLength={255}
-                    required
-                    placeholder="Motivo dello scalo"
-                    value={note}
-                    onChange={(e) => setNote(e.target.value)}
-                  />
+                  <input className="form-control" placeholder="Motivo dello scalo (obbligatorio)" value={note} onChange={(e) => setNote(e.target.value)} />
                 </div>
-
                 <div className="col-12">
-                  <button className="btn btn-danger w-100" type="submit" data-confirm="Confermi lo scalo manuale del credito?">
-                    Scala
+                  <button className="btn btn-outline-danger w-100" type="submit" disabled={busy}>
+                    <i className="bi bi-dash-circle me-1" />
+                    {busy ? "Registrazione…" : "Scala credito"}
                   </button>
                 </div>
               </form>
+              <div className="small text-muted mt-2">Lo scalo manuale riduce il credito del cliente e resta tracciato nei movimenti. La nota è obbligatoria.</div>
             </div>
-          </div>
-        </div>
-
-        <div className="col-12 col-xl-9 order-xl-1">
-          <div className="card p-3 mb-3">
-            <form
-              method="get"
-              className="row g-2 align-items-end"
-              onSubmit={(e) => {
-                e.preventDefault();
-              }}
-            >
-              <input type="hidden" name="page" value="credit_movements" />
-              <div className="col-lg-4">
-                <label className="form-label">Cliente</label>
-                <div className="app-combobox dropdown" id="creditClientFilterBox">
-                  <button
-                    className="btn btn-outline-secondary dropdown-toggle w-100 app-combobox-toggle"
-                    type="button"
-                    aria-expanded={filterOpen}
-                    onClick={() => setFilterOpen((v) => !v)}
-                  >
-                    <span className={`app-combobox-text ${filterLabel ? "" : "d-none"}`}>{filterLabel}</span>
-                    <span className={`text-muted app-combobox-placeholder ${filterLabel ? "d-none" : ""}`}>Tutti i clienti</span>
-                  </button>
-                  <div className={`dropdown-menu p-2 w-100 ${filterOpen ? "show" : ""}`}>
-                    <input
-                      type="text"
-                      className="form-control form-control-sm app-combobox-search"
-                      placeholder="Cerca..."
-                      autoComplete="off"
-                      value={filterSearch}
-                      onChange={(e) => setFilterSearch(e.target.value)}
-                    />
-                    <div className="app-combobox-list mt-2">
-                      <button
-                        type="button"
-                        className="dropdown-item"
-                        onClick={() => {
-                          setFilterClientId("");
-                          setFilterOpen(false);
-                        }}
-                      >
-                        Tutti i clienti
-                      </button>
-                      {filterMatches.map((it) => (
-                        <button
-                          type="button"
-                          key={it.id}
-                          className="dropdown-item"
-                          onClick={() => {
-                            setFilterClientId(it.id);
-                            setFilterOpen(false);
-                          }}
-                        >
-                          {it.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <input type="hidden" name="client_id" value={filterClientId} />
-                </div>
-              </div>
-              <div className="col-lg-4 d-flex align-items-end gap-2 app-filter-actions">
-                <button className="btn btn-outline-primary app-filter-submit" type="submit">
-                  <i className="bi bi-search me-1" />
-                  Filtra
-                </button>
-              </div>
-            </form>
-          </div>
-
-          <div className="card mb-3">
-            <div className="card-header d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2">
-              <div className="fw-semibold">Movimenti Credito</div>
-            </div>
-
-            <div className="table-responsive">
-              <table className="table mb-0 align-middle">
-                <thead>
-                  <tr>
-                    <th>Data</th>
-                    <th>Cliente</th>
-                    <th>Tipo</th>
-                    <th className="text-end">Ricarica</th>
-                    <th className="text-end">Bonus</th>
-                    <th className="text-end">Totale</th>
-                    <th>Sede</th>
-                    <th className="text-muted">Nota</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredMovements.length === 0 ? (
-                    <tr>
-                      <td colSpan={8} className="text-muted p-3">
-                        {loading ? "Caricamento…" : "Nessun movimento."}
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredMovements.map((m) => (
-                      <tr key={m.id}>
-                        <td>{fmtDateTime(m.createdAt)}</td>
-                        <td>{clientName(m.clientId)}</td>
-                        <td>{TYPE_LABELS[m.type] ?? m.type}</td>
-                        <td className="text-end">—</td>
-                        <td className="text-end">—</td>
-                        <td className="text-end">{fmtMoney(m.amount)}</td>
-                        <td>—</td>
-                        <td className="text-muted">{m.note || "—"}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div className="card mb-3">
-            <div className="card-header d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2">
-              <div className="fw-semibold">Credito in sospeso</div>
-            </div>
-
-            <div className="card-body text-muted">Nessun credito in sospeso.</div>
           </div>
         </div>
       </div>

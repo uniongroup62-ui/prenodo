@@ -9700,6 +9700,206 @@ export async function fidelityWalletManualMove(
   return { ok: true, message, removed: op === "remove" ? pts : 0, lockedReserved, missing, detail: await getFidelityWalletDetail(slug, clientId) };
 }
 
+// ---- Credit MOVEMENTS ledger (credit_movements.php "Movimenti Credito") -------
+export type CreditMovement = {
+  createdAt: string;
+  clientId: number;
+  clientName: string;
+  kind: "recharge" | "void" | "redeem" | "manual_debit" | "manual_credit";
+  sourceType: string;
+  sourceId: number;
+  locationName: string;
+  rechargeAmount: number | null;
+  bonusAmount: number | null;
+  totalAmount: number; // signed euro delta
+  note: string;
+};
+export type CreditPending = { id: number; publicCode: string; clientId: number; clientName: string; startsAt: string; status: string; creditUsed: number };
+export type CreditMovementsData = {
+  clients: { id: number; name: string; email: string; credit: number }[];
+  movements: CreditMovement[];
+  pending: CreditPending[];
+  total: number;
+};
+
+// Full credit ledger (port of credit_movements.php's UNION): recharges (+ their
+// storno), appointment + sale credit usage, and manual credit_adjustments — merged,
+// newest first. Plus the pending-credit list (open appointments holding credit).
+export async function getManageCreditMovements(slug: string, clientId: number): Promise<CreditMovementsData> {
+  const scoped = clientId > 0;
+  const cw = (col: string): { where: string; params: unknown[] } => (scoped ? { where: `${col} = ?`, params: [clientId] } : { where: "", params: [] });
+
+  const clientRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, full_name, email, credit_balance", orderBy: "full_name ASC" }).catch(() => [] as RowDataPacket[]);
+  const clientMap = new Map<number, string>();
+  for (const c of clientRows) clientMap.set(Number(c.id), String(c.full_name ?? ""));
+  const clients = clientRows.map((c) => ({ id: Number(c.id), name: String(c.full_name ?? ""), email: String(c.email ?? ""), credit: roundMoney(Number(c.credit_balance ?? 0)) }));
+
+  // Location id -> name (for appointment/sale rows; recharges/adjustments carry their own name).
+  const locRows = await tenantSelect<RowDataPacket>({ slug, table: "locations", columns: "id, name" }).catch(() => [] as RowDataPacket[]);
+  const locMap = new Map<number, string>();
+  for (const l of locRows) locMap.set(Number(l.id), String(l.name ?? ""));
+  const nameOf = (id: number) => (id > 0 ? locMap.get(id) ?? "" : "");
+
+  const movements: CreditMovement[] = [];
+
+  // Recharges (+ storno rows for voided recharges).
+  const rc = cw("client_id");
+  const rechRows = await tenantSelect<RowDataPacket>({ slug, table: "recharges", columns: "id, client_id, base_amount, bonus_amount, total_amount, note, is_void, voided_at, created_at, location_id, location_name", where: rc.where, params: rc.params }).catch(() => [] as RowDataPacket[]);
+  for (const r of rechRows) {
+    const id = Number(r.id ?? 0);
+    const voided = Number(r.is_void ?? 0) === 1;
+    const locName = String(r.location_name ?? "") || nameOf(Number(r.location_id ?? 0));
+    movements.push({
+      createdAt: toIso(r.created_at),
+      clientId: Number(r.client_id ?? 0),
+      clientName: clientMap.get(Number(r.client_id ?? 0)) ?? "",
+      kind: "recharge",
+      sourceType: "credit_recharge",
+      sourceId: id,
+      locationName: locName,
+      rechargeAmount: roundMoney(Number(r.base_amount ?? 0)),
+      bonusAmount: roundMoney(Number(r.bonus_amount ?? 0)),
+      totalAmount: roundMoney(Number(r.total_amount ?? 0)),
+      note: `${String(r.note ?? "") || `Ricarica credito #${id}`}${voided ? " (stornata)" : ""}`,
+    });
+    if (voided) {
+      movements.push({
+        createdAt: toIso(r.voided_at ?? r.created_at),
+        clientId: Number(r.client_id ?? 0),
+        clientName: clientMap.get(Number(r.client_id ?? 0)) ?? "",
+        kind: "void",
+        sourceType: "credit_recharge",
+        sourceId: id,
+        locationName: locName,
+        rechargeAmount: -roundMoney(Number(r.base_amount ?? 0)),
+        bonusAmount: -roundMoney(Number(r.bonus_amount ?? 0)),
+        totalAmount: -roundMoney(Number(r.total_amount ?? 0)),
+        note: `Storno ricarica credito #${id}`,
+      });
+    }
+  }
+
+  // Appointment credit usage.
+  const ac = cw("client_id");
+  const apptRows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id, public_code, client_id, credit_used, status, created_at, location_id", where: `COALESCE(credit_used,0) > 0${ac.where ? ` AND ${ac.where}` : ""}`, params: ac.params }).catch(() => [] as RowDataPacket[]);
+  for (const a of apptRows) {
+    const open = ["pending", "scheduled"].includes(String(a.status ?? ""));
+    const code = String(a.public_code ?? "") || `#${a.id}`;
+    movements.push({
+      createdAt: toIso(a.created_at),
+      clientId: Number(a.client_id ?? 0),
+      clientName: clientMap.get(Number(a.client_id ?? 0)) ?? "",
+      kind: "redeem",
+      sourceType: "appointment",
+      sourceId: Number(a.id ?? 0),
+      locationName: nameOf(Number(a.location_id ?? 0)),
+      rechargeAmount: null,
+      bonusAmount: null,
+      totalAmount: -roundMoney(Number(a.credit_used ?? 0)),
+      note: `Credito usato su prenotazione ${code}${open ? " (in sospeso)" : ""}`,
+    });
+  }
+
+  // Sale credit usage (excluding cancelled sales).
+  const sc = cw("client_id");
+  const saleRows = await tenantSelect<RowDataPacket>({ slug, table: "sales", columns: "id, client_id, credit_used, sale_date, status, location_id", where: `COALESCE(credit_used,0) > 0 AND (status IS NULL OR LOWER(status) NOT IN ('cancelled','canceled','annullata','annullato'))${sc.where ? ` AND ${sc.where}` : ""}`, params: sc.params }).catch(() => [] as RowDataPacket[]);
+  for (const s of saleRows) {
+    movements.push({
+      createdAt: toIso(s.sale_date ?? s.created_at),
+      clientId: Number(s.client_id ?? 0),
+      clientName: clientMap.get(Number(s.client_id ?? 0)) ?? "",
+      kind: "redeem",
+      sourceType: "sale",
+      sourceId: Number(s.id ?? 0),
+      locationName: nameOf(Number(s.location_id ?? 0)),
+      rechargeAmount: null,
+      bonusAmount: null,
+      totalAmount: -roundMoney(Number(s.credit_used ?? 0)),
+      note: `Credito usato in vendita #${s.id}`,
+    });
+  }
+
+  // Manual credit adjustments.
+  const dc = cw("client_id");
+  const adjRows = await tenantSelect<RowDataPacket>({ slug, table: "credit_adjustments", columns: "id, client_id, delta_amount, note, created_at, location_id, location_name", where: dc.where, params: dc.params }).catch(() => [] as RowDataPacket[]);
+  for (const d of adjRows) {
+    const delta = roundMoney(Number(d.delta_amount ?? 0));
+    movements.push({
+      createdAt: toIso(d.created_at),
+      clientId: Number(d.client_id ?? 0),
+      clientName: clientMap.get(Number(d.client_id ?? 0)) ?? "",
+      kind: delta < 0 ? "manual_debit" : "manual_credit",
+      sourceType: "credit_adjustment",
+      sourceId: Number(d.id ?? 0),
+      locationName: String(d.location_name ?? "") || nameOf(Number(d.location_id ?? 0)),
+      rechargeAmount: null,
+      bonusAmount: null,
+      totalAmount: delta,
+      note: String(d.note ?? "") || `Rettifica credito #${d.id}`,
+    });
+  }
+
+  movements.sort((a, b) => {
+    const ta = new Date(a.createdAt).getTime();
+    const tb = new Date(b.createdAt).getTime();
+    if (tb !== ta) return tb - ta;
+    return b.sourceId - a.sourceId;
+  });
+  const total = movements.length;
+  const capped = movements.slice(0, 300);
+
+  // Pending credit: open appointments still holding credit.
+  const pc = cw("client_id");
+  const pendRows = await tenantSelect<RowDataPacket>({ slug, table: "appointments", columns: "id, public_code, client_id, starts_at, status, credit_used, location_id", where: `status IN ('pending','scheduled') AND COALESCE(credit_used,0) > 0${pc.where ? ` AND ${pc.where}` : ""}`, params: pc.params, orderBy: "starts_at ASC, id ASC", limit: 200 }).catch(() => [] as RowDataPacket[]);
+  const pending: CreditPending[] = pendRows.map((a) => ({
+    id: Number(a.id ?? 0),
+    publicCode: String(a.public_code ?? "") || `#${a.id}`,
+    clientId: Number(a.client_id ?? 0),
+    clientName: clientMap.get(Number(a.client_id ?? 0)) ?? "",
+    startsAt: a.starts_at ? toIso(a.starts_at) : "",
+    status: String(a.status ?? ""),
+    creditUsed: roundMoney(Number(a.credit_used ?? 0)),
+  }));
+
+  return { clients, movements: capped, pending, total };
+}
+
+// Manually scale (debit) a client's credit wallet (port of credit_movements.php
+// manual_credit_debit): blocked-client + note-required + sufficient-balance guards,
+// writes a credit_adjustments debit row and decrements clients.credit_balance.
+export async function manualCreditDebit(slug: string, clientId: number, amountRaw: unknown, noteRaw: string, by: number): Promise<{ ok: true; message: string; movements: CreditMovementsData }> {
+  if (clientId <= 0) throw new Error("Seleziona un cliente.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, full_name, credit_balance, is_blocked", where: "id = ?", params: [clientId], limit: 1 });
+  if (!rows[0]) throw new Error("Cliente non trovato.");
+  if (Number(rows[0].is_blocked ?? 0) === 1) throw new Error("Cliente bloccato: operazione non consentita.");
+
+  const amount = roundMoney(Number(String(amountRaw ?? "").replace(",", ".")));
+  if (!Number.isFinite(amount) || amount <= 0.00001) throw new Error("Inserisci un importo valido.");
+  if (amount > 99999999.99) throw new Error("Importo troppo alto. Massimo 99999999.99.");
+
+  const note = String(noteRaw ?? "").trim().slice(0, 255);
+  if (note === "") throw new Error("Inserisci una nota per motivare lo scalo manuale.");
+
+  const balanceBefore = roundMoney(Number(rows[0].credit_balance ?? 0));
+  if (balanceBefore + 0.00001 < amount) throw new Error(`Credito insufficiente. Saldo attuale € ${balanceBefore.toFixed(2)}.`);
+  const balanceAfter = roundMoney(balanceBefore - amount);
+
+  await tenantInsert(await tenantTable(slug, "credit_adjustments"), {
+    client_id: clientId,
+    direction: "debit",
+    amount,
+    delta_amount: -amount,
+    balance_before: balanceBefore,
+    balance_after: balanceAfter,
+    note,
+    created_by: by > 0 ? by : null,
+    created_at: new Date(),
+  });
+  await tenantUpdate({ slug, table: "clients", id: clientId, values: { credit_balance: balanceAfter } });
+
+  return { ok: true, message: `Credito scalato manualmente: -€ ${amount.toFixed(2)}.`, movements: await getManageCreditMovements(slug, clientId) };
+}
+
 async function getSingleClient(slug: string, id: number): Promise<ManagedClient> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Cliente non trovato.");

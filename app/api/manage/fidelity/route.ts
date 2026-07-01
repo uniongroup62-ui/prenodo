@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, deleteFidelityCard, fidelityWalletManualMove, getFidelityEnabled, getFidelityLevelsSettings, getFidelityMembership, getFidelityPointsSettings, getFidelityWallet, issueFidelityCard, listDbClients, listDbWalletMovements, listFidelityCampaigns, reactivateFidelityCard, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign, updateFidelityCardStatus } from "@/lib/db-repositories";
+import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, deleteFidelityCard, fidelityWalletManualMove, getFidelityEnabled, getFidelityLevelsSettings, getFidelityMembership, getFidelityPointsSettings, getFidelityWallet, getManageCreditMovements, issueFidelityCard, listDbClients, listDbWalletMovements, listFidelityCampaigns, manualCreditDebit, reactivateFidelityCard, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign, updateFidelityCardStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -8,8 +8,8 @@ import type { WalletMovementType } from "@/lib/tenant-store";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const readPerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "fidelity.membership", "pos.manage"];
-const writePerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "fidelity.membership"];
+const readPerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "fidelity.membership", "credit_movements.manage", "pos.manage"];
+const writePerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "fidelity.membership", "credit_movements.manage"];
 
 export async function GET(request: Request) {
   const tenantSlug = manageTenantSlugFromRequest(request);
@@ -49,6 +49,12 @@ export async function GET(request: Request) {
     if (url.searchParams.get("action") === "wallet") {
       if (!can(session.user.perms, "fidelity.wallet") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso portafoglio fidelity mancante.", 403);
       return Response.json({ ok: true, sourceMode: "database", wallet: await getFidelityWallet(tenantSlug, parseInteger(url.searchParams.get("client_id"), 0)) });
+    }
+
+    // CREDIT movements ledger (credit_movements.php "Movimenti Credito").
+    if (url.searchParams.get("action") === "credit") {
+      if (!can(session.user.perms, "credit_movements.manage") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso movimenti credito mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", credit: await getManageCreditMovements(tenantSlug, parseInteger(url.searchParams.get("client_id"), 0)) });
     }
 
     const clients = await listDbClients({ slug: tenantSlug });
@@ -92,6 +98,13 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "fidelity.levels") && !can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso livelli fidelity mancante.", 403);
       const levels = await saveFidelityLevels(tenantSlug, body);
       return Response.json({ ok: true, sourceMode: "database", levels });
+    }
+
+    // CREDIT manual debit (port of credit_movements.php manual_credit_debit).
+    if (body.action === "credit_debit" || body._mode === "manual_credit_debit") {
+      if (!can(session.user.perms, "credit_movements.manage") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso movimenti credito mancante.", 403);
+      const result = await manualCreditDebit(tenantSlug, parseInteger(body.client_id, 0), body.amount, String(body.note ?? ""), session.user.id);
+      return Response.json({ sourceMode: "database", ...result });
     }
 
     // Fidelity WALLET manual points movement (port of manual_move_points).
