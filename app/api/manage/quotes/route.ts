@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
+import { convertDbQuoteToSale, createDbQuote, deleteDbQuote, getManageQuoteDetail, listDbClients, listDbProducts, listDbQuotes, listDbServices, sendQuoteEmail, updateDbQuoteStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
@@ -21,6 +21,13 @@ export async function GET(request: Request) {
     // clients (for the cliente picker) + services + products (for the line
     // items). Numeric prices are parsed from the managed catalog so the form can
     // seed an editable unit price per line.
+    // Quote DETAIL (action=view): header + client + items + totals + linked sale.
+    if (url.searchParams.get("action") === "view") {
+      const detail = await getManageQuoteDetail(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
+      if (!detail) return jsonError("Preventivo non trovato.", 404);
+      return Response.json({ ok: true, sourceMode: "database", detail });
+    }
+
     if (url.searchParams.get("action") === "context") {
       const [clients, services, products] = await Promise.all([
         listDbClients({ slug: tenantSlug }),

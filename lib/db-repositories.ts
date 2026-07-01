@@ -3580,6 +3580,130 @@ export async function deleteDbQuote(slug: string, id: number): Promise<{ ok: tru
   return { ok: true };
 }
 
+// ---- Quote DETAIL (quotes.php action=view) -----------------------------------
+export type QuoteDetailItem = { description: string; sku: string; itemType: string; qty: number; unitPrice: number; taxRate: number; discountPercent: number; lineTotal: number };
+export type ManageQuoteDetail = {
+  id: number;
+  number: string;
+  quoteDate: string;
+  validUntil: string;
+  status: string;
+  statusLabel: string;
+  statusBadge: string;
+  locationName: string;
+  client: {
+    name: string;
+    companyName: string;
+    vatNumber: string;
+    taxCode: string;
+    sdi: string;
+    pec: string;
+    phone: string;
+    email: string;
+    address: string;
+    cap: string;
+    city: string;
+    province: string;
+  };
+  items: QuoteDetailItem[];
+  subtotal: number;
+  discountTotal: number;
+  taxTotal: number;
+  total: number;
+  notes: string;
+  terms: string;
+  publicNote: string;
+  linkedSaleId: number | null;
+  linkedSaleCancelled: boolean;
+  canEdit: boolean;
+  canSendEmail: boolean;
+};
+
+const QUOTE_STATUS_META: Record<string, { label: string; badge: string }> = {
+  draft: { label: "Bozza", badge: "bg-secondary" },
+  sent: { label: "Inviato", badge: "bg-info text-dark" },
+  accepted: { label: "Accettato", badge: "bg-success" },
+  converted: { label: "Pagato", badge: "bg-success" },
+  rejected: { label: "Rifiutato", badge: "bg-danger" },
+};
+
+// Full quote DETAIL (port of quotes.php action=view): the header + client card +
+// line items + totals + notes/terms + the linked sale (sales.source_quote_id) and
+// the edit/send-email eligibility flags. Read-only.
+export async function getManageQuoteDetail(slug: string, id: number): Promise<ManageQuoteDetail | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "quotes", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const qrow = rows[0];
+  const status = quoteStatus(String(qrow.status ?? "draft"));
+
+  const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "quote_items", where: "quote_id = ?", params: [id], orderBy: "position ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const items: QuoteDetailItem[] = itemRows.map((r) => ({
+    description: String(r.description ?? ""),
+    sku: String(r.sku ?? ""),
+    itemType: String(r.item_type ?? ""),
+    qty: Number(r.qty ?? 1),
+    unitPrice: roundMoney(Number(r.unit_price ?? 0)),
+    taxRate: Number(r.tax_rate ?? 0),
+    discountPercent: Number(r.discount_percent ?? 0),
+    lineTotal: roundMoney(Number(r.line_total ?? 0)),
+  }));
+
+  // Linked sale (the reverse link is sales.source_quote_id; prefer a non-cancelled one).
+  let linkedSaleId: number | null = null;
+  let linkedSaleCancelled = false;
+  const saleRows = await tenantSelect<RowDataPacket>({ slug, table: "sales", columns: "id, status", where: "source_quote_id = ?", params: [id], orderBy: "id DESC" }).catch(() => [] as RowDataPacket[]);
+  if (saleRows.length > 0) {
+    const active = saleRows.find((r) => !["cancelled", "canceled"].includes(String(r.status ?? "").trim().toLowerCase()));
+    const chosen = active ?? saleRows[0];
+    linkedSaleId = Number(chosen.id ?? 0) || null;
+    linkedSaleCancelled = !active;
+  }
+
+  const meta = QUOTE_STATUS_META[status] ?? { label: status || "—", badge: "bg-secondary" };
+  const validUntil = qrow.valid_until ? String(qrow.valid_until).slice(0, 10) : "";
+  const notExpired = validUntil === "" || validUntil >= todayIso();
+  const canEdit = status === "draft" || status === "sent";
+  const canSendEmail = (status === "draft" || status === "sent") && notExpired;
+
+  return {
+    id,
+    number: String(qrow.number ?? ""),
+    quoteDate: qrow.quote_date ? String(qrow.quote_date).slice(0, 10) : "",
+    validUntil,
+    status,
+    statusLabel: meta.label,
+    statusBadge: meta.badge,
+    locationName: String(qrow.location_name ?? ""),
+    client: {
+      name: String(qrow.client_name ?? ""),
+      companyName: String(qrow.client_company_name ?? ""),
+      vatNumber: String(qrow.client_vat_number ?? ""),
+      taxCode: String(qrow.client_tax_code ?? ""),
+      sdi: String(qrow.client_sdi ?? ""),
+      pec: String(qrow.client_pec ?? ""),
+      phone: String(qrow.client_phone ?? ""),
+      email: String(qrow.client_email ?? ""),
+      address: String(qrow.client_address ?? ""),
+      cap: String(qrow.client_cap ?? ""),
+      city: String(qrow.client_city ?? ""),
+      province: String(qrow.client_province ?? ""),
+    },
+    items,
+    subtotal: roundMoney(Number(qrow.subtotal ?? 0)),
+    discountTotal: roundMoney(Number(qrow.discount_total ?? 0)),
+    taxTotal: roundMoney(Number(qrow.tax_total ?? 0)),
+    total: roundMoney(Number(qrow.total ?? 0)),
+    notes: String(qrow.notes ?? ""),
+    terms: String(qrow.terms ?? ""),
+    publicNote: String(qrow.public_note ?? ""),
+    linkedSaleId,
+    linkedSaleCancelled,
+    canEdit,
+    canSendEmail,
+  };
+}
+
 // Port of the quotes.php manual "Invia email" action (action=email): emails the
 // quote to the client with the public-page link and a PDF link, then marks the
 // quote sent. The Next quotes route previously only flipped the status via

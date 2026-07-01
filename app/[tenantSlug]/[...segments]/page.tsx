@@ -19,6 +19,7 @@ import { PromotionsContent } from "@/components/modules/promotions-content";
 import { PromotionFormContent } from "@/components/modules/promotion_form-content";
 import { QuotesContent } from "@/components/modules/quotes-content";
 import { QuoteFormContent } from "@/components/modules/quote_form-content";
+import { QuoteDetailContent } from "@/components/modules/quote_detail-content";
 import { RechargesContent } from "@/components/modules/recharges-content";
 import { SuppliersContent } from "@/components/modules/suppliers-content";
 import { SupplierFormContent } from "@/components/modules/supplier_form-content";
@@ -280,6 +281,16 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <QuoteFormContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful quote DETAIL (quotes.php action=view): header + client + items +
+  // totals + linked sale + Invia email, instead of the Tailwind fallback.
+  if (page === "quotes" && query.action === "view") {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <QuoteDetailContent />
       </ManageShell>
     );
   }
