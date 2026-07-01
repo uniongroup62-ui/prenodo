@@ -473,10 +473,19 @@ function serviceTitleOf(a: Appointment): string {
   return serviceNamesOf(a).join(" • ");
 }
 
-// Pixel grid constants for the static agenda (5-min granularity like calendar.js).
-const SLOT_MIN_PER_ROW = 30;
-const ROW_HEIGHT = 48; // px per 30-min row
-const PX_PER_MIN = ROW_HEIGHT / SLOT_MIN_PER_ROW;
+// Pixel grid constants for the static agenda. Faithful to calendar.js
+// slotDuration 00:05 + slotLabelInterval 00:30: the grid draws a slot LINE every 5
+// minutes (ROW_HEIGHT=17px per 5-min row, matching .fc-timegrid-slot{height:17px} in
+// calendar.css) and shows a time LABEL only on the :00/:30 major rows. PX_PER_MIN
+// (17/5 = 3.4) drives EVERY vertical position (blocks, now-indicator, store bands,
+// hover, drag-select), so the whole grid scales from these two numbers.
+const SLOT_MIN_PER_ROW = 5;
+const ROW_HEIGHT = 17; // px per 5-min row (calendar.css .fc-timegrid-slot height)
+const PX_PER_MIN = ROW_HEIGHT / SLOT_MIN_PER_ROW; // 3.4
+// Minutes between LABELLED (major) rows — legacy slotLabelInterval 00:30. Rows whose
+// minute-of-day is NOT a multiple of this get the .fc-timegrid-slot-minor class (no
+// label, lighter line), like FullCalendar's minor slots.
+const SLOT_LABEL_INTERVAL_MIN = 30;
 const DEFAULT_DURATION_MIN = 60;
 // Snap step for drag-move / quick-book, matching calendar.js snapDuration 00:05:00
 // (AXIS_STEP_MINUTES = 5). A dropped/clicked Y position is rounded to this step.
@@ -486,6 +495,21 @@ function minToTime(min: number): string {
   const clamped = Math.max(0, min);
   return `${pad(Math.floor(clamped / 60))}:${pad(clamped % 60)}`;
 }
+
+// A grid row is MAJOR (labelled, darker line) when its minute-of-day is a multiple of
+// the label interval (30) — like FullCalendar's slotLabelInterval 00:30; otherwise it is
+// a MINOR 5-min row (no label, lighter line, .fc-timegrid-slot-minor). Absolute
+// minute-of-day is used (not offset from the window start) so labels land on the real
+// :00/:30 clock ticks, matching FullCalendar even when the axis opens off a half-hour.
+function isMajorRow(min: number): boolean {
+  return min % SLOT_LABEL_INTERVAL_MIN === 0;
+}
+// Border colours for the 5-min slot lines, mirroring calendar.css: major (:00/:30) rows
+// get the darker #cfdaea top border, minor rows the lighter #edf2f8. Kept inline (in
+// addition to the .fc-timegrid-slot-minor class) so the grid renders correctly even
+// where the scoped CSS does not match.
+const SLOT_LINE_MAJOR = "#cfdaea";
+const SLOT_LINE_MINOR = "#edf2f8";
 
 function snapMin(min: number, step: number): number {
   return Math.round(min / step) * step;
@@ -673,7 +697,7 @@ export function CalendarContent() {
   // getCalendarHoverTimeInfoFromPoint / renderCalendarHoverTimeFromPoint) ===
   // As the pointer moves over a column body, `hover` carries the column it is over
   // (`col`: staff id in Day / iso date in Week), the snapped time's pixel offset
-  // (`lineTop`, from the window start), the SLOT band offset (`slotTop` — the 30-min
+  // (`lineTop`, from the window start), the SLOT band offset (`slotTop` — the 5-min
   // row), and the HH:MM `label` (snapped to SNAP_MIN). null hides the overlay. It is
   // set ONLY inside the rAF callback driven by the pointer handler (never in an
   // effect), so there is no set-state-in-effect. A rAF id + last-point ref throttle the
@@ -916,33 +940,61 @@ export function CalendarContent() {
     [scheduleForDate],
   );
 
-  // Visible time window from business hours for the focused day-of-week (Day view),
-  // EXPANDED by the dynamic axis so out-of-hours appointments are not clipped: if a
-  // booking on `date` starts before open or ends after close, the window grows to fit
-  // it (rounded to the slot). Falls back to plain business hours when the day is empty.
+  // Visible time window for the focused date (Day view). Faithful to the legacy
+  // getStoreScheduleForDate: the axis bounds are the EFFECTIVE schedule of THIS date,
+  // so a special-open (business_hours_exceptions) or closure overrides the standard
+  // day-of-week hours. We take the first interval's start (min) and the last interval's
+  // end (max) from scheduleForDate(date); when it resolves nothing (closed day / no
+  // rows) we fall back to the plain day-of-week window (like the legacy's STORE_WEEK_*
+  // baseline). The dynamic axis then EXPANDS this so out-of-hours appointments on `date`
+  // are not clipped (a booking starting before open / ending after close widens it,
+  // rounded to the slot).
   const { minMin, maxMin } = useMemo(() => {
-    const { open, close } = windowForDow(new Date(`${date}T12:00:00`).getDay());
+    const dow = new Date(`${date}T12:00:00`).getDay();
+    const fallback = windowForDow(dow);
+    const sched = scheduleForDate(date);
+    let open = fallback.open;
+    let close = fallback.close;
+    if (sched.intervals.length) {
+      open = sched.intervals[0].start;
+      close = sched.intervals[sched.intervals.length - 1].end;
+    }
     const dayAppts = appointments.filter((a) => a.date === date);
     const { open: o, close: c } = expandWindowForAppointments(open, close, dayAppts);
     return { minMin: o, maxMin: c };
-  }, [windowForDow, date, appointments]);
+  }, [windowForDow, scheduleForDate, date, appointments]);
 
-  // Week time window: the UNION (min open .. max close) of the 7 days' business
-  // hours, so every day's appointments fit in the shared Week grid — then EXPANDED by
-  // the dynamic axis over the whole week's appointments (any booking starting before /
-  // ending after the union window widens it, rounded to the slot).
+  // Week time window: the UNION (min open .. max close) of the 7 days' EFFECTIVE
+  // schedules, so every day's appointments fit in the shared Week grid. Faithful to the
+  // legacy buildWeekBusinessHoursForRange, which maps each visible date to its effective
+  // schedule (honouring special-opens / closures) rather than the plain day-of-week
+  // hours. For each date we take the first interval's start and the last interval's end
+  // from scheduleForDate, falling back to windowForDow when a date resolves nothing
+  // (closed / no rows). Then EXPANDED by the dynamic axis over the whole week's
+  // appointments (any booking starting before / ending after the union window widens it,
+  // rounded to the slot).
   const { weekMinMin, weekMaxMin } = useMemo(() => {
     const days = weekDates(date);
-    const dows = days.map((d) => new Date(`${d}T12:00:00`).getDay());
-    const opens = dows.map((d) => windowForDow(d).open);
-    const closes = dows.map((d) => windowForDow(d).close);
+    const opens: number[] = [];
+    const closes: number[] = [];
+    for (const d of days) {
+      const fallback = windowForDow(new Date(`${d}T12:00:00`).getDay());
+      const sched = scheduleForDate(d);
+      if (sched.intervals.length) {
+        opens.push(sched.intervals[0].start);
+        closes.push(sched.intervals[sched.intervals.length - 1].end);
+      } else {
+        opens.push(fallback.open);
+        closes.push(fallback.close);
+      }
+    }
     const baseOpen = Math.min(...opens);
     const baseClose = Math.max(...closes);
     const weekSet = new Set(days);
     const weekAppts = appointments.filter((a) => weekSet.has(a.date));
     const { open: o, close: c } = expandWindowForAppointments(baseOpen, baseClose, weekAppts);
     return { weekMinMin: o, weekMaxMin: c };
-  }, [windowForDow, date, appointments]);
+  }, [windowForDow, scheduleForDate, date, appointments]);
 
   const rows = useMemo(() => {
     const out: number[] = [];
@@ -1207,7 +1259,7 @@ export function CalendarContent() {
   // underlying empty-cell click / drag. Reuses the legacy CSS classes so they are
   // styled identically by app.css / calendar.css:
   //   - .calendar-hover-time-line  (guide line at the snapped time)
-  //   - .calendar-hover-slot-highlight (subtle band for the snapped 30-min slot)
+  //   - .calendar-hover-slot-highlight (subtle band for the snapped 5-min slot)
   //   - .calendar-hover-time-display.calendar-hover-time-display--floating (HH:MM label)
   // The drag-select band reuses .calendar-hover-slot-highlight too (a stronger,
   // explicitly-styled variant), matching the legacy selection look.
@@ -1224,7 +1276,7 @@ export function CalendarContent() {
         <>
           {showHover ? (
             <>
-              {/* Subtle highlight band for the snapped 30-min slot. */}
+              {/* Subtle highlight band for the snapped 5-min slot. */}
               <div
                 className="calendar-hover-slot-highlight is-visible"
                 aria-hidden="true"
@@ -2070,15 +2122,18 @@ export function CalendarContent() {
               </span>
             </>
           ) : null}
-          {weekRows.map((m) => (
-            <div
-              key={m}
-              className="fc-timegrid-slot-label"
-              style={{ height: ROW_HEIGHT, fontSize: 11, color: "#64748b", textAlign: "right", paddingRight: 6, boxSizing: "border-box" }}
-            >
-              {`${pad(Math.floor(m / 60))}:${pad(m % 60)}`}
-            </div>
-          ))}
+          {weekRows.map((m) => {
+            const major = isMajorRow(m);
+            return (
+              <div
+                key={m}
+                className={`fc-timegrid-slot-label${major ? "" : " fc-timegrid-slot-minor"}`}
+                style={{ height: ROW_HEIGHT, fontSize: 11, color: "#64748b", textAlign: "right", paddingRight: 6, boxSizing: "border-box" }}
+              >
+                {major ? `${pad(Math.floor(m / 60))}:${pad(m % 60)}` : ""}
+              </div>
+            );
+          })}
         </div>
 
         {/* Day columns */}
@@ -2168,13 +2223,16 @@ export function CalendarContent() {
                   {/* HOVER guide-line / slot-highlight / time label + live drag-select
                       band overlays for this day column (non-interactive). */}
                   {renderHoverOverlay(`week-${iso}`, weekMinMin)}
-                  {weekRows.map((m) => (
-                    <div
-                      key={m}
-                      className="fc-timegrid-slot"
-                      style={{ height: ROW_HEIGHT, borderTop: "1px solid var(--calendar-line, #eef2f7)", boxSizing: "border-box" }}
-                    />
-                  ))}
+                  {weekRows.map((m) => {
+                    const major = isMajorRow(m);
+                    return (
+                      <div
+                        key={m}
+                        className={`fc-timegrid-slot${major ? "" : " fc-timegrid-slot-minor"}`}
+                        style={{ height: ROW_HEIGHT, borderTop: `1px solid ${major ? SLOT_LINE_MAJOR : SLOT_LINE_MINOR}`, boxSizing: "border-box" }}
+                      />
+                    );
+                  })}
 
                   {dayAppts.map((a) => {
                     const startMin = timeToMin(a.time);
@@ -2778,26 +2836,33 @@ export function CalendarContent() {
                             </span>
                           </>
                         ) : null}
-                        {rows.map((m) => (
-                          <div
-                            key={m}
-                            className="fc-timegrid-slot-label"
-                            style={{
-                              height: ROW_HEIGHT,
-                              fontSize: 11,
-                              color: "#64748b",
-                              textAlign: "right",
-                              paddingRight: 6,
-                              boxSizing: "border-box",
-                            }}
-                          >
-                            {`${pad(Math.floor(m / 60))}:${pad(m % 60)}`}
-                          </div>
-                        ))}
+                        {rows.map((m) => {
+                          const major = isMajorRow(m);
+                          return (
+                            <div
+                              key={m}
+                              className={`fc-timegrid-slot-label${major ? "" : " fc-timegrid-slot-minor"}`}
+                              style={{
+                                height: ROW_HEIGHT,
+                                fontSize: 11,
+                                color: "#64748b",
+                                textAlign: "right",
+                                paddingRight: 6,
+                                boxSizing: "border-box",
+                              }}
+                            >
+                              {major ? `${pad(Math.floor(m / 60))}:${pad(m % 60)}` : ""}
+                            </div>
+                          );
+                        })}
                       </div>
 
-                      {/* Staff columns */}
-                      <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0, position: "relative" }}>
+                      {/* Staff columns. overflowX:auto mirrors FullCalendar's dayMinWidth:
+                          when the per-column min-width (--calendar-staff-col-min) makes the
+                          columns wider than the container (many operators), this wrapper
+                          scrolls horizontally instead of squishing the columns to nil; with
+                          one / a few columns flex-grow still fills the width. */}
+                      <div style={{ display: "flex", flex: "1 1 auto", minWidth: 0, position: "relative", overflowX: "auto" }}>
                         {/* NOW-INDICATOR line (Giorno): a single red line spanning ALL
                             staff columns, faithful to updateStaffNowIndicator. Uses the
                             legacy .fc-timegrid-now-indicator-line class (calendar.css
@@ -2829,7 +2894,10 @@ export function CalendarContent() {
                               <div
                                 key={s.id}
                                 className="fc-timegrid-col"
-                                style={{ flex: "1 1 0", minWidth: 0, borderRight: "1px solid var(--calendar-line, #e2e8f0)", position: "relative" }}
+                                // flex-grow to fill the width with one / a few columns, but
+                                // never shrink below --calendar-staff-col-min (dayMinWidth):
+                                // once the columns overflow the container the wrapper scrolls.
+                                style={{ flex: "1 1 0", minWidth: "var(--calendar-staff-col-min, 140px)", borderRight: "1px solid var(--calendar-line, #e2e8f0)", position: "relative" }}
                               >
                                 <div
                                   className="fc-col-header-cell"
@@ -2912,13 +2980,16 @@ export function CalendarContent() {
                                   {/* HOVER guide-line / slot-highlight / time label + live
                                       drag-select band overlays (non-interactive). */}
                                   {renderHoverOverlay(`day-${s.id}`, minMin)}
-                                  {rows.map((m) => (
-                                    <div
-                                      key={m}
-                                      className="fc-timegrid-slot"
-                                      style={{ height: ROW_HEIGHT, borderTop: "1px solid var(--calendar-line, #eef2f7)", boxSizing: "border-box" }}
-                                    />
-                                  ))}
+                                  {rows.map((m) => {
+                                    const major = isMajorRow(m);
+                                    return (
+                                      <div
+                                        key={m}
+                                        className={`fc-timegrid-slot${major ? "" : " fc-timegrid-slot-minor"}`}
+                                        style={{ height: ROW_HEIGHT, borderTop: `1px solid ${major ? SLOT_LINE_MAJOR : SLOT_LINE_MINOR}`, boxSizing: "border-box" }}
+                                      />
+                                    );
+                                  })}
 
                                   {/* Appointment blocks positioned by time */}
                                   {colAppts.map((a) => {

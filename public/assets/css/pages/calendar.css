@@ -249,6 +249,11 @@ body:not(.booking-public-body):not(.onboarding-body):not(.auth-body):has(.calend
   --fc-page-bg-color:transparent;
   --fc-neutral-bg-color:#fff;
   --fc-today-bg-color:#f4f7fd;
+  /* Minimum width for a single staff column in the Day (staffTimeGridDay) grid,
+     mirroring FullCalendar's dayMinWidth: with many operators the columns keep this
+     floor and the columns wrapper scrolls horizontally instead of squishing to nil.
+     With one / a few columns flex-grow still fills the container. */
+  --calendar-staff-col-min:140px;
 }
 .calendar-shell--agenda #calendar{
   min-height:var(--calendar-viewport-height, 520px);
