@@ -6285,13 +6285,127 @@ export async function redeemDbGift(id: number, slug: string): Promise<GiftReward
   return getSingleGift(slug, id);
 }
 
+export type InstallmentPlanSearchFilters = {
+  status?: string;
+  clientId?: number;
+  saleId?: number;
+  q?: string;
+  dueFrom?: string;
+  dueTo?: string;
+};
+
 export async function listDbInstallmentPlans(slug: string): Promise<InstallmentPlan[]> {
+  return searchDbInstallmentPlans(slug, {});
+}
+
+// Faithful port of SaleInstallments::searchPlans() (~lines 889-964).
+export async function searchDbInstallmentPlans(
+  slug: string,
+  filters: InstallmentPlanSearchFilters = {},
+): Promise<InstallmentPlan[]> {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  const clientId = Number(filters.clientId ?? 0);
+  if (clientId > 0) {
+    clauses.push("client_id = ?");
+    params.push(clientId);
+  }
+
+  // Base status filter (only the three stored values are pushed to SQL; the
+  // synthetic statuses overdue/open/paid/all are handled below).
+  const status = String(filters.status ?? "").trim().toLowerCase();
+  if (["active", "completed", "cancelled"].includes(status)) {
+    clauses.push("status = ?");
+    params.push(status);
+  }
+
+  const saleId = Number(filters.saleId ?? 0);
+  if (saleId > 0) {
+    clauses.push("sale_id = ?");
+    params.push(saleId);
+  }
+
+  const q = String(filters.q ?? "").trim();
+  if (q !== "") {
+    // PHP joins clients for c.full_name LIKE ?; tenantSelect can't join, so we
+    // resolve matching client ids first (tenant-scoped) and fold them in.
+    const like = `%${q}%`;
+    const clientRows = await tenantSelect<RowDataPacket>({
+      slug,
+      table: "clients",
+      columns: "id",
+      where: "full_name LIKE ?",
+      params: [like],
+    }).catch(() => [] as RowDataPacket[]);
+    const nameClientIds = clientRows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+    const qInt = Number.parseInt(q, 10);
+    const qId = Number.isNaN(qInt) ? 0 : qInt;
+    const orParts: string[] = ["notes LIKE ?", "sale_id = ?", "client_id = ?"];
+    params.push(like, qId, qId);
+    if (nameClientIds.length > 0) {
+      orParts.push(`client_id IN (${nameClientIds.map(() => "?").join(",")})`);
+      params.push(...nameClientIds);
+    }
+    clauses.push(`(${orParts.join(" OR ")})`);
+  }
+
+  const dueFrom = normalizeClientDate(filters.dueFrom);
+  const dueTo = normalizeClientDate(filters.dueTo);
+  if (dueFrom || dueTo) {
+    // Faithful EXISTS on sale_installments.due_date; scope the subquery to the
+    // resolved tenant table + tenant_id so it never leaks cross-tenant.
+    const instTable = await tenantTable(slug, "sale_installments");
+    const scoped = instTable.mode === "shared" && (await columnExists(instTable.name, "tenant_id"));
+    const subClauses: string[] = ["i.plan_id = p.id"];
+    const subParams: unknown[] = [];
+    if (scoped) {
+      subClauses.push("i.tenant_id = ?");
+      subParams.push(instTable.tenantId ?? 0);
+    }
+    if (dueFrom) {
+      subClauses.push("i.due_date >= ?");
+      subParams.push(dueFrom);
+    }
+    if (dueTo) {
+      subClauses.push("i.due_date <= ?");
+      subParams.push(dueTo);
+    }
+    clauses.push(`EXISTS (SELECT 1 FROM ${quoteIdentifier(instTable.name)} i WHERE ${subClauses.join(" AND ")})`);
+    // EXISTS params must precede the other where params: rebuild ordering.
+    params.push(...subParams);
+  }
+
   const rows = await tenantSelect<RowDataPacket>({
     slug,
     table: "sale_installment_plans",
-    orderBy: "created_at DESC, id DESC",
+    where: clauses.length ? clauses.map((c) => `(${c})`).join(" AND ") : "",
+    params,
+    // status precedence (active=0, completed=1, else=2), then first_due_date, then id DESC.
+    orderBy:
+      "CASE WHEN status = 'active' THEN 0 WHEN status = 'completed' THEN 1 ELSE 2 END ASC, COALESCE(first_due_date, '9999-12-31') ASC, id DESC",
   });
-  return Promise.all(rows.map((row) => mapInstallmentPlan(slug, row)));
+
+  const hydrated = await Promise.all(
+    rows.map(async (row) => ({
+      // Raw stored status ('active'|'completed'|'cancelled'), matching PHP's p.status.
+      rawStatus: String(row.status ?? "active").trim().toLowerCase(),
+      plan: await mapInstallmentPlan(slug, row),
+    })),
+  );
+
+  // Synthetic status overrides (applied post-hydration, exactly as PHP searchPlans).
+  let filtered = hydrated;
+  if (status === "overdue") {
+    filtered = hydrated.filter((h) => h.plan.overdueCount > 0 && h.rawStatus !== "cancelled");
+  } else if (status === "paid") {
+    filtered = hydrated.filter((h) => h.rawStatus === "completed");
+  } else if (status === "open") {
+    filtered = hydrated.filter((h) => h.rawStatus !== "cancelled" && h.plan.remaining > 0.00001);
+  }
+  // "all" and unrecognized statuses apply no additional filter.
+
+  return filtered.map((h) => h.plan);
 }
 
 export async function createDbInstallmentPlan(
@@ -7620,17 +7734,89 @@ async function mapInstallmentPlan(slug: string, row: RowDataPacket): Promise<Ins
     orderBy: "installment_no ASC, id ASC",
   });
   const installments = installmentRows.map(mapInstallment);
-  const paid = roundMoney(installments.filter((item) => item.status === "paid").reduce((total, item) => total + item.amount, 0));
+  const today = todayIso();
+
+  // Faithful port of SaleInstallments::hydratePlan() aggregates.
+  const downPayment = roundMoney(Number(row.down_payment_amount ?? 0));
+  let paidAmountTotal = 0;
+  let cancelledPaidAmount = 0;
+  let pendingAmount = 0;
+  let paidCount = 0;
+  let pendingCount = 0;
+  let overdueCount = 0;
+  let nextDueDate: string | undefined;
+  let nextDueAmount = 0;
+
+  for (const rowItem of installmentRows) {
+    const rawStatus = String(rowItem.status ?? "pending").trim().toLowerCase();
+    const dueDate = String(rowItem.due_date ?? "").slice(0, 10);
+    const amount = roundMoney(Number(rowItem.amount ?? 0));
+    const paidAmountRow = roundMoney(Number(rowItem.paid_amount ?? 0));
+    const effectiveOverdue = rawStatus === "pending" && dueDate !== "" && dueDate < today;
+
+    if (rawStatus === "paid") {
+      paidCount += 1;
+      paidAmountTotal += paidAmountRow > 0.00001 ? paidAmountRow : amount;
+      continue;
+    }
+    if (rawStatus === "cancelled" || rawStatus === "canceled") {
+      const paidAt = String(rowItem.paid_at ?? "").trim();
+      if (paidAmountRow > 0.00001 || paidAt !== "") {
+        cancelledPaidAmount += paidAmountRow > 0.00001 ? paidAmountRow : amount;
+      }
+      continue;
+    }
+
+    pendingCount += 1;
+    pendingAmount += amount;
+    if (effectiveOverdue) {
+      overdueCount += 1;
+    }
+    if (nextDueDate === undefined || (dueDate !== "" && dueDate < nextDueDate)) {
+      nextDueDate = dueDate;
+      nextDueAmount = amount;
+    }
+  }
+
+  const pendingAmountTotal = roundMoney(pendingAmount);
+  const remaining = roundMoney(pendingAmountTotal);
+  const collected = roundMoney(downPayment + roundMoney(paidAmountTotal) + roundMoney(cancelledPaidAmount));
   const total = roundMoney(Number(row.sale_total ?? row.financed_amount ?? 0));
+  const paid = roundMoney(installments.filter((item) => item.status === "paid").reduce((sum, item) => sum + item.amount, 0));
+
+  const rawPlanStatus = String(row.status ?? "active");
+  const planMeta = planStatusMeta(rawPlanStatus, overdueCount, remaining);
+  const intervalValue = Math.max(1, Number(row.interval_value ?? 1));
+  const intervalUnit = String(row.interval_unit ?? "month").trim().toLowerCase();
+
+  const sale = Number(row.sale_id ?? 0) > 0 ? await getSaleRow(slug, Number(row.sale_id ?? 0)) : null;
+  const saleDate = sale?.sale_date ? String(sale.sale_date).slice(0, 10) : undefined;
+
   return {
     id,
     saleId: Number(row.sale_id ?? 0),
+    saleDate,
     clientId: Number(row.client_id ?? 0),
     clientName: await appointmentClientName(slug, Number(row.client_id ?? 0)),
     total,
     paid,
-    status: installmentPlanStatus(String(row.status ?? "active"), total, paid, installments),
+    status: installmentPlanStatus(rawPlanStatus, total, paid, installments),
+    statusLabel: planMeta.label,
+    statusBadge: planMeta.badge,
     installments,
+    paidCount,
+    pendingCount,
+    overdueCount,
+    remaining,
+    collected,
+    nextDueDate: nextDueDate && nextDueDate !== "" ? nextDueDate : undefined,
+    nextDueAmount: roundMoney(nextDueAmount),
+    downPayment,
+    paymentType: installmentPaymentTypeLabel(String(row.payment_type ?? "")),
+    intervalLabel: installmentIntervalLabel(intervalUnit, intervalValue),
+    notes: trimOrNull(row.notes) ?? undefined,
+    cancelledReason: trimOrNull(row.cancelled_reason) ?? undefined,
+    cancelledAt: row.cancelled_at ? toIso(row.cancelled_at) : undefined,
     createdAt: toIso(row.created_at),
   };
 }
@@ -7638,11 +7824,19 @@ async function mapInstallmentPlan(slug: string, row: RowDataPacket): Promise<Ins
 function mapInstallment(row: RowDataPacket): Installment {
   const rawStatus = String(row.status ?? "pending");
   const dueDate = String(row.due_date ?? todayIso()).slice(0, 10);
+  const paidAmount = roundMoney(Number(row.paid_amount ?? 0));
+  const meta = installmentStatusMeta(rawStatus, dueDate);
   return {
     id: Number(row.id ?? 0),
+    installmentNo: Number(row.installment_no ?? 0),
     dueDate,
     amount: roundMoney(Number(row.amount ?? 0)),
+    paidAmount: paidAmount > 0.00001 ? paidAmount : undefined,
+    paymentType: trimOrNull(row.payment_type) ?? undefined,
+    note: trimOrNull(row.note) ?? undefined,
     status: installmentStatus(rawStatus, dueDate),
+    statusLabel: meta.label,
+    statusBadge: meta.badge,
     paidAt: row.paid_at ? toIso(row.paid_at) : undefined,
   };
 }
@@ -7651,6 +7845,47 @@ function installmentStatus(status: string, dueDate: string): InstallmentStatus {
   if (status === "paid") return "paid";
   if (status === "pending" && dueDate < todayIso()) return "overdue";
   return "due";
+}
+
+type StatusMeta = { key: string; label: string; badge: string };
+
+// Faithful port of SaleInstallments::planStatusMeta() (~lines 1220-1226).
+function planStatusMeta(status: string, overdueCount = 0, remainingAmount = 0): StatusMeta {
+  const normalized = String(status ?? "").trim().toLowerCase();
+  if (normalized === "cancelled" || normalized === "canceled") return { key: "cancelled", label: "Annullato", badge: "text-bg-secondary" };
+  if (remainingAmount <= 0.00001) return { key: "completed", label: "Completato", badge: "text-bg-success" };
+  if (overdueCount > 0) return { key: "overdue", label: "Scaduto", badge: "text-bg-danger" };
+  return { key: "active", label: "Attivo", badge: "text-bg-primary" };
+}
+
+// Faithful port of SaleInstallments::installmentStatusMeta() (~lines 1228-1235),
+// using the effective overdue rule (pending + due_date < today -> overdue).
+function installmentStatusMeta(status: string, dueDate: string): StatusMeta {
+  const normalized = String(status ?? "pending").trim().toLowerCase();
+  if (normalized === "paid") return { key: "paid", label: "Pagata", badge: "text-bg-success" };
+  if (normalized === "cancelled" || normalized === "canceled") return { key: "cancelled", label: "Annullata", badge: "text-bg-secondary" };
+  const due = String(dueDate ?? "").slice(0, 10);
+  if (due !== "" && due < todayIso()) return { key: "overdue", label: "Scaduta", badge: "text-bg-danger" };
+  return { key: "pending", label: "Da incassare", badge: "text-bg-warning" };
+}
+
+// Port of SaleInstallments::paymentTypeLabel() + normalizePaymentType() (~lines 240-278).
+function installmentPaymentTypeLabel(raw: string): string {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (["cash", "contanti"].includes(v)) return "Contanti";
+  if (["card", "carta", "carta_credito", "carta di credito", "carta-di-credito"].includes(v)) return "Carta di Credito";
+  if (["check", "assegno"].includes(v)) return "Assegno";
+  if (["bank", "bank_transfer", "bank transfer", "bonifico", "bonifico bancario", "wire", "transfer"].includes(v)) return "Bonifico";
+  return "";
+}
+
+// Port of SaleInstallments::intervalLabel() (~lines 288-294).
+function installmentIntervalLabel(unit: string, value: number): string {
+  const u = String(unit ?? "").trim().toLowerCase();
+  const v = Math.max(1, Number(value ?? 1));
+  if (u === "day") return `${v} ${v === 1 ? "giorno" : "giorni"}`;
+  if (u === "week") return `${v} ${v === 1 ? "settimana" : "settimane"}`;
+  return `${v} ${v === 1 ? "mese" : "mesi"}`;
 }
 
 function installmentPlanStatus(status: string, total: number, paid: number, installments: Installment[]): InstallmentPlanStatus {

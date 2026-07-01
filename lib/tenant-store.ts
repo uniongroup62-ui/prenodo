@@ -511,21 +511,43 @@ export type InstallmentPlanStatus = "active" | "completed" | "cancelled";
 
 export type Installment = {
   id: number;
+  installmentNo: number;
   dueDate: string;
   amount: number;
+  paidAmount?: number;
+  paymentType?: string;
+  note?: string;
   status: InstallmentStatus;
+  statusLabel: string;
+  statusBadge: string;
   paidAt?: string;
 };
 
 export type InstallmentPlan = {
   id: number;
   saleId: number;
+  saleDate?: string;
   clientId: number;
   clientName: string;
   total: number;
   paid: number;
   status: InstallmentPlanStatus;
+  statusLabel: string;
+  statusBadge: string;
   installments: Installment[];
+  paidCount: number;
+  pendingCount: number;
+  overdueCount: number;
+  remaining: number;
+  collected: number;
+  nextDueDate?: string;
+  nextDueAmount?: number;
+  downPayment: number;
+  paymentType: string;
+  intervalLabel: string;
+  notes?: string;
+  cancelledReason?: string;
+  cancelledAt?: string;
   createdAt: string;
 };
 
