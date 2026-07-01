@@ -7,6 +7,7 @@ import { ClientFormContent } from "@/components/modules/client_form-content";
 import { ClientDetailContent } from "@/components/modules/client_detail-content";
 import { CommissionsContent } from "@/components/modules/commissions-content";
 import { CostsContent } from "@/components/modules/costs-content";
+import { CostCategoriesContent } from "@/components/modules/cost_categories-content";
 import { CostFormContent } from "@/components/modules/cost_form-content";
 import { CouponsContent } from "@/components/modules/coupons-content";
 import { CouponFormContent } from "@/components/modules/coupon_form-content";
@@ -139,6 +140,7 @@ const FAITHFUL_MODULES: Record<string, React.ComponentType<{ slug?: string }>> =
   quote_settings: QuoteSettingsContent,
   services: ServicesContent,
   service_categories: ServiceCategoriesContent,
+  cost_categories: CostCategoriesContent,
   service_recommendations: ServiceRecommendationsContent,
   packages: PackagesContent,
   package_settings: PackageSettingsContent,
