@@ -580,6 +580,15 @@ export function PosContent() {
   const [appointmentSaleCode, setAppointmentSaleCode] = useState("");
   const appointmentPreloadRef = useRef(false);
 
+  // "Vendita da preventivo": when the POS is opened with ?quote=<id> the cart is pre-loaded from
+  // that quote's CLIENT + LINES (action=quote_cart) at the quote's snapshot prices. The id is
+  // remembered so handleCheckout sends source_quote_id (linking the sale + flipping the quote to
+  // 'converted' server-side); the code drives the "Vendita da preventivo #<code>" banner. Reset on
+  // a successful checkout. (Full cart-lock — disabling tiles/coupon/promo — is a later refinement.)
+  const [quoteSaleId, setQuoteSaleId] = useState(0);
+  const [quoteSaleCode, setQuoteSaleCode] = useState("");
+  const quotePreloadRef = useRef(false);
+
   const successTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(() => {
@@ -676,6 +685,78 @@ export function PosContent() {
       )
       .catch(() => {
         // degrade to an empty POS — the staff can still build the sale manually.
+      });
+    return () => {
+      active = false;
+    };
+    // Runs once on mount; slug is stable for the page lifetime.
+  }, [slug]);
+
+  // "Vendita da preventivo" pre-load (mount-once): when the POS URL carries ?quote=<id>, fetch the
+  // quote's CLIENT + LINES (GET action=quote_cart) and seed the cart — each quote line as a cart
+  // line of its own type at the quote's snapshot price. The quote id is remembered so handleCheckout
+  // sends source_quote_id (the sale links to the quote + the quote flips to 'converted'). Guard ref
+  // makes it run once; a missing/converted quote degrades to an empty POS (no banner). Mirrors the
+  // ?appointment= pre-load above.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (quotePreloadRef.current) return;
+    const rawId = new URLSearchParams(window.location.search).get("quote");
+    const quoteId = Math.max(0, Number.parseInt(String(rawId ?? ""), 10) || 0);
+    if (quoteId <= 0) {
+      quotePreloadRef.current = true;
+      return;
+    }
+    quotePreloadRef.current = true;
+    let active = true;
+    fetch(`/api/manage/pos?slug=${encodeURIComponent(slug)}&action=quote_cart&quote_id=${quoteId}`, {
+      headers: { "x-tenant-slug": slug },
+    })
+      .then((r) => r.json())
+      .then(
+        (j: {
+          ok?: boolean;
+          quoteId?: number;
+          code?: string | null;
+          clientId?: number;
+          clientName?: string;
+          items?: Array<{ type?: string; refId?: number; name?: string; unitPrice?: number; quantity?: number }>;
+        }) => {
+          if (!active) return;
+          if (j?.ok === false || !j) return; // degrade to an empty POS
+          const qId = Math.max(0, Number(j?.quoteId ?? quoteId) || 0);
+          if (qId <= 0) return;
+          const cId = Math.max(0, Number(j?.clientId ?? 0) || 0);
+          if (cId > 0) selectClient(cId, String(j?.clientName ?? "").trim());
+          const lines = Array.isArray(j?.items) ? j.items : [];
+          if (lines.length > 0) {
+            setCart((prev) => {
+              const next = prev.map((l) => ({ ...l }));
+              for (const line of lines) {
+                const type = String(line?.type ?? "service") as CartLine["type"];
+                const refId = Math.max(0, Number(line?.refId ?? 0) || 0);
+                const quantity = Math.max(1, Math.round(Number(line?.quantity ?? 1) || 1));
+                const unitPrice = roundMoney(Math.max(0, Number(line?.unitPrice ?? 0) || 0));
+                const status: CartLine["status"] = type === "product" ? "collected" : type === "service" ? "executed" : "prepaid";
+                next.push({
+                  key: `${Date.now()}-${Math.floor(Math.random() * 1000)}-${refId}`,
+                  type,
+                  refId,
+                  name: String(line?.name ?? "Riga preventivo"),
+                  quantity: Math.min(1000, quantity),
+                  unitPrice,
+                  status,
+                });
+              }
+              return next;
+            });
+          }
+          setQuoteSaleId(qId);
+          setQuoteSaleCode(j?.code && String(j.code).trim() ? String(j.code).trim() : `#${qId}`);
+        },
+      )
+      .catch(() => {
+        // degrade to an empty POS
       });
     return () => {
       active = false;
@@ -1597,6 +1678,9 @@ export function PosContent() {
       // 'done' (checkoutManageSale sets appointments.status='done' when appointment_id>0) and
       // stamps "Appuntamento #<id>" on the sale notes. 0 for a normal POS sale.
       appointment_id: appointmentSaleId > 0 ? appointmentSaleId : 0,
+      // "Vendita da preventivo": link the sale to the source quote so the backend sets
+      // sales.source_quote_id + flips the quote to 'converted'. 0 for a normal POS sale.
+      source_quote_id: quoteSaleId > 0 ? quoteSaleId : 0,
       notes: notes.trim(),
       // RATEIZZAZIONE: when a rate plan is active (mode installment + client + count >= 2),
       // send the plan params as JSON. The backend writes the sale_installment_plans row + N
@@ -1677,6 +1761,10 @@ export function PosContent() {
       // now marked 'done' server-side). A fresh ?appointment= visit re-seeds on a new mount.
       setAppointmentSaleId(0);
       setAppointmentSaleCode("");
+      // The sale is no longer "da preventivo": clear the link + banner (the quote is now
+      // 'converted' server-side). A fresh ?quote= visit re-seeds on a new mount.
+      setQuoteSaleId(0);
+      setQuoteSaleCode("");
       setSuccessMsg(`Vendita conclusa${saleCode}.`);
       if (successTimer.current) clearTimeout(successTimer.current);
       successTimer.current = setTimeout(() => setSuccessMsg(""), 6000);
@@ -1731,6 +1819,18 @@ export function PosContent() {
           <i className="bi bi-calendar-check"></i>
           <span>
             Vendita da appuntamento <strong>{appointmentSaleCode}</strong> — concludendo la vendita l&apos;appuntamento verrà segnato come eseguito.
+          </span>
+        </div>
+      ) : null}
+
+      {/* "Vendita da preventivo" banner: shown when the POS was opened with ?quote=<id> and the cart
+          was pre-loaded from that quote. The checkout sends source_quote_id, so concluding the sale
+          links it (sales.source_quote_id) + flips the quote to 'converted'. */}
+      {quoteSaleId > 0 ? (
+        <div className="alert alert-info d-flex align-items-center gap-2" id="posQuoteBanner">
+          <i className="bi bi-file-earmark-text"></i>
+          <span>
+            Vendita da preventivo <strong>{quoteSaleCode}</strong> — concludendo la vendita il preventivo verrà segnato come convertito.
           </span>
         </div>
       ) : null}

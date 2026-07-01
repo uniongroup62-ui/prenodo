@@ -280,6 +280,17 @@ export function QuotesContent() {
                           <a className="btn btn-sm btn-outline-secondary" href={href(`&action=view&id=${q.id}`)}>
                             Apri
                           </a>{" "}
+                          {q.status !== "converted" ? (
+                            <>
+                              <a
+                                className="btn btn-sm btn-success"
+                                href={`/${encodeURIComponent(slug)}/pos?quote=${q.id}`}
+                                title="Carica il preventivo in cassa e incassa"
+                              >
+                                Incassa
+                              </a>{" "}
+                            </>
+                          ) : null}
                           <a
                             className="btn btn-sm btn-outline-danger"
                             href={href(`&action=delete&id=${q.id}`)}
