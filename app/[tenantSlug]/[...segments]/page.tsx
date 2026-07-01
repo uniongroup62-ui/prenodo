@@ -5,6 +5,7 @@ import { ManageShell } from "@/components/manage-shell";
 import { ClientsContent } from "@/components/modules/clients-content";
 import { ClientFormContent } from "@/components/modules/client_form-content";
 import { ClientDetailContent } from "@/components/modules/client_detail-content";
+import { ClientHistoryContent } from "@/components/modules/client_history-content";
 import { CommissionsContent } from "@/components/modules/commissions-content";
 import { CommissionsSettingsContent } from "@/components/modules/commissions_settings-content";
 import { CostsContent } from "@/components/modules/costs-content";
@@ -366,6 +367,17 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ClientDetailContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful client STORICO ("Vedi tutto" / action=history): the deep per-status
+  // appointment lists + active packages/giftboxes/giftcards + quotes/sales,
+  // instead of the Tailwind ManagementApp fallback.
+  if (page === "clients" && query.action === "history") {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <ClientHistoryContent />
       </ManageShell>
     );
   }

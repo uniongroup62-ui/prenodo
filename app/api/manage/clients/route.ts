@@ -9,6 +9,7 @@ import {
   getDbClient,
   getManageClientDeleteSummary,
   getManageClientDetail,
+  getManageClientHistory,
   listDbClients,
   quickBookClientContext,
   quickBookClientResidualsDetail,
@@ -120,6 +121,21 @@ export async function GET(request: Request) {
       return Response.json({ ok: true, sourceMode: "database", ...detail });
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : "Errore dettaglio cliente.");
+    }
+  }
+
+  // Faithful client STORICO (action=history) reader. Port of clients.php
+  // action=history: per-status appointment lists + active packages/giftboxes/
+  // giftcards + last 10 quotes/sales + summary counts.
+  if (url.searchParams.get("action") === "history") {
+    const clientId = parseInteger(url.searchParams.get("id"));
+    if (clientId <= 0) return jsonError("ID cliente mancante.");
+    try {
+      const history = await getManageClientHistory(tenantSlug, clientId);
+      if (!history) return jsonError("Cliente non trovato.", 404);
+      return Response.json({ ok: true, sourceMode: "database", ...history });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : "Errore storico cliente.");
     }
   }
 

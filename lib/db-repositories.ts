@@ -881,6 +881,236 @@ export async function removeManageClientTag(slug: string, clientId: number, tagI
   return getDbClientTags(slug, clientId);
 }
 
+// ---- Client STORICO (action=history) — the deep per-table drilldown ----------
+export type ClientHistoryAppt = {
+  id: number;
+  startsAt: string;
+  statusKey: string;
+  statusLabel: string;
+  statusBadge: string;
+  serviceNames: string;
+  staffNames: string;
+  subtotal: number;
+  discountAmount: number;
+  totalNet: number;
+};
+export type ClientHistorySale = { id: number; saleDate: string; total: number; purchasedItem: string };
+export type ClientHistoryQuote = { id: number; number: string; quoteDate: string; validUntil: string; total: number; status: string };
+export type ManageClientHistory = {
+  client: ManagedClient;
+  summary: { total: number; done: number; scheduled: number; pending: number; canceled: number; lastVisit: string | null; nextVisit: string | null };
+  scheduledAppts: ClientHistoryAppt[];
+  doneAppts: ClientHistoryAppt[];
+  canceledAppts: ClientHistoryAppt[];
+  packages: QuickBookResidualPackageDetail[];
+  giftboxes: QuickBookResidualGiftboxDetail[];
+  giftcards: QuickBookResidualGiftcardDetail[];
+  quotes: ClientHistoryQuote[];
+  sales: ClientHistorySale[];
+  salesTotal: number;
+};
+
+// Normalize an appointment status to the legacy history buckets (client_history_appt_status_sql).
+function clientHistoryStatusKey(raw: unknown): "done" | "scheduled" | "pending" | "canceled" | "no_show" {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (["done", "completato", "completed", "concluso"].includes(s)) return "done";
+  if (["canceled", "cancelled", "annullato"].includes(s)) return "canceled";
+  if (["no_show", "no show", "noshow"].includes(s)) return "no_show";
+  if (["scheduled", "confermato", "confirmed", "prenotato"].includes(s)) return "scheduled";
+  return "pending";
+}
+function clientHistoryStatusMeta(key: string): { label: string; badge: string } {
+  switch (key) {
+    case "done": return { label: "Completato", badge: "bg-success" };
+    case "scheduled": return { label: "Confermato", badge: "bg-primary" };
+    case "canceled": return { label: "Annullato", badge: "bg-danger" };
+    case "no_show": return { label: "No show", badge: "bg-secondary" };
+    default: return { label: "In attesa", badge: "bg-warning text-dark" };
+  }
+}
+
+// Full client STORICO (port of clients.php action=history): per-status appointment
+// lists (scheduled/done/canceled, ≤10 each with service + staff names, subtotal,
+// discount, net), active packages/giftboxes/giftcards (reused from the residuals
+// detail), the last 10 quotes + sales, and the summary counts. All reads are
+// tenant-scoped + client-filtered; the appointment service/staff names are joined
+// in memory (no cross-tenant raw joins).
+export async function getManageClientHistory(slug: string, clientId: number): Promise<ManageClientHistory | null> {
+  if (clientId <= 0) return null;
+  const client = await getDbClient(clientId, slug);
+  if (!client) return null;
+
+  const SECTION_LIMIT = 10;
+
+  // --- Appointments (all for the client) + in-memory service/staff resolution ---
+  const apptRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, starts_at, status, discount_type, discount_value, service_id",
+    where: "client_id = ?",
+    params: [clientId],
+    orderBy: "starts_at DESC, id DESC",
+    limit: 500,
+  }).catch(() => [] as RowDataPacket[]);
+  const apptIds = apptRows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+
+  const svcByAppt = new Map<number, { names: string[]; subtotal: number }>();
+  const staffIdByAppt = new Map<number, Set<number>>();
+  const staffIds = new Set<number>();
+  if (apptIds.length > 0) {
+    const ph = apptIds.map(() => "?").join(",");
+    const svcRows = await tenantSelect<RowDataPacket>({ slug, table: "appointment_services", columns: "appointment_id, service_name, price, qty", where: `appointment_id IN (${ph})`, params: apptIds }).catch(() => [] as RowDataPacket[]);
+    for (const r of svcRows) {
+      const aid = Number(r.appointment_id ?? 0);
+      if (aid <= 0) continue;
+      const entry = svcByAppt.get(aid) ?? { names: [], subtotal: 0 };
+      const nm = String(r.service_name ?? "").trim();
+      if (nm !== "" && !entry.names.includes(nm)) entry.names.push(nm);
+      entry.subtotal += Math.max(0, Number(r.price ?? 0)) * Math.max(1, Number(r.qty ?? 1));
+      svcByAppt.set(aid, entry);
+    }
+    const staffRows = await tenantSelect<RowDataPacket>({ slug, table: "appointment_staff", columns: "appointment_id, staff_id", where: `appointment_id IN (${ph})`, params: apptIds }).catch(() => [] as RowDataPacket[]);
+    for (const r of staffRows) {
+      const aid = Number(r.appointment_id ?? 0);
+      const sid = Number(r.staff_id ?? 0);
+      if (aid <= 0 || sid <= 0) continue;
+      const set = staffIdByAppt.get(aid) ?? new Set<number>();
+      set.add(sid);
+      staffIdByAppt.set(aid, set);
+      staffIds.add(sid);
+    }
+  }
+  const staffName = new Map<number, string>();
+  if (staffIds.size > 0) {
+    const ids = Array.from(staffIds);
+    const ph = ids.map(() => "?").join(",");
+    const rows = await tenantSelect<RowDataPacket>({ slug, table: "staff", columns: "id, full_name", where: `id IN (${ph})`, params: ids }).catch(() => [] as RowDataPacket[]);
+    for (const r of rows) staffName.set(Number(r.id ?? 0), String(r.full_name ?? ""));
+  }
+
+  const now = Date.now();
+  let done = 0, scheduled = 0, pending = 0, canceled = 0;
+  let lastVisit: string | null = null;
+  let nextVisit: string | null = null;
+  const scheduledAppts: ClientHistoryAppt[] = [];
+  const doneAppts: ClientHistoryAppt[] = [];
+  const canceledAppts: ClientHistoryAppt[] = [];
+
+  for (const r of apptRows) {
+    const id = Number(r.id ?? 0);
+    const startsAt = toIso(r.starts_at);
+    const key = clientHistoryStatusKey(r.status);
+    if (key === "done") done++;
+    else if (key === "scheduled") scheduled++;
+    else if (key === "pending") pending++;
+    else if (key === "canceled" || key === "no_show") canceled++;
+
+    const startMs = new Date(startsAt).getTime();
+    if (Number.isFinite(startMs)) {
+      if (startMs < now && (lastVisit === null || startMs > new Date(lastVisit).getTime())) lastVisit = startsAt;
+      if (startMs >= now && (key === "pending" || key === "scheduled") && (nextVisit === null || startMs < new Date(nextVisit).getTime())) nextVisit = startsAt;
+    }
+
+    const svc = svcByAppt.get(id) ?? { names: [], subtotal: 0 };
+    const subtotal = roundMoney(svc.subtotal);
+    let discountAmount = 0;
+    const dtype = String(r.discount_type ?? "");
+    const dval = Number(r.discount_value ?? 0);
+    if (dval > 0) {
+      if (dtype === "percent") discountAmount = subtotal * (dval / 100);
+      else if (dtype === "fixed") discountAmount = dval;
+      discountAmount = Math.min(Math.max(0, discountAmount), subtotal);
+    }
+    const staffNames = Array.from(staffIdByAppt.get(id) ?? []).map((sid) => staffName.get(sid) ?? "").filter((n) => n !== "").join(", ");
+    const meta = clientHistoryStatusMeta(key);
+    const row: ClientHistoryAppt = {
+      id,
+      startsAt,
+      statusKey: key,
+      statusLabel: meta.label,
+      statusBadge: meta.badge,
+      serviceNames: svc.names.length > 0 ? svc.names.join(", ") : "(nessun servizio)",
+      staffNames,
+      subtotal,
+      discountAmount: roundMoney(discountAmount),
+      totalNet: roundMoney(Math.max(0, subtotal - discountAmount)),
+    };
+    if (key === "done" && doneAppts.length < SECTION_LIMIT) doneAppts.push(row);
+    else if ((key === "pending" || key === "scheduled") && scheduledAppts.length < SECTION_LIMIT) scheduledAppts.push(row);
+    else if ((key === "canceled" || key === "no_show") && canceledAppts.length < SECTION_LIMIT) canceledAppts.push(row);
+  }
+
+  // --- Active packages/giftboxes/giftcards (reuse the residuals detail) ---
+  const residuals = await quickBookClientResidualsDetail(slug, clientId).catch(() => null);
+
+  // --- Sales (last 10, non-cancelled) + purchased-item summary + total ---
+  const saleRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "sales",
+    columns: "id, sale_date, total, notes, status",
+    where: "client_id = ? AND (status IS NULL OR status NOT IN ('cancelled','canceled'))",
+    params: [clientId],
+    orderBy: "sale_date DESC, id DESC",
+    limit: SECTION_LIMIT,
+  }).catch(() => [] as RowDataPacket[]);
+  const saleIds = saleRows.map((r) => Number(r.id ?? 0)).filter((n) => n > 0);
+  const itemsBySale = new Map<number, string[]>();
+  if (saleIds.length > 0) {
+    const ph = saleIds.map(() => "?").join(",");
+    const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "sale_items", columns: "sale_id, item_name, qty, id", where: `sale_id IN (${ph})`, params: saleIds, orderBy: "id ASC" }).catch(() => [] as RowDataPacket[]);
+    for (const r of itemRows) {
+      const sid = Number(r.sale_id ?? 0);
+      if (sid <= 0) continue;
+      const arr = itemsBySale.get(sid) ?? [];
+      const qty = Number(r.qty ?? 0);
+      const nm = String(r.item_name ?? "").trim();
+      if (nm !== "") arr.push(qty > 1 ? `${qty}x ${nm}` : nm);
+      itemsBySale.set(sid, arr);
+    }
+  }
+  const sales: ClientHistorySale[] = saleRows.map((r) => {
+    const id = Number(r.id ?? 0);
+    const items = itemsBySale.get(id) ?? [];
+    const fallback = String(r.notes ?? "").trim();
+    return { id, saleDate: toIso(r.sale_date), total: roundMoney(Number(r.total ?? 0)), purchasedItem: items.length > 0 ? items.join(", ") : fallback !== "" ? fallback : "—" };
+  });
+  const salesTotalRows = await tenantSelect<RowDataPacket>({ slug, table: "sales", columns: "total", where: "client_id = ? AND (status IS NULL OR status NOT IN ('cancelled','canceled'))", params: [clientId] }).catch(() => [] as RowDataPacket[]);
+  const salesTotal = roundMoney(salesTotalRows.reduce((sum, r) => sum + Number(r.total ?? 0), 0));
+
+  // --- Quotes (last 10) ---
+  const quoteRows = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "quotes",
+    columns: "id, number, quote_date, valid_until, total, status",
+    where: "client_id = ?",
+    params: [clientId],
+    orderBy: "quote_date DESC, id DESC",
+    limit: SECTION_LIMIT,
+  }).catch(() => [] as RowDataPacket[]);
+  const quotes: ClientHistoryQuote[] = quoteRows.map((r) => ({
+    id: Number(r.id ?? 0),
+    number: String(r.number ?? ""),
+    quoteDate: r.quote_date ? toIso(r.quote_date) : "",
+    validUntil: r.valid_until ? toIso(r.valid_until) : "",
+    total: roundMoney(Number(r.total ?? 0)),
+    status: String(r.status ?? ""),
+  }));
+
+  return {
+    client,
+    summary: { total: apptRows.length, done, scheduled, pending, canceled, lastVisit, nextVisit },
+    scheduledAppts,
+    doneAppts,
+    canceledAppts,
+    packages: residuals?.packages ?? [],
+    giftboxes: residuals?.giftboxes ?? [],
+    giftcards: residuals?.giftcards ?? [],
+    quotes,
+    sales,
+    salesTotal,
+  };
+}
+
 export type ManageClientDetail = {
   client: ManagedClient;
   fidelity: { points: number; creditBalance: number };
