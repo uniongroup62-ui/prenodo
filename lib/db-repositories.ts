@@ -9168,6 +9168,337 @@ export async function deleteFidelityCampaign(slug: string, id: number, by: numbe
   return { ok: true, mode: "soft" };
 }
 
+// ---- Fidelity MEMBERSHIP / cards (fidelity_membership.php) ---------------------
+export type FidelityCard = {
+  id: number;
+  code: string;
+  clientId: number;
+  clientName: string;
+  clientEmail: string;
+  issuedAt: string;
+  expiresAt: string;
+  status: string;
+  expired: boolean;
+};
+export type FidelityCardValidity = { enabled: boolean; value: number; unit: string; defaultExpiresAt: string };
+export type FidelityMembershipData = {
+  fidelityEnabled: boolean;
+  cards: FidelityCard[];
+  total: number;
+  expiredCount: number;
+  validity: FidelityCardValidity;
+};
+
+// Card validity config from businesses.fidelity_adhesion_json (port of
+// fidelity_card_default_validity_config). enabled = card_expiry_enabled (or value>0).
+function parseCardValidityConfig(raw: unknown): { enabled: boolean; value: number; unit: string } {
+  const s = String(raw ?? "").trim();
+  let data: Record<string, unknown> = {};
+  if (s !== "") { try { const p = JSON.parse(s); if (p && typeof p === "object" && !Array.isArray(p)) data = p as Record<string, unknown>; } catch { data = {}; } }
+  let value = Math.max(0, Math.trunc(Number(data.card_default_validity_value ?? 0) || 0));
+  if (value > 36500) value = 36500;
+  let unit = String(data.card_default_validity_unit ?? "days").toLowerCase();
+  if (!["days", "months", "years"].includes(unit)) unit = "days";
+  const enabled = Object.prototype.hasOwnProperty.call(data, "card_expiry_enabled") ? truthyFlag(data.card_expiry_enabled) : value > 0;
+  return { enabled, value: enabled ? value : 0, unit };
+}
+
+function truthyFlag(v: unknown): boolean {
+  return ["1", "true", "on", "yes"].includes(String(v ?? "").toLowerCase());
+}
+
+// Add a card duration to a Y-m-d date (port of fidelity_card_add_duration_ymd:
+// months/years clamp the day-of-month, days is a plain calendar add).
+function addMonthsClampedYmd(baseYmd: string, months: number): string {
+  const [y, m, d] = baseYmd.split("-").map((p) => Number.parseInt(p, 10));
+  const total = y * 12 + (m - 1) + months;
+  const ny = Math.floor(total / 12);
+  const nm = ((total % 12) + 12) % 12; // 0-11
+  const daysInMonth = new Date(Date.UTC(ny, nm + 1, 0)).getUTCDate();
+  const nd = Math.min(d, daysInMonth);
+  return `${String(ny).padStart(4, "0")}-${String(nm + 1).padStart(2, "0")}-${String(nd).padStart(2, "0")}`;
+}
+
+function addCardDuration(baseYmd: string, value: number, unit: string): string {
+  if (unit === "months") return addMonthsClampedYmd(baseYmd, value);
+  if (unit === "years") return addMonthsClampedYmd(baseYmd, value * 12);
+  const [y, m, d] = baseYmd.split("-").map((p) => Number.parseInt(p, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + value);
+  return dt.toISOString().slice(0, 10);
+}
+
+// Default card expiry from an issue date (port of fidelity_card_default_expires_at):
+// null when expiry is disabled / no validity configured.
+function cardDefaultExpiresAt(cfg: { enabled: boolean; value: number; unit: string }, baseYmd: string): string | null {
+  if (!cfg.enabled || cfg.value <= 0) return null;
+  const base = normalizeClientDate(baseYmd) ?? todayIso();
+  return addCardDuration(base, cfg.value, cfg.unit);
+}
+
+// Port of fidelity_card_code_normalize: strip whitespace, cut to 20 chars.
+function normalizeCardCode(raw: unknown): string {
+  return String(raw ?? "").trim().replace(/\s+/g, "").slice(0, 20);
+}
+
+// Permanent anti-reuse check (port of fidelity_card_code_ever_used): the code is
+// "used" if a live card carries it OR it sits in the tenant's card_code_registry.
+async function cardCodeEverUsed(slug: string, normalizedCode: string): Promise<boolean> {
+  if (normalizedCode === "") return true;
+  const norm = normalizedCode.toUpperCase();
+  const inCards = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id", where: "code = ?", params: [normalizedCode], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  if (inCards.length > 0) return true;
+  const inReg = await tenantSelect<RowDataPacket>({ slug, table: "card_code_registry", columns: "id", where: "normalized_code = ?", params: [norm], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  return inReg.length > 0;
+}
+
+// Highest numeric code across live cards + the registry (port of fidelity_card_code_max_numeric).
+async function cardCodeMaxNumeric(slug: string): Promise<number> {
+  const cards = await tenantTable(slug, "cards");
+  const reg = await tenantTable(slug, "card_code_registry");
+  const tid = cards.tenantId ?? 0;
+  let max = 0;
+  const r1 = await dbQuery<RowDataPacket[]>(`SELECT COALESCE(MAX(code::bigint),0) m FROM ${quoteIdentifier(cards.name)} WHERE tenant_id = ? AND code ~ '^[0-9]+$'`, [tid]).catch(() => [] as RowDataPacket[]);
+  max = Math.max(max, Number(r1[0]?.m ?? 0));
+  const r2 = await dbQuery<RowDataPacket[]>(`SELECT COALESCE(MAX(normalized_code::bigint),0) m FROM ${quoteIdentifier(reg.name)} WHERE tenant_id = ? AND normalized_code ~ '^[0-9]+$'`, [tid]).catch(() => [] as RowDataPacket[]);
+  max = Math.max(max, Number(r2[0]?.m ?? 0));
+  return max;
+}
+
+// Reserve/remember a code in the permanent registry so it can never be reused,
+// even after the card is deleted (port of the registry reserve/remember helpers).
+async function rememberCardCode(slug: string, normalizedCode: string, cardId: number, clientId: number, source: string, note: string): Promise<void> {
+  if (normalizedCode === "") return;
+  const norm = normalizedCode.toUpperCase();
+  const existing = await tenantSelect<RowDataPacket>({ slug, table: "card_code_registry", columns: "id", where: "normalized_code = ?", params: [norm], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  if (existing.length > 0) {
+    await tenantUpdate({ slug, table: "card_code_registry", id: Number(existing[0].id), values: { last_seen_at: new Date(), card_id: cardId > 0 ? cardId : null, client_id: clientId > 0 ? clientId : null } }).catch(() => 0);
+    return;
+  }
+  await tenantInsert(await tenantTable(slug, "card_code_registry"), {
+    code: normalizedCode,
+    normalized_code: norm,
+    card_id: cardId > 0 ? cardId : null,
+    client_id: clientId > 0 ? clientId : null,
+    first_seen_at: new Date(),
+    last_seen_at: new Date(),
+    source,
+    note: note || null,
+  });
+}
+
+// Restore + clear the Fidelity benefits reserved on a single client's pending/
+// scheduled appointments (per-client port of fidelity_card_release_pending_
+// appointment_discounts_for_clients). Returns the number of appointments touched.
+async function releasePendingAppointmentFidelityForClient(slug: string, clientId: number): Promise<number> {
+  if (clientId <= 0) return 0;
+  const linked = await tenantSelect<RowDataPacket>({
+    slug,
+    table: "appointments",
+    columns: "id, fidelity_points_used, fidelity_gift_points_used",
+    where: "client_id = ? AND status IN ('pending','scheduled') AND (COALESCE(fidelity_points_used,0) > 0 OR COALESCE(fidelity_discount,0) > 0 OR COALESCE(fidelity_gift_points_used,0) > 0 OR COALESCE(fidelity_gift_idx,0) > 0 OR COALESCE(fidelity_conflict_choice,'') <> '')",
+    params: [clientId],
+  }).catch(() => [] as RowDataPacket[]);
+  for (const appt of linked) {
+    const restore = Math.max(0, Math.round(Number(appt.fidelity_points_used ?? 0))) + Math.max(0, Math.round(Number(appt.fidelity_gift_points_used ?? 0)));
+    if (restore > 0) {
+      const clients = await tenantTable(slug, "clients");
+      await dbExecute(`UPDATE ${quoteIdentifier(clients.name)} SET points = COALESCE(points,0) + ? WHERE id = ? AND tenant_id = ?`, [restore, clientId, clients.tenantId ?? 0]).catch(() => undefined);
+    }
+    await tenantUpdate({ slug, table: "appointments", id: Number(appt.id), values: { fidelity_points_used: 0, fidelity_discount: 0, fidelity_gift_points_used: 0, fidelity_gift_idx: null, fidelity_conflict_choice: "", fidelity_campaign_id: null } }).catch(() => 0);
+  }
+  return linked.length;
+}
+
+// List the Fidelity cards + validity config (port of the fidelity_membership.php list).
+export async function getFidelityMembership(slug: string, q: string): Promise<FidelityMembershipData> {
+  const fidelityEnabled = await getFidelityEnabled(slug);
+  const bizRows = await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_adhesion_json", orderBy: "id ASC", limit: 1 });
+  const cfg = parseCardValidityConfig(bizRows[0]?.fidelity_adhesion_json);
+  const today = todayIso();
+
+  const cardRows = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id, code, client_id, issued_at, expires_at, status", orderBy: "id DESC", limit: 500 }).catch(() => [] as RowDataPacket[]);
+  const clientIds = [...new Set(cardRows.map((r) => Number(r.client_id ?? 0)).filter((n) => n > 0))];
+  const clientMap = new Map<number, { name: string; email: string }>();
+  if (clientIds.length > 0) {
+    const placeholders = clientIds.map(() => "?").join(",");
+    const clientRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, full_name, email", where: `id IN (${placeholders})`, params: clientIds }).catch(() => [] as RowDataPacket[]);
+    for (const c of clientRows) clientMap.set(Number(c.id), { name: String(c.full_name ?? ""), email: String(c.email ?? "") });
+  }
+
+  const term = q.trim().toLowerCase();
+  let cards: FidelityCard[] = cardRows.map((r) => {
+    const clientId = Number(r.client_id ?? 0);
+    const client = clientMap.get(clientId) ?? { name: "", email: "" };
+    const expiresAt = normalizeClientDate(typeof r.expires_at === "string" ? r.expires_at : r.expires_at ? dateIsoLocal(new Date(String(r.expires_at))) : "") ?? "";
+    const issuedAt = normalizeClientDate(typeof r.issued_at === "string" ? r.issued_at : r.issued_at ? dateIsoLocal(new Date(String(r.issued_at))) : "") ?? "";
+    return {
+      id: Number(r.id ?? 0),
+      code: String(r.code ?? ""),
+      clientId,
+      clientName: client.name,
+      clientEmail: client.email,
+      issuedAt,
+      expiresAt,
+      status: String(r.status ?? "active"),
+      expired: expiresAt !== "" && expiresAt < today,
+    };
+  });
+  if (term !== "") {
+    cards = cards.filter((c) => c.code.toLowerCase().includes(term) || c.clientName.toLowerCase().includes(term) || c.clientEmail.toLowerCase().includes(term));
+  }
+
+  return {
+    fidelityEnabled,
+    cards,
+    total: cards.length,
+    expiredCount: cards.filter((c) => c.expired).length,
+    validity: { enabled: cfg.enabled, value: cfg.value, unit: cfg.unit, defaultExpiresAt: cardDefaultExpiresAt(cfg, today) ?? "" },
+  };
+}
+
+// Issue a card (port of fidelity_membership.php create_card).
+export async function issueFidelityCard(slug: string, body: Record<string, string>): Promise<{ ok: true; code: string; cardId: number }> {
+  if (!(await getFidelityEnabled(slug))) throw new Error("Attiva prima la Fidelity per gestire le tessere.");
+  const clientId = Math.trunc(Number(String(body.client_id ?? "").trim())) || 0;
+  if (clientId <= 0) throw new Error("Seleziona un cliente.");
+
+  const clientRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, credit_balance", where: "id = ?", params: [clientId], limit: 1 });
+  if (!clientRows[0]) throw new Error("Cliente non trovato.");
+
+  const already = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id", where: "client_id = ?", params: [clientId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  if (already.length > 0) throw new Error("Questo cliente ha già una tessera.");
+
+  const rawCode = String(body.code ?? "");
+  let code = normalizeCardCode(rawCode);
+  if (rawCode.trim() !== "" && code === "") throw new Error("Codice tessera non valido.");
+  if (code !== "" && (await cardCodeEverUsed(slug, code))) {
+    throw new Error("Codice tessera gia utilizzato in passato. Anche se la tessera e stata eliminata, il codice non puo essere riutilizzato.");
+  }
+
+  const cfg = parseCardValidityConfig((await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_adhesion_json", orderBy: "id ASC", limit: 1 }))[0]?.fidelity_adhesion_json);
+  const today = todayIso();
+  const issuedAt = normalizeClientDate(body.issued_at) ?? today;
+  const expiresAt = cardDefaultExpiresAt(cfg, issuedAt);
+
+  let status = String(body.status ?? "active").trim().toLowerCase();
+  if (!["active", "inactive"].includes(status)) status = "active";
+  if (status === "active" && expiresAt !== null && expiresAt < today) {
+    const [y, m, d] = expiresAt.split("-");
+    throw new Error(`Con la Data emissione selezionata la tessera risulta già scaduta (${d}/${m}/${y}). Scegli una data più recente oppure crea la tessera come Disattiva.`);
+  }
+
+  // Generate a numeric progressive code when left blank.
+  if (code === "") {
+    let next = Math.max(0, await cardCodeMaxNumeric(slug)) + 1;
+    let tries = 0;
+    for (;;) {
+      code = String(next).padStart(6, "0");
+      if (!(await cardCodeEverUsed(slug, code))) break;
+      next += 1;
+      tries += 1;
+      if (tries >= 10000) throw new Error("Impossibile generare un codice tessera univoco. Inserisci un codice manuale mai usato.");
+    }
+  }
+
+  const credit = roundMoney(Number(clientRows[0].credit_balance ?? 0) || 0);
+  // Reserve the code in the permanent registry BEFORE creating the card, then attach.
+  await rememberCardCode(slug, code, 0, clientId, "card_create", "");
+  const cardId = await tenantInsert(await tenantTable(slug, "cards"), {
+    code,
+    client_id: clientId,
+    issued_at: issuedAt,
+    expires_at: expiresAt,
+    status,
+    credit: credit > 0 ? credit : 0,
+  });
+  await rememberCardCode(slug, code, cardId, clientId, "card_create", "");
+
+  return { ok: true, code, cardId };
+}
+
+// Update a card's status (port of fidelity_membership.php update_card).
+export async function updateFidelityCardStatus(slug: string, cardId: number, statusRaw: string): Promise<{ ok: true; status: string; releasedAppointments: number }> {
+  if (cardId <= 0) throw new Error("Tessera non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id, client_id, expires_at, status", where: "id = ?", params: [cardId], limit: 1 });
+  if (!rows[0]) throw new Error("Tessera non trovata.");
+
+  const today = todayIso();
+  const currentExpires = normalizeClientDate(typeof rows[0].expires_at === "string" ? rows[0].expires_at : rows[0].expires_at ? dateIsoLocal(new Date(String(rows[0].expires_at))) : "");
+  let status = String(statusRaw ?? "active").trim().toLowerCase();
+  if (!["active", "inactive"].includes(status)) status = "active";
+  if (status === "active" && currentExpires !== null && currentExpires < today) {
+    throw new Error("La tessera è scaduta: usa il pulsante Riattiva tessera per ricalcolare la nuova scadenza.");
+  }
+
+  const clientId = Number(rows[0].client_id ?? 0);
+  await tenantUpdate({ slug, table: "cards", id: cardId, values: { status } });
+  let releasedAppointments = 0;
+  if (status === "inactive" && clientId > 0) {
+    releasedAppointments = await releasePendingAppointmentFidelityForClient(slug, clientId);
+  }
+  return { ok: true, status, releasedAppointments };
+}
+
+// Reactivate an expired card, recomputing the expiry from today (port of reactivate_card).
+export async function reactivateFidelityCard(slug: string, cardId: number): Promise<{ ok: true; expiresAt: string }> {
+  if (cardId <= 0) throw new Error("Tessera non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id, expires_at, status", where: "id = ?", params: [cardId], limit: 1 });
+  if (!rows[0]) throw new Error("Tessera non trovata.");
+  const today = todayIso();
+  const currentExpires = normalizeClientDate(typeof rows[0].expires_at === "string" ? rows[0].expires_at : rows[0].expires_at ? dateIsoLocal(new Date(String(rows[0].expires_at))) : "");
+  if (currentExpires === null || currentExpires >= today) throw new Error("La tessera non è scaduta.");
+
+  const cfg = parseCardValidityConfig((await tenantSelect<RowDataPacket>({ slug, table: "businesses", columns: "fidelity_adhesion_json", orderBy: "id ASC", limit: 1 }))[0]?.fidelity_adhesion_json);
+  const newExpires = cardDefaultExpiresAt(cfg, today);
+  if (newExpires === null) throw new Error("Imposta prima una durata tessera in Fidelity → Adesione → Impostazioni tessera Fidelity per poter riattivare la tessera.");
+
+  await tenantUpdate({ slug, table: "cards", id: cardId, values: { expires_at: newExpires, status: "active" } });
+  return { ok: true, expiresAt: newExpires };
+}
+
+// Delete a card + reset the client's Fidelity state (port of delete_card): keep the
+// code permanently reserved, release pending-appointment Fidelity benefits, remove
+// fidelity-only accumulating gifts, wipe points/lots/transactions + fidelity_level.
+export async function deleteFidelityCard(slug: string, cardId: number): Promise<{ ok: true; removedGifts: number; releasedAppointments: number }> {
+  if (cardId <= 0) throw new Error("Tessera non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "cards", columns: "id, client_id, code", where: "id = ?", params: [cardId], limit: 1 });
+  if (!rows[0]) throw new Error("Tessera non trovata.");
+  const clientId = Number(rows[0].client_id ?? 0);
+  const code = normalizeCardCode(rows[0].code);
+
+  let removedGifts = 0;
+  let releasedAppointments = 0;
+  if (code !== "") await rememberCardCode(slug, code, cardId, clientId, "card_delete", "Codice tessera eliminata: non riutilizzabile");
+
+  if (clientId > 0) {
+    releasedAppointments = await releasePendingAppointmentFidelityForClient(slug, clientId);
+
+    // Remove fidelity-only gifts still in accumulation for this client.
+    const giftInstances = await dbQuery<RowDataPacket[]>(
+      `SELECT gi.id FROM ${quoteIdentifier((await tenantTable(slug, "gift_instances")).name)} gi JOIN ${quoteIdentifier((await tenantTable(slug, "gifts")).name)} g ON g.id = gi.gift_id AND g.tenant_id = gi.tenant_id WHERE gi.tenant_id = ? AND gi.client_id = ? AND LOWER(TRIM(COALESCE(gi.state,'accumulo'))) = 'accumulo' AND LOWER(TRIM(COALESCE(g.eligibility,'fidelity_only'))) = 'fidelity_only'`,
+      [(await tenantTable(slug, "gift_instances")).tenantId ?? 0, clientId],
+    ).catch(() => [] as RowDataPacket[]);
+    for (const gi of giftInstances) {
+      await tenantDelete({ slug, table: "gift_instances", id: Number(gi.id) }).catch(() => 0);
+      removedGifts += 1;
+    }
+
+    const clients = await tenantTable(slug, "clients");
+    const tx = await tenantTable(slug, "transactions");
+    const lots = await tenantTable(slug, "point_lots");
+    await dbExecute(`DELETE FROM ${quoteIdentifier(tx.name)} WHERE tenant_id = ? AND client_id = ?`, [tx.tenantId ?? 0, clientId]).catch(() => undefined);
+    await dbExecute(`DELETE FROM ${quoteIdentifier(lots.name)} WHERE tenant_id = ? AND client_id = ?`, [lots.tenantId ?? 0, clientId]).catch(() => undefined);
+    await dbExecute(`UPDATE ${quoteIdentifier(clients.name)} SET points = 0, fidelity_level = '' WHERE tenant_id = ? AND id = ?`, [clients.tenantId ?? 0, clientId]).catch(async () => {
+      await dbExecute(`UPDATE ${quoteIdentifier(clients.name)} SET points = 0 WHERE tenant_id = ? AND id = ?`, [clients.tenantId ?? 0, clientId]).catch(() => undefined);
+    });
+  }
+
+  await tenantDelete({ slug, table: "cards", id: cardId });
+
+  return { ok: true, removedGifts, releasedAppointments };
+}
+
 async function getSingleClient(slug: string, id: number): Promise<ManagedClient> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Cliente non trovato.");

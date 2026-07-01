@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, getFidelityEnabled, getFidelityLevelsSettings, getFidelityPointsSettings, listDbClients, listDbWalletMovements, listFidelityCampaigns, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign } from "@/lib/db-repositories";
+import { addDbWalletMovement, dbWalletBalance, deleteFidelityCampaign, deleteFidelityCard, getFidelityEnabled, getFidelityLevelsSettings, getFidelityMembership, getFidelityPointsSettings, issueFidelityCard, listDbClients, listDbWalletMovements, listFidelityCampaigns, reactivateFidelityCard, saveFidelityCampaign, saveFidelityLevels, saveFidelityPointsSettings, setFidelityEnabled, toggleFidelityCampaign, updateFidelityCardStatus } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -8,8 +8,8 @@ import type { WalletMovementType } from "@/lib/tenant-store";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const readPerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "pos.manage"];
-const writePerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points"];
+const readPerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "fidelity.membership", "pos.manage"];
+const writePerms = ["fidelity.manage", "fidelity.wallet", "fidelity.recharges", "fidelity.points", "fidelity.membership"];
 
 export async function GET(request: Request) {
   const tenantSlug = manageTenantSlugFromRequest(request);
@@ -37,6 +37,12 @@ export async function GET(request: Request) {
     // Fidelity card LEVELS settings (fidelity_levels.php).
     if (url.searchParams.get("action") === "levels") {
       return Response.json({ ok: true, sourceMode: "database", levels: await getFidelityLevelsSettings(tenantSlug) });
+    }
+
+    // Fidelity MEMBERSHIP / cards list (fidelity_membership.php "Adesione").
+    if (url.searchParams.get("action") === "membership") {
+      if (!can(session.user.perms, "fidelity.membership") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso adesione fidelity mancante.", 403);
+      return Response.json({ ok: true, sourceMode: "database", membership: await getFidelityMembership(tenantSlug, url.searchParams.get("q") ?? "") });
     }
 
     const clients = await listDbClients({ slug: tenantSlug });
@@ -80,6 +86,27 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "fidelity.levels") && !can(session.user.perms, "fidelity.points") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso livelli fidelity mancante.", 403);
       const levels = await saveFidelityLevels(tenantSlug, body);
       return Response.json({ ok: true, sourceMode: "database", levels });
+    }
+
+    // Fidelity MEMBERSHIP / card actions (port of create/update/reactivate/delete_card).
+    const cardAction = String(body.action ?? body._mode ?? "");
+    if (["card_create", "create_card", "card_update", "update_card", "card_reactivate", "reactivate_card", "card_delete", "delete_card"].includes(cardAction)) {
+      if (!can(session.user.perms, "fidelity.membership") && !can(session.user.perms, "fidelity.manage")) return jsonError("Permesso adesione fidelity mancante.", 403);
+      const cardId = parseInteger(body.card_id, 0);
+      if (cardAction === "card_create" || cardAction === "create_card") {
+        const result = await issueFidelityCard(tenantSlug, body);
+        return Response.json({ sourceMode: "database", ...result, membership: await getFidelityMembership(tenantSlug, "") });
+      }
+      if (cardAction === "card_update" || cardAction === "update_card") {
+        const result = await updateFidelityCardStatus(tenantSlug, cardId, String(body.status ?? "active"));
+        return Response.json({ sourceMode: "database", ...result, membership: await getFidelityMembership(tenantSlug, "") });
+      }
+      if (cardAction === "card_reactivate" || cardAction === "reactivate_card") {
+        const result = await reactivateFidelityCard(tenantSlug, cardId);
+        return Response.json({ sourceMode: "database", ...result, membership: await getFidelityMembership(tenantSlug, "") });
+      }
+      const result = await deleteFidelityCard(tenantSlug, cardId);
+      return Response.json({ sourceMode: "database", ...result, membership: await getFidelityMembership(tenantSlug, "") });
     }
 
     // Points campaign CRUD (port of save/toggle/delete_fidelity_campaign).
