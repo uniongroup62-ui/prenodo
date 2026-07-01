@@ -1,5 +1,6 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import {
+  deleteManageGiftBoxTemplate,
   getManageGiftBoxTemplate,
   giftFormCatalog,
   issueDbGiftBox,
@@ -76,6 +77,13 @@ export async function POST(request: Request) {
       if (!can(session.user.perms, "giftbox.manage")) return jsonError("Permesso GiftBox mancante.", 403);
       const template = await saveManageGiftBoxTemplate(tenantSlug, body, parseInteger(body.id, 0));
       return Response.json({ ok: true, source: "giftbox?action=save", sourceMode: "database", template, templates: await listManageGiftBoxTemplates(tenantSlug) });
+    }
+
+    // Soft-delete a giftbox template (port of giftbox.php tab=boxes action=delete).
+    if (action === "delete") {
+      if (!can(session.user.perms, "giftbox.manage")) return jsonError("Permesso GiftBox mancante.", 403);
+      await deleteManageGiftBoxTemplate(tenantSlug, parseInteger(body.id, 0), session.user.id);
+      return Response.json({ ok: true, source: "giftbox?action=delete", sourceMode: "database", templates: await listManageGiftBoxTemplates(tenantSlug) });
     }
 
     if (action === "issue") {

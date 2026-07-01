@@ -9419,6 +9419,17 @@ export async function saveManageGiftBoxTemplate(slug: string, body: Record<strin
   return saved;
 }
 
+// Soft-delete a giftbox TEMPLATE (port of GiftBox::softDeleteGiftBox): set
+// deleted_at + deleted_by + active=0 so it drops out of the catalog but any
+// already-issued instances keep their snapshot. Idempotent.
+export async function deleteManageGiftBoxTemplate(slug: string, id: number, by: number): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("ID GiftBox mancante.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftboxes", columns: "id", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("GiftBox non trovata.");
+  await tenantUpdate({ slug, table: "giftboxes", id, values: { deleted_at: new Date(), deleted_by: by > 0 ? by : null, active: 0 } });
+  return { ok: true };
+}
+
 async function getSingleInstallmentPlan(slug: string, id: number): Promise<InstallmentPlan> {
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "sale_installment_plans", where: "id = ?", params: [id], limit: 1 });
   if (!rows[0]) throw new Error("Piano rateale non trovato.");

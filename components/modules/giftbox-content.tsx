@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 // Faithful port of the PHP giftbox page (app/pages/giftbox.php).
 type Row = Record<string, unknown>;
@@ -25,14 +25,41 @@ export function GiftboxContent() {
   const [items, setItems] = useState<Row[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loadingTemplates, setLoadingTemplates] = useState(true);
+  const [busyId, setBusyId] = useState(0);
+
+  const loadTemplates = useCallback(() => {
+    fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}&action=templates`, { headers: { "x-tenant-slug": slug } })
+      .then((r) => r.json())
+      .then((j) => setTemplates(Array.isArray(j.templates) ? j.templates : []))
+      .catch(() => setTemplates([]))
+      .finally(() => setLoadingTemplates(false));
+  }, [slug]);
+
+  // Soft-delete a giftbox template via POST (issued instances keep their snapshot).
+  async function deleteTemplate(t: Template) {
+    if (busyId) return;
+    if (typeof window !== "undefined" && !window.confirm("Eliminare questa GiftBox dal catalogo? Le GiftBox già emesse restano valide.")) return;
+    setBusyId(t.id);
+    try {
+      const res = await fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "delete", id: t.id }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        if (typeof window !== "undefined") window.alert(j?.error || "Impossibile eliminare la GiftBox.");
+      } else {
+        loadTemplates();
+      }
+    } finally {
+      setBusyId(0);
+    }
+  }
 
   useEffect(() => {
     if (tab === "boxes") {
-      fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}&action=templates`, { headers: { "x-tenant-slug": slug } })
-        .then((r) => r.json())
-        .then((j) => setTemplates(Array.isArray(j.templates) ? j.templates : []))
-        .catch(() => setTemplates([]))
-        .finally(() => setLoadingTemplates(false));
+      loadTemplates();
       return;
     }
     fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}`, { headers: { "x-tenant-slug": slug } })
@@ -42,7 +69,7 @@ export function GiftboxContent() {
         setItems(Array.isArray(list) ? list : []);
       })
       .catch(() => {});
-  }, [slug, tab]);
+  }, [slug, tab, loadTemplates]);
 
   const settingsHref = `/${encodeURIComponent(slug)}/giftbox_settings`;
   const boxesHref = `/${encodeURIComponent(slug)}/giftbox?tab=boxes`;
@@ -110,7 +137,15 @@ export function GiftboxContent() {
                           href={`/${encodeURIComponent(slug)}/giftbox?action=edit&id=${t.id}`}
                         >
                           Modifica
-                        </a>
+                        </a>{" "}
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-outline-danger"
+                          disabled={busyId === t.id}
+                          onClick={() => deleteTemplate(t)}
+                        >
+                          Elimina
+                        </button>
                       </td>
                     </tr>
                   ))
