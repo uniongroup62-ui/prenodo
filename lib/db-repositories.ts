@@ -8004,6 +8004,46 @@ export async function cancelManageGiftBoxInstance(slug: string, id: number, by: 
   return { ok: true };
 }
 
+// Update a giftbox instance's recipient + note + expiry (port of giftbox.php
+// update_instance / GiftBox::updateInstance). Assigning a recipient_client_id
+// links the giftbox to that client (so it shows in their residuals) and forces
+// the recipient name/email from the client's anagrafica (like the legacy). A
+// cancelled instance is not editable.
+export async function updateManageGiftBoxInstance(
+  slug: string,
+  id: number,
+  input: { recipientClientId?: number; recipientName?: string; recipientEmail?: string; note?: string; expiresAt?: string },
+): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Istanza non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftbox_instances", columns: "id, status", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Istanza non trovata.");
+  const st = String(rows[0].status ?? "").trim().toLowerCase();
+  if (st === "cancelled" || st === "canceled") throw new Error("GiftBox annullata: non modificabile.");
+
+  let recipientName = String(input.recipientName ?? "").trim();
+  let recipientEmail = String(input.recipientEmail ?? "").trim();
+  const recipientClientId = Math.max(0, Math.trunc(Number(input.recipientClientId ?? 0)));
+  if (recipientClientId > 0) {
+    const cRows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "full_name, email", where: "id = ?", params: [recipientClientId], limit: 1 });
+    if (!cRows[0]) throw new Error("Cliente destinatario non trovato.");
+    const cName = String(cRows[0].full_name ?? "").trim();
+    if (cName !== "") recipientName = cName;
+    const cEmail = String(cRows[0].email ?? "").trim();
+    if (cEmail !== "" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cEmail)) recipientEmail = cEmail;
+  }
+
+  const values = await filterColumns((await tenantTable(slug, "giftbox_instances")).name, {
+    recipient_client_id: recipientClientId > 0 ? recipientClientId : null,
+    recipient_name: recipientName !== "" ? recipientName : null,
+    recipient_email: recipientEmail !== "" ? recipientEmail : null,
+    note: input.note !== undefined ? (String(input.note).trim() || null) : undefined,
+    expires_at: input.expiresAt !== undefined && normalizeClientDate(input.expiresAt) ? normalizeClientDate(input.expiresAt) : undefined,
+    updated_at: new Date(),
+  });
+  await tenantUpdate({ slug, table: "giftbox_instances", id, values });
+  return { ok: true };
+}
+
 // Redeem an ENTIRE giftbox instance (port of giftbox.php redeem_instance /
 // GiftBox::redeemInstance): mark all remaining units redeemed → status='redeemed'.
 export async function redeemManageGiftBoxInstanceFull(slug: string, id: number, by: number): Promise<{ ok: true }> {

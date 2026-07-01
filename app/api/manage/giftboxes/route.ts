@@ -6,11 +6,13 @@ import {
   getManageGiftBoxTemplate,
   giftFormCatalog,
   issueDbGiftBox,
+  listDbClients,
   listDbGiftBoxes,
   listManageGiftBoxTemplates,
   redeemDbGiftBox,
   redeemManageGiftBoxInstanceFull,
   saveManageGiftBoxTemplate,
+  updateManageGiftBoxInstance,
 } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
@@ -59,7 +61,8 @@ export async function GET(request: Request) {
     if (action === "view" || action === "edit_instance") {
       const detail = await getManageGiftBoxInstance(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
       if (!detail) return jsonError("GiftBox non trovata.", 404);
-      return Response.json({ ok: true, sourceMode: "database", detail });
+      const clients = (await listDbClients({ slug: tenantSlug })).map((c) => ({ id: c.id, name: c.name }));
+      return Response.json({ ok: true, sourceMode: "database", detail, clients });
     }
 
     return Response.json({
@@ -122,6 +125,20 @@ export async function POST(request: Request) {
       await redeemManageGiftBoxInstanceFull(tenantSlug, id, session.user.id);
       const detail = await getManageGiftBoxInstance(tenantSlug, id);
       return Response.json({ ok: true, source: "giftbox?action=redeem_full", sourceMode: "database", detail });
+    }
+
+    // Update an instance's recipient/note/expiry (port of update_instance).
+    if (action === "update_instance") {
+      const id = parseInteger(body.instance_id ?? body.id, 0);
+      await updateManageGiftBoxInstance(tenantSlug, id, {
+        recipientClientId: parseInteger(body.recipient_client_id, 0),
+        recipientName: body.recipient_name,
+        recipientEmail: body.recipient_email,
+        note: body.note,
+        expiresAt: body.expires_at,
+      });
+      const detail = await getManageGiftBoxInstance(tenantSlug, id);
+      return Response.json({ ok: true, source: "giftbox?action=update_instance", sourceMode: "database", detail });
     }
 
     // Cancel an instance (port of cancel / GiftBox::cancelInstance).

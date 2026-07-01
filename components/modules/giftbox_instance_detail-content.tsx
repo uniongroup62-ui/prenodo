@@ -60,6 +60,14 @@ export function GiftBoxInstanceDetailContent() {
   const [flash, setFlash] = useState("");
   const [busy, setBusy] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  // Recipient edit (assign to a client + name/email/note/expiry).
+  const [clients, setClients] = useState<Array<{ id: number; name: string }>>([]);
+  const [recClientId, setRecClientId] = useState(0);
+  const [recName, setRecName] = useState("");
+  const [recEmail, setRecEmail] = useState("");
+  const [recNote, setRecNote] = useState("");
+  const [recExpiry, setRecExpiry] = useState("");
+  const [savingRec, setSavingRec] = useState(false);
 
   useEffect(() => {
     const gid = instanceIdFromUrl();
@@ -80,6 +88,12 @@ export function GiftBoxInstanceDetailContent() {
         if (!active) return;
         if (j && j.ok && j.detail) {
           setData(j.detail);
+          setClients(Array.isArray(j.clients) ? j.clients : []);
+          setRecClientId(Number(j.detail.clientId ?? 0) || 0);
+          setRecName(String(j.detail.recipientName ?? ""));
+          setRecEmail(String(j.detail.recipientEmail ?? ""));
+          setRecNote(String(j.detail.note ?? ""));
+          setRecExpiry(String(j.detail.expiresAt ?? "").slice(0, 10));
           setError("");
         } else {
           setError(j?.error || "GiftBox non trovata.");
@@ -121,6 +135,32 @@ export function GiftBoxInstanceDetailContent() {
       }
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Save recipient changes (port of update_instance). Assigning a client forces
+  // the name/email from that client's anagrafica (server-side too).
+  async function saveRecipient(e: React.FormEvent) {
+    e.preventDefault();
+    if (savingRec) return;
+    setSavingRec(true);
+    setError("");
+    setFlash("");
+    try {
+      const res = await fetch(`/api/manage/giftboxes?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "update_instance", instance_id: String(id), recipient_client_id: String(recClientId), recipient_name: recName, recipient_email: recEmail, note: recNote, expires_at: recExpiry }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        setError(String(j?.error ?? "Impossibile aggiornare il destinatario."));
+      } else {
+        setFlash("Destinatario aggiornato.");
+        setReloadKey((k) => k + 1);
+      }
+    } finally {
+      setSavingRec(false);
     }
   }
 
@@ -195,6 +235,40 @@ export function GiftBoxInstanceDetailContent() {
                     </button>
                   ) : null}
                 </div>
+              </div>
+            ) : null}
+
+            {data.status !== "cancelled" ? (
+              <div className="card p-3 mt-3">
+                <div className="fw-semibold mb-2">
+                  <i className="bi bi-person me-1" />
+                  Destinatario
+                </div>
+                <form className="d-flex flex-column gap-2" onSubmit={saveRecipient}>
+                  <div>
+                    <label className="form-label small mb-1">Abbina a un cliente</label>
+                    <select
+                      className="form-select form-select-sm"
+                      value={recClientId}
+                      onChange={(e) => setRecClientId(Number(e.target.value) || 0)}
+                    >
+                      <option value={0}>— Nessun cliente —</option>
+                      {clients.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="form-text">Se abbini un cliente, nome ed email vengono presi dalla sua anagrafica.</div>
+                  </div>
+                  <input className="form-control form-control-sm" placeholder="Nome destinatario" value={recName} disabled={recClientId > 0} onChange={(e) => setRecName(e.target.value)} />
+                  <input className="form-control form-control-sm" placeholder="Email destinatario" value={recEmail} disabled={recClientId > 0} onChange={(e) => setRecEmail(e.target.value)} />
+                  <input className="form-control form-control-sm" type="date" value={recExpiry} onChange={(e) => setRecExpiry(e.target.value)} />
+                  <textarea className="form-control form-control-sm" rows={2} placeholder="Nota" value={recNote} onChange={(e) => setRecNote(e.target.value)} />
+                  <button className="btn btn-sm btn-primary" type="submit" disabled={savingRec}>
+                    {savingRec ? "Salvataggio…" : "Salva destinatario"}
+                  </button>
+                </form>
               </div>
             ) : null}
           </div>
