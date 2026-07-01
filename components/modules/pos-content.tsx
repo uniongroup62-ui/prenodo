@@ -265,6 +265,9 @@ type CartLine = {
   bonusAmount?: number;
   totalAmount?: number;
   earnPoints?: boolean;
+  // Custom GiftBox build: the chosen services/products that compose a one-off box (only set on a
+  // giftbox line with refId 0). Sent to checkout so saveGiftboxFromCart materialises the template.
+  customItems?: Array<{ type: "service" | "product"; id: number; qty: number }>;
 };
 
 // Legacy POS base payment type (the single payment_type radio: cash/card/check/bank).
@@ -536,6 +539,15 @@ export function PosContent() {
   const [gbRecipientClientId, setGbRecipientClientId] = useState(0);
   const [gbMessage, setGbMessage] = useState("");
   const [gbHideAmount, setGbHideAmount] = useState(false);
+  // GIFTBOX build mode: "template" sells a pre-defined giftboxes template; "custom" composes a
+  // one-off box from chosen catalog services/products (port of pos.php issue_giftbox custom-build,
+  // which builds a transient template via GiftBox::saveGiftBox). The chosen items post as the
+  // giftbox line's customItems (refId 0) and saveGiftboxFromCart materialises the template at checkout.
+  const [gbBuildMode, setGbBuildMode] = useState<"template" | "custom">("template");
+  const [gbCustomItems, setGbCustomItems] = useState<Array<{ key: string; type: "service" | "product"; id: number; name: string; qty: number }>>([]);
+  const [gbPickType, setGbPickType] = useState<"service" | "product">("service");
+  const [gbPickId, setGbPickId] = useState(0);
+  const [gbPickQty, setGbPickQty] = useState("1");
 
   // RECHARGE sale modal (wired): the chosen recharge_templates id (0 = custom amount), the base
   // amount the client pays, the bonus rule (kind/value), the earn-points-on-bonus toggle, and an
@@ -1195,6 +1207,34 @@ export function PosContent() {
     setGbRecipientClientId(0);
     setGbMessage("");
     setGbHideAmount(false);
+    setGbBuildMode("template");
+    setGbCustomItems([]);
+    setGbPickType("service");
+    setGbPickId(0);
+    setGbPickQty("1");
+  }
+
+  // Add the picked catalog service/product to the in-progress custom GiftBox contents.
+  function addItemToGiftboxBuild() {
+    if (gbPickId <= 0) {
+      setErrorMsg("Seleziona un servizio o prodotto da aggiungere alla GiftBox.");
+      return;
+    }
+    const qty = Math.max(1, Number.parseInt(gbPickQty, 10) || 1);
+    const source = gbPickType === "service" ? services : products;
+    const found = source.find((x) => x.id === gbPickId);
+    const name = found?.name ?? (gbPickType === "service" ? "Servizio" : "Prodotto");
+    setGbCustomItems((prev) => [
+      ...prev,
+      { key: `${Date.now()}-${Math.floor(Math.random() * 1000)}`, type: gbPickType, id: gbPickId, name, qty },
+    ]);
+    setGbPickId(0);
+    setGbPickQty("1");
+    setErrorMsg("");
+  }
+
+  function removeGiftboxBuildItem(key: string) {
+    setGbCustomItems((prev) => prev.filter((x) => x.key !== key));
   }
 
   // "Aggiungi alla lista": validate the template + price + recipient + dates and push a
@@ -1203,8 +1243,14 @@ export function PosContent() {
   // instance owned by the recipient + its items copied from the template's giftbox_items).
   function addGiftboxToCart() {
     setErrorMsg("");
-    const tpl = giftboxes.find((g) => g.id === gbTemplateId);
-    if (!tpl) {
+    const isCustom = gbBuildMode === "custom";
+    const tpl = isCustom ? null : giftboxes.find((g) => g.id === gbTemplateId);
+    if (isCustom) {
+      if (gbCustomItems.length === 0) {
+        setErrorMsg("Aggiungi almeno un servizio o prodotto alla GiftBox personalizzata.");
+        return;
+      }
+    } else if (!tpl) {
       setErrorMsg("Seleziona una GiftBox.");
       return;
     }
@@ -1231,12 +1277,12 @@ export function PosContent() {
       setErrorMsg('La data "Valida al" deve essere successiva a "Valida dal".');
       return;
     }
-    const labelName = recipientName || tpl.name;
+    const labelName = recipientName || (isCustom ? "personalizzata" : tpl!.name);
     setCart((prev) => [
       {
         key: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
         type: "giftbox",
-        refId: tpl.id,
+        refId: isCustom ? 0 : tpl!.id,
         name: `GiftBox ${labelName}`,
         quantity: 1,
         unitPrice: price,
@@ -1248,6 +1294,7 @@ export function PosContent() {
         eventType: gbEventType || "giftbox",
         message: gbMessage.trim() || undefined,
         hideAmount: gbHideAmount,
+        customItems: isCustom ? gbCustomItems.map((ci) => ({ type: ci.type, id: ci.id, qty: ci.qty })) : undefined,
       },
       ...prev,
     ]);
@@ -1505,6 +1552,9 @@ export function PosContent() {
               expiresAt: line.expiresAt ?? "",
               message: line.message ?? "",
               hideAmount: line.hideAmount ? 1 : 0,
+              // Custom-build contents (nested array — survives the items_json JSON parse intact,
+              // unlike a top-level body field). Present only for a refId-0 custom box.
+              ...(line.customItems && line.customItems.length > 0 ? { customItems: line.customItems } : {}),
             }
           : {}),
         // Recharge meta (only set on recharge lines): the backend reads these to insert the
@@ -3048,36 +3098,123 @@ export function PosContent() {
                 Mittente: <strong id="posGiftboxClientLabel">{clientId ? clientName : "Cliente banco"}</strong>
               </div>
 
-              <label className="form-label">GiftBox</label>
-              <select
-                className="form-select"
-                id="posGiftboxSelect"
-                required
-                value={gbTemplateId || ""}
-                onChange={(e) => chooseGiftboxTemplate(Number.parseInt(e.target.value, 10) || 0)}
-              >
-                <option value="">Seleziona...</option>
-                {giftboxes.map((g) => (
-                  <option value={g.id} data-name={g.name} data-validity-days={g.validityDays} key={g.id}>
-                    {g.name}
-                    {g.items.length > 0 ? ` (${g.items.length} voci)` : ""}
-                  </option>
-                ))}
-              </select>
+              <div className="btn-group w-100 mb-3" role="group" aria-label="Modalità GiftBox">
+                <input
+                  type="radio"
+                  className="btn-check"
+                  name="gbBuildMode"
+                  id="gbModeTemplate"
+                  autoComplete="off"
+                  checked={gbBuildMode === "template"}
+                  onChange={() => setGbBuildMode("template")}
+                />
+                <label className="btn btn-outline-primary" htmlFor="gbModeTemplate">Da modello</label>
+                <input
+                  type="radio"
+                  className="btn-check"
+                  name="gbBuildMode"
+                  id="gbModeCustom"
+                  autoComplete="off"
+                  checked={gbBuildMode === "custom"}
+                  onChange={() => setGbBuildMode("custom")}
+                />
+                <label className="btn btn-outline-primary" htmlFor="gbModeCustom">Personalizzata</label>
+              </div>
 
-              {selectedGiftbox && selectedGiftbox.items.length > 0 ? (
-                <div className="border rounded p-2 mt-2" id="posGiftboxContentBox">
-                  <div className="fw-semibold mb-1 small">Contenuto GiftBox</div>
-                  <ul className="mb-0 small text-muted">
-                    {selectedGiftbox.items.map((it) => (
-                      <li key={it.giftboxItemId}>
-                        {(it.label || (it.itemType === "product" ? "Prodotto" : "Servizio"))}
-                        {it.qty > 1 ? ` ×${it.qty}` : ""}
-                      </li>
+              {gbBuildMode === "template" ? (
+                <>
+                  <label className="form-label">GiftBox</label>
+                  <select
+                    className="form-select"
+                    id="posGiftboxSelect"
+                    required
+                    value={gbTemplateId || ""}
+                    onChange={(e) => chooseGiftboxTemplate(Number.parseInt(e.target.value, 10) || 0)}
+                  >
+                    <option value="">Seleziona...</option>
+                    {giftboxes.map((g) => (
+                      <option value={g.id} data-name={g.name} data-validity-days={g.validityDays} key={g.id}>
+                        {g.name}
+                        {g.items.length > 0 ? ` (${g.items.length} voci)` : ""}
+                      </option>
                     ))}
-                  </ul>
+                  </select>
+
+                  {selectedGiftbox && selectedGiftbox.items.length > 0 ? (
+                    <div className="border rounded p-2 mt-2" id="posGiftboxContentBox">
+                      <div className="fw-semibold mb-1 small">Contenuto GiftBox</div>
+                      <ul className="mb-0 small text-muted">
+                        {selectedGiftbox.items.map((it) => (
+                          <li key={it.giftboxItemId}>
+                            {(it.label || (it.itemType === "product" ? "Prodotto" : "Servizio"))}
+                            {it.qty > 1 ? ` ×${it.qty}` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div>
+                  <label className="form-label">Contenuto GiftBox personalizzata</label>
+                  <div className="row g-2">
+                    <div className="col-3">
+                      <select
+                        className="form-select"
+                        aria-label="Tipo elemento"
+                        value={gbPickType}
+                        onChange={(e) => { setGbPickType(e.target.value === "product" ? "product" : "service"); setGbPickId(0); }}
+                      >
+                        <option value="service">Servizio</option>
+                        <option value="product">Prodotto</option>
+                      </select>
+                    </div>
+                    <div className="col-6">
+                      <select
+                        className="form-select"
+                        aria-label="Elemento"
+                        value={gbPickId || ""}
+                        onChange={(e) => setGbPickId(Number.parseInt(e.target.value, 10) || 0)}
+                      >
+                        <option value="">Seleziona...</option>
+                        {(gbPickType === "service" ? services : products).map((x) => (
+                          <option value={x.id} key={x.id}>{x.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="col-2">
+                      <input
+                        className="form-control"
+                        type="number"
+                        min="1"
+                        step="1"
+                        aria-label="Quantità"
+                        value={gbPickQty}
+                        onChange={(e) => setGbPickQty(e.target.value)}
+                      />
+                    </div>
+                    <div className="col-1 d-grid">
+                      <button type="button" className="btn btn-outline-primary" onClick={addItemToGiftboxBuild} aria-label="Aggiungi al box">+</button>
+                    </div>
+                  </div>
+
+                  {gbCustomItems.length > 0 ? (
+                    <ul className="list-group mt-2">
+                      {gbCustomItems.map((ci) => (
+                        <li className="list-group-item d-flex justify-content-between align-items-center py-1" key={ci.key}>
+                          <span className="small">
+                            <span className="badge bg-light text-dark me-1">{ci.type === "product" ? "Prodotto" : "Servizio"}</span>
+                            {ci.name}{ci.qty > 1 ? ` ×${ci.qty}` : ""}
+                          </span>
+                          <button type="button" className="btn btn-sm btn-link text-danger p-0" onClick={() => removeGiftboxBuildItem(ci.key)} aria-label="Rimuovi">Rimuovi</button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div className="form-text">Aggiungi i servizi/prodotti che comporranno la GiftBox.</div>
+                  )}
                 </div>
-              ) : null}
+              )}
 
               <div className="row g-2 mt-3">
                 <div className="col-6">
