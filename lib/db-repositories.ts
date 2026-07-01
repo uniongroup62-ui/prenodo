@@ -5946,24 +5946,57 @@ export async function redeemDbCoupon(code: string, subtotal: number, slug: strin
 
 // Editable coupon record for the NEW / EDIT form. Extends the list CouponRule
 // with the description + apply_scope columns that the coupons.php editor posts
-// but the dashboard list does not surface.
+// but the dashboard list does not surface, plus the edit-view audit fields
+// (created/cancelled by/at/reason + active usage + can-cancel) shown in the
+// legacy status card above the form.
 export type ManageCouponRecord = CouponRule & {
   description: string;
   applyScope: string;
+  createdAt: string;
+  createdByLabel: string;
+  cancelledAt: string;
+  cancelledByLabel: string;
+  cancelledReason: string;
+  activeUsedCount: number;
+  canCancel: boolean;
 };
 
+// Resolve a user id to a display label (name || email || #id), like the legacy
+// audit-field lookup. Returns "—" for a missing/zero id.
+async function couponUserLabel(slug: string, id: number): Promise<string> {
+  if (!id || id <= 0) return "—";
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "users", columns: "name, email", where: "id = ?", params: [id], limit: 1 }).catch(() => [] as RowDataPacket[]);
+  if (!rows[0]) return `#${id}`;
+  const name = String(rows[0].name ?? "").trim();
+  if (name !== "") return name;
+  const email = String(rows[0].email ?? "").trim();
+  return email !== "" ? email : `#${id}`;
+}
+
 // Edit-form prefill: return ONE coupon's editable fields for one id. Port of
-// coupons.php action=edit (loads the coupons row). Reuses mapCoupon (the list
-// pipeline) and reads the extra description/apply_scope columns directly.
+// coupons.php action=edit (loads the coupons row + the audit status card).
+// Reuses mapCoupon (the list pipeline) and reads the extra
+// description/apply_scope + audit columns directly.
 export async function getManageCoupon(slug: string, id: number): Promise<ManageCouponRecord | null> {
   if (id <= 0) return null;
   const rows = await tenantSelect<RowDataPacket>({ slug, table: "coupons", where: "id = ? AND deleted_at IS NULL", params: [id], limit: 1 });
   if (!rows[0]) return null;
-  const base = await mapCoupon(slug, rows[0]);
+  const row = rows[0];
+  const base = await mapCoupon(slug, row);
+  const stats = await couponUsageStats(slug, base);
+  // toIso() substitutes "now" for null, so guard the nullable audit timestamps.
+  const isoOrEmpty = (v: unknown): string => (v ? toIso(v) : "");
   return {
     ...base,
-    description: String(rows[0].description ?? ""),
-    applyScope: String(rows[0].apply_scope ?? "all"),
+    description: String(row.description ?? ""),
+    applyScope: String(row.apply_scope ?? "all"),
+    createdAt: isoOrEmpty(row.created_at),
+    createdByLabel: await couponUserLabel(slug, Number(row.created_by ?? 0)),
+    cancelledAt: isoOrEmpty(row.cancelled_at),
+    cancelledByLabel: await couponUserLabel(slug, Number(row.cancelled_by ?? 0)),
+    cancelledReason: String(row.cancelled_reason ?? ""),
+    activeUsedCount: stats.activeUsedCount,
+    canCancel: Number(row.is_active ?? 0) === 1 && !row.deleted_at,
   };
 }
 

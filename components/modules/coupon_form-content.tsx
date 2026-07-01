@@ -31,9 +31,40 @@ type CouponForm = {
   valid_to: string;
 };
 
+// Edit-view audit fields shown in the legacy status card above the form.
+type CouponMeta = {
+  active: boolean;
+  startsAt: string;
+  endsAt: string;
+  usageLimit: number;
+  activeUsedCount: number;
+  createdAt: string;
+  createdByLabel: string;
+  cancelledAt: string;
+  cancelledByLabel: string;
+  cancelledReason: string;
+  canCancel: boolean;
+};
+
 function tenantSlug(): string {
   if (typeof window === "undefined") return "";
   return window.location.pathname.split("/")[1] || "";
+}
+
+// Mirrors coupons_status_info(): disabled / scheduled / expired / active.
+function statusInfo(meta: CouponMeta): { label: string; badge: string } {
+  const today = new Date().toISOString().slice(0, 10);
+  const validFrom = (meta.startsAt ?? "").slice(0, 10);
+  const validTo = (meta.endsAt ?? "").slice(0, 10);
+  if (!meta.active) return { label: "Disattivato", badge: "bg-secondary" };
+  if (validFrom !== "" && validFrom > today) return { label: "Programmato", badge: "bg-info text-dark" };
+  if (validTo !== "" && validTo < today) return { label: "Scaduto", badge: "bg-warning text-dark" };
+  return { label: "Attiva", badge: "bg-success" };
+}
+
+function fmtDateTime(value: string): string {
+  const v = (value ?? "").trim();
+  return v !== "" ? v.slice(0, 19).replace("T", " ") : "—";
 }
 
 function emptyForm(): CouponForm {
@@ -61,9 +92,13 @@ export function CouponFormContent() {
   const slug = tenantSlug();
   const [action] = useState<"new" | "edit">(resolveAction);
   const [form, setForm] = useState<CouponForm>(emptyForm());
+  const [meta, setMeta] = useState<CouponMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [showCancel, setShowCancel] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelling, setCancelling] = useState(false);
 
   // On edit (action=edit&id=) prefill from coupons?action=get. On new, keep the
   // faithful defaults (percent / 10 / scope all_services_products).
@@ -96,6 +131,19 @@ export function CouponFormContent() {
                 valid_from: String(c.startsAt ?? "").slice(0, 10),
                 valid_to: String(c.endsAt ?? "").slice(0, 10),
               });
+              setMeta({
+                active: Boolean(c.active),
+                startsAt: String(c.startsAt ?? ""),
+                endsAt: String(c.endsAt ?? ""),
+                usageLimit: Number(c.usageLimit ?? 0),
+                activeUsedCount: Number(c.activeUsedCount ?? 0),
+                createdAt: String(c.createdAt ?? ""),
+                createdByLabel: String(c.createdByLabel ?? "—"),
+                cancelledAt: String(c.cancelledAt ?? ""),
+                cancelledByLabel: String(c.cancelledByLabel ?? "—"),
+                cancelledReason: String(c.cancelledReason ?? ""),
+                canCancel: Boolean(c.canCancel),
+              });
             })
             .catch(() => setError("Errore nel caricamento del coupon."))
         : Promise.resolve();
@@ -109,6 +157,29 @@ export function CouponFormContent() {
 
   function backToList() {
     window.location.href = `/${encodeURIComponent(slug)}/coupons`;
+  }
+
+  // Disable the coupon (port of coupons.php action=cancel): POST action=cancel
+  // with the optional reason, then reload so the status card reflects it.
+  async function cancelCoupon() {
+    if (cancelling || !meta) return;
+    setCancelling(true);
+    try {
+      const res = await fetch(`/api/manage/coupons?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "cancel", id: form.id, cancel_reason: cancelReason }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        setError(String(j?.error ?? "Impossibile disattivare il coupon."));
+        setShowCancel(false);
+        return;
+      }
+      window.location.reload();
+    } finally {
+      setCancelling(false);
+    }
   }
 
   async function onSubmit(event: React.FormEvent) {
@@ -192,6 +263,102 @@ export function CouponFormContent() {
       </div>
 
       {error ? <div className="alert alert-danger">{error}</div> : null}
+
+      {action === "edit" && meta ? (
+        <div className="card p-3 mb-3">
+          <div className="row g-3 align-items-start">
+            <div className="col-md-3">
+              <div className="text-muted small mb-1">Stato</div>
+              <span className={`badge ${statusInfo(meta).badge}`}>{statusInfo(meta).label}</span>
+            </div>
+            <div className="col-md-3">
+              <div className="text-muted small mb-1">Data creazione</div>
+              <div className="fw-semibold">{fmtDateTime(meta.createdAt)}</div>
+            </div>
+            <div className="col-md-3">
+              <div className="text-muted small mb-1">Creato da</div>
+              <div className="fw-semibold">{meta.createdByLabel}</div>
+            </div>
+            <div className="col-md-3 text-md-end">
+              {meta.canCancel ? (
+                <button type="button" className="btn btn-outline-danger" onClick={() => setShowCancel(true)}>
+                  Disattiva coupon
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          <hr className="my-3" />
+
+          <div className="row g-3">
+            <div className="col-md-2">
+              <div className="text-muted small mb-1">Limite per cliente</div>
+              <div>
+                <strong>{meta.usageLimit > 0 ? meta.usageLimit : "Illimitato"}</strong>
+              </div>
+            </div>
+            <div className="col-md-2">
+              <div className="text-muted small mb-1">Utilizzi attivi totali</div>
+              <div>{meta.activeUsedCount}</div>
+            </div>
+            <div className="col-md-2">
+              <div className="text-muted small mb-1">Data disattivazione</div>
+              <div>{fmtDateTime(meta.cancelledAt)}</div>
+            </div>
+            <div className="col-md-2">
+              <div className="text-muted small mb-1">Disattivato da</div>
+              <div>{meta.cancelledByLabel}</div>
+            </div>
+            <div className="col-md-4">
+              <div className="text-muted small mb-1">Motivo</div>
+              <div>{meta.cancelledReason !== "" ? meta.cancelledReason : "—"}</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showCancel && meta ? (
+        <>
+          <div className="modal fade show d-block" tabIndex={-1} role="dialog">
+            <div className="modal-dialog modal-dialog-centered">
+              <div className="modal-content">
+                <div className="modal-header">
+                  <h5 className="modal-title">Disattiva coupon #{form.id}</h5>
+                  <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => setShowCancel(false)} />
+                </div>
+                <div className="modal-body">
+                  <div className="alert alert-warning mb-3">
+                    <div className="fw-semibold mb-1">Conferma disattivazione</div>
+                    <div>
+                      Da questo momento il coupon non sarà più utilizzabile per nuove vendite o prenotazioni. Le
+                      vendite/prenotazioni già associate manterranno il coupon storico.
+                    </div>
+                  </div>
+                  <label className="form-label">Motivazione (opzionale)</label>
+                  <textarea
+                    className="form-control"
+                    rows={3}
+                    maxLength={255}
+                    placeholder="Es. fine validità commerciale / stop utilizzo interno..."
+                    value={cancelReason}
+                    onChange={(e) => setCancelReason(e.target.value)}
+                  />
+                  <div className="form-text">Massimo 255 caratteri.</div>
+                </div>
+                <div className="modal-footer">
+                  <button type="button" className="btn btn-outline-secondary" onClick={() => setShowCancel(false)}>
+                    Indietro
+                  </button>
+                  <button type="button" className="btn btn-danger" disabled={cancelling} onClick={cancelCoupon}>
+                    {cancelling ? "Disattivazione…" : "Conferma disattivazione"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="modal-backdrop fade show" />
+        </>
+      ) : null}
 
       {loading ? (
         <div className="card p-3 text-muted small">Caricamento…</div>
