@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
-import { consumeDbClientPackage, deleteManagePackageCatalog, getManageClientPackage, getManagePackageCatalog, getPackageCatalogFormContext, issueDbClientPackage, listDbPackageState, listManagePackageCatalog, saveManagePackageCatalog, updateManageClientPackageExpiry } from "@/lib/db-repositories";
+import { addManageClientPackageUsage, consumeDbClientPackage, deleteManagePackageCatalog, getManageClientPackage, getManagePackageCatalog, getPackageCatalogFormContext, issueDbClientPackage, listDbPackageState, listManagePackageCatalog, saveManagePackageCatalog, updateManageClientPackageExpiry } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { canAny } from "@/lib/role-permissions";
@@ -102,6 +102,15 @@ export async function POST(request: Request) {
       await updateManageClientPackageExpiry(tenantSlug, cpId, String(body.expires_at ?? ""));
       const detail = await getManageClientPackage(tenantSlug, cpId);
       return Response.json({ ok: true, source: "packages?action=update_expiry", sourceMode: "database", detail });
+    }
+
+    // Register a manual usage movement (port of usage_add, service path):
+    // scala/ripristina sedute on a client package. Gated by packages.clients.
+    if (action === "usage_add") {
+      const cpId = parseInteger(body.client_package_id ?? body.id, 0);
+      await addManageClientPackageUsage(tenantSlug, cpId, String(body.op ?? ""), parseInteger(body.qty, 1), parseInteger(body.service_id, 0), String(body.note ?? ""), session.user.id);
+      const detail = await getManageClientPackage(tenantSlug, cpId);
+      return Response.json({ ok: true, source: "packages?action=usage_add", sourceMode: "database", detail });
     }
 
     // Delete a catalog template (port of action=catalog_delete): detach client

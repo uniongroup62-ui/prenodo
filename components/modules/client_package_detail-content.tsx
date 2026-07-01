@@ -62,6 +62,12 @@ export function ClientPackageDetailContent() {
   const [expiry, setExpiry] = useState("");
   const [savingExpiry, setSavingExpiry] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  // Usage (scala/ripristina) form.
+  const [usageOp, setUsageOp] = useState<"consume" | "restore">("consume");
+  const [usageQty, setUsageQty] = useState(1);
+  const [usageServiceId, setUsageServiceId] = useState(0);
+  const [usageNote, setUsageNote] = useState("");
+  const [savingUsage, setSavingUsage] = useState(false);
 
   const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
@@ -103,6 +109,33 @@ export function ClientPackageDetailContent() {
 
   function page(suffix: string): string {
     return `/${encodeURIComponent(slug)}/${`${suffix}`.replace("&", "?")}`;
+  }
+
+  // Register a manual usage movement (scala/ripristina) — port of usage_add.
+  async function saveUsage(e: React.FormEvent) {
+    e.preventDefault();
+    if (savingUsage) return;
+    setSavingUsage(true);
+    setError("");
+    setFlash("");
+    try {
+      const res = await fetch(`/api/manage/packages?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({ action: "usage_add", client_package_id: String(cpId), op: usageOp, qty: String(usageQty), service_id: String(usageServiceId), note: usageNote }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j?.error) {
+        setError(String(j?.error ?? "Errore nella registrazione dell'utilizzo."));
+      } else {
+        setFlash("Movimento registrato.");
+        setUsageNote("");
+        setUsageQty(1);
+        reload();
+      }
+    } finally {
+      setSavingUsage(false);
+    }
   }
 
   async function saveExpiry(e: React.FormEvent) {
@@ -199,6 +232,39 @@ export function ClientPackageDetailContent() {
                 </div>
               )}
             </div>
+
+            {data.status !== "cancelled" ? (
+              <div className="card p-3 mt-3">
+                <div className="fw-semibold mb-2">
+                  <i className="bi bi-sliders me-1" />
+                  Registra utilizzo
+                </div>
+                <form className="d-flex flex-column gap-2" onSubmit={saveUsage}>
+                  <div className="d-flex gap-2">
+                    <select className="form-select" value={usageOp} onChange={(e) => setUsageOp(e.target.value as "consume" | "restore")}>
+                      <option value="consume">Scala</option>
+                      <option value="restore">Ripristina</option>
+                    </select>
+                    <input className="form-control" type="number" min={1} step={1} style={{ maxWidth: "6rem" }} value={usageQty} onChange={(e) => setUsageQty(Math.max(1, Number(e.target.value) || 1))} />
+                  </div>
+                  {data.contents.length > 0 ? (
+                    <select className="form-select" value={usageServiceId} onChange={(e) => setUsageServiceId(Number(e.target.value))}>
+                      {data.contents.length > 1 ? <option value={0}>Seleziona servizio…</option> : null}
+                      {data.contents.map((c) => (
+                        <option key={c.id} value={c.serviceId}>
+                          {c.serviceName} ({c.sessionsRemaining}/{c.sessionsTotal})
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  <input className="form-control" placeholder="Nota (opzionale)" value={usageNote} maxLength={255} onChange={(e) => setUsageNote(e.target.value)} />
+                  <button className="btn btn-outline-primary" type="submit" disabled={savingUsage}>
+                    {savingUsage ? "Registrazione…" : "Registra"}
+                  </button>
+                </form>
+                <div className="form-text mt-1">Scala = diminuisce le residue. Ripristina = aumenta le residue.</div>
+              </div>
+            ) : null}
           </div>
 
           {/* Right: contents + usages */}

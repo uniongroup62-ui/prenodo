@@ -4571,6 +4571,97 @@ export async function updateManageClientPackageExpiry(slug: string, id: number, 
   return { ok: true };
 }
 
+// Recompute a client package's stored status from remaining + expiry (port of
+// pkg_status_calc), preserving cancelled/completed.
+function recomputeClientPackageStatus(stored: string, remaining: number, expiresAt: string): string {
+  const s = String(stored ?? "").trim().toLowerCase();
+  if (s === "canceled" || s === "cancelled") return s;
+  if (remaining <= 0) return "completed";
+  const exp = String(expiresAt ?? "").slice(0, 10);
+  if (exp !== "" && exp < todayIso()) return "expired";
+  return "active";
+}
+
+// Register a manual usage movement on a client package (port of packages.php
+// action=usage_add, SERVICE path): op 'consume'|'restore' × qty, on a specific
+// service (required when the package is multi-service, else the first/only one).
+// Consume can't exceed the remaining sedute; restore can't exceed the total.
+// Refuses on a cancelled package, and consume on an expired one. Writes the
+// client_package_usages row (delta<0 consume / >0 restore) + syncs
+// client_package_services + the client_packages aggregate + status. The
+// product ritira/ripristina (stock-linked) path is intentionally not ported
+// here — it belongs with the warehouse stock-doc subsystem.
+export async function addManageClientPackageUsage(
+  slug: string,
+  id: number,
+  op: string,
+  qty: number,
+  serviceId: number,
+  note: string,
+  by: number,
+): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Pacchetto non valido.");
+  const mode = String(op ?? "").trim().toLowerCase();
+  if (mode !== "consume" && mode !== "restore") throw new Error("Operazione non valida.");
+  const q = Math.trunc(Number(qty));
+  if (!Number.isFinite(q) || q <= 0 || q > 10000) throw new Error("Quantità non valida.");
+  const delta = mode === "restore" ? Math.abs(q) : -Math.abs(q);
+
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "client_packages", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Pacchetto non trovato.");
+  const cp = rows[0];
+  const stored = String(cp.status ?? "active").trim().toLowerCase();
+  if (stored === "canceled" || stored === "cancelled") throw new Error("Pacchetto annullato: non puoi registrare sedute o ritiri.");
+  const expiresAt = String(cp.expires_at ?? "");
+  const isExpired = recomputeClientPackageStatus(stored, Math.max(0, Number(cp.sessions_remaining ?? 0)), expiresAt) === "expired";
+  if (isExpired && delta < 0) throw new Error("Pacchetto scaduto: non puoi scalare sedute o ritiri. Puoi aggiornare la scadenza o registrare un ripristino.");
+
+  const usageTable = await tenantTable(slug, "client_package_usages");
+  const cpsRows = await tenantSelect<RowDataPacket>({ slug, table: "client_package_services", where: "client_package_id = ?", params: [id], orderBy: "sort_order ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+
+  if (cpsRows.length > 0) {
+    const isMulti = cpsRows.length > 1;
+    let targetServiceId = serviceId;
+    if (isMulti && targetServiceId <= 0) throw new Error("Seleziona il servizio da scalare.");
+    if (targetServiceId <= 0) targetServiceId = Number(cpsRows[0].service_id ?? 0);
+    const target = cpsRows.find((r) => Number(r.service_id ?? 0) === targetServiceId);
+    if (!target) throw new Error("Servizio non incluso in questo pacchetto.");
+
+    const remaining = Math.max(0, Number(target.sessions_remaining ?? 0));
+    const total = Math.max(0, Number(target.sessions_total ?? 0));
+    const newRemaining = remaining + delta;
+    if (delta < 0 && Math.abs(delta) > remaining) throw new Error("Sedute insufficienti per il servizio selezionato.");
+    if (newRemaining > total) throw new Error("Superi le sedute totali del servizio selezionato.");
+
+    await tenantUpdate({ slug, table: "client_package_services", id: Number(target.id ?? 0), values: { sessions_remaining: newRemaining } });
+
+    let sumTotal = 0;
+    let sumRemaining = 0;
+    for (const r of cpsRows) {
+      sumTotal += Number(r.sessions_total ?? 0);
+      sumRemaining += Number(r.id ?? 0) === Number(target.id ?? 0) ? newRemaining : Number(r.sessions_remaining ?? 0);
+    }
+    if (sumTotal <= 0) sumTotal = Math.max(1, Number(cp.sessions_total ?? 1));
+
+    await tenantInsert(usageTable, { client_package_id: id, service_id: targetServiceId, item_type: "service", item_id: targetServiceId, used_at: new Date(), delta, note: note.trim() !== "" ? note.trim() : null, created_by: by > 0 ? by : null }).catch(() => 0);
+    const newStatus = recomputeClientPackageStatus(stored, sumRemaining, expiresAt);
+    await tenantUpdate({ slug, table: "client_packages", id, values: { sessions_total: sumTotal, sessions_remaining: sumRemaining, status: newStatus } });
+    return { ok: true };
+  }
+
+  // Fallback: no per-service rows — operate on the client_packages aggregate.
+  const remaining = Math.max(0, Number(cp.sessions_remaining ?? 0));
+  const total = Math.max(0, Number(cp.sessions_total ?? 0));
+  const newRemaining = remaining + delta;
+  if (delta < 0 && Math.abs(delta) > remaining) throw new Error("Sedute insufficienti.");
+  if (newRemaining > total) throw new Error("Superi le sedute totali: aumenta prima le sedute totali.");
+  const sid = Number(cp.service_id ?? 0);
+  await tenantInsert(usageTable, { client_package_id: id, service_id: sid > 0 ? sid : null, item_type: sid > 0 ? "service" : null, item_id: sid > 0 ? sid : null, used_at: new Date(), delta, note: note.trim() !== "" ? note.trim() : null, created_by: by > 0 ? by : null }).catch(() => 0);
+  const newStatus = recomputeClientPackageStatus(stored, newRemaining, expiresAt);
+  await tenantUpdate({ slug, table: "client_packages", id, values: { sessions_remaining: newRemaining, status: newStatus } });
+  return { ok: true };
+}
+
 export async function issueDbClientPackage(
   input: { packageId?: number; clientId?: number; clientName?: string; expiresAt?: string; sourceSaleId?: number },
   slug: string,
