@@ -16,11 +16,20 @@ type CostRow = {
   amount: number;
   paidAmount: number;
   remainingAmount: number;
+  vatPercent: number | null;
   dueDate: string;
   status: "open" | "overdue" | "paid";
   isPaid: boolean;
+  isPartial: boolean;
+  paidAt: string;
+  paymentMethod: string;
   docNumber: string;
+  docDate: string;
+  notes: string;
   isRecurring: boolean;
+  recurrenceInterval: number;
+  recurrenceUnit: string;
+  recurrenceEndDate: string;
   locationId: number | null;
   locationName: string;
   attachmentName: string;
@@ -112,6 +121,8 @@ export function CostsContent() {
   // Bulk selection (scadenziario): the checked cost ids for "Elimina selezionati".
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Per-row detail ("Riepilogo") modal (faithful to the legacy cost summary modal).
+  const [detailCost, setDetailCost] = useState<CostRow | null>(null);
 
   const load = useCallback(
     (filters: { cat: string; from: string; to: string; status: string; q: string }) => {
@@ -466,6 +477,14 @@ export function CostsContent() {
                             )}
                           </td>
                           <td className="text-end costs-nowrap">
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-outline-secondary"
+                              title="Riepilogo"
+                              onClick={() => setDetailCost(r)}
+                            >
+                              <i className="bi bi-eye" />
+                            </button>{" "}
                             <a
                               className="btn btn-sm btn-outline-secondary"
                               href={href(`&tab=scadenziario&action=edit&id=${r.id}`)}
@@ -498,6 +517,131 @@ export function CostsContent() {
           </div>
         </>
       )}
+
+      {/* Per-row "Riepilogo" modal (faithful to the legacy cost summary modal): a read-only detail
+          of the selected cost. Controlled by React (content is the selected row). */}
+      {detailCost ? (
+        <>
+          <div className="modal fade show costs-detail-modal" style={{ display: "block" }} tabIndex={-1} role="dialog" aria-modal="true">
+            <div className="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+              <div className="modal-content">
+                <div className="modal-header">
+                  <h5 className="modal-title">Riepilogo costo</h5>
+                  <button type="button" className="btn-close" aria-label="Chiudi" onClick={() => setDetailCost(null)} />
+                </div>
+                <div className="modal-body">
+                  <dl className="row mb-0 small costs-detail-list">
+                    <dt className="col-sm-5">Titolo</dt>
+                    <dd className="col-sm-7 fw-semibold">{detailCost.title}</dd>
+                    <dt className="col-sm-5">Scadenza</dt>
+                    <dd className="col-sm-7">{fmtDate(detailCost.dueDate)}</dd>
+                    <dt className="col-sm-5">Categoria</dt>
+                    <dd className="col-sm-7">
+                      {detailCost.categoryName ? (
+                        <span className="badge" style={{ backgroundColor: detailCost.categoryColor || "#6c757d" }}>{detailCost.categoryName}</span>
+                      ) : "—"}
+                    </dd>
+                    <dt className="col-sm-5">Fornitore</dt>
+                    <dd className="col-sm-7">{detailCost.supplierName || "—"}</dd>
+                    {showLocationCol ? (
+                      <>
+                        <dt className="col-sm-5">Sede</dt>
+                        <dd className="col-sm-7">{detailCost.locationName || "Tutte le sedi"}</dd>
+                      </>
+                    ) : null}
+                    <dt className="col-sm-5">Totale</dt>
+                    <dd className="col-sm-7">€ {fmtMoney(detailCost.amount)}</dd>
+                    <dt className="col-sm-5">Pagato</dt>
+                    <dd className="col-sm-7">€ {fmtMoney(detailCost.paidAmount)}</dd>
+                    <dt className="col-sm-5">Residuo</dt>
+                    <dd className="col-sm-7">€ {fmtMoney(detailCost.remainingAmount)}</dd>
+                    {detailCost.vatPercent != null ? (
+                      <>
+                        <dt className="col-sm-5">IVA</dt>
+                        <dd className="col-sm-7">{detailCost.vatPercent}%</dd>
+                      </>
+                    ) : null}
+                    <dt className="col-sm-5">Stato</dt>
+                    <dd className="col-sm-7">
+                      {detailCost.isPaid ? (
+                        <span className="badge text-bg-success">Pagato</span>
+                      ) : detailCost.status === "overdue" ? (
+                        <span className="badge text-bg-danger">Scaduto</span>
+                      ) : (
+                        <span className="badge text-bg-warning">Da pagare</span>
+                      )}
+                    </dd>
+                    {detailCost.paymentMethod ? (
+                      <>
+                        <dt className="col-sm-5">Metodo pagamento</dt>
+                        <dd className="col-sm-7">{detailCost.paymentMethod}</dd>
+                      </>
+                    ) : null}
+                    {detailCost.docNumber ? (
+                      <>
+                        <dt className="col-sm-5">Documento</dt>
+                        <dd className="col-sm-7">{detailCost.docNumber}{detailCost.docDate ? ` — ${fmtDate(detailCost.docDate)}` : ""}</dd>
+                      </>
+                    ) : null}
+                    {detailCost.isPaid && detailCost.paidAt ? (
+                      <>
+                        <dt className="col-sm-5">Pagato il</dt>
+                        <dd className="col-sm-7">{fmtDate(detailCost.paidAt)}</dd>
+                      </>
+                    ) : null}
+                    {detailCost.isRecurring ? (
+                      <>
+                        <dt className="col-sm-5">Ricorrenza</dt>
+                        <dd className="col-sm-7">
+                          Ogni {detailCost.recurrenceInterval || 1} {recurrenceUnitLabel(detailCost.recurrenceUnit, detailCost.recurrenceInterval || 1)}
+                          {detailCost.recurrenceEndDate ? ` — fino al ${fmtDate(detailCost.recurrenceEndDate)}` : " — senza fine"}
+                        </dd>
+                      </>
+                    ) : null}
+                    {detailCost.notes ? (
+                      <>
+                        <dt className="col-sm-5">Note</dt>
+                        <dd className="col-sm-7" style={{ whiteSpace: "pre-line" }}>{detailCost.notes}</dd>
+                      </>
+                    ) : null}
+                    {detailCost.attachmentName ? (
+                      <>
+                        <dt className="col-sm-5">Allegato</dt>
+                        <dd className="col-sm-7">{detailCost.attachmentName}</dd>
+                      </>
+                    ) : null}
+                  </dl>
+                </div>
+                <div className="modal-footer">
+                  <a className="btn btn-outline-primary" href={href(`&tab=scadenziario&action=edit&id=${detailCost.id}`)}>
+                    <i className="bi bi-pencil me-1" />
+                    Modifica
+                  </a>
+                  <button type="button" className="btn btn-secondary" onClick={() => setDetailCost(null)}>
+                    Chiudi
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="modal-backdrop fade show" onClick={() => setDetailCost(null)} />
+        </>
+      ) : null}
     </div>
   );
+}
+
+// "giorno/i", "settimana/e", "mese/i", "anno/i" for a recurrence unit + count (faithful labels).
+function recurrenceUnitLabel(unit: string, count: number): string {
+  const plural = count !== 1;
+  switch (unit) {
+    case "day":
+      return plural ? "giorni" : "giorno";
+    case "week":
+      return plural ? "settimane" : "settimana";
+    case "year":
+      return plural ? "anni" : "anno";
+    default:
+      return plural ? "mesi" : "mese";
+  }
 }
