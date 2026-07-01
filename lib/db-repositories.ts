@@ -7870,6 +7870,161 @@ export async function redeemDbGiftBox(id: number, quantity: number, slug: string
   return getSingleGiftBox(slug, id);
 }
 
+// ---- GiftBox INSTANCE detail + manage (giftbox.php tab=instances) ------------
+export type ManageGiftBoxInstanceItem = { id: number; itemType: string; name: string; qty: number };
+export type ManageGiftBoxInstance = {
+  id: number;
+  code: string;
+  giftboxName: string;
+  recipientName: string;
+  recipientEmail: string;
+  clientId: number;
+  status: string;
+  statusLabel: string;
+  statusBadge: string;
+  issuedAt: string;
+  expiresAt: string;
+  redeemedAt: string;
+  cancelledAt: string;
+  pointsCost: number;
+  note: string;
+  items: ManageGiftBoxInstanceItem[];
+  totalUnits: number;
+  redeemedUnits: number;
+  remainingUnits: number;
+  linkedSaleId: number | null;
+  canRedeem: boolean;
+  canCancel: boolean;
+};
+
+const GIFTBOX_STATUS_META: Record<string, { label: string; badge: string }> = {
+  active: { label: "Attiva", badge: "bg-success" },
+  issued: { label: "Attiva", badge: "bg-success" },
+  redeemed: { label: "Riscattata", badge: "bg-secondary" },
+  expired: { label: "Scaduta", badge: "bg-warning text-dark" },
+  cancelled: { label: "Annullata", badge: "bg-danger" },
+};
+
+// Full giftbox INSTANCE detail (port of giftbox.php action=edit_instance): the
+// header (code / template name / recipient / status / dates / points) + the
+// instance items (giftbox_instance_items with resolved names) + redeemed/residual
+// units + the linked sale (parsed from the "Vendita #N" note). Read-only.
+export async function getManageGiftBoxInstance(slug: string, id: number): Promise<ManageGiftBoxInstance | null> {
+  if (id <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftbox_instances", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) return null;
+  const inst = rows[0];
+
+  const giftboxId = Number(inst.giftbox_id ?? 0);
+  let giftboxName = "";
+  if (giftboxId > 0) {
+    const gb = await tenantSelect<RowDataPacket>({ slug, table: "giftboxes", columns: "name", where: "id = ?", params: [giftboxId], limit: 1 }).catch(() => [] as RowDataPacket[]);
+    giftboxName = String(gb[0]?.name ?? "");
+  }
+
+  const itemRows = await tenantSelect<RowDataPacket>({ slug, table: "giftbox_instance_items", where: "instance_id = ?", params: [id], orderBy: "sort_order ASC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  const items: ManageGiftBoxInstanceItem[] = [];
+  let totalUnits = 0;
+  for (const r of itemRows) {
+    const itemType = String(r.item_type ?? "service");
+    const qty = Math.max(1, Number(r.qty ?? 1));
+    totalUnits += qty;
+    let name = String(r.custom_label ?? "").trim() || snapshotServiceName(r.service_snapshot_json);
+    if (name === "") {
+      if (itemType === "product") {
+        const pr = await tenantSelect<RowDataPacket>({ slug, table: "products", columns: "name", where: "id = ?", params: [Number(r.product_id ?? 0)], limit: 1 }).catch(() => [] as RowDataPacket[]);
+        name = String(pr[0]?.name ?? `Prodotto #${r.product_id}`);
+      } else {
+        name = await serviceNameById(slug, Number(r.service_id ?? 0), `Servizio #${r.service_id}`);
+      }
+    }
+    items.push({ id: Number(r.id ?? 0), itemType, name, qty });
+  }
+
+  const rawStatus = String(inst.status ?? "issued").trim().toLowerCase();
+  const trackedRedeemed = await giftBoxRedeemedUnits(slug, id);
+  const isCancelled = rawStatus === "cancelled" || rawStatus === "canceled";
+  const isRedeemed = rawStatus === "redeemed";
+  // A fully redeemed/cancelled instance has no residual (matches the legacy).
+  const redeemedUnits = isRedeemed ? totalUnits : Math.min(totalUnits, trackedRedeemed);
+  const remainingUnits = isCancelled || isRedeemed ? 0 : Math.max(0, totalUnits - redeemedUnits);
+  // Status with cancelled taking priority (giftBoxStatus would map a 0-residual
+  // cancelled instance to "redeemed").
+  const exp = String(inst.expires_at ?? "").slice(0, 10);
+  const status = isCancelled
+    ? "cancelled"
+    : isRedeemed || remainingUnits <= 0
+      ? "redeemed"
+      : exp !== "" && exp < todayIso()
+        ? "expired"
+        : "active";
+  const meta = GIFTBOX_STATUS_META[status] ?? { label: status, badge: "bg-secondary" };
+
+  // Linked sale from the "Vendita #N" note marker (issueGiftboxFromSale).
+  let linkedSaleId: number | null = null;
+  const noteMatch = String(inst.note ?? "").match(/Vendita\s+#(\d+)/i);
+  if (noteMatch) linkedSaleId = Number(noteMatch[1]) || null;
+
+  return {
+    id,
+    code: String(inst.code ?? ""),
+    giftboxName,
+    recipientName: String(inst.recipient_name ?? ""),
+    recipientEmail: String(inst.recipient_email ?? ""),
+    clientId: Number(inst.recipient_client_id ?? inst.client_id ?? 0) || 0,
+    status,
+    statusLabel: meta.label,
+    statusBadge: meta.badge,
+    issuedAt: inst.issued_at ? toIso(inst.issued_at) : "",
+    expiresAt: inst.expires_at ? String(inst.expires_at).slice(0, 10) : "",
+    redeemedAt: inst.redeemed_at ? toIso(inst.redeemed_at) : "",
+    cancelledAt: inst.cancelled_at ? toIso(inst.cancelled_at) : "",
+    pointsCost: Number(inst.points_cost ?? 0) || 0,
+    note: String(inst.note ?? ""),
+    items,
+    totalUnits,
+    redeemedUnits,
+    remainingUnits,
+    linkedSaleId,
+    canRedeem: (status === "active") && remainingUnits > 0,
+    canCancel: status === "active",
+  };
+}
+
+// Cancel a giftbox instance (port of giftbox.php cancel / GiftBox::cancelInstance):
+// status='cancelled' + cancelled_at/by. Refuses an already redeemed/cancelled one.
+export async function cancelManageGiftBoxInstance(slug: string, id: number, by: number): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Istanza non valida.");
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "giftbox_instances", columns: "id, status", where: "id = ?", params: [id], limit: 1 });
+  if (!rows[0]) throw new Error("Istanza non trovata.");
+  const st = String(rows[0].status ?? "").trim().toLowerCase();
+  if (st === "cancelled" || st === "canceled") throw new Error("GiftBox già annullata.");
+  if (st === "redeemed") throw new Error("GiftBox già riscattata: non annullabile.");
+  await tenantUpdate({ slug, table: "giftbox_instances", id, values: { status: "cancelled", cancelled_at: new Date(), cancelled_by: by > 0 ? by : null } });
+  return { ok: true };
+}
+
+// Redeem an ENTIRE giftbox instance (port of giftbox.php redeem_instance /
+// GiftBox::redeemInstance): mark all remaining units redeemed → status='redeemed'.
+export async function redeemManageGiftBoxInstanceFull(slug: string, id: number, by: number): Promise<{ ok: true }> {
+  if (id <= 0) throw new Error("Istanza non valida.");
+  const detail = await getManageGiftBoxInstance(slug, id);
+  if (!detail) throw new Error("Istanza non trovata.");
+  if (detail.status === "cancelled") throw new Error("GiftBox annullata: non riscattabile.");
+  if (detail.status === "redeemed" || detail.remainingUnits <= 0) throw new Error("GiftBox già riscattata.");
+  if (detail.status === "expired") throw new Error("GiftBox scaduta: non riscattabile.");
+  // Log a manual redemption for the residual, then flip the instance to redeemed.
+  await tenantInsert(await tenantTable(slug, "giftbox_redemptions"), {
+    instance_id: id,
+    redeemed_at: new Date(),
+    source_type: "manual",
+    note: "Riscatto manuale GiftBox",
+    redeemed_by: by > 0 ? by : null,
+  }).catch(() => 0);
+  await tenantUpdate({ slug, table: "giftbox_instances", id, values: { status: "redeemed", redeemed_at: new Date(), redeemed_by: by > 0 ? by : null, redeemed_source_type: "manual" } });
+  return { ok: true };
+}
+
 export async function listDbGifts(slug: string): Promise<GiftReward[]> {
   const rows = await tenantSelect<RowDataPacket>({
     slug,

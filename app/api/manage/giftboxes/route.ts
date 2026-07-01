@@ -1,12 +1,15 @@
 import { jsonError, parseInteger, parseRequestBody } from "@/lib/api-utils";
 import {
+  cancelManageGiftBoxInstance,
   deleteManageGiftBoxTemplate,
+  getManageGiftBoxInstance,
   getManageGiftBoxTemplate,
   giftFormCatalog,
   issueDbGiftBox,
   listDbGiftBoxes,
   listManageGiftBoxTemplates,
   redeemDbGiftBox,
+  redeemManageGiftBoxInstanceFull,
   saveManageGiftBoxTemplate,
 } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
@@ -49,6 +52,14 @@ export async function GET(request: Request) {
       const template = await getManageGiftBoxTemplate(tenantSlug, templateId);
       if (!template) return jsonError("GiftBox non trovata.", 404);
       return Response.json({ ok: true, source: "giftbox?action=get", sourceMode: "database", template });
+    }
+
+    // Instance DETAIL (tab=instances action=view/edit_instance): header + items +
+    // redeemed/residual units + linked sale + redeem/cancel eligibility.
+    if (action === "view" || action === "edit_instance") {
+      const detail = await getManageGiftBoxInstance(tenantSlug, parseInteger(url.searchParams.get("id"), 0));
+      if (!detail) return jsonError("GiftBox non trovata.", 404);
+      return Response.json({ ok: true, sourceMode: "database", detail });
     }
 
     return Response.json({
@@ -103,6 +114,22 @@ export async function POST(request: Request) {
       const quantity = parseInteger(body.quantity, 1);
       const giftBox = await redeemDbGiftBox(id, quantity, tenantSlug);
       return Response.json({ ok: true, source: "giftbox?action=redeem", sourceMode: "database", giftBox, giftBoxes: await listDbGiftBoxes(tenantSlug) });
+    }
+
+    // Redeem an ENTIRE instance (port of redeem_instance): all remaining -> redeemed.
+    if (action === "redeem_full" || action === "redeem_instance") {
+      const id = parseInteger(body.instance_id ?? body.id, 0);
+      await redeemManageGiftBoxInstanceFull(tenantSlug, id, session.user.id);
+      const detail = await getManageGiftBoxInstance(tenantSlug, id);
+      return Response.json({ ok: true, source: "giftbox?action=redeem_full", sourceMode: "database", detail });
+    }
+
+    // Cancel an instance (port of cancel / GiftBox::cancelInstance).
+    if (action === "cancel" || action === "cancel_instance") {
+      const id = parseInteger(body.instance_id ?? body.id, 0);
+      await cancelManageGiftBoxInstance(tenantSlug, id, session.user.id);
+      const detail = await getManageGiftBoxInstance(tenantSlug, id);
+      return Response.json({ ok: true, source: "giftbox?action=cancel", sourceMode: "database", detail });
     }
 
     return jsonError("Azione GiftBox non supportata.");

@@ -28,6 +28,7 @@ import { GiftcardContent } from "@/components/modules/giftcard-content";
 import { GiftsContent } from "@/components/modules/gifts-content";
 import { GiftFormContent } from "@/components/modules/gift_form-content";
 import { GiftBoxFormContent } from "@/components/modules/giftbox_form-content";
+import { GiftBoxInstanceDetailContent } from "@/components/modules/giftbox_instance_detail-content";
 import { HoursContent } from "@/components/modules/hours-content";
 import { ProductsContent } from "@/components/modules/products-content";
 import { ProductFormContent } from "@/components/modules/product_form-content";
@@ -381,6 +382,18 @@ export default async function TenantPage({
     return (
       <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
         <ClientPackageDetailContent />
+      </ManageShell>
+    );
+  }
+
+  // Faithful giftbox INSTANCE detail (giftbox.php tab=instances action=view/
+  // edit_instance): header + contents + redeem/cancel, instead of the Tailwind
+  // fallback. (Guarded before the tab=boxes template editor branch below, which
+  // handles new/edit.)
+  if (page === "giftbox" && (query.action === "view" || query.action === "edit_instance")) {
+    return (
+      <ManageShell slug={tenantSlug} userName={session.user.name} currentPage={page}>
+        <GiftBoxInstanceDetailContent />
       </ManageShell>
     );
   }
