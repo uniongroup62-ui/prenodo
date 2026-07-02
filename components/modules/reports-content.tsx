@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 // Pixel-faithful port of the PHP reports page (app/pages/reports.php,
 // ?page=reports). The original is a read-only analytics dashboard (filter
@@ -9,6 +9,19 @@ import { useEffect, useState } from "react";
 // subset of the KPIs the PHP page renders. Values present in the API are
 // pre-filled on mount; values not exposed by the API fall back to the PHP
 // "empty" defaults ("0", "€ 0,00", "—", "N/D", "Non indicato").
+
+type ReportRow = { name: string; revenue: number; qty?: number; saleCount?: number };
+type Analytics = {
+  from: string;
+  to: string;
+  summary: { soldRevenue: number; grossRevenue: number; saleCount: number; servedClients: number; averageTicket: number; appointmentCount: number };
+  comparison: { from: string; to: string; soldRevenue: number; saleCount: number; deltaPct: number } | null;
+  daily: { day: string; revenue: number; saleCount: number }[];
+  topClients: { clientId: number; name: string; revenue: number; saleCount: number }[];
+  topServices: ReportRow[];
+  topProducts: ReportRow[];
+  operators: { name: string; revenue: number; saleCount: number }[];
+};
 
 type ReportsResponse = {
   ok?: boolean;
@@ -22,6 +35,7 @@ type ReportsResponse = {
   };
   paymentTotals?: Record<string, number>;
   mix?: { services?: number; products?: number };
+  analytics?: Analytics;
 };
 
 function tenantSlug(): string {
@@ -59,16 +73,47 @@ export function ReportsContent() {
 
   const [data, setData] = useState<ReportsResponse | null>(null);
 
-  useEffect(() => {
-    fetch(`/api/manage/reports?slug=${encodeURIComponent(slug)}`, {
-      headers: { "x-tenant-slug": slug },
-    })
+  // Resolve the range preset (or custom from/to) to a [from, to] window (YYYY-MM-DD),
+  // mirroring reports.php's period presets. Uses UTC to match the server's date math.
+  const resolveRange = useCallback((): { from: string; to: string } => {
+    const iso = (d: Date) => d.toISOString().slice(0, 10);
+    const now = new Date();
+    const y = now.getUTCFullYear();
+    const m = now.getUTCMonth();
+    const d = now.getUTCDate();
+    const dayMs = 86400000;
+    const back = (n: number) => iso(new Date(Date.UTC(y, m, d) - n * dayMs));
+    switch (range) {
+      case "today": return { from: iso(now), to: iso(now) };
+      case "yesterday": return { from: back(1), to: back(1) };
+      case "last_7": return { from: back(6), to: iso(now) };
+      case "last_30": return { from: back(29), to: iso(now) };
+      case "last_90": return { from: back(89), to: iso(now) };
+      case "last_180": return { from: back(179), to: iso(now) };
+      case "month_previous": return { from: iso(new Date(Date.UTC(y, m - 1, 1))), to: iso(new Date(Date.UTC(y, m, 0))) };
+      case "year_current": return { from: iso(new Date(Date.UTC(y, 0, 1))), to: iso(now) };
+      case "custom": return { from, to };
+      case "month_current":
+      default: return { from: iso(new Date(Date.UTC(y, m, 1))), to: iso(now) };
+    }
+  }, [range, from, to]);
+
+  const load = useCallback(() => {
+    const rng = resolveRange();
+    const params = new URLSearchParams({ slug, from: rng.from, to: rng.to });
+    if (compare) params.set("compare", "1");
+    return fetch(`/api/manage/reports?${params.toString()}`, { headers: { "x-tenant-slug": slug } })
       .then((r) => r.json())
       .then((j: ReportsResponse) => setData(j))
       .catch(() => setData(null));
-  }, [slug]);
+  }, [slug, resolveRange, compare]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const k = data?.kpis ?? {};
+  const a = data?.analytics;
   const showCustom = range === "custom";
 
   return (
@@ -79,7 +124,7 @@ export function ReportsContent() {
         <div className="bs-page-heading">
           <div className="bs-page-kicker">Analisi</div>
           <h1 className="bs-page-title">Report</h1>
-          <div className="bs-page-subtitle">Mese corrente / 01/06/2026 - 29/06/2026 / Sede1 / Grafici per giorno</div>
+          <div className="bs-page-subtitle">{a ? `Periodo ${a.from.split("-").reverse().join("/")} – ${a.to.split("-").reverse().join("/")}` : "Statistiche vendite del periodo"}</div>
         </div>
       </div>
 
@@ -261,24 +306,29 @@ export function ReportsContent() {
       <div className="report-kpi-grid mb-3">
         <div className="report-kpi">
           <div className="label">Incasso</div>
-          <div className="value">{fmtMoney(k.revenue)}</div>
+          <div className="value">{fmtMoney(a?.summary.soldRevenue)}</div>
           <div className="sub">
-            Venduto {fmtMoney(k.revenue)} / Lordo {fmtMoney(k.revenue)}
+            Venduto {fmtMoney(a?.summary.soldRevenue)} / Lordo {fmtMoney(a?.summary.grossRevenue)}
           </div>
+          {a?.comparison ? (
+            <div className={`sub ${a.comparison.deltaPct >= 0 ? "text-success" : "text-danger"}`}>
+              {a.comparison.deltaPct >= 0 ? "▲" : "▼"} {Math.abs(a.comparison.deltaPct)}% vs periodo prec. ({fmtMoney(a.comparison.soldRevenue)})
+            </div>
+          ) : null}
         </div>
         <div className="report-kpi">
           <div className="label">Vendite</div>
-          <div className="value">{fmtInt(k.activeSales)}</div>
+          <div className="value">{fmtInt(a?.summary.saleCount)}</div>
           <div className="sub">Periodo selezionato</div>
         </div>
         <div className="report-kpi">
           <div className="label">Scontrino medio</div>
-          <div className="value">{fmtMoney(k.averageTicket)}</div>
+          <div className="value">{fmtMoney(a?.summary.averageTicket)}</div>
           <div className="sub">Periodo selezionato</div>
         </div>
         <div className="report-kpi">
           <div className="label">Clienti serviti</div>
-          <div className="value">0</div>
+          <div className="value">{fmtInt(a?.summary.servedClients)}</div>
           <div className="sub">Clienti associati alle vendite</div>
         </div>
       </div>
@@ -286,9 +336,8 @@ export function ReportsContent() {
       <div className="report-kpi-grid mb-3">
         <div className="report-kpi">
           <div className="label">Prenotazioni</div>
-          <div className="value">0</div>
+          <div className="value">{fmtInt(a?.summary.appointmentCount)}</div>
           <div className="sub">Non annullate nel periodo</div>
-          <div className="sub">In attesa 0 / Prenotate 0 / Eseguite 0 / Annullate 2 / No show 0</div>
         </div>
         <div className="report-kpi">
           <div className="label">Clienti in archivio</div>
@@ -318,6 +367,106 @@ export function ReportsContent() {
           <div className="label">Commissioni</div>
           <div className="value">€ 0,00</div>
           <div className="sub">Da pagare € 0,00</div>
+        </div>
+      </div>
+
+      {/* Date-filtered analytics (top clients / operators / services / products + daily trend). */}
+      <div className="row g-3 mb-3">
+        <div className="col-xl-6">
+          <div className="report-panel p-3">
+            <div className="fw-semibold mb-2">Migliori clienti</div>
+            <div className="table-responsive">
+              <table className="table table-sm align-middle mb-0">
+                <thead><tr><th>Cliente</th><th className="text-end">Vendite</th><th className="text-end">Incasso</th></tr></thead>
+                <tbody>
+                  {(a?.topClients ?? []).length === 0 ? (
+                    <tr><td colSpan={3} className="text-muted p-2">Nessun dato nel periodo.</td></tr>
+                  ) : (
+                    (a?.topClients ?? []).map((c) => (
+                      <tr key={c.clientId}><td>{c.name}</td><td className="text-end">{c.saleCount}</td><td className="text-end">{fmtMoney(c.revenue)}</td></tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div className="col-xl-6">
+          <div className="report-panel p-3">
+            <div className="fw-semibold mb-2">Operatori</div>
+            <div className="table-responsive">
+              <table className="table table-sm align-middle mb-0">
+                <thead><tr><th>Operatore</th><th className="text-end">Vendite</th><th className="text-end">Incasso</th></tr></thead>
+                <tbody>
+                  {(a?.operators ?? []).length === 0 ? (
+                    <tr><td colSpan={3} className="text-muted p-2">Nessun dato nel periodo.</td></tr>
+                  ) : (
+                    (a?.operators ?? []).map((o) => (
+                      <tr key={o.name}><td>{o.name}</td><td className="text-end">{o.saleCount}</td><td className="text-end">{fmtMoney(o.revenue)}</td></tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div className="col-xl-6">
+          <div className="report-panel p-3">
+            <div className="fw-semibold mb-2">Servizi più venduti</div>
+            <div className="table-responsive">
+              <table className="table table-sm align-middle mb-0">
+                <thead><tr><th>Servizio</th><th className="text-end">Qtà</th><th className="text-end">Incasso</th></tr></thead>
+                <tbody>
+                  {(a?.topServices ?? []).length === 0 ? (
+                    <tr><td colSpan={3} className="text-muted p-2">Nessun dato nel periodo.</td></tr>
+                  ) : (
+                    (a?.topServices ?? []).map((s) => (
+                      <tr key={s.name}><td>{s.name}</td><td className="text-end">{s.qty ?? 0}</td><td className="text-end">{fmtMoney(s.revenue)}</td></tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div className="col-xl-6">
+          <div className="report-panel p-3">
+            <div className="fw-semibold mb-2">Prodotti più venduti</div>
+            <div className="table-responsive">
+              <table className="table table-sm align-middle mb-0">
+                <thead><tr><th>Prodotto</th><th className="text-end">Qtà</th><th className="text-end">Incasso</th></tr></thead>
+                <tbody>
+                  {(a?.topProducts ?? []).length === 0 ? (
+                    <tr><td colSpan={3} className="text-muted p-2">Nessun dato nel periodo.</td></tr>
+                  ) : (
+                    (a?.topProducts ?? []).map((s) => (
+                      <tr key={s.name}><td>{s.name}</td><td className="text-end">{s.qty ?? 0}</td><td className="text-end">{fmtMoney(s.revenue)}</td></tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div className="col-12">
+          <div className="report-panel p-3">
+            <div className="fw-semibold mb-2">Andamento incasso per giorno</div>
+            <div className="table-responsive" style={{ maxHeight: 240, overflowY: "auto" }}>
+              <table className="table table-sm align-middle mb-0">
+                <thead><tr><th>Giorno</th><th className="text-end">Vendite</th><th className="text-end">Incasso</th></tr></thead>
+                <tbody>
+                  {(a?.daily ?? []).length === 0 ? (
+                    <tr><td colSpan={3} className="text-muted p-2">Nessuna vendita nel periodo.</td></tr>
+                  ) : (
+                    (a?.daily ?? []).map((row) => {
+                      const [yy, mm, dd] = row.day.split("-");
+                      return (<tr key={row.day}><td>{dd}/{mm}/{yy}</td><td className="text-end">{row.saleCount}</td><td className="text-end">{fmtMoney(row.revenue)}</td></tr>);
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </div>
 

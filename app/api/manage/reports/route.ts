@@ -1,5 +1,6 @@
-import { jsonError } from "@/lib/api-utils";
+import { jsonError, parseInteger } from "@/lib/api-utils";
 import { listDbClients, listDbProducts, listDbSales, posDbSummary } from "@/lib/db-repositories";
+import { getManageReports } from "@/lib/manage-reports";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can } from "@/lib/role-permissions";
@@ -14,11 +15,15 @@ export async function GET(request: Request) {
   if (!can(session.user.perms, "reports.view")) return jsonError("Permesso report mancante.", 403);
 
   try {
-    const [summary, sales, clients, products] = await Promise.all([
+    const url = new URL(request.url);
+    const compare = ["1", "true", "yes", "on"].includes((url.searchParams.get("compare") ?? "").toLowerCase());
+    const [summary, sales, clients, products, analytics] = await Promise.all([
       posDbSummary(tenantSlug),
       listDbSales({ slug: tenantSlug }),
       listDbClients({ slug: tenantSlug }),
       listDbProducts({ slug: tenantSlug }),
+      // Date-filtered analytics (from/to = YYYY-MM-DD; default = current month).
+      getManageReports(tenantSlug, url.searchParams.get("from") ?? "", url.searchParams.get("to") ?? "", parseInteger(url.searchParams.get("location_id"), 0), compare),
     ]);
 
     return Response.json({
@@ -38,6 +43,7 @@ export async function GET(request: Request) {
         products: summary.productTotal,
       },
       latestSales: sales.slice(0, 5),
+      analytics,
     });
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Errore report.");
