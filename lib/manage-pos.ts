@@ -22,12 +22,14 @@ import {
   addDbWalletMovement,
   dbClientGiftcards,
   dbWalletBalance,
+  evaluatePromotionsForCart,
   getDbAppointmentForEdit,
   listDbQuotes,
   listFidelityCampaigns,
   previewDbCoupon,
   redeemDbGiftCard,
   refundDbGiftCard,
+  type PromoCartLine,
 } from "@/lib/db-repositories";
 import { getManageLocationContext } from "@/lib/manage-locations";
 import {
@@ -493,6 +495,25 @@ export async function checkoutManageSale(
 
   const subtotal = roundMoney(items.reduce((total, item) => total + item.total, 0));
   const manualDiscount = roundMoney(Math.max(0, input.discount ?? 0));
+
+  // PROMOTION (Block 3b): apply the operator-selected promotion (input.promotionId) to
+  // the service/product cart via the promotions engine (evaluatePromotionsForCart). The
+  // promotion discount joins the sale discount like a coupon; the applied promo + its
+  // discount are stamped on the sale and a promotion_redemptions row is recorded below.
+  let promoDiscount = 0;
+  let promoApplied: { id: number; name: string; nonDiscountedSubtotal: number } | null = null;
+  if (input.promotionId && input.promotionId > 0) {
+    const now = new Date();
+    const promoCart: PromoCartLine[] = items
+      .filter((it) => (it.type === "service" || it.type === "product") && it.refId > 0 && it.unitPrice > 0)
+      .map((it) => ({ type: it.type === "product" ? "product" : "service", id: it.refId, qty: it.quantity, unitPrice: it.unitPrice }));
+    const evaluated = await evaluatePromotionsForCart(slug, promoCart, now.toISOString().slice(0, 10), `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`, client.id, locationId);
+    const chosen = evaluated.promotions.find((p) => p.promotionId === input.promotionId);
+    if (!chosen || !chosen.eligible || chosen.discount <= 0) throw new Error("La promozione selezionata non è applicabile a questa vendita.");
+    promoDiscount = Math.min(subtotal, chosen.discount);
+    promoApplied = { id: chosen.promotionId, name: chosen.title, nonDiscountedSubtotal: roundMoney(Math.max(0, subtotal - chosen.eligibleAmount)) };
+  }
+
   const couponCode = clean(input.couponCode, 40);
   let couponDiscount = 0;
   if (couponCode) {
@@ -501,12 +522,12 @@ export async function checkoutManageSale(
     couponDiscount = coupon.discount;
   }
   // FIDELITY points redemption: convert the requested points into an euro discount,
-  // capped by the client balance + the amount still payable after manual + coupon. The
-  // points discount is ADDED to the sale discount (so the total drops) and the points are
-  // consumed below, linked to the sale id. Mirrors pos.php: discount += fid_discount.
-  const baseForPoints = roundMoney(Math.max(0, subtotal - manualDiscount - couponDiscount));
+  // capped by the client balance + the amount still payable after manual + promo + coupon.
+  // The points discount is ADDED to the sale discount (so the total drops) and the points
+  // are consumed below, linked to the sale id. Mirrors pos.php: discount += fid_discount.
+  const baseForPoints = roundMoney(Math.max(0, subtotal - manualDiscount - promoDiscount - couponDiscount));
   const redemption = await resolveFidelityRedemption(slug, client.id, input.fidelityPointsUse ?? 0, baseForPoints);
-  const discount = Math.min(subtotal, roundMoney(manualDiscount + couponDiscount + redemption.discount));
+  const discount = Math.min(subtotal, roundMoney(manualDiscount + promoDiscount + couponDiscount + redemption.discount));
   const total = roundMoney(Math.max(0, subtotal - discount));
   const payments = normalizePayments(input.payments, total);
   const paidAmount = roundMoney(payments.reduce((sum, payment) => sum + payment.amount, 0));
@@ -563,7 +584,10 @@ export async function checkoutManageSale(
     created_by: operator.id,
     operator_name: clean(operator.name, 120),
     location_id: locationId,
-    promotion_applied_id: input.promotionId && input.promotionId > 0 ? input.promotionId : null,
+    promotion_applied_id: promoApplied ? promoApplied.id : null,
+    promotion_applied_name: promoApplied ? clean(promoApplied.name, 190) : null,
+    promotion_applied_discount: promoApplied ? promoDiscount : 0,
+    promotion_applied_non_discounted_subtotal: promoApplied ? promoApplied.nonDiscountedSubtotal : 0,
     credit_used: residui.creditUsed,
     giftcard_id: residui.giftcardId > 0 ? residui.giftcardId : null,
     giftcard_used: residui.giftcardUsed,
@@ -579,6 +603,23 @@ export async function checkoutManageSale(
     // without the column (the notes marker keeps derivePayments correct regardless).
     payment_methods: JSON.stringify({ base: baseMethod }),
   }));
+
+  // RECORD the promotion redemption (port of Promotions::reserveSaleUse): one
+  // promotion_redemptions row linked to the sale, reversed on void (deleted in
+  // cancelLinkedSaleResidues). Schema-guarded via filterColumns.
+  if (promoApplied && promoDiscount > 0) {
+    const redTable = await tenantTable(slug, "promotion_redemptions").catch(() => null);
+    if (redTable) {
+      await tenantInsert(redTable, await filterColumns(redTable.name, {
+        promotion_id: promoApplied.id,
+        client_id: client.id > 0 ? client.id : null,
+        sale_id: saleId,
+        discount_amount: promoDiscount,
+        location_id: locationId,
+        redeemed_at: new Date(),
+      })).catch(() => 0);
+    }
+  }
 
   // CONSUME the residui, linking each consumption to the sale id so a later void can
   // restore it (cancelLinkedSaleResidues reverses both). GiftCard first, then credit.
@@ -3707,6 +3748,13 @@ async function cancelLinkedSaleResidues(
   // restore (which reverses a CONSUMED giftbox via giftbox_redemptions) — a different
   // operation keyed off the sale linkage, so the two never collide.
   await cancelIssuedSaleGiftboxes(slug, saleId, reason);
+
+  // REMOVE the promotion redemption this sale recorded (Block 3b), so a voided sale
+  // no longer counts against the promotion's per-customer/day limits.
+  const redTable = await tenantTable(slug, "promotion_redemptions").catch(() => null);
+  if (redTable) {
+    await dbExecute(`DELETE FROM ${quoteIdentifier(redTable.name)} WHERE tenant_id = ? AND sale_id = ?`, [redTable.tenantId ?? 0, saleId]).catch(() => undefined);
+  }
 
   if (!saleRow) return;
   const creditUsed = roundMoney(Number(saleRow.credit_used ?? 0) || 0);
