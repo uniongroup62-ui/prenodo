@@ -468,6 +468,16 @@ export function PosContent() {
   const [couponApplying, setCouponApplying] = useState(false);
   const couponReqRef = useRef(0);
 
+  // Promotion (Block 3b): the operator-detected automatic promotion. promotionId/name/
+  // discount mirror the best eligible promotion the engine returned for the current cart;
+  // promotion_id is sent on checkout (the backend re-evaluates and refuses if no longer
+  // applicable, so the shown discount always equals the charged one).
+  const [promotionId, setPromotionId] = useState(0);
+  const [promotionName, setPromotionName] = useState("");
+  const [promotionDiscountRaw, setPromotionDiscountRaw] = useState(0);
+  const [promotionMsg, setPromotionMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [promotionEvaluating, setPromotionEvaluating] = useState(false);
+
   // Payment: ONE base method for the remainder after residui (faithful single
   // payment_type radio). Defaults to Contanti.
   const [baseMethod, setBaseMethod] = useState<PaymentMethod>("cash");
@@ -813,13 +823,37 @@ export function PosContent() {
     return 0;
   }, [discountType, discountValue, subtotal]);
 
+  // A detected promotion is applied to a cart SNAPSHOT; when the cart/client changes it can
+  // go stale (the backend would recompute or refuse), so reset it on change. React-endorsed
+  // "adjust state on prior-render change" pattern (setState during render, guarded) — avoids
+  // an effect + touching every cart mutator.
+  const promoCartSig = `${clientId ?? 0}|${cart.map((l) => `${l.type}:${l.refId}:${l.quantity}:${l.unitPrice}`).join(",")}`;
+  const [prevPromoSig, setPrevPromoSig] = useState(promoCartSig);
+  if (promoCartSig !== prevPromoSig) {
+    setPrevPromoSig(promoCartSig);
+    if (promotionId !== 0) {
+      setPromotionId(0);
+      setPromotionName("");
+      setPromotionDiscountRaw(0);
+      setPromotionMsg(null);
+    }
+  }
+
+  // Promotion discount (Block 3b), composed like the backend: it applies after the
+  // manual discount and before the coupon (discount = manual + promo + coupon + fidelity,
+  // capped at subtotal), so the shown total equals the server's.
+  const promotionDiscount = useMemo(
+    () => roundMoney(Math.min(Math.max(0, promotionDiscountRaw), Math.max(0, subtotal - manualDiscount))),
+    [promotionDiscountRaw, subtotal, manualDiscount],
+  );
+
   // The coupon discount shown is the previewed value, but it is composed with the
   // manual discount exactly like the backend (discount = min(subtotal, manual +
   // coupon)), so it never drives the total negative and the shown total equals the
-  // server's. Only the part of the coupon that fits after the manual discount counts.
+  // server's. Only the part of the coupon that fits after the manual + promo discount counts.
   const codeDiscount = useMemo(
-    () => roundMoney(Math.min(Math.max(0, couponDiscount), Math.max(0, subtotal - manualDiscount))),
-    [couponDiscount, subtotal, manualDiscount],
+    () => roundMoney(Math.min(Math.max(0, couponDiscount), Math.max(0, subtotal - manualDiscount - promotionDiscount))),
+    [couponDiscount, subtotal, manualDiscount, promotionDiscount],
   );
 
   // ---- fidelity points redemption math ----
@@ -838,10 +872,10 @@ export function PosContent() {
   }, [residuals]);
   const pointsBalance = useMemo(() => Math.max(0, Math.floor(residuals?.points ?? 0)), [residuals]);
   const minPoints = useMemo(() => Math.max(0, Math.floor(residuals?.fidelity.minPoints ?? 0)), [residuals]);
-  // The amount still payable after manual + coupon — the cap the points discount fits into.
+  // The amount still payable after manual + promo + coupon — the cap the points discount fits into.
   const baseForPoints = useMemo(
-    () => roundMoney(Math.max(0, subtotal - manualDiscount - codeDiscount)),
-    [subtotal, manualDiscount, codeDiscount],
+    () => roundMoney(Math.max(0, subtotal - manualDiscount - promotionDiscount - codeDiscount)),
+    [subtotal, manualDiscount, promotionDiscount, codeDiscount],
   );
   // The most whole points the payable amount allows: floor(baseForPoints / euroPerPoint).
   const maxPointsByAmount = useMemo(
@@ -870,8 +904,8 @@ export function PosContent() {
   }, [fidelityEnabled, pointsUseInput, pointsBalance]);
 
   const total = useMemo(
-    () => roundMoney(Math.max(0, subtotal - manualDiscount - codeDiscount - fidelityDiscount)),
-    [subtotal, manualDiscount, codeDiscount, fidelityDiscount],
+    () => roundMoney(Math.max(0, subtotal - manualDiscount - promotionDiscount - codeDiscount - fidelityDiscount)),
+    [subtotal, manualDiscount, promotionDiscount, codeDiscount, fidelityDiscount],
   );
 
   // ---- rateizzazione (installment plan) math ----
@@ -1530,6 +1564,57 @@ export function PosContent() {
     setCouponMsg(null);
   }, [clearCouponState]);
 
+  // ---- Promotion (Block 3b) ----
+  const clearPromotion = useCallback(() => {
+    setPromotionId(0);
+    setPromotionName("");
+    setPromotionDiscountRaw(0);
+  }, []);
+
+  // "Rileva promozione": evaluate the service/product cart against the active promotions
+  // (POST action=evaluate) and apply the best eligible one. promotion_id is then sent on
+  // checkout, where the backend re-evaluates + records the redemption.
+  const detectPromotion = useCallback(async () => {
+    if (subtotal <= 0) {
+      setPromotionMsg({ text: "Aggiungi almeno un elemento al carrello.", ok: false });
+      return;
+    }
+    setPromotionEvaluating(true);
+    try {
+      const promoCart = cart
+        .filter((l) => (l.type === "service" || l.type === "product") && l.refId > 0 && l.unitPrice > 0)
+        .map((l) => ({ type: l.type, id: l.refId, qty: l.quantity, unitPrice: l.unitPrice }));
+      const now = new Date();
+      const res = await fetch(`/api/manage/promotions?slug=${encodeURIComponent(slug)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-tenant-slug": slug },
+        body: JSON.stringify({
+          action: "evaluate",
+          cart_json: JSON.stringify(promoCart),
+          date: now.toISOString().slice(0, 10),
+          time: `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
+          client_id: clientId ?? 0,
+        }),
+      });
+      const data: { ok?: boolean; error?: string; best?: { promotionId: number; title: string; discount: number } | null } = await res.json().catch(() => ({}));
+      const best = data?.best;
+      if (res.ok && data?.ok && best && best.discount > 0) {
+        setPromotionId(best.promotionId);
+        setPromotionName(best.title);
+        setPromotionDiscountRaw(roundMoney(best.discount));
+        setPromotionMsg({ text: `Promozione "${best.title}" applicata.`, ok: true });
+      } else {
+        clearPromotion();
+        setPromotionMsg({ text: "Nessuna promozione applicabile a questo carrello.", ok: false });
+      }
+    } catch {
+      clearPromotion();
+      setPromotionMsg({ text: "Errore durante la verifica delle promozioni.", ok: false });
+    } finally {
+      setPromotionEvaluating(false);
+    }
+  }, [subtotal, cart, clientId, slug, clearPromotion]);
+
   // ---- Residui mutators ----
   // "Usa max" for credit: apply the most the credit can cover (clamped to the remaining
   // total after the giftcard) — the creditUse memo re-clamps, so set the raw cap here.
@@ -1672,6 +1757,9 @@ export function PosContent() {
       payments_json: paymentsJson,
       discount: manualDiscount,
       coupon_code: couponCode.trim(),
+      // PROMOTION applied (Block 3b): the backend re-evaluates the promotion against the
+      // cart and refuses the checkout if it is no longer applicable.
+      promotion_id: promotionId > 0 ? promotionId : 0,
       // FIDELITY points to spend as a discount (the backend re-validates + consumes them).
       fidelity_points_use: pointsUsed,
       // "Vendita da appuntamento": link the sale to the appointment so the backend marks it
@@ -2291,6 +2379,36 @@ export function PosContent() {
                     {couponMsg?.text ?? ""}
                   </div>
                 </div>
+
+                <div className="mt-2" id="posPromotionBox">
+                  <div className="input-group input-group-sm">
+                    <button
+                      className="btn btn-outline-primary"
+                      type="button"
+                      id="posPromotionDetectBtn"
+                      disabled={promotionEvaluating || subtotal <= 0}
+                      onClick={() => void detectPromotion()}
+                    >
+                      <i className="bi bi-magic me-1" />
+                      {promotionEvaluating ? "Verifica…" : "Rileva promozione"}
+                    </button>
+                    {promotionId > 0 ? (
+                      <button
+                        className="btn btn-outline-secondary"
+                        type="button"
+                        onClick={() => {
+                          clearPromotion();
+                          setPromotionMsg(null);
+                        }}
+                      >
+                        Rimuovi
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className={`form-text${promotionMsg ? (promotionMsg.ok ? " text-success" : " text-danger") : ""}`}>
+                    {promotionMsg?.text ?? "Applica automaticamente la migliore promozione attiva sul carrello."}
+                  </div>
+                </div>
               </div>
 
               <div className="row g-2 mb-2">
@@ -2595,6 +2713,14 @@ export function PosContent() {
                 <div className="d-flex justify-content-between">
                   <span>Subtotale</span>
                   <strong id="posSubtotalVal">{fmtEUR(subtotal)}</strong>
+                </div>
+
+                <div
+                  className={`d-flex justify-content-between text-muted small${promotionDiscount > 0 ? "" : " d-none"}`}
+                  id="posPromotionRow"
+                >
+                  <span>{promotionName ? `Promozione (${promotionName})` : "Promozione"}</span>
+                  <span>- {fmtEUR(promotionDiscount)}</span>
                 </div>
 
                 <div
