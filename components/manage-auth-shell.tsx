@@ -1,27 +1,18 @@
-"use client";
-
-import { useEffect } from "react";
-
 // Shared chrome for the faithful PHP /manage auth pages (login, register,
 // forgot/reset password). Reproduces app/pages/manage_account.php markup +
 // loads the original auth CSS, and renders the right-hand visual card.
-
-export function useAuthBodyClass() {
-  useEffect(() => {
-    const previous = document.body.className;
-    document.body.className = "account-page account-page--auth manage-page";
-    return () => {
-      document.body.className = previous;
-    };
-  }, []);
-}
+//
+// The stylesheets are hoisted render-blocking via React's `precedence` support
+// (they land in <head> in the SSR HTML, before first paint) and the page classes
+// live on a wrapping <div> that is server-rendered — so there is NO flash of
+// unstyled content. (Previously the CSS was injected + the body class set from a
+// client useEffect, which only ran after the first paint → the FOUC.)
 
 export function ManageAuthShell({ children }: { children: React.ReactNode }) {
-  useAuthBodyClass();
   return (
-    <>
-      <link rel="stylesheet" href="/assets/css/pages/public_account.css" />
-      <link rel="stylesheet" href="/assets/css/pages/manage_account.css" />
+    <div className="account-page account-page--auth manage-page">
+      <link rel="stylesheet" href="/assets/css/pages/public_account.css" precedence="default" />
+      <link rel="stylesheet" href="/assets/css/pages/manage_account.css" precedence="default" />
 
       <a className="auth-back" href="/attivita" aria-label="Torna indietro">
         &larr;
@@ -36,7 +27,7 @@ export function ManageAuthShell({ children }: { children: React.ReactNode }) {
         </section>
         <ManageAuthVisual />
       </main>
-    </>
+    </div>
   );
 }
 
