@@ -8095,6 +8095,257 @@ export async function promotionFormContext(slug: string): Promise<{
   };
 }
 
+// ---- Promotion APPLICATION engine (Block 3, port of Promotions::evaluatePromotion) ----
+export type PromoCartLine = { type: "service" | "product"; id: number; qty: number; unitPrice: number };
+export type PromoEvalResult = { promotionId: number; title: string; eligible: boolean; discount: number; reason: string; eligibleQty: number; eligibleAmount: number };
+
+const PROMO_CANCELLED_STATES = ["canceled", "cancelled", "annullato", "annullata", "rejected", "rifiutato", "rifiutata", "deleted", "eliminato", "eliminata"];
+
+type PromoChildren = {
+  blackouts: Set<string>;
+  windows: { day: number; start: string; end: string }[];
+  serviceDefs: Map<number, { type: "percent" | "fixed"; value: number; minQty: number }>;
+  productDefs: Map<number, { type: "percent" | "fixed"; value: number; minQty: number }>;
+  locationIds: Set<number>;
+};
+
+// Per-client target context (computed once): previous non-cancelled appointment
+// count + last appointment date before the cutoff, plus the client anagrafica used
+// by the new/inactive/birthday/fidelity target rules.
+type PromoClientCtx = {
+  clientId: number;
+  registrationDate: string;
+  birthDate: string;
+  createdAt: string;
+  fidelityLevel: string;
+  prevApptCount: number;
+  lastApptDate: string;
+  adhering: boolean;
+};
+
+function promoNormTime(time: string | null): string {
+  const s = String(time ?? "").trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return "";
+  return `${m[1].padStart(2, "0")}:${m[2]}`;
+}
+
+async function loadPromoClientCtx(slug: string, clientId: number, date: string, time: string): Promise<PromoClientCtx | null> {
+  if (clientId <= 0) return null;
+  const rows = await tenantSelect<RowDataPacket>({ slug, table: "clients", columns: "id, registration_date, birth_date, created_at, fidelity_level", where: "id = ?", params: [clientId], limit: 1 });
+  if (!rows[0]) return null;
+  const today = todayIso();
+  const cutoff = date === today ? `${date} 00:00:00` : time ? `${date} ${time}:00` : `${date} 23:59:59`;
+  const appt = await tenantTable(slug, "appointments");
+  const notIn = PROMO_CANCELLED_STATES.map(() => "?").join(",");
+  const agg = await dbQuery<RowDataPacket[]>(
+    `SELECT COUNT(*) c, MAX(starts_at) m FROM ${quoteIdentifier(appt.name)} WHERE tenant_id = ? AND client_id = ? AND status NOT IN (${notIn}) AND starts_at < ?`,
+    [appt.tenantId ?? 0, clientId, ...PROMO_CANCELLED_STATES, cutoff],
+  ).catch(() => [] as RowDataPacket[]);
+  return {
+    clientId,
+    registrationDate: rows[0].registration_date ? toIso(rows[0].registration_date).slice(0, 10) : "",
+    birthDate: rows[0].birth_date ? toIso(rows[0].birth_date).slice(0, 10) : "",
+    createdAt: rows[0].created_at ? toIso(rows[0].created_at).slice(0, 10) : "",
+    fidelityLevel: String(rows[0].fidelity_level ?? "").trim().toLowerCase(),
+    prevApptCount: Number(agg[0]?.c ?? 0),
+    lastApptDate: agg[0]?.m ? toIso(agg[0].m).slice(0, 10) : "",
+    adhering: await fidelityIsClientAdhering(slug, clientId),
+  };
+}
+
+// Port of Promotions::checkClientTarget (new/inactive/birthday/fidelity). Returns
+// true when eligible, otherwise the Italian reason string.
+function checkPromoTarget(target: string, promo: RowDataPacket, ctx: PromoClientCtx | null, date: string): true | string {
+  if (target === "all") return true;
+  if (!ctx) return "Richiede un cliente selezionato.";
+
+  if (target === "new") {
+    const within = Math.max(0, Number(promo.new_within_days ?? 0) || 0);
+    if (within <= 0) return ctx.prevApptCount <= 0 ? true : "Valida solo per nuovi clienti.";
+    const reg = ctx.registrationDate || ctx.createdAt;
+    if (!reg) return `Valida solo per clienti registrati negli ultimi ${within} giorni.`;
+    const minDate = addDaysToIso(date, -within);
+    if (reg < minDate) return `Valida solo per clienti registrati negli ultimi ${within} giorni.`;
+    return ctx.prevApptCount <= 0 ? true : "Valida solo per nuovi clienti.";
+  }
+
+  if (target === "inactive") {
+    const days = Math.max(1, Number(promo.inactive_days ?? 0) || 30);
+    if (!ctx.lastApptDate) return true;
+    const threshold = addDaysToIso(date, -days);
+    return ctx.lastApptDate <= threshold ? true : `Valida per clienti inattivi da almeno ${days} giorni.`;
+  }
+
+  if (target === "birthday") {
+    if (!ctx.birthDate) return "Valida solo per clienti con data di nascita.";
+    const mday = ctx.birthDate.slice(5, 10);
+    const window = Math.max(0, Number(promo.birthday_window_days ?? 0) || 0);
+    if (window <= 0) return date.slice(5, 10) === mday ? true : "Valida solo il giorno del compleanno.";
+    const y = Number(date.slice(0, 4));
+    const dts = Date.parse(`${date}T00:00:00Z`);
+    const dist = (yy: number) => Math.abs(Math.round((Date.parse(`${yy}-${mday}T00:00:00Z`) - dts) / 86400000));
+    const min = Math.min(dist(y - 1), dist(y), dist(y + 1));
+    return min <= window ? true : `Valida entro ±${window} giorni dal compleanno.`;
+  }
+
+  if (target === "fidelity") {
+    if (!ctx.adhering) return "Valida solo per clienti aderenti alla Fidelity.";
+    const levels = ((): string[] => { try { const p = JSON.parse(String(promo.target_fidelity_levels ?? "[]")); return Array.isArray(p) ? p.map((v) => String(v ?? "").trim().toLowerCase()).filter(Boolean) : []; } catch { return []; } })();
+    if (levels.length > 0) {
+      const cur = ctx.fidelityLevel !== "" ? `points:${ctx.fidelityLevel}` : "";
+      if (cur === "" || !levels.includes(cur)) return "Valida solo per alcuni livelli Fidelity.";
+    }
+    return true;
+  }
+  return true;
+}
+
+function addDaysToIso(iso: string, days: number): string {
+  const [y, m, d] = iso.split("-").map((p) => Number.parseInt(p, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+// Compute the total discount a promotion grants on a cart (port of the scope/qty
+// discount computation in evaluatePromotion — per-line total; the legacy's unit-by-
+// unit pro-rata only changes rounding distribution, not the total). Returns cents.
+function computePromoDiscountCents(promo: RowDataPacket, ch: PromoChildren, cart: PromoCartLine[]): { discountC: number; eligibleQty: number; eligibleAmountC: number } {
+  const svcMode = String(promo.apply_services_mode ?? "all").toLowerCase();
+  const prdMode = String(promo.apply_products_mode ?? "none").toLowerCase();
+  const cents = (v: number) => Math.round(v * 100);
+
+  const svcType = String(promo.discount_type ?? "percent").toLowerCase() === "fixed" ? "fixed" : "percent";
+  let svcVal = Math.max(0, Number(promo.discount_value ?? 0) || 0);
+  if (svcType === "percent" && svcVal > 100) svcVal = 100;
+  const svcMinQty = Math.max(1, Number(promo.min_qty ?? 1) || 1);
+
+  const prdValRaw = promo.products_discount_value;
+  let prdType: string;
+  let prdVal: number;
+  if (prdValRaw === null || prdValRaw === undefined || prdValRaw === "") { prdType = svcType; prdVal = svcVal; }
+  else { prdType = String(promo.products_discount_type ?? "").toLowerCase(); if (prdType !== "percent" && prdType !== "fixed") prdType = svcType; prdVal = Math.max(0, Number(prdValRaw) || 0); if (prdType === "percent" && prdVal > 100) prdVal = 100; }
+  const prdMinQty = Math.max(1, Number(promo.products_min_qty ?? promo.min_qty ?? 1) || 1);
+
+  let discountC = 0;
+  let eligibleQty = 0;
+  let eligibleAmountC = 0;
+  let globalSvcTotalC = 0;
+  let globalSvcQty = 0;
+  let globalPrdTotalC = 0;
+  let globalPrdQty = 0;
+
+  for (const line of cart) {
+    const type = line.type;
+    const id = Math.trunc(Number(line.id)) || 0;
+    const qty = Math.max(1, Math.trunc(Number(line.qty)) || 1);
+    const unitC = cents(Math.max(0, Number(line.unitPrice) || 0));
+    if (id <= 0 || unitC <= 0) continue;
+    const lineTotC = unitC * qty;
+
+    if (type === "service") {
+      if (svcMode === "all") { eligibleQty += qty; eligibleAmountC += lineTotC; globalSvcTotalC += lineTotC; globalSvcQty += qty; }
+      else if (svcMode === "selected" && ch.serviceDefs.has(id)) {
+        eligibleQty += qty; eligibleAmountC += lineTotC;
+        const def = ch.serviceDefs.get(id)!;
+        if (qty >= def.minQty) discountC += def.type === "percent" ? Math.round((lineTotC * def.value) / 100) : Math.min(unitC, cents(def.value)) * qty;
+      }
+    } else if (type === "product") {
+      if (prdMode === "all") { eligibleQty += qty; eligibleAmountC += lineTotC; globalPrdTotalC += lineTotC; globalPrdQty += qty; }
+      else if (prdMode === "selected" && ch.productDefs.has(id)) {
+        eligibleQty += qty; eligibleAmountC += lineTotC;
+        const def = ch.productDefs.get(id)!;
+        if (qty >= def.minQty) discountC += def.type === "percent" ? Math.round((lineTotC * def.value) / 100) : Math.min(unitC, cents(def.value)) * qty;
+      }
+    }
+  }
+
+  // Global groups (scope=all): gate on the group qty >= the group min_qty.
+  if (globalSvcQty >= svcMinQty && globalSvcTotalC > 0) discountC += svcType === "percent" ? Math.round((globalSvcTotalC * svcVal) / 100) : Math.min(globalSvcTotalC, cents(svcVal));
+  if (globalPrdQty >= prdMinQty && globalPrdTotalC > 0) discountC += prdType === "percent" ? Math.round((globalPrdTotalC * prdVal) / 100) : Math.min(globalPrdTotalC, cents(prdVal));
+
+  if (discountC > eligibleAmountC) discountC = eligibleAmountC;
+  return { discountC: Math.max(0, discountC), eligibleQty, eligibleAmountC };
+}
+
+// Evaluate one active promotion against a cart + context (port of the guard chain
+// in evaluatePromotion: active/date/blackout/time-window/location/excluded/target,
+// then the discount). date=YYYY-MM-DD, time=HH:MM (optional), locationId optional.
+function evaluateOnePromotion(promo: RowDataPacket, ch: PromoChildren, cart: PromoCartLine[], date: string, time: string, clientId: number, locationId: number, ctx: PromoClientCtx | null): PromoEvalResult {
+  const base: PromoEvalResult = { promotionId: Number(promo.id ?? 0), title: String(promo.title ?? ""), eligible: false, discount: 0, reason: "", eligibleQty: 0, eligibleAmount: 0 };
+
+  if (Number(promo.is_active ?? 0) !== 1) return { ...base, reason: "Promozione non attiva." };
+  const start = String(promo.starts_at ?? "").slice(0, 10);
+  const end = String(promo.ends_at ?? "").slice(0, 10);
+  if (start && /^\d{4}-\d{2}-\d{2}$/.test(start) && date < start) return { ...base, reason: "Promozione non ancora valida." };
+  if (end && /^\d{4}-\d{2}-\d{2}$/.test(end) && date > end) return { ...base, reason: "Promozione scaduta." };
+  if (ch.blackouts.has(date)) return { ...base, reason: "Non valida in questa data." };
+
+  if (ch.windows.length > 0) {
+    const dow = ((new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7) + 1; // 1=Mon..7=Sun
+    const dayWindows = ch.windows.filter((w) => w.day === dow);
+    if (dayWindows.length === 0) return { ...base, reason: "Non valida in questo giorno." };
+    if (time && !dayWindows.some((w) => w.start && w.end && time >= w.start && time <= w.end)) return { ...base, reason: "Non valida in questo orario." };
+  }
+
+  if (locationId > 0 && ch.locationIds.size > 0 && !ch.locationIds.has(locationId)) return { ...base, reason: "Promozione non valida per questa sede." };
+
+  const excluded = ((): number[] => { try { const p = JSON.parse(String(promo.excluded_client_ids ?? "[]")); return Array.isArray(p) ? p.map((v) => Math.trunc(Number(v)) || 0) : []; } catch { return []; } })();
+  if (clientId > 0 && excluded.includes(clientId)) return { ...base, reason: "Cliente escluso da questa promozione." };
+
+  let target = String(promo.target_type ?? "all").toLowerCase();
+  if (!["all", "new", "inactive", "birthday", "fidelity"].includes(target)) target = "all";
+  const targetOk = checkPromoTarget(target, promo, ctx, date);
+  if (targetOk !== true) return { ...base, reason: targetOk };
+
+  const { discountC, eligibleQty, eligibleAmountC } = computePromoDiscountCents(promo, ch, cart);
+  if (eligibleQty <= 0) return { ...base, reason: "Nessun servizio/prodotto nel carrello rientra nello scope della promozione." };
+  const discount = roundMoney(discountC / 100);
+  return { promotionId: base.promotionId, title: base.title, eligible: discount > 0, discount, reason: discount > 0 ? "Promozione valida." : "Nessuno sconto applicabile.", eligibleQty, eligibleAmount: roundMoney(eligibleAmountC / 100) };
+}
+
+// Evaluate ALL active promotions against a cart; return the eligible ones (discount
+// desc) + the best. Loads each promotion's child mappings in batch (tenant-safe).
+export async function evaluatePromotionsForCart(slug: string, cart: PromoCartLine[], date: string, time: string, clientId: number, locationId: number): Promise<{ promotions: PromoEvalResult[]; best: PromoEvalResult | null }> {
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : todayIso();
+  const t = promoNormTime(time);
+  const promos = await tenantSelect<RowDataPacket>({ slug, table: "promotions", where: "COALESCE(is_active,0) = 1", orderBy: "priority DESC, id ASC" }).catch(() => [] as RowDataPacket[]);
+  if (promos.length === 0) return { promotions: [], best: null };
+  const ids = promos.map((p) => Number(p.id));
+  const inList = ids.map(() => "?").join(",");
+
+  const grab = async (table: string): Promise<Map<number, RowDataPacket[]>> => {
+    const rows = await tenantSelect<RowDataPacket>({ slug, table, where: `promotion_id IN (${inList})`, params: ids }).catch(() => [] as RowDataPacket[]);
+    const map = new Map<number, RowDataPacket[]>();
+    for (const r of rows) { const pid = Number(r.promotion_id ?? 0); if (!map.has(pid)) map.set(pid, []); map.get(pid)!.push(r); }
+    return map;
+  };
+  const [boMap, twMap, svcMap, prdMap, locMap] = await Promise.all([grab("promotion_blackout_dates"), grab("promotion_time_windows"), grab("promotion_services"), grab("promotion_products"), grab("promotion_locations")]);
+  const ctx = clientId > 0 ? await loadPromoClientCtx(slug, clientId, day, t) : null;
+
+  const results: PromoEvalResult[] = [];
+  for (const promo of promos) {
+    const pid = Number(promo.id);
+    const defMap = (rows: RowDataPacket[] | undefined, refCol: string) => {
+      const m = new Map<number, { type: "percent" | "fixed"; value: number; minQty: number }>();
+      for (const r of rows ?? []) { const t2 = String(r.discount_type ?? "percent").toLowerCase() === "fixed" ? "fixed" : "percent"; m.set(Number(r[refCol] ?? 0), { type: t2 as "percent" | "fixed", value: Math.max(0, Number(r.discount_value ?? 0) || 0), minQty: Math.max(1, Number(r.min_qty ?? 1) || 1) }); }
+      return m;
+    };
+    const ch: PromoChildren = {
+      blackouts: new Set((boMap.get(pid) ?? []).map((r) => (typeof r.blackout_date === "string" ? r.blackout_date.slice(0, 10) : r.blackout_date ? toIso(r.blackout_date).slice(0, 10) : "")).filter(Boolean)),
+      windows: (twMap.get(pid) ?? []).map((r) => ({ day: Number(r.day_of_week ?? 0), start: String(r.start_time ?? "").slice(0, 5), end: String(r.end_time ?? "").slice(0, 5) })),
+      serviceDefs: defMap(svcMap.get(pid), "service_id"),
+      productDefs: defMap(prdMap.get(pid), "product_id"),
+      locationIds: new Set((locMap.get(pid) ?? []).map((r) => Number(r.location_id ?? 0)).filter((n) => n > 0)),
+    };
+    results.push(evaluateOnePromotion(promo, ch, cart, day, t, clientId, locationId, ctx));
+  }
+
+  const eligible = results.filter((r) => r.eligible).sort((a, b) => b.discount - a.discount);
+  return { promotions: eligible, best: eligible[0] ?? null };
+}
+
 // Selected-scope services/products that must still resolve to a live, active
 // catalog item before an inactive promotion can be re-activated (port of
 // Promotions::activationContentIssues). Returns human-readable blocker strings.

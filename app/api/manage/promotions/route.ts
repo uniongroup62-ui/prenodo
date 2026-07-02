@@ -1,5 +1,5 @@
 import { jsonError, parseInteger, parseNumber, parseRequestBody } from "@/lib/api-utils";
-import { deleteManagePromotion, getManagePromotion, listDbPromotions, previewDbPromotion, promotionFormContext, saveManagePromotion, toggleManagePromotion } from "@/lib/db-repositories";
+import { deleteManagePromotion, evaluatePromotionsForCart, getManagePromotion, listDbPromotions, previewDbPromotion, promotionFormContext, saveManagePromotion, toggleManagePromotion, type PromoCartLine } from "@/lib/db-repositories";
 import { currentManageSession } from "@/lib/manage-auth";
 import { manageTenantSlugFromRequest } from "@/lib/manage-request";
 import { can, canAny } from "@/lib/role-permissions";
@@ -58,6 +58,16 @@ export async function POST(request: Request) {
       const active = ["1", "true", "yes", "on"].includes((body.active ?? "").toLowerCase());
       const promotion = await toggleManagePromotion(tenantSlug, id, active, session.user.id);
       return Response.json({ ok: true, source: "promotions?action=toggle", sourceMode: "database", promotion, promotions: await listDbPromotions(tenantSlug) });
+    }
+
+    // Evaluate active promotions against a cart (port of Promotions::evaluatePromotion,
+    // the matching + discount computation). Read-only preview — does not apply/record.
+    if (action === "evaluate") {
+      if (!canAny(session.user.perms, ["promotions.manage", "pos.manage"])) return jsonError("Permesso promozioni mancante.", 403);
+      let cart: PromoCartLine[] = [];
+      try { const parsed = JSON.parse(String(body.cart_json ?? "[]")); if (Array.isArray(parsed)) cart = parsed as PromoCartLine[]; } catch { cart = []; }
+      const result = await evaluatePromotionsForCart(tenantSlug, cart, String(body.date ?? ""), String(body.time ?? ""), parseInteger(body.client_id, 0), parseInteger(body.location_id, 0));
+      return Response.json({ ok: true, sourceMode: "database", ...result });
     }
 
     // Delete a promotion (port of promotions.php action=delete / Promotions::delete).
